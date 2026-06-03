@@ -281,3 +281,13 @@ license = "MIT"
 [[siphasher.clarify.files]]
 path = "COPYING"
 checksum = "c962ee4d1d05ddc138b202b2540219ebc57893fcf97b364852094a9a94ce1365"
+
+# rcgen is dual-licensed MIT OR Apache-2.0; its LICENSE is a combined notice
+# carrying "est31 <MTest31@outlook.com> and contributors". Pick MIT from the
+# disjunction and bind the real file.
+[rcgen.clarify]
+license = "MIT"
+
+[[rcgen.clarify.files]]
+path = "LICENSE"
+checksum = "debe6fed7ac143217c7f533759c54b14f18cd01d5fe195c51d83c2ae2d136cb4"
