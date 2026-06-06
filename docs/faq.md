@@ -76,7 +76,7 @@ Lore, formerly called Unreal Revision Control, is the built-in version control s
 
 ## How can I contribute?
 
-All contributions are welcome via GitHub. Lore uses DCO (Developer Certificate of Origin) rather than a CLA — this avoids the legal overhead that prevents many contributors from participating. To get started, read the [contribution guidelines](https://github.com/EpicGames/lore/blob/main/CONTRIBUTING.md) in the repository, pick up an open issue, and submit a pull request. You can also [join the conversation on Discord](https://discord.gg/WBkv3rJy), where the maintainers are active.
+All contributions are welcome via GitHub. Lore uses DCO (Developer Certificate of Origin) rather than a CLA — this avoids the legal overhead that prevents many contributors from participating. To get started, read the [contribution guidelines](https://github.com/EpicGames/lore/blob/main/CONTRIBUTING.md) in the repository, pick up an open issue, and submit a pull request. You can also [join the conversation on Discord](https://discord.gg/E4SFJKRPbg), where the maintainers are active.
 
 ## Will Lore always be fully open source?
 
