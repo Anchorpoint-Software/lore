@@ -17,7 +17,6 @@ use lore_base::types::*;
 use lore_error_set::prelude::*;
 use parking_lot::Mutex;
 use tokio::task::JoinHandle;
-use tokio::task::JoinSet;
 use url::Url;
 
 use crate::auth;
@@ -253,6 +252,10 @@ async fn connect_impl(
         identity: identity.clone(),
         protocol: protocol.clone(),
         environment,
+        storage_ready: ServiceReady::new(),
+        revision_ready: ServiceReady::new(),
+        lock_ready: ServiceReady::new(),
+        repository_ready: ServiceReady::new(),
         storage_building: tokio::sync::Mutex::new(None),
         storage: parking_lot::RwLock::new(None),
         revision: dashmap::DashMap::new(),
@@ -264,14 +267,15 @@ async fn connect_impl(
         stale: std::sync::atomic::AtomicBool::new(false),
     });
 
-    let subtasks = Arc::new(tokio::sync::Mutex::new(JoinSet::new()));
+    let subtask_aborts: Arc<parking_lot::Mutex<Vec<tokio::task::AbortHandle>>> =
+        Arc::new(parking_lot::Mutex::new(Vec::new()));
+
     let connect_task = lore_spawn!({
-        // Keep a reference to make the connection stick in case it is reused
         let environment_client = environment_client.clone();
         let connection = connection.clone();
         let remote_url = remote_url.clone();
         let identity = identity.clone();
-        let subtasks = subtasks.clone();
+        let subtask_aborts = subtask_aborts.clone();
         async move {
             let endpoint_description = if repository.is_zero() {
                 format!("{remote_url} repository service")
@@ -281,23 +285,25 @@ async fn connect_impl(
             lore_trace!("Connecting to {endpoint_description}");
 
             if !repository.is_zero() {
-                // Trigger a token exchange first to parallelize the connection phase using the
-                // now cached authz token. If the exchange was done above to find a valid identity,
-                // this will short circuit and just returned the cached token
                 if !auth_url.is_empty() {
                     lore_trace!("Token exchange for identity {identity} for {auth_url}");
-                    auth::exchange::exchange(&auth_url, &identity, repository, remote_domain)
-                        .await
-                        .inspect_err(|err| lore_debug!("Auth exchange failed: {err}"))
-                        .forward::<ProtocolError>("authorization failure")?;
+                    if let Err(err) =
+                        auth::exchange::exchange(&auth_url, &identity, repository, remote_domain)
+                            .await
+                            .inspect_err(|err| lore_debug!("Auth exchange failed: {err}"))
+                            .forward::<ProtocolError>("authorization failure")
+                    {
+                        connection.storage_ready.complete(Err(err.clone()));
+                        connection.revision_ready.complete(Err(err.clone()));
+                        connection.lock_ready.complete(Err(err.clone()));
+                        connection.repository_ready.complete(Err(err));
+                        return;
+                    }
                 } else {
                     lore_debug!("Unauthenticated server, no token exchange");
                 }
             }
 
-            // Per-service endpoint URLs. Each service uses its own URL from
-            // the environment response when provided; otherwise the caller-
-            // supplied `remote_url` is used for that service.
             let remote_url_str = remote_url.as_str();
             let storage_url: String = connection
                 .environment
@@ -315,56 +321,85 @@ async fn connect_impl(
 
             // Storage connections are always created -- they're repository-agnostic.
             // Per-repository auth is handled by session_start().
-            {
-                let mut subtasks = subtasks.lock().await;
-                let max_connections = max_connections.clamp(1, MAX_STORAGE_CONNECTIONS);
-                lore_trace!(
-                    "Connecting storage service to {storage_url} using {max_connections} connections"
-                );
-                for index in 0..max_connections {
-                    let storage_url = storage_url.clone();
-                    let auth_url = auth_url.clone();
-                    let connection = connection.clone();
-                    let identity = identity.clone();
-                    let environment_client = environment_client.clone();
-                    lore_spawn!(subtasks, async move {
-                        let _environment_client = environment_client;
-                        let storage = connection
-                            .protocol
-                            .storage(
-                                Arc::downgrade(&connection),
-                                storage_url.as_str(),
-                                auth_url.as_str(),
-                                identity.as_str(),
-                                repository,
-                                index,
-                            )
-                            .await?;
-                        let mut building = connection.storage_building.lock().await;
-                        if let Some(vec) = building.as_mut() {
-                            vec.push(storage);
-                        } else {
-                            *building = Some(vec![storage]);
+            let max_connections = max_connections.clamp(1, MAX_STORAGE_CONNECTIONS);
+            lore_trace!(
+                "Connecting storage service to {storage_url} using {max_connections} connections"
+            );
+            let storage_remaining = Arc::new(std::sync::atomic::AtomicUsize::new(max_connections));
+            let storage_error: Arc<parking_lot::Mutex<Option<ProtocolError>>> =
+                Arc::new(parking_lot::Mutex::new(None));
+            for index in 0..max_connections {
+                let storage_url = storage_url.clone();
+                let auth_url = auth_url.clone();
+                let connection = connection.clone();
+                let identity = identity.clone();
+                let environment_client = environment_client.clone();
+                let storage_remaining = storage_remaining.clone();
+                let storage_error = storage_error.clone();
+                let handle = lore_spawn!(async move {
+                    let _environment_client = environment_client;
+                    let result = connection
+                        .protocol
+                        .storage(
+                            Arc::downgrade(&connection),
+                            storage_url.as_str(),
+                            auth_url.as_str(),
+                            identity.as_str(),
+                            repository,
+                            index,
+                        )
+                        .await;
+                    match result {
+                        Ok(storage) => {
+                            let mut building = connection.storage_building.lock().await;
+                            if let Some(vec) = building.as_mut() {
+                                vec.push(storage);
+                            } else {
+                                *building = Some(vec![storage]);
+                            }
                         }
-                        Ok(())
-                    });
-                }
+                        Err(err) => {
+                            let mut slot = storage_error.lock();
+                            if slot.is_none() {
+                                *slot = Some(err);
+                            }
+                        }
+                    }
+                    if storage_remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+                        let err = storage_error.lock().take();
+                        if let Some(err) = err {
+                            connection.storage_ready.complete(Err(err));
+                        } else {
+                            let connections = connection
+                                .storage_building
+                                .lock()
+                                .await
+                                .take()
+                                .unwrap_or_default();
+                            if !connections.is_empty() {
+                                *connection.storage.write() =
+                                    Some(Arc::new(StorageConnector::new(connections)));
+                            }
+                            connection.storage_ready.complete(Ok(()));
+                        }
+                    }
+                });
+                subtask_aborts.lock().push(handle.abort_handle());
             }
 
             // Admin services are created lazily per-repository via Connection::admin().
 
             if !repository.is_zero() {
                 {
-                    let mut subtasks = subtasks.lock().await;
                     lore_trace!("Connecting revision service to {revision_url}");
                     let revision_url = revision_url.clone();
                     let auth_url = auth_url.clone();
                     let connection = connection.clone();
                     let identity = identity.clone();
                     let environment_client = environment_client.clone();
-                    lore_spawn!(subtasks, async move {
+                    let handle = lore_spawn!(async move {
                         let _environment_client = environment_client;
-                        let revision = connection
+                        let result = connection
                             .protocol
                             .revision(
                                 Arc::downgrade(&connection),
@@ -373,23 +408,28 @@ async fn connect_impl(
                                 identity.as_str(),
                                 repository,
                             )
-                            .await?;
-                        connection.revision.insert(repository, revision);
-                        Ok(())
+                            .await;
+                        match result {
+                            Ok(revision) => {
+                                connection.revision.insert(repository, revision);
+                                connection.revision_ready.complete(Ok(()));
+                            }
+                            Err(err) => connection.revision_ready.complete(Err(err)),
+                        }
                     });
+                    subtask_aborts.lock().push(handle.abort_handle());
                 }
 
                 {
-                    let mut subtasks = subtasks.lock().await;
                     lore_trace!("Connecting lock service to {lock_url}");
                     let lock_url = lock_url.clone();
                     let auth_url = auth_url.clone();
                     let connection = connection.clone();
                     let identity = identity.clone();
                     let environment_client = environment_client.clone();
-                    lore_spawn!(subtasks, async move {
+                    let handle = lore_spawn!(async move {
                         let _environment_client = environment_client;
-                        let lock = connection
+                        let result = connection
                             .protocol
                             .lock(
                                 Arc::downgrade(&connection),
@@ -398,23 +438,31 @@ async fn connect_impl(
                                 identity.as_str(),
                                 repository,
                             )
-                            .await?;
-                        connection.lock.insert(repository, lock);
-                        Ok(())
+                            .await;
+                        match result {
+                            Ok(lock) => {
+                                connection.lock.insert(repository, lock);
+                                connection.lock_ready.complete(Ok(()));
+                            }
+                            Err(err) => connection.lock_ready.complete(Err(err)),
+                        }
                     });
+                    subtask_aborts.lock().push(handle.abort_handle());
                 }
+            } else {
+                connection.revision_ready.complete(Ok(()));
+                connection.lock_ready.complete(Ok(()));
             }
 
             {
-                let mut subtasks = subtasks.lock().await;
                 let repository_service_url = repository_service_url.clone();
                 let auth_url = auth_url.clone();
                 let connection = connection.clone();
                 let identity = identity.clone();
                 let environment_client = environment_client.clone();
-                lore_spawn!(subtasks, async move {
+                let handle = lore_spawn!(async move {
                     let _environment_client = environment_client;
-                    let repository = connection
+                    let result = connection
                         .protocol
                         .repository(
                             Arc::downgrade(&connection),
@@ -423,22 +471,27 @@ async fn connect_impl(
                             auth_url.as_str(),
                             identity.as_str(),
                         )
-                        .await?;
-                    let mut conn_lock = connection.repository.lock().await;
-                    *conn_lock = Some(repository);
-                    Ok(())
+                        .await;
+                    match result {
+                        Ok(repository) => {
+                            let mut conn_lock = connection.repository.lock().await;
+                            *conn_lock = Some(repository);
+                            drop(conn_lock);
+                            connection.repository_ready.complete(Ok(()));
+                        }
+                        Err(err) => connection.repository_ready.complete(Err(err)),
+                    }
                 });
+                subtask_aborts.lock().push(handle.abort_handle());
             }
-
-            Ok(())
         }
     });
 
     {
         let mut lock = connection.connector.lock().await;
         *lock = Some(Connector {
-            task: connect_task,
-            subtasks,
+            setup_handle: connect_task,
+            subtask_aborts,
         });
     }
 
@@ -447,9 +500,52 @@ async fn connect_impl(
     Ok(connection)
 }
 
+/// Multi-waiter "set once" completion signal. Each per-service connect
+/// subtask owns one; consumers await readiness via `wait`. Calling
+/// `complete` twice is a no-op — the first value wins, which matters during
+/// cancellation when a subtask may already have raced to a success.
+#[derive(Default)]
+struct ServiceReady {
+    notify: tokio::sync::Notify,
+    result: parking_lot::Mutex<Option<Result<(), ProtocolError>>>,
+}
+
+impl ServiceReady {
+    fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    fn complete(&self, result: Result<(), ProtocolError>) {
+        let mut guard = self.result.lock();
+        if guard.is_some() {
+            return;
+        }
+        *guard = Some(result);
+        drop(guard);
+        self.notify.notify_waiters();
+    }
+
+    async fn wait(&self) -> Result<(), ProtocolError> {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(result) = self.result.lock().as_ref() {
+                return result.clone();
+            }
+            notified.await;
+        }
+    }
+}
+
 struct Connector {
-    task: JoinHandle<Result<(), ProtocolError>>,
-    subtasks: Arc<tokio::sync::Mutex<JoinSet<Result<(), ProtocolError>>>>,
+    /// Outer setup task: runs token exchange and spawns per-service
+    /// subtasks. Each subtask signals its own `ServiceReady` independently;
+    /// this handle exists so `cancel_connect` can abort the setup phase.
+    setup_handle: JoinHandle<()>,
+    /// Abort handles for every subtask the setup task has spawned. Pushed by
+    /// the setup task as it spawns them; consumed by `cancel_connect`.
+    subtask_aborts: Arc<parking_lot::Mutex<Vec<tokio::task::AbortHandle>>>,
 }
 
 /// Connection over a protocol
@@ -459,9 +555,17 @@ pub struct Connection {
     pub identity: String,
     pub environment: EnvironmentConfig,
     protocol: Arc<dyn Protocol>,
-    /// Temporary storage during connection establishment. Moved to `storage` after connect.
+    /// Per-service readiness. Signalled by each subtask on completion (or
+    /// by `cancel_connect` on shutdown). Outlives `connector` so waiters
+    /// resolve to a cancelled error after cleanup rather than hanging.
+    storage_ready: Arc<ServiceReady>,
+    revision_ready: Arc<ServiceReady>,
+    lock_ready: Arc<ServiceReady>,
+    repository_ready: Arc<ServiceReady>,
+    /// Temporary collection point for storage subtasks. The last subtask to
+    /// finish freezes the Vec into `storage` and signals `storage_ready`.
     storage_building: tokio::sync::Mutex<Option<Vec<Arc<dyn Storage>>>>,
-    /// Frozen storage connector, set once after `ensure_connected` completes.
+    /// Frozen storage connector, set once all storage subtasks complete.
     storage: parking_lot::RwLock<Option<Arc<StorageConnector>>>,
     /// Per-repository services, created lazily on first access.
     revision: dashmap::DashMap<RepositoryId, Arc<dyn Revision>>,
@@ -512,39 +616,45 @@ impl Connection {
         self.identity.as_str()
     }
 
-    async fn ensure_connected(self: &Arc<Self>) -> Result<(), ProtocolError> {
-        let mut connector = self.connector.lock().await;
-        let Some(connector) = connector.take() else {
-            return Ok(());
-        };
-        let mut connect_result: Result<(), ProtocolError> = connector
-            .task
-            .await
-            .unwrap_or_else(|_| Err(ProtocolError::internal("task failed")));
-        let mut subtasks = connector.subtasks.lock().await;
-        lore_trace!("Waiting for {} connect tasks to finish", subtasks.len());
-        while let Some(result) = subtasks.join_next().await {
-            connect_result = connect_result
-                .and(result.unwrap_or_else(|_| Err(ProtocolError::internal("task failed"))));
-        }
-        if connect_result.is_ok() {
-            // Freeze the collected connections into an immutable StorageConnector
-            let connections = self
-                .storage_building
-                .lock()
-                .await
-                .take()
-                .unwrap_or_default();
-            if !connections.is_empty() {
-                *self.storage.write() = Some(Arc::new(StorageConnector::new(connections)));
-            }
-            lore_trace!("Connection to {} complete", self.remote_url);
-        } else {
-            self.stale.store(true, Ordering::Relaxed);
+    /// Mark the connection failed and unregister it from the connection cache.
+    /// Idempotent — additional callers find no entry and no-op.
+    fn mark_failed(self: &Arc<Self>) {
+        if !self.stale.swap(true, Ordering::Relaxed) {
             remove_connection(self.clone());
             lore_warn!("Connection to {} failed", self.remote_url);
         }
-        connect_result
+    }
+
+    pub async fn ensure_repository_connected(self: &Arc<Self>) -> Result<(), ProtocolError> {
+        let result = self.repository_ready.wait().await;
+        if result.is_err() {
+            self.mark_failed();
+        }
+        result
+    }
+
+    pub async fn ensure_revision_connected(self: &Arc<Self>) -> Result<(), ProtocolError> {
+        let result = self.revision_ready.wait().await;
+        if result.is_err() {
+            self.mark_failed();
+        }
+        result
+    }
+
+    pub async fn ensure_lock_connected(self: &Arc<Self>) -> Result<(), ProtocolError> {
+        let result = self.lock_ready.wait().await;
+        if result.is_err() {
+            self.mark_failed();
+        }
+        result
+    }
+
+    pub async fn ensure_storage_connected(self: &Arc<Self>) -> Result<(), ProtocolError> {
+        let result = self.storage_ready.wait().await;
+        if result.is_err() {
+            self.mark_failed();
+        }
+        result
     }
 
     async fn cancel_connect(&self) -> Result<(), ProtocolError> {
@@ -554,13 +664,18 @@ impl Connection {
         };
         self.stale.store(true, Ordering::Relaxed);
         lore_trace!("Connection to {} cancelled", self.remote_url);
-        connector.task.abort();
-        {
-            let mut subtasks = connector.subtasks.lock().await;
-            subtasks.abort_all();
-            while subtasks.join_next().await.is_some() {}
+        connector.setup_handle.abort();
+        for handle in std::mem::take(&mut *connector.subtask_aborts.lock()) {
+            handle.abort();
         }
-        let _ = connector.task.await;
+        let cancelled = || ProtocolError::internal("connection cancelled");
+        // Unblock anyone awaiting readiness — `complete` is a no-op if a real
+        // result already won the race.
+        self.storage_ready.complete(Err(cancelled()));
+        self.revision_ready.complete(Err(cancelled()));
+        self.lock_ready.complete(Err(cancelled()));
+        self.repository_ready.complete(Err(cancelled()));
+        let _ = connector.setup_handle.await;
         Ok(())
     }
 
@@ -584,7 +699,7 @@ impl Connection {
 
     /// Returns a raw storage connection from the pool via round-robin.
     pub async fn storage(self: &Arc<Self>) -> Result<Arc<dyn Storage>, ProtocolError> {
-        self.ensure_connected().await?;
+        self.ensure_storage_connected().await?;
         let connector = self.storage_connector()?;
         let connections = connector.connections();
         if connections.is_empty() {
@@ -605,7 +720,7 @@ impl Connection {
         repository: RepositoryId,
         correlation_id: &str,
     ) -> Result<Arc<StorageSession>, ProtocolError> {
-        self.ensure_connected().await?;
+        self.ensure_storage_connected().await?;
         let connector = self.storage_connector()?;
         let (session, pool) = connector
             .session(repository, correlation_id, self.clone())
@@ -648,7 +763,7 @@ impl Connection {
         repository: RepositoryId,
         correlation_id: &str,
     ) -> Result<(), ProtocolError> {
-        self.ensure_connected().await?;
+        self.ensure_storage_connected().await?;
         let connector = self.storage_connector()?;
         if connector.is_partition_authorized(repository) {
             return Ok(());
@@ -666,7 +781,7 @@ impl Connection {
         self: &Arc<Self>,
         repository: RepositoryId,
     ) -> Result<Arc<dyn Revision>, ProtocolError> {
-        self.ensure_connected().await?;
+        self.ensure_revision_connected().await?;
         if let Some(entry) = self.revision.get(&repository) {
             return Ok(entry.value().clone());
         }
@@ -685,7 +800,7 @@ impl Connection {
     }
 
     pub async fn repository(self: &Arc<Self>) -> Result<Arc<dyn Repository>, ProtocolError> {
-        self.ensure_connected().await?;
+        self.ensure_repository_connected().await?;
 
         let lock = self.repository.lock().await;
         if let Some(repository) = lock.as_ref() {
@@ -699,7 +814,6 @@ impl Connection {
         self: &Arc<Self>,
         repository: RepositoryId,
     ) -> Result<Arc<dyn Admin>, ProtocolError> {
-        self.ensure_connected().await?;
         if let Some(entry) = self.admin.get(&repository) {
             return Ok(entry.value().clone());
         }
@@ -721,7 +835,7 @@ impl Connection {
         self: &Arc<Self>,
         repository: RepositoryId,
     ) -> Result<Arc<dyn Lock>, ProtocolError> {
-        self.ensure_connected().await?;
+        self.ensure_lock_connected().await?;
         if let Some(entry) = self.lock.get(&repository) {
             return Ok(entry.value().clone());
         }
