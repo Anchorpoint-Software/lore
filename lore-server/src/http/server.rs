@@ -134,13 +134,10 @@ pub fn create_router(
         .nest("/v1", authenticated_router);
 
     if shared_state.presign_config.is_some() {
-        let presigned_router = Router::new()
-            .route(
-                "/presigned/{repository_id}/{address}",
-                routing::get(presigned::handler),
-            )
-            .with_state(Arc::new(shared_state.clone()));
-        router = router.nest("/v1", presigned_router);
+        router = router.nest(
+            "/v1/presigned",
+            presigned::create_router(Arc::new(shared_state.clone())),
+        );
     }
 
     router.layer(HttpMetricsLayer::new())

@@ -195,9 +195,7 @@ mod tests {
     use std::time::SystemTime;
     use std::time::UNIX_EPOCH;
 
-    use axum::Router;
     use axum::http::StatusCode;
-    use axum::routing;
     use axum_test::TestServer;
     use lore_base::runtime::LORE_CONTEXT;
     use lore_revision::fragment;
@@ -207,6 +205,7 @@ mod tests {
     use crate::http::presign_token::CURRENT_TOKEN_VERSION;
     use crate::http::presign_token::PresignTokenPayload;
     use crate::http::presign_token::sign;
+    use crate::http::presigned;
     use crate::http::server::PresignConfig;
     use crate::http::server::ServerState;
     use crate::store::test_store_create;
@@ -220,15 +219,6 @@ mod tests {
             default_ttl_seconds: 3600,
             max_ttl_seconds: 86400,
         }
-    }
-
-    fn handler_router(state: ServerState) -> Router {
-        Router::new()
-            .route(
-                "/presigned/{repository_id}/{address}",
-                routing::get(super::handler),
-            )
-            .with_state(Arc::new(state))
     }
 
     fn valid_token(repository_id: &str, address: &str, config: &PresignConfig) -> String {
@@ -270,11 +260,11 @@ mod tests {
                     max_file_size: 100,
                     presign_config: Some(config),
                 };
-                let app = handler_router(state);
+                let app = presigned::create_router(Arc::new(state));
                 let server = TestServer::new(app).unwrap();
 
                 let response = server
-                    .get(&format!("/presigned/{repo_hex}/{address}"))
+                    .get(&format!("/{repo_hex}/{address}"))
                     .add_query_param("token", token)
                     .await;
 
@@ -295,13 +285,12 @@ mod tests {
                 let config = test_presign_config();
                 let repo_hex = format!("{repository}");
 
-                // Token expired in the past
                 let payload = PresignTokenPayload {
                     version: CURRENT_TOKEN_VERSION,
                     key_id: config.key_id.clone(),
                     repository: repo_hex.clone(),
                     address: address.to_string(),
-                    expires_at: 1, /* expires_at */
+                    expires_at: 1,
                     content_type: None,
                     content_encoding: None,
                     content_disposition: None,
@@ -315,11 +304,11 @@ mod tests {
                     max_file_size: 100,
                     presign_config: Some(config),
                 };
-                let app = handler_router(state);
+                let app = presigned::create_router(Arc::new(state));
                 let server = TestServer::new(app).unwrap();
 
                 let response = server
-                    .get(&format!("/presigned/{repo_hex}/{address}"))
+                    .get(&format!("/{repo_hex}/{address}"))
                     .add_query_param("token", token)
                     .await;
 
@@ -361,11 +350,11 @@ mod tests {
                     max_file_size: 100,
                     presign_config: Some(config),
                 };
-                let app = handler_router(state);
+                let app = presigned::create_router(Arc::new(state));
                 let server = TestServer::new(app).unwrap();
 
                 let response = server
-                    .get(&format!("/presigned/{repo_hex}/{address_str}"))
+                    .get(&format!("/{repo_hex}/{address_str}"))
                     .add_query_param("token", token)
                     .await;
 

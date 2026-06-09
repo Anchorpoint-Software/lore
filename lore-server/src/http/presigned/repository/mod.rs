@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-pub mod contents;
+pub mod redeem;
+
+use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::Path;
@@ -8,9 +10,10 @@ use axum::extract::Request;
 use axum::middleware;
 use axum::middleware::Next;
 use axum::response::Response;
+use axum::routing;
+use lore_telemetry::tracing::fields::REPOSITORY_ID;
 use serde::Deserialize;
-use tracing::Instrument;
-use tracing::info_span;
+use tracing::Span;
 
 use crate::http::server::ServerState;
 
@@ -20,15 +23,13 @@ struct TracePath {
 }
 
 async fn trace(Path(params): Path<TracePath>, request: Request, next: Next) -> Response {
-    let span = info_span!("http_repository", repository_id = params.repository_id);
-    next.run(request).instrument(span.or_current()).await
+    Span::current().record(REPOSITORY_ID, &params.repository_id as &str);
+    next.run(request).await
 }
 
-pub fn create_router<S>(shared_state: ServerState) -> Router<S> {
-    let contents_router = contents::create_router(shared_state.clone());
-
+pub fn create_router(state: Arc<ServerState>) -> Router {
     Router::new()
-        .nest("/content", contents_router)
+        .route("/{address}", routing::get(redeem::handler))
         .layer(middleware::from_fn(trace))
-        .with_state(shared_state)
+        .with_state(state)
 }
