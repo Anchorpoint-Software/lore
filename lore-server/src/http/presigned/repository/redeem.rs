@@ -32,8 +32,8 @@ use thiserror::Error;
 use tokio::sync::mpsc::channel;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::warn;
 
+use crate::http::log_http_error;
 use crate::http::presign_token::PresignTokenError;
 use crate::http::presign_token::verify;
 use crate::http::server::ServerState;
@@ -61,19 +61,15 @@ pub enum RedeemError {
 
 impl IntoResponse for RedeemError {
     fn into_response(self) -> axum::response::Response {
-        warn!("get_presigned_content error: {:?}", &self);
-
-        let (status, msg) = match self {
-            e @ (RedeemError::ParseRepository(_) | RedeemError::ParseAddress(_)) => {
-                (StatusCode::BAD_REQUEST, e.to_string())
+        let (status, msg) = match &self {
+            RedeemError::ParseRepository(_) | RedeemError::ParseAddress(_) => {
+                (StatusCode::BAD_REQUEST, self.to_string())
             }
             RedeemError::InvalidToken(_) | RedeemError::TokenMismatch => (
                 StatusCode::UNAUTHORIZED,
                 "invalid or expired token".to_string(),
             ),
-            RedeemError::ReadStream(ref e)
-                if e.is_address_not_found() || e.is_payload_not_found() =>
-            {
+            RedeemError::ReadStream(e) if e.is_address_not_found() || e.is_payload_not_found() => {
                 (StatusCode::NOT_FOUND, "address not found".to_string())
             }
             RedeemError::NotConfigured => (
@@ -85,6 +81,8 @@ impl IntoResponse for RedeemError {
                 "Something went wrong. See server log for more info.".to_string(),
             ),
         };
+
+        log_http_error(&self, status);
 
         let mut headers = HeaderMap::new();
         headers.insert("content-type", "text/plain".parse().unwrap());

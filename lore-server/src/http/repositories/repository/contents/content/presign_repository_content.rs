@@ -24,6 +24,7 @@ use thiserror::Error;
 use tracing::warn;
 
 use crate::auth::jwt::AuthorizationToken;
+use crate::http::log_http_error;
 use crate::http::presign_token::CURRENT_TOKEN_VERSION;
 use crate::http::presign_token::PresignTokenPayload;
 use crate::http::presign_token::sign;
@@ -49,11 +50,9 @@ pub enum PresignError {
 
 impl IntoResponse for PresignError {
     fn into_response(self) -> axum::response::Response {
-        warn!("presign_repository_content error: {:?}", &self);
-
-        let (status, msg) = match self {
-            e @ (PresignError::ParseRepository(_) | PresignError::ParseAddress(_)) => {
-                (StatusCode::BAD_REQUEST, e.to_string())
+        let (status, msg) = match &self {
+            PresignError::ParseRepository(_) | PresignError::ParseAddress(_) => {
+                (StatusCode::BAD_REQUEST, self.to_string())
             }
             PresignError::NotConfigured => (
                 StatusCode::NOT_FOUND,
@@ -65,6 +64,8 @@ impl IntoResponse for PresignError {
             ),
             PresignError::NotFound => (StatusCode::NOT_FOUND, "address not found".to_string()),
         };
+
+        log_http_error(&self, status);
 
         let mut headers = HeaderMap::new();
         headers.insert("content-type", "text/plain".parse().unwrap());
