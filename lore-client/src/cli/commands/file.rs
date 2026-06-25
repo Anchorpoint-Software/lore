@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Anchorpoint Software GmbH
 // SPDX-License-Identifier: MIT
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -434,6 +435,28 @@ pub struct FileWriteArgs {
 
 #[derive(Args)]
 #[group(required = true, multiple = false)]
+pub struct FileReadSource {
+    /// Address of a blob
+    #[clap(long)]
+    address: Option<String>,
+
+    /// Path to a file
+    #[clap(long)]
+    path: Option<String>,
+}
+
+#[derive(Args)]
+pub struct FileReadArgs {
+    #[clap(flatten)]
+    source: FileReadSource,
+
+    /// Revision specifier
+    #[clap(long, requires = "path")]
+    revision: Option<String>,
+}
+
+#[derive(Args)]
+#[group(required = true, multiple = false)]
 pub struct FileObliterateArgs {
     /// Address of a blob
     #[clap(long)]
@@ -562,6 +585,8 @@ pub enum FileCommands {
     Diff(FileDiffArgs),
     /// Write data to a specific location
     Write(FileWriteArgs),
+    /// Read file content to stdout
+    Read(FileReadArgs),
     /// Hash a local file
     Hash(FileHashArgs),
 }
@@ -1510,6 +1535,45 @@ pub fn handle_file_write(globals: LoreGlobalArgs, args: &FileWriteArgs) -> u8 {
     return runtime().block_on(file::write(globals, write_args, callback)) as u8;
 }
 
+pub fn handle_file_read(globals: LoreGlobalArgs, args: &FileReadArgs) -> u8 {
+    let read_args = LoreFileReadArgs {
+        address: LoreString::from(&args.source.address),
+        path: LoreString::from(&args.source.path),
+        revision: LoreString::from(&args.revision),
+    };
+
+    let stdout = Arc::new(Mutex::new(std::io::BufWriter::new(std::io::stdout())));
+    let sink = stdout.clone();
+    let callback = output_formatter().unwrap_or(Some(
+        (Box::new(move |event: &LoreEvent| match event {
+            LoreEvent::FileRead(data) => {
+                use std::io::Write;
+                // SAFETY: the LoreBytes view is valid for the callback invocation.
+                let _ = sink.lock().write_all(unsafe { data.bytes.as_slice() });
+            }
+            LoreEvent::Error(_data) => {
+                eprintln!(
+                    "{}Failed to read file{}",
+                    CommonStyles::FAILURE,
+                    anstyle::Reset
+                );
+            }
+            LoreEvent::Maintenance(data) => {
+                util::handle_maintenance_event(data);
+            }
+            _ => (),
+        }) as EventCallbackFn)
+            .with_defaults(),
+    ));
+
+    let status = runtime().block_on(file::read(globals, read_args, callback)) as u8;
+    {
+        use std::io::Write;
+        let _ = stdout.lock().flush();
+    }
+    status
+}
+
 pub fn handle_file_obliterate(globals: LoreGlobalArgs, args: &FileObliterateArgs) -> u8 {
     let obliterate_args = LoreFileObliterateArgs {
         address: LoreString::from(&args.address),
@@ -1832,6 +1896,9 @@ pub fn handle_file_commands(cmd: &FileCommands, globals: LoreGlobalArgs) -> u8 {
         }
         FileCommands::Write(args) => {
             return handle_file_write(globals, args);
+        }
+        FileCommands::Read(args) => {
+            return handle_file_read(globals, args);
         }
         FileCommands::Reset(args) => {
             return handle_file_reset(globals, args);

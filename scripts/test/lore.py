@@ -1,5 +1,6 @@
 #!/usr/bin/python3
 # SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+# SPDX-FileCopyrightText: 2026 Anchorpoint Software GmbH
 # SPDX-License-Identifier: MIT
 from __future__ import annotations
 
@@ -1443,6 +1444,21 @@ class Lore:
             + (["--path", self._fix_path(path)] if path else [])
             + (["--revision", revision] if revision else [])
             + (["--output", output] if output else []),
+            **kwargs,
+        )
+
+    def read(
+        self,
+        path: str | None = None,
+        address: str | None = None,
+        revision: str | None = None,
+        **kwargs: Unpack[GlobalOptions],
+    ):
+        return self.run(
+            ["file", "read"]
+            + (["--path", self._fix_path(path)] if path else [])
+            + (["--address", address] if address else [])
+            + (["--revision", revision] if revision else []),
             **kwargs,
         )
 

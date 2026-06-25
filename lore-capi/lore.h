@@ -1104,6 +1104,31 @@ typedef struct lore_file_dump_event_data_t {
   uint8_t match_made;
 } lore_file_dump_event_data_t;
 
+// Borrowed byte slice handed to callbacks.
+//
+// The pointer is valid only for the duration of the callback that receives
+// it; callers must copy the bytes if they need them beyond that scope.
+typedef struct lore_bytes_t {
+  // Pointer to the start of the byte slice.
+  const void *ptr;
+  // Number of bytes in the slice.
+  uintptr_t len;
+} lore_bytes_t;
+
+// Data for the event carrying file content read into memory. `bytes` is a
+// borrowed view valid only for the callback invocation; the read emits one
+// event per fragment, each with a running `offset`.
+typedef struct lore_file_read_event_data_t {
+  // Address of the content.
+  struct lore_address_t address;
+  // Byte offset of this payload within the file content.
+  uint64_t offset;
+  // Total content size in bytes.
+  uint64_t size_content;
+  // Payload bytes for this part of the content.
+  struct lore_bytes_t bytes;
+} lore_file_read_event_data_t;
+
 // Event data reported at the start of adding file dependencies.
 typedef struct lore_file_dependency_add_begin_event_data_t {
   // Number of source files being processed.
@@ -2315,17 +2340,6 @@ typedef struct lore_storage_get_header_event_data_t {
   uint64_t size_content;
 } lore_storage_get_header_event_data_t;
 
-// Borrowed byte slice handed to callbacks.
-//
-// The pointer is valid only for the duration of the callback that receives
-// it; callers must copy the bytes if they need them beyond that scope.
-typedef struct lore_bytes_t {
-  // Pointer to the start of the byte slice.
-  const void *ptr;
-  // Number of bytes in the slice.
-  uintptr_t len;
-} lore_bytes_t;
-
 // Per-fragment (or single-buffer) payload event for `get`. The `bytes`
 // view is valid only during the callback invocation.
 typedef struct lore_storage_get_data_event_data_t {
@@ -2797,6 +2811,8 @@ enum lore_event_id_t {
   LORE_EVENT_FILE_OBLITERATE,
   // A dump of a file.
   LORE_EVENT_FILE_DUMP,
+  // File content read into memory.
+  LORE_EVENT_FILE_READ,
   // The start of adding file dependencies.
   LORE_EVENT_FILE_DEPENDENCY_ADD_BEGIN,
   // One entry while adding file dependencies.
@@ -3142,6 +3158,7 @@ typedef struct lore_event_t {
     struct lore_file_write_event_data_t file_write;
     struct lore_file_obliterate_event_data_t file_obliterate;
     struct lore_file_dump_event_data_t file_dump;
+    struct lore_file_read_event_data_t file_read;
     struct lore_file_dependency_add_begin_event_data_t file_dependency_add_begin;
     struct lore_file_dependency_add_entry_event_data_t file_dependency_add_entry;
     struct lore_file_dependency_add_end_event_data_t file_dependency_add_end;
@@ -3783,6 +3800,16 @@ typedef struct lore_file_dump_args_t {
   // Repository path to dump; used when `address` is empty
   struct lore_string_t path;
 } lore_file_dump_args_t;
+
+// Arguments for reading a file's content into memory by path/revision or by address.
+typedef struct lore_file_read_args_t {
+  // Address of data to read; takes precedence over `path` when non-empty
+  struct lore_string_t address;
+  // Repository path to the file; used when `address` is empty
+  struct lore_string_t path;
+  // Revision of the file to read (used with `path`)
+  struct lore_string_t revision;
+} lore_file_read_args_t;
 
 // Arguments for adding file dependencies, expanded from flat parallel arrays.
 typedef struct lore_file_dependency_add_args_t {
@@ -7206,6 +7233,58 @@ int32_t lore_file_dump(const struct lore_global_args_t *globals,
 // | `LORE_EVENT_FILE_DUMP` | `lore_file_dump_event_data_t` | Emitted with binary content of the requested file |
 void lore_file_dump_async(const struct lore_global_args_t *globals,
                           const struct lore_file_dump_args_t *args,
+                          struct lore_event_callback_config_t callback);
+
+// Read the content of a file into memory by path/revision or by address.
+//
+// # Events
+//
+// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+//
+// ## Standard Events
+//
+// These events are emitted by all interface functions:
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted when an error occurs |
+// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+//
+// ## File Events
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_FILE_READ` | `lore_file_read_event_data_t` | Emitted with file content, one event per fragment |
+int32_t lore_file_read(const struct lore_global_args_t *globals,
+                       const struct lore_file_read_args_t *args,
+                       struct lore_event_callback_config_t callback);
+
+// Asynchronous version of `lore_file_read`.
+//
+// # Events
+//
+// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+//
+// ## Standard Events
+//
+// These events are emitted by all interface functions:
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted when an error occurs |
+// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+//
+// ## File Events
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_FILE_READ` | `lore_file_read_event_data_t` | Emitted with file content, one event per fragment |
+void lore_file_read_async(const struct lore_global_args_t *globals,
+                          const struct lore_file_read_args_t *args,
                           struct lore_event_callback_config_t callback);
 
 // Adds dependency relationships between files.

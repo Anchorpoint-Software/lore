@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Anchorpoint Software GmbH
 // SPDX-License-Identifier: MIT
 use enum_dispatch::enum_dispatch;
 use lore_macro::LoreCommand;
@@ -59,6 +60,7 @@ pub enum LoreCommand {
     FileWrite(crate::file::LoreFileWriteArgs),
     FileObliterate(crate::file::LoreFileObliterateArgs),
     FileDump(crate::file::LoreFileDumpArgs),
+    FileRead(crate::file::LoreFileReadArgs),
     FileDependencyAdd(crate::dependency::LoreFileDependencyAddArgs),
     FileDependencyRemove(crate::dependency::LoreFileDependencyRemoveArgs),
     FileDependencyList(crate::dependency::LoreFileDependencyListArgs),

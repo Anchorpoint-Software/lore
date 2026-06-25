@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Anchorpoint Software GmbH
 // SPDX-License-Identifier: MIT
 use std::str::FromStr;
 use std::sync::Arc;
@@ -12,6 +13,8 @@ use lore_revision::file::hash::HashError;
 use lore_revision::file::history::HistoryOptions;
 use lore_revision::file::info::InfoOptions;
 use lore_revision::file::obliterate::ObliterateError;
+use lore_revision::file::read::ReadError;
+use lore_revision::file::read::ReadFileOptions;
 use lore_revision::file::reset::ResetOptions;
 use lore_revision::file::unstage::UnstageOptions;
 use lore_revision::file::write::WriteAddressOptions;
@@ -1113,6 +1116,59 @@ async fn write_impl(
     }
 
     Ok(())
+}
+
+/// Arguments for reading a file's content into memory by path/revision or by address.
+#[repr(C)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[handler(read_local)]
+pub struct LoreFileReadArgs {
+    /// Address of data to read; takes precedence over `path` when non-empty
+    pub address: LoreString,
+    /// Repository path to the file; used when `address` is empty
+    pub path: LoreString,
+    /// Revision of the file to read (used with `path`)
+    pub revision: LoreString,
+}
+
+/// Reads a file's content into memory by path/revision or by address, delivering
+/// the bytes via [`LoreEvent::FileRead`](crate::interface::LoreEvent::FileRead),
+/// one event per fragment.
+pub async fn read(
+    globals: LoreGlobalArgs,
+    args: LoreFileReadArgs,
+    callback: LoreEventCallback,
+) -> i32 {
+    dispatch_call(globals, args, callback, read_local).await
+}
+
+async fn read_local(
+    globals: LoreGlobalArgs,
+    args: LoreFileReadArgs,
+    callback: LoreEventCallback,
+) -> i32 {
+    repository_call_read(globals, callback, args, read, read_impl).await
+}
+
+async fn read_impl(
+    repository: Arc<RepositoryContext>,
+    args: LoreFileReadArgs,
+) -> Result<(), ReadError> {
+    if !args.address.is_empty() {
+        let address = Address::from_str(args.address.as_str()).map_err(|_err| {
+            ReadError::from(lore_base::error::InvalidAddress {
+                address: args.address.to_string(),
+            })
+        })?;
+
+        lore_revision::file::read::read_address(repository, address).await
+    } else {
+        let options = ReadFileOptions {
+            revision: args.revision.into(),
+        };
+
+        lore_revision::file::read::read_file(repository, args.path.to_string(), options).await
+    }
 }
 
 /// Arguments for permanently removing a file or address from repository history.

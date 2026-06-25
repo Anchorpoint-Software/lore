@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Anchorpoint Software GmbH
 // SPDX-License-Identifier: MIT
 #![allow(non_camel_case_types)]
 #![allow(unused_parens)]
@@ -98,6 +99,7 @@ use crate::file::hash::LoreFileHashEventData;
 use crate::file::history::LoreFileHistoryEventData;
 use crate::file::info::LoreFileInfoEventData;
 use crate::file::obliterate::LoreFileObliterateEventData;
+use crate::file::read::LoreFileReadEventData;
 use crate::file::reset::LoreFileResetBeginEventData;
 use crate::file::reset::LoreFileResetEndEventData;
 use crate::file::reset::LoreFileResetFileEventData;
@@ -627,6 +629,8 @@ pub enum LoreEvent {
     FileObliterate(LoreFileObliterateEventData),
     /// A dump of a file.
     FileDump(LoreFileDumpEventData),
+    /// File content read into memory.
+    FileRead(LoreFileReadEventData),
     /// The start of adding file dependencies.
     FileDependencyAddBegin(LoreFileDependencyAddBeginEventData),
     /// One entry while adding file dependencies.

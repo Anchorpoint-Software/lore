@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Anchorpoint Software GmbH
 // SPDX-License-Identifier: MIT
 use std::ffi::CString;
 use std::path::PathBuf;
@@ -3039,6 +3040,70 @@ pub extern "C" fn lore_file_dump_async(
     callback: LoreEventCallbackConfig,
 ) {
     run_asynchronously(globals, args, callback, crate::file::dump);
+}
+
+pub type LoreFileReadArgs = crate::file::LoreFileReadArgs;
+
+/// Read the content of a file into memory by path/revision or by address.
+///
+/// # Events
+///
+/// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+///
+/// ## Standard Events
+///
+/// These events are emitted by all interface functions:
+///
+/// | Tag | Data Type | Description |
+/// |-----|-----------|-------------|
+/// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted when an error occurs |
+/// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+///
+/// ## File Events
+///
+/// | Tag | Data Type | Description |
+/// |-----|-----------|-------------|
+/// | `LORE_EVENT_FILE_READ` | `lore_file_read_event_data_t` | Emitted with file content, one event per fragment |
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_file_read(
+    globals: &LoreGlobalArgs,
+    args: &LoreFileReadArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(globals, args, callback, crate::file::read)
+}
+
+/// Asynchronous version of `lore_file_read`.
+///
+/// # Events
+///
+/// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+///
+/// ## Standard Events
+///
+/// These events are emitted by all interface functions:
+///
+/// | Tag | Data Type | Description |
+/// |-----|-----------|-------------|
+/// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted when an error occurs |
+/// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+///
+/// ## File Events
+///
+/// | Tag | Data Type | Description |
+/// |-----|-----------|-------------|
+/// | `LORE_EVENT_FILE_READ` | `lore_file_read_event_data_t` | Emitted with file content, one event per fragment |
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_file_read_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreFileReadArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(globals, args, callback, crate::file::read);
 }
 
 pub type LoreFileDependencyAddArgs = crate::dependency::LoreFileDependencyAddArgs;
