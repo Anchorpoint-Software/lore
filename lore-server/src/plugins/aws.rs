@@ -92,6 +92,10 @@ pub struct AwsImmutableStorePluginConfig {
     #[serde(default = "default_timeout")]
     pub timeout_millis: u64,
 
+    /// Maximum number of concurrently submitted existence-check tasks.
+    #[serde(default)]
+    pub batch_exist_submission_limit: Option<usize>,
+
     /// Force write mode (bypasses some safety checks).
     #[serde(default)]
     pub force_write: bool,
@@ -311,11 +315,14 @@ impl ImmutableStorePluginFactory for AwsImmutableStorePluginFactory {
             timeout_millis: plugin_config.timeout_millis,
         };
 
-        let store_settings = AwsImmutableStoreSettings::new(
+        let mut store_settings = AwsImmutableStoreSettings::new(
             s3_settings,
             dynamodb_settings,
             plugin_config.force_write,
         );
+        if let Some(limit) = plugin_config.batch_exist_submission_limit {
+            store_settings.batch_exist_submission_limit = limit;
+        }
 
         let store = AwsImmutableStore::new(s3_client, dynamodb_client, &store_settings);
 
@@ -641,6 +648,7 @@ mod tests {
             s3_slow_operation_threshold_millis = 1000
             dynamodb_slow_operation_threshold_millis = 500
             timeout_millis = 3000
+            batch_exist_submission_limit = 5000
             force_write = true
         "#;
 
@@ -663,6 +671,7 @@ mod tests {
         assert_eq!(plugin_config.s3_slow_operation_threshold_millis, 1000);
         assert_eq!(plugin_config.dynamodb_slow_operation_threshold_millis, 500);
         assert_eq!(plugin_config.timeout_millis, 3000);
+        assert_eq!(plugin_config.batch_exist_submission_limit, Some(5000));
         assert!(plugin_config.force_write);
     }
 
@@ -690,6 +699,7 @@ mod tests {
             u64::MAX
         );
         assert_eq!(plugin_config.timeout_millis, 5000);
+        assert_eq!(plugin_config.batch_exist_submission_limit, None);
         assert!(!plugin_config.force_write);
     }
 
