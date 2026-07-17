@@ -4652,6 +4652,12 @@ pub async fn diff_filesystem_ex(
 /// drained — discarding mid-walk mutates `parent.child` / sibling chains
 /// under walks that are still reading them and races into
 /// `node_discard_patch`'s `"Discard hierarchy broken"`.
+///
+/// Entries are applied in insertion order: subtree discards are queued
+/// post-order (children before their directory), and a directory can only
+/// be unlinked after its children are gone. Sorting by node id would break
+/// that invariant, since block slot reuse makes ids non-monotonic with
+/// tree depth.
 async fn apply_pending_discards(
     state: Arc<State>,
     repository: Arc<RepositoryContext>,
@@ -4660,8 +4666,8 @@ async fn apply_pending_discards(
     if pending_discards.is_empty() {
         return Ok(());
     }
-    pending_discards.sort_unstable();
-    pending_discards.dedup();
+    let mut seen = std::collections::HashSet::with_capacity(pending_discards.len());
+    pending_discards.retain(|node_id| seen.insert(*node_id));
 
     for discard_node_id in pending_discards {
         let Ok(discard_node) = state.node(repository.clone(), discard_node_id).await else {
@@ -4843,6 +4849,7 @@ async fn diff_filesystem_subtree_impl(
             // Path doesn't exist on filesystem - everything in state is deleted
             diff_filesystem_missing(
                 ctx.from,
+                ctx.current,
                 ctx.filesystem_path,
                 ctx.filter_mode,
                 ctx.scan_dirty,
@@ -5494,6 +5501,19 @@ async fn flush_pending_dir_deletes(
     Ok(())
 }
 
+/// Outcome of one node in the missing-subtree delete walk.
+#[derive(Clone, Copy, PartialEq)]
+enum SubtreeDeleteOutcome {
+    /// A delete was emitted for this node or a descendant (buffered ancestor
+    /// directories were flushed).
+    Materialized,
+    /// Nothing under this node materialized; the node was kept as-is.
+    Dropped,
+    /// The node was queued for discard as a reverted unstaged add (implies
+    /// nothing materialized and no delete was emitted).
+    Discarded,
+}
+
 /// Walk a revision subtree that is absent from the filesystem and emit `Delete`
 /// changes for only the portion that was actually materialized on disk under the
 /// active filter, returning whether anything materialized.
@@ -5517,6 +5537,17 @@ async fn flush_pending_dir_deletes(
 /// the granularity it is reported. `node_mark_dirty` short-circuits on a node
 /// already carrying the base `Dirty` bit (which `DirtyDelete` includes), so a
 /// sibling's upward propagation never clobbers a directory's `DirtyDelete`.
+///
+/// Deletes are only real for content that exists in the current revision.
+/// `current_node` is this node's counterpart in `current_state` (the committed
+/// revision), or `INVALID_NODE` when the path is not part of it. During a scan,
+/// an unstaged node without a counterpart is a reverted add — the user created
+/// it and removed it again without ever committing — so instead of reporting a
+/// phantom `Delete` and persisting `DirtyDelete`, the node is queued into
+/// `pending_discards` (post-order, children before their directory) and dropped
+/// from the staged tree. A staged descendant keeps its ancestor chain alive; a
+/// filter-excluded child is never visited, so its parent directory must also
+/// survive or the excluded node would be orphaned.
 #[allow(clippy::too_many_arguments)]
 async fn emit_filesystem_subtree_deletes(
     state: Arc<State>,
@@ -5528,9 +5559,25 @@ async fn emit_filesystem_subtree_deletes(
     scan_dirty: bool,
     sink: &mut ChangeSink<'_>,
     pending: &mut Vec<(NodeID, RelativePath)>,
-) -> Result<bool, StateError> {
+    current_state: &Arc<State>,
+    current_repository: &Arc<RepositoryContext>,
+    current_node: NodeID,
+    pending_discards: &mut Vec<NodeID>,
+) -> Result<SubtreeDeleteOutcome, StateError> {
+    let in_current = current_node.is_valid_node_id();
+    let revertible = scan_dirty && !in_current && !node.is_staged();
+
     // Caller guarantees `node` is not filter-excluded.
     if node.is_file() || node.is_link() {
+        if revertible {
+            lore_trace!(
+                "Queueing reverted-add node {} for discard (no file at {}, not in current)",
+                node_id,
+                path
+            );
+            pending_discards.push(node_id);
+            return Ok(SubtreeDeleteOutcome::Discarded);
+        }
         flush_pending_dir_deletes(&state, &repository, sink, pending, scan_dirty).await?;
         if scan_dirty {
             state
@@ -5538,7 +5585,7 @@ async fn emit_filesystem_subtree_deletes(
                 .await?;
         }
         emit_single_delete(state, repository, node_id, path, sink).await?;
-        return Ok(true);
+        return Ok(SubtreeDeleteOutcome::Materialized);
     }
 
     pending.push((node_id, path.clone()));
@@ -5546,10 +5593,13 @@ async fn emit_filesystem_subtree_deletes(
 
     let mut children =
         StateNodeChildrenWithNameIterator::new(state.clone(), repository.clone(), node_id).await?;
-    let mut had_child = false;
+    // A surviving child is one that stays in the staged tree: filter-excluded
+    // (never visited) or visited but not discarded. Only a directory with no
+    // surviving children may itself be discarded or reported as an empty-
+    // directory deletion.
+    let mut any_surviving_child = false;
     let mut any_materialized = false;
     while let Some((child_id, child_node, child_name)) = children.next().await? {
-        had_child = true;
         let child_path = path.push_into_buf(&child_name).freeze();
         // Release the block read lock before recursing (see NodeNameLock docs).
         drop(child_name);
@@ -5557,9 +5607,22 @@ async fn emit_filesystem_subtree_deletes(
             .filter
             .excludes(&child_path, child_node.is_directory(), filter_mode)
         {
+            any_surviving_child = true;
             continue;
         }
-        if Box::pin(emit_filesystem_subtree_deletes(
+        let child_current_node = if in_current {
+            current_state
+                .find_subnode(
+                    current_repository.clone(),
+                    current_node,
+                    child_node.name_hash,
+                )
+                .await
+                .unwrap_or(INVALID_NODE)
+        } else {
+            INVALID_NODE
+        };
+        let outcome = Box::pin(emit_filesystem_subtree_deletes(
             state.clone(),
             repository.clone(),
             child_id,
@@ -5569,29 +5632,51 @@ async fn emit_filesystem_subtree_deletes(
             scan_dirty,
             sink,
             pending,
+            current_state,
+            current_repository,
+            child_current_node,
+            pending_discards,
         ))
-        .await?
-        {
+        .await?;
+        if outcome == SubtreeDeleteOutcome::Materialized {
             any_materialized = true;
+        }
+        if outcome != SubtreeDeleteOutcome::Discarded {
+            any_surviving_child = true;
         }
     }
 
     if any_materialized {
         // The first materializing descendant already flushed this directory.
-        return Ok(true);
+        return Ok(SubtreeDeleteOutcome::Materialized);
     }
 
-    if !had_child && !repository.filter.excludes(path, true, filter_mode) {
-        // Empty in-view directory: clone/checkout writes it, so its absence is a
-        // real deletion. It is the materializing leaf here, and its own buffered
-        // entry (pushed above) is flushed and marked along with its ancestors.
-        flush_pending_dir_deletes(&state, &repository, sink, pending, scan_dirty).await?;
-        return Ok(true);
+    if !any_surviving_child {
+        // No children at all, or every child was discarded as a reverted add.
+        if revertible {
+            // The directory itself was never committed either: discard it after
+            // its children instead of reporting it deleted.
+            pending.truncate(depth - 1);
+            lore_trace!(
+                "Queueing reverted-add directory {} for discard (no directory at {}, not in current)",
+                node_id,
+                path
+            );
+            pending_discards.push(node_id);
+            return Ok(SubtreeDeleteOutcome::Discarded);
+        }
+        if !repository.filter.excludes(path, true, filter_mode) {
+            // Empty in-view directory: clone/checkout writes it, so its absence is a
+            // real deletion. It is the materializing leaf here, and its own buffered
+            // entry (pushed above) is flushed and marked along with its ancestors.
+            flush_pending_dir_deletes(&state, &repository, sink, pending, scan_dirty).await?;
+            return Ok(SubtreeDeleteOutcome::Materialized);
+        }
     }
 
     // Nothing under this directory materialized: drop its buffered entry.
     pending.truncate(depth - 1);
-    Ok(false)
+    Ok(SubtreeDeleteOutcome::Dropped)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5925,9 +6010,18 @@ async fn diff_filesystem_directory_walk(
             continue;
         };
 
+        let current_counterpart = current_node_list
+            .children
+            .as_slice()
+            .binary_search_by(|child| child.name.cmp(&from_named_node.name))
+            .map(|index| current_node_list.children[index].node)
+            .unwrap_or(INVALID_NODE);
+        let in_current = current_counterpart.is_valid_node_id();
+
         // Emit deletes only for the materialized portion of the subtree,
         // suppressing directories the filter merely descended through but never
-        // wrote to disk (see emit_filesystem_subtree_deletes).
+        // wrote to disk, and discarding reverted unstaged adds instead of
+        // reporting them deleted (see emit_filesystem_subtree_deletes).
         if from_node.node.is_directory() {
             let mut pending = Vec::new();
             emit_filesystem_subtree_deletes(
@@ -5940,6 +6034,10 @@ async fn diff_filesystem_directory_walk(
                 ctx.scan_dirty,
                 &mut ChangeSink::Vec(&mut *changes),
                 &mut pending,
+                &ctx.current.state,
+                &ctx.current.repository,
+                current_counterpart,
+                pending_discards,
             )
             .await?;
             continue;
@@ -5950,11 +6048,6 @@ async fn diff_filesystem_directory_walk(
         // removing the file. Discard the node so state_staged matches the
         // filesystem rather than emitting a Delete change for a node that
         // shouldn't exist.
-        let in_current = current_node_list
-            .children
-            .as_slice()
-            .binary_search_by(|child| child.name.cmp(&from_named_node.name))
-            .is_ok();
         if ctx.scan_dirty && from_node.node.is_file() && !in_current {
             lore_trace!(
                 "Queueing reverted-DirtyAdd node {} (no file at {}, not in current)",
@@ -6318,6 +6411,7 @@ async fn diff_filesystem_single_file(
 /// Everything in state under this path is considered deleted.
 async fn diff_filesystem_missing(
     from: FilesystemTraversal,
+    current: FilesystemTraversal,
     node_path: RelativePath,
     filter_mode: FilterMode,
     scan_dirty: bool,
@@ -6331,6 +6425,30 @@ async fn diff_filesystem_missing(
             .state
             .node(from.repository.clone(), from.root_node)
             .await?;
+
+        // A scanned path that exists neither on disk nor in the current
+        // revision is a reverted unstaged add: drop its whole subtree from the
+        // staged tree instead of reporting a phantom delete for content no
+        // revision ever had. A staged descendant blocks the discard and falls
+        // back to the regular delete report.
+        if scan_dirty
+            && !current.root_node.is_valid_node_id()
+            && !from_node.is_staged()
+            && let Some(discards) = collect_revertible_subtree(
+                from.state.clone(),
+                from.repository.clone(),
+                from.root_node,
+            )
+            .await?
+        {
+            lore_trace!(
+                "Filesystem path {} does not exist and is not in the current revision, discarding {} reverted-add node(s)",
+                node_path,
+                discards.len()
+            );
+            apply_pending_discards(from.state.clone(), from.repository.clone(), discards).await?;
+            return Ok((changes, stats));
+        }
 
         lore_trace!(
             "Filesystem path {} does not exist, marking state node {} as deleted",
@@ -6375,6 +6493,39 @@ async fn diff_filesystem_missing(
     }
 
     Ok((changes, stats))
+}
+
+/// Collect `node_id`'s subtree in post-order (children before their
+/// directory) for a reverted-add discard. Returns `None` when the subtree
+/// contains a staged node — staged content must survive the revert, so the
+/// caller falls back to the regular delete report.
+#[allow(clippy::type_complexity)]
+fn collect_revertible_subtree(
+    state: Arc<State>,
+    repository: Arc<RepositoryContext>,
+    node_id: NodeID,
+) -> Pin<Box<dyn Future<Output = Result<Option<Vec<NodeID>>, StateError>> + Send>> {
+    Box::pin(async move {
+        let node = state.node(repository.clone(), node_id).await?;
+        if node.is_staged() {
+            return Ok(None);
+        }
+
+        let mut discards = Vec::new();
+        if node.is_directory() {
+            let children = state.node_children(repository.clone(), node_id).await?;
+            for child_id in children {
+                match collect_revertible_subtree(state.clone(), repository.clone(), child_id)
+                    .await?
+                {
+                    Some(child_discards) => discards.extend(child_discards),
+                    None => return Ok(None),
+                }
+            }
+        }
+        discards.push(node_id);
+        Ok(Some(discards))
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
