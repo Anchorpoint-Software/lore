@@ -189,6 +189,40 @@ mod tests {
         );
     }
 
+    /// Deleting a never-committed EMPTY folder must leave no trace either —
+    /// whether or not the scan registered a node for it, later scans must not
+    /// report the path.
+    #[tokio::test]
+    async fn scan_forgets_deleted_untracked_empty_folder() {
+        let tempdir = TempDir::new("lore-scan-revert-test-");
+        let repository_path = tempdir.path().to_path_buf();
+        let globals = offline_globals(&repository_path);
+
+        create_repository(&globals).await;
+
+        let base = repository_path.join("base.txt");
+        write_file(&base, b"base");
+        stage_and_commit(&globals, vec![LoreString::from(&base)], "base").await;
+
+        std::fs::create_dir_all(repository_path.join("emptyfolder"))
+            .expect("Failed to create emptyfolder");
+        scan_status(&globals).await;
+
+        std::fs::remove_dir_all(repository_path.join("emptyfolder"))
+            .expect("Failed to remove emptyfolder");
+
+        let entries = scan_status(&globals).await;
+        assert!(
+            entries_under(&entries, "emptyfolder").is_empty(),
+            "vanished never-committed empty folder must not be reported, got: {entries:?}"
+        );
+        let entries = scan_status(&globals).await;
+        assert!(
+            entries_under(&entries, "emptyfolder").is_empty(),
+            "phantom empty folder resurfaced on a later scan: {entries:?}"
+        );
+    }
+
     /// Deleting a committed folder must still report `Delete` for its content.
     #[tokio::test]
     async fn scan_reports_deletes_for_committed_folder() {
