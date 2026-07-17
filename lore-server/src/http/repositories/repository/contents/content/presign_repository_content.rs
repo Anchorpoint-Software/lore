@@ -40,6 +40,8 @@ pub enum PresignError {
     ParseAddress(FromHexError),
     #[error("Presign feature is not configured")]
     NotConfigured,
+    #[error("Only service accounts may vend presigned URLs")]
+    NotServiceAccount,
     #[error("Content not found")]
     NotFound,
     #[error("Store error checking content existence")]
@@ -57,6 +59,10 @@ impl IntoResponse for PresignError {
             PresignError::NotConfigured => (
                 StatusCode::NOT_FOUND,
                 "presigned URL feature is not enabled".to_string(),
+            ),
+            PresignError::NotServiceAccount => (
+                StatusCode::FORBIDDEN,
+                "only service accounts may vend presigned URLs".to_string(),
             ),
             PresignError::StoreError | PresignError::SystemTime(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -87,6 +93,18 @@ pub struct PresignResponse {
     pub expires_at: u64,
 }
 
+/// Whether the caller is a service account.
+///
+/// Reads the `is_service_account` claim from the token. A `None` token means no
+/// JWT verifier is configured and auth is disabled server-wide, which counts as
+/// a service account.
+fn call_is_service_account(user_info: &Option<AuthorizationToken>) -> bool {
+    match user_info {
+        Some(token) => token.is_service_account.unwrap_or(false),
+        None => true,
+    }
+}
+
 pub async fn handler(
     State(state): State<Arc<ServerState>>,
     Path((repository_id, address)): Path<(String, String)>,
@@ -99,6 +117,10 @@ pub async fn handler(
         .as_ref()
         .ok_or(PresignError::NotConfigured)?
         .clone();
+
+    if !call_is_service_account(&user_info) {
+        return Err(PresignError::NotServiceAccount);
+    }
 
     let repository = repository_id
         .parse::<RepositoryId>()
@@ -184,12 +206,47 @@ mod tests {
     use rand::random;
     use serde_json::json;
 
+    use super::call_is_service_account;
+    use crate::auth::jwt::AuthorizationToken;
     use crate::http::server::LoreHttpServerSettings;
     use crate::http::server::PresignConfig;
     use crate::http::server::ServerHealth;
     use crate::http::server::ServerState;
     use crate::http::server::create_router;
     use crate::store::test_store_create;
+
+    fn token_with_service_account(is_service_account: Option<bool>) -> AuthorizationToken {
+        AuthorizationToken {
+            is_service_account,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn service_account_may_vend() {
+        assert!(call_is_service_account(&Some(token_with_service_account(
+            Some(true)
+        ))));
+    }
+
+    #[test]
+    fn non_service_account_may_not_vend() {
+        assert!(!call_is_service_account(&Some(token_with_service_account(
+            Some(false)
+        ))));
+    }
+
+    #[test]
+    fn missing_service_account_claim_may_not_vend() {
+        assert!(!call_is_service_account(&Some(token_with_service_account(
+            None
+        ))));
+    }
+
+    #[test]
+    fn no_auth_configured_may_vend() {
+        assert!(call_is_service_account(&None));
+    }
 
     fn test_presign_config() -> PresignConfig {
         let key_bytes = [0u8; 32];
