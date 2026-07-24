@@ -533,3 +533,10 @@ def pytest_configure(config):
     """Register the xdist controller cleanup plugin early so its
     pytest_sessionfinish hook fires on the controller process."""
     config.pluginmanager.register(_XdistControllerCleanup(), "lore_xdist_cleanup")
+    config.addinivalue_line(
+        "markers", "regression: mark tests that don't run on every CI"
+    )
+    config.addinivalue_line(
+        "markers",
+        "bug_reproduction: mark tests that are known to fail and are a reproduction of a bug",
+    )
