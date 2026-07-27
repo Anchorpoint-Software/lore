@@ -592,6 +592,7 @@ async fn launch_grpc_internal_server(
             mutable_store,
             notification_sender,
             hook_dispatcher,
+            settings.environment.clone().unwrap_or_default(),
         )?
         .with_tls_config(cert_path, key_path, cert_chain_path)?
         .with_http2_config(

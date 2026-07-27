@@ -568,6 +568,15 @@ mod test {
                     response: Arc::clone(&self.response),
                 })
             }
+
+            fn forwarded_repository_service(
+                &self,
+            ) -> Box<dyn crate::grpc::forwarded_requests::repository_service::ForwardedRepositoryServiceClient>
+{
+                unreachable!(
+                    "forwarded_repository_service should not be called in branch_create tests"
+                )
+            }
         }
 
         fn make_request(

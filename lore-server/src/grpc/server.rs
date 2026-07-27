@@ -555,6 +555,7 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
             self.0.immutable_store.clone(),
             self.0.mutable_store.clone(),
             self.0.hook_dispatcher.clone(),
+            self.0.forwarded_requests.clone(),
             rpc_timeout,
         );
 
