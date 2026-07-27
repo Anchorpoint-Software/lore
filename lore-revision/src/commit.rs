@@ -15,6 +15,7 @@ use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
 use serde::Deserialize;
 use serde::Serialize;
+use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::task::AbortOnDropHandle;
@@ -68,6 +69,7 @@ use crate::node::NodeIDExt;
 use crate::node::ROOT_NODE;
 use crate::progress::DEFAULT_WORK_CHANNEL_CAPACITY;
 use crate::progress::DiscoveryStats;
+use crate::progress::MAX_CONCURRENT_DIRECTORY_TASKS;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
 use crate::revision::sync;
@@ -1261,6 +1263,7 @@ pub(crate) async fn commit_files_and_rehash(
         let subnodes_to_discard = subnodes_to_discard.clone();
         let stats = stats.clone();
         let tracker = tracker.clone();
+        let dir_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_DIRECTORY_TASKS));
         lore_spawn!(async move {
             let result = commit_directory(
                 repository,
@@ -1278,6 +1281,7 @@ pub(crate) async fn commit_files_and_rehash(
                 stats,
                 parent_branch,
                 tracker,
+                dir_semaphore,
             )
             .await;
             discover_stats
@@ -1374,6 +1378,7 @@ async fn commit_directory(
     stats: Arc<CommitStats>,
     parent_branch: BranchId,
     tracker: Arc<lore_storage::write_tracker::WriteTracker>,
+    dir_semaphore: Arc<Semaphore>,
 ) -> Result<(), CommitError> {
     let node_index = Node::index(node_id);
     let block = state
@@ -1448,39 +1453,70 @@ async fn commit_directory(
                     .fetch_add(1, Ordering::Relaxed);
             }
         } else if child_node.is_directory() {
-            lore_spawn!(tasks, {
-                let repository = repository.clone();
-                let token = token.share();
-                let state = state.clone();
-                let delta = delta.clone();
-                let discard = discard.clone();
-                let subnodes_to_discard = subnodes_to_discard.clone();
-                let file_tx = file_tx.clone();
-                let metadata = metadata.clone();
-                let link_messages = link_messages.clone();
-                let stats = stats.clone();
-                let tracker = tracker.clone();
-                async move {
+            // Inline fallback rather than a blocking acquire: a parent awaiting
+            // its children must never block on a permit a descendant needs, or
+            // the bounded fan-out would deadlock.
+            match dir_semaphore.clone().try_acquire_owned() {
+                Ok(permit) => {
+                    lore_spawn!(tasks, {
+                        let repository = repository.clone();
+                        let token = token.share();
+                        let state = state.clone();
+                        let delta = delta.clone();
+                        let discard = discard.clone();
+                        let subnodes_to_discard = subnodes_to_discard.clone();
+                        let file_tx = file_tx.clone();
+                        let metadata = metadata.clone();
+                        let link_messages = link_messages.clone();
+                        let stats = stats.clone();
+                        let tracker = tracker.clone();
+                        let dir_semaphore = dir_semaphore.clone();
+                        async move {
+                            let _permit = permit;
+                            commit_directory_recurse(
+                                repository,
+                                token,
+                                state,
+                                absolute_path,
+                                relative_path,
+                                child_node_id,
+                                delta,
+                                discard,
+                                subnodes_to_discard,
+                                file_tx,
+                                metadata,
+                                link_messages,
+                                stats,
+                                parent_branch,
+                                tracker,
+                                dir_semaphore,
+                            )
+                            .await
+                        }
+                    });
+                }
+                Err(_) => {
                     commit_directory_recurse(
-                        repository,
-                        token,
-                        state,
+                        repository.clone(),
+                        token.share(),
+                        state.clone(),
                         absolute_path,
                         relative_path,
                         child_node_id,
-                        delta,
-                        discard,
-                        subnodes_to_discard,
-                        file_tx,
-                        metadata,
-                        link_messages,
-                        stats,
+                        delta.clone(),
+                        discard.clone(),
+                        subnodes_to_discard.clone(),
+                        file_tx.clone(),
+                        metadata.clone(),
+                        link_messages.clone(),
+                        stats.clone(),
                         parent_branch,
-                        tracker,
+                        tracker.clone(),
+                        dir_semaphore.clone(),
                     )
-                    .await
+                    .await?;
                 }
-            });
+            }
         } else if child_node.is_link() {
             lore_debug!(
                 "Before committing link node, parent node {} address {}",
@@ -1578,6 +1614,7 @@ fn commit_directory_recurse(
     stats: Arc<CommitStats>,
     parent_branch: BranchId,
     tracker: Arc<lore_storage::write_tracker::WriteTracker>,
+    dir_semaphore: Arc<Semaphore>,
 ) -> Pin<Box<dyn Future<Output = Result<(), CommitError>> + Send>> {
     Box::pin(commit_directory(
         repository,
@@ -1595,6 +1632,7 @@ fn commit_directory_recurse(
         stats,
         parent_branch,
         tracker,
+        dir_semaphore,
     ))
 }
 
@@ -2241,6 +2279,8 @@ async fn commit_link(
                 let metadata = metadata.clone();
                 let stats = stats.clone();
                 let tracker = work_tracker.clone();
+                // Own budget per linked sub-repo, isolated from the parent's.
+                let dir_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_DIRECTORY_TASKS));
                 lore_spawn!(async move {
                     commit_directory_recurse(
                         repository,
@@ -2260,6 +2300,7 @@ async fn commit_link(
                         stats,
                         link_branch,
                         tracker,
+                        dir_semaphore,
                     )
                     .await
                 })
