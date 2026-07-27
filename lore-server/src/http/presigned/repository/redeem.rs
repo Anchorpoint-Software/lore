@@ -181,6 +181,13 @@ pub async fn handler(
                     .map_err(RedeemError::HeaderGeneration)?,
             );
 
+            let remaining_ttl = payload.expires_at.saturating_sub(now);
+            response_headers.insert(
+                axum::http::header::CACHE_CONTROL,
+                HeaderValue::from_str(&format!("public, immutable, max-age={remaining_ttl}"))
+                    .map_err(RedeemError::HeaderGeneration)?,
+            );
+
             let stream = ReceiverStream::new(rx).map(Ok::<Bytes, RedeemError>);
             Ok((StatusCode::OK, response_headers, Body::from_stream(stream)))
         })
@@ -365,6 +372,26 @@ mod tests {
 
                 assert_eq!(response.status_code(), StatusCode::OK);
                 assert_eq!(response.as_bytes(), &payload[..]);
+
+                let cache_control = response
+                    .headers()
+                    .get("cache-control")
+                    .expect("missing Cache-Control header")
+                    .to_str()
+                    .unwrap();
+                assert!(
+                    cache_control.starts_with("public, immutable, max-age="),
+                    "unexpected Cache-Control value: {cache_control}"
+                );
+                let max_age: u64 = cache_control
+                    .strip_prefix("public, immutable, max-age=")
+                    .unwrap()
+                    .parse()
+                    .expect("max-age is not a number");
+                assert!(
+                    max_age > 3590 && max_age <= 3600,
+                    "max-age {max_age} not in expected range"
+                );
             })
             .await;
     }
