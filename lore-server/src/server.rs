@@ -1233,6 +1233,10 @@ async fn configure_composite_store(
         .await?;
         composite_store_builder =
             composite_store_builder.with_durable(durable_settings.mode.clone(), store)?;
+        if let Some(delay) = settings.durable_store_delay_ms {
+            composite_store_builder =
+                composite_store_builder.with_durable_delay(Duration::from_millis(delay));
+        }
     }
 
     if let Some(replicas) = settings.replica.as_ref() {

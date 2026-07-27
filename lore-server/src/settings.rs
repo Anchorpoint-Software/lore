@@ -376,6 +376,7 @@ pub struct CompositeStoreSettings {
     pub replica: Option<Vec<CompositeSubStoreSettings>>,
     pub replica_factory: Option<ReplicaFactorySettings>,
     pub should_cache_query_results: Option<bool>,
+    pub durable_store_delay_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
