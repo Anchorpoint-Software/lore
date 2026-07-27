@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 @pytest.mark.smoke
 @pytest.mark.xdist_group("forwarded_requests")
-class TestForwardedBranchCreate:
+class TestForwardedBranch:
     """
     Smoke tests for the forwarded-request delegation path.
 
@@ -26,7 +26,7 @@ class TestForwardedBranchCreate:
     so branch state is fully isolated between them. Server 2 is configured with
     [server.grpc_public_services.forwarded_requests] pointing at Server 1's
     internal gRPC port and revision_branch_create = true. When a client calls
-    BranchCreate on Server 2, Server 2 forwards the request to Server 1 instead
+    e.g. BranchCreate on Server 2, Server 2 forwards the request to Server 1 instead
     of executing it locally.
 
     Because the mutable stores are separate, the store Server 2 writes to is
@@ -74,7 +74,7 @@ class TestForwardedBranchCreate:
     def server_2_config(self, request, tmp_path_factory, server_1_config):
         """
         Config for Server 2: the delegation *source*. Its local.toml is extended
-        with the forwarded_requests block that tells it to forward BranchCreate
+        with the forwarded_requests block that tells it to forward operations
         to Server 1's internal gRPC port. No certs are needed because Server 1's
         internal listener runs without TLS in this test.
         """
@@ -104,6 +104,7 @@ class TestForwardedBranchCreate:
             f.write(f'url = "http://{server_hostname}:{server_1_internal_port}"\n')
             f.write("[server.grpc_public_services.forwarded_requests.enabled_rpcs]\n")
             f.write("revision_branch_create = true\n")
+            f.write("revision_branch_list = true\n")
 
         return server_root, server_env
 
@@ -200,11 +201,35 @@ class TestForwardedBranchCreate:
             f"Branch '{branch_name}' should exist on server 1 after delegated create"
         )
 
-        # Server 2's mutable store was never written to — branch absent there
-        assert not server_2_repo.branch_list().has_remote_branch(branch_name), (
-            f"Branch '{branch_name}' should not exist on server 2's store "
-            "(request was delegated, not written locally)"
-        )
+    @pytest.mark.smoke
+    def test_branch_list_delegates_read_to_server_1(self, repos):
+        """Verify delegation by listing via Server 2 and checking the result comes from Server 1."""
+        server_1_repo, server_2_repo = repos
+        branch_names = [
+            f"feature-{uuid.uuid4().hex[:8]}",
+            f"feature-{uuid.uuid4().hex[:8]}",
+        ]
+
+        # Push both branches directly to Server 1 — Server 2 never receives
+        # BranchCreate RPCs for them, so they are absent from Server 2's store.
+        for branch_name in branch_names:
+            logger.info("Pushing branch '%s' directly to server 1", branch_name)
+            server_1_repo.branch_create(branch_name)
+            server_1_repo.branch_push(branch_name)
+
+        # Server 1's store has all branches
+        for branch_name in branch_names:
+            assert server_1_repo.branch_list().has_remote_branch(branch_name), (
+                f"Branch '{branch_name}' should exist on server 1 after direct push"
+            )
+
+        # Listing via Server 2 delegates to Server 1 — all branches appear even
+        # though none were written to Server 2's mutable store.
+        for branch_name in branch_names:
+            assert server_2_repo.branch_list().has_remote_branch(branch_name), (
+                f"Branch '{branch_name}' should appear in server 2's delegated list "
+                "(BranchList was forwarded to server 1)"
+            )
 
 
 @pytest.mark.smoke

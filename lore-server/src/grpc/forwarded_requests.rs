@@ -138,6 +138,8 @@ pub struct RpcFlags {
     pub revision_branch_delete: bool,
     #[serde(default)]
     pub revision_branch_get: bool,
+    #[serde(default)]
+    pub revision_branch_list: bool,
 
     #[serde(default)]
     pub repository_create: bool,
