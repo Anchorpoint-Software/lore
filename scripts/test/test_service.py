@@ -2,38 +2,24 @@
 # SPDX-License-Identifier: MIT
 import logging
 import os
-import platform
 
 import pytest
 
 from error_types import ServiceCallError
 from lore import Lore
+from service_util import LORE_SERVICE_ENVIRONMENT
 
 logger = logging.getLogger(__name__)
 
-LORE_SERVICE_ENVIRONMENT = {"LORE_USE_SERVICE": "1"}
-
-
-def service_supported():
-    return platform.system() in ("Windows", "Linux", "Darwin")
-
 
 @pytest.mark.smoke
-@pytest.mark.xdist_group("lore_service")
 @pytest.mark.skip(reason="Unknown issue specifically running in CI for OSS")
-@pytest.mark.skipif(
-    not service_supported(), reason="Service not supported on " + platform.system()
-)
 def test_service_down(new_lore_repo):
     with pytest.raises(ServiceCallError):
         new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
 
 
 @pytest.mark.smoke
-@pytest.mark.xdist_group("lore_service")
-@pytest.mark.skipif(
-    not service_supported(), reason="Service not supported on " + platform.system()
-)
 def test_service_call(new_lore_repo, background_lore_service):
     repo: Lore = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
 
@@ -53,12 +39,8 @@ def test_service_call(new_lore_repo, background_lore_service):
 
 
 @pytest.mark.smoke
-@pytest.mark.xdist_group("lore_service")
-@pytest.mark.skipif(
-    not service_supported(), reason="Service not supported on " + platform.system()
-)
 def test_service_resolves_relative_paths_against_caller(
-    new_lore_repo, lore_service_in_directory, tmp_path
+    new_lore_repo, lore_service_runner, tmp_path
 ):
     """Relative paths belong to the directory the command was run in.
 
@@ -73,7 +55,7 @@ def test_service_resolves_relative_paths_against_caller(
     caller_directory = tmp_path / "caller"
     service_directory.mkdir()
     caller_directory.mkdir()
-    lore_service_in_directory(service_directory)
+    lore_service_runner.start(str(service_directory))
 
     # Seed a remote to clone from. Routed through the service like the rest,
     # but against the repository's own absolute path, so unaffected by the

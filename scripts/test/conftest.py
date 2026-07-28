@@ -5,6 +5,8 @@ import logging
 import os
 import platform
 import subprocess
+import typing
+
 import sys
 from pathlib import Path
 from time import sleep
@@ -21,6 +23,7 @@ from lore_server import (
     launch_lore_server,
     lore_local_server,
 )
+from service_util import service_supported
 
 logger = logging.getLogger(__name__)
 
@@ -204,51 +207,76 @@ def _wait_for_service_ready(lore_executable_path, service_process, attempts=30):
     pytest.fail("Timed out waiting for Lore background service to accept connections")
 
 
-@pytest.fixture(scope="function")
-def lore_service_in_directory(lore_executable_path, global_dir_name):
-    """Starts the service in a chosen directory, for tests that need the
-    service's own working directory to differ from the caller's. The service
-    shares the test's isolated global config so shared stores it creates land
-    where the client looks for them."""
-    processes = []
+class TrackedServices(object):
+    def __init__(self, lore_executable_path: str, global_dir_name: str):
+        self.lore_executable_path = lore_executable_path
+        self.global_dir_name = global_dir_name
+        self.service_processes: typing.Dict[str | None, subprocess.Popen | None] = {}
 
-    def start(directory):
+    def start(self, directory: str | None = None):
+        """Starts the service, optionally with a chosen working directory. The service
+        shares the test's isolated global config so shared stores it creates land
+        where the client looks for them."""
+        assert self.service_processes.get(directory) is None
+
         env = os.environ.copy()
-        env["LORE_GLOBAL_PATH"] = global_dir_name
-        service_process = subprocess.Popen(
-            [lore_executable_path, "service", "run"], cwd=str(directory), env=env
+        env["LORE_GLOBAL_PATH"] = self.global_dir_name
+
+        command_args = [self.lore_executable_path, "service", "run"]
+        logger.info("Executing Lore service command: %s", command_args)
+        process = subprocess.Popen(command_args, cwd=directory, env=env)
+        _wait_for_service_ready(self.lore_executable_path, process)
+        self.service_processes[directory] = process
+
+        return process
+
+    def terminate(self, directory: str | None = None):
+        process = self.service_processes.get(directory)
+        if process is not None:
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                logger.warning("Lore service did not exit on terminate, killing it")
+                process.kill()
+            self.service_processes[directory] = None
+
+    def terminate_all(self):
+        for key in list(self.service_processes.keys()):
+            self.terminate(key)
+
+
+@pytest.fixture(
+    scope="function",
+    params=[
+        pytest.param(
+            None,
+            marks=[
+                pytest.mark.skipif(
+                    not service_supported(),
+                    reason="Service not supported on " + platform.system(),
+                ),
+                pytest.mark.xdist_group("lore_service"),
+            ],
         )
-        processes.append(service_process)
-        _wait_for_service_ready(lore_executable_path, service_process)
-        return service_process
+    ],
+)
+def lore_service_runner(lore_executable_path, global_dir_name):
+    """Provides a utility able to start the Lore service process, and cleans up any un-terminated service when the test
+    ends.
+    Automatically marks any test using this as skipped if services aren't supported and as part of the lore_service
+    xdist_group"""
+    tracked_services = TrackedServices(lore_executable_path, global_dir_name)
 
-    yield start
+    yield tracked_services
 
-    for service_process in processes:
-        service_process.terminate()
-        try:
-            service_process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            logger.warning("Lore service did not exit on terminate, killing it")
-            service_process.kill()
+    tracked_services.terminate_all()
 
 
 @pytest.fixture(scope="function")
-def background_lore_service(lore_executable_path):
-    command_args = [lore_executable_path, "service", "run"]
-    logger.info("Executing Lore service command: %s", command_args)
-    service_process = subprocess.Popen(command_args)
-
-    _wait_for_service_ready(lore_executable_path, service_process)
-
-    yield service_process
-
-    service_process.terminate()
-    try:
-        service_process.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        logger.warning("Lore service did not exit on terminate, killing it")
-        service_process.kill()
+def background_lore_service(lore_service_runner):
+    """Automatically starts a Lore service process using the service runner
+    before the test begins"""
+    yield lore_service_runner.start()
 
 
 @pytest.fixture(scope="session")
