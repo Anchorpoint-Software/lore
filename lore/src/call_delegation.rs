@@ -345,6 +345,28 @@ mod tests {
         assert!(!handler_ran, "the verb must not run on a rejected call");
     }
 
+    /// A batch write verb's entry name. The entry type is only reached by
+    /// descending into it, so declaring it text-free instead of deriving the
+    /// check would let a name through unread.
+    #[test]
+    fn a_batch_entry_name_that_is_not_utf8_is_rejected() {
+        let args = crate::revision_tree::add::LoreRevisionTreeAddArgs {
+            id: 1,
+            handle: crate::revision_tree::handle::LoreRevisionTree::INVALID,
+            entries: lore_revision::interface::LoreArray::from_vec(vec![
+                crate::revision_tree::add::LoreRevisionTreeAddEntry {
+                    name: invalid_utf8(),
+                    ..Default::default()
+                },
+            ]),
+        };
+
+        let (status, handler_ran) = dispatch(&LoreGlobalArgs::default(), &args);
+
+        assert_eq!(status, rejected_status());
+        assert!(!handler_ran, "the verb must not run on a rejected call");
+    }
+
     /// A text field of a nested struct, reached by descending one field deep.
     #[test]
     fn a_text_field_of_a_nested_argument_struct_that_is_not_utf8_is_rejected() {

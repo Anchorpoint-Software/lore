@@ -80,6 +80,7 @@ use crate::dependency::LoreFileDependencyRemoveBeginEventData;
 use crate::dependency::LoreFileDependencyRemoveEndEventData;
 use crate::dependency::LoreFileDependencyRemoveEntryEventData;
 use crate::event::revision_tree::LoreRevisionTreeAddCompleteEventData;
+use crate::event::revision_tree::LoreRevisionTreeBatchCompleteEventData;
 use crate::event::revision_tree::LoreRevisionTreeChildEventData;
 use crate::event::revision_tree::LoreRevisionTreeCloseCompleteEventData;
 use crate::event::revision_tree::LoreRevisionTreeCommitCompleteEventData;
@@ -337,8 +338,12 @@ impl<'de> serde::Deserialize<'de> for LoreBytes {
 /// Narrower than the general library error code — events emitted per
 /// put/get/copy/etc. item embed this code so a caller can branch on the
 /// common cases cheaply without parsing the companion `LORE_EVENT_ERROR`
-/// detail. Variants overlap with the general library error code where they
-/// share a meaning.
+/// detail.
+///
+/// Numbered independently of the general library error code that a `Complete`
+/// event's status carries: `NONE`, `INVALID_ARGUMENTS` and `ADDRESS_NOT_FOUND`
+/// happen to share its values, `INTERNAL` (3 against -1) and `SLOW_DOWN`
+/// (4 against 5) do not. Compare a code from an event only against this enum.
 ///
 /// cbindgen:prefix-with-name
 /// cbindgen:rename-all=ScreamingSnakeCase
@@ -1130,6 +1135,8 @@ pub enum LoreEvent {
     CompactionProgress(LoreCompactionProgressEventData),
     /// A store compaction pass ended.
     CompactionEnd(LoreCompactionEndEventData),
+    /// A batch write call on a revision tree completed as a whole.
+    RevisionTreeBatchComplete(LoreRevisionTreeBatchCompleteEventData),
 }
 
 impl LoreEvent {

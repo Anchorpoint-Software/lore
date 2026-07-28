@@ -100,16 +100,15 @@ async fn resolve_path_impl(
     callback: LoreEventCallback,
 ) -> i32 {
     let handle = args.handle;
-    let miss_id = args.id;
     revision_tree_call(
         globals,
         callback,
         handle,
         args,
         resolve_path,
-        move || {
+        |args: &LoreRevisionTreeResolvePathArgs| {
             emit_resolve_complete(
-                miss_id,
+                args.id,
                 INVALID_NODE,
                 RepositoryId::default(),
                 Hash::default(),
@@ -196,6 +195,8 @@ mod tests {
     use lore_base::types::Context;
     use lore_base::types::Hash;
     use lore_base::types::Partition;
+    use lore_revision::interface::LoreArray;
+    use lore_revision::interface::LoreNodeType;
     use lore_revision::node::Node;
     use lore_revision::node::NodeFlags;
     use lore_revision::repository::RepositoryContext;
@@ -204,6 +205,9 @@ mod tests {
     use lore_storage::hash::hash_string;
 
     use super::*;
+    use crate::revision_tree::add::LoreRevisionTreeAddArgs;
+    use crate::revision_tree::add::LoreRevisionTreeAddEntry;
+    use crate::revision_tree::add::add;
     use crate::revision_tree::handle as rt_handle;
     use crate::revision_tree::handle::LoreRevisionTree;
     use crate::revision_tree::load::LoreRevisionTreeLoadArgs;
@@ -216,6 +220,7 @@ mod tests {
         Error(u32),
         Complete(i32),
         RevisionTreeLoaded(u64),
+        AddComplete(u64, NodeID, LoreErrorCode),
         ResolvePathComplete(u64, NodeID, RepositoryId, Hash, LoreErrorCode),
         Other(u32),
     }
@@ -226,6 +231,9 @@ mod tests {
                 LoreEvent::Error(data) => Self::Error(data.error_type),
                 LoreEvent::Complete(data) => Self::Complete(data.status),
                 LoreEvent::RevisionTreeLoaded(data) => Self::RevisionTreeLoaded(data.handle_id),
+                LoreEvent::RevisionTreeAddComplete(data) => {
+                    Self::AddComplete(data.id, data.node_id, data.error_code)
+                }
                 LoreEvent::RevisionTreeResolvePathComplete(data) => Self::ResolvePathComplete(
                     data.id,
                     data.node_id,
@@ -390,6 +398,132 @@ mod tests {
             resolve_pos < complete_pos,
             "ResolvePathComplete must fire before Complete, got {events:?}"
         );
+
+        release(handle, store_handle_id);
+    }
+
+    /// Build `a/b/c.txt` in one batch add. Returns the node ids of `a`, `a/b`
+    /// and `a/b/c.txt`.
+    async fn build_nested_tree(handle: LoreRevisionTree) -> (NodeID, NodeID, NodeID) {
+        let directory =
+            |id: u64, parent_entry: u32, name: &str, nested: bool| LoreRevisionTreeAddEntry {
+                id,
+                parent_node_id: if nested { INVALID_NODE } else { ROOT_NODE },
+                parent_entry,
+                name: LoreString::from_str(name),
+                kind: LoreNodeType::Directory as u32,
+                mode: 0o755,
+                size: 0,
+                address: Address::default(),
+            };
+        let entries = vec![
+            directory(1, 0, "a", false),
+            directory(2, 0, "b", true),
+            LoreRevisionTreeAddEntry {
+                kind: LoreNodeType::File as u32,
+                mode: 0o644,
+                size: 12,
+                ..directory(3, 1, "c.txt", true)
+            },
+        ];
+
+        let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let status = add(
+            LoreGlobalArgs::default(),
+            LoreRevisionTreeAddArgs {
+                id: 100,
+                handle,
+                entries: LoreArray::from_vec(entries),
+            },
+            make_callback(sink.clone()),
+        )
+        .await;
+        let events = sink.lock().unwrap().clone();
+        assert_eq!(status, 0, "building the fixture tree must succeed");
+
+        let added = |id: u64| {
+            events
+                .iter()
+                .find_map(|event| match event {
+                    CapturedEvent::AddComplete(event_id, node_id, code) if *event_id == id => {
+                        assert_eq!(*code, LoreErrorCode::None, "entry {id} must succeed");
+                        Some(*node_id)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("entry {id} must emit AddComplete, got {events:?}"))
+        };
+        (added(1), added(2), added(3))
+    }
+
+    #[tokio::test]
+    async fn resolve_existing_path_returns_node_id() {
+        let repository = Partition::from([0x99u8; 16]);
+        let (handle, store_handle_id) = load_handle("resolve-existing", repository).await;
+        let (a, b, c) = build_nested_tree(handle).await;
+
+        // Each level is asserted separately: resolving only the leaf would pass
+        // even if the walk skipped or double-consumed an intermediate component.
+        for (id, path, expected) in [(20u64, "a", a), (21, "a/b", b), (22, "a/b/c.txt", c)] {
+            let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+            let status = resolve_path(
+                LoreGlobalArgs::default(),
+                LoreRevisionTreeResolvePathArgs {
+                    id,
+                    handle,
+                    path: LoreString::from_str(path),
+                },
+                make_callback(sink.clone()),
+            )
+            .await;
+
+            assert_eq!(status, 0, "resolving {path} must succeed");
+            let events = sink.lock().unwrap().clone();
+            let (node_id, resolved_repository, _revision, error_code) =
+                resolve_outcome(&events, id)
+                    .unwrap_or_else(|| panic!("ResolvePathComplete must fire for {path}"));
+            assert_eq!(error_code, LoreErrorCode::None, "got {events:?}");
+            assert_eq!(
+                node_id, expected,
+                "{path} must resolve to the node the add reported, got {events:?}"
+            );
+            assert_eq!(
+                resolved_repository, repository,
+                "a link-free path resolves in the handle's repository, got {events:?}"
+            );
+        }
+
+        release(handle, store_handle_id);
+    }
+
+    #[tokio::test]
+    async fn resolve_path_below_a_leaf_returns_invalid_arguments() {
+        let (handle, store_handle_id) =
+            load_handle("resolve-below-leaf", Partition::from([0xAAu8; 16])).await;
+        build_nested_tree(handle).await;
+
+        let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let status = resolve_path(
+            LoreGlobalArgs::default(),
+            LoreRevisionTreeResolvePathArgs {
+                id: 23,
+                handle,
+                path: LoreString::from_str("a/b/c.txt/deeper"),
+            },
+            make_callback(sink.clone()),
+        )
+        .await;
+
+        assert_eq!(status, 1, "descending through a file must fail");
+        let events = sink.lock().unwrap().clone();
+        let (node_id, _repository, _revision, error_code) =
+            resolve_outcome(&events, 23).expect("ResolvePathComplete must fire");
+        assert_eq!(
+            error_code,
+            LoreErrorCode::InvalidArguments,
+            "got {events:?}"
+        );
+        assert_eq!(node_id, INVALID_NODE);
 
         release(handle, store_handle_id);
     }

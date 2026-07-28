@@ -296,6 +296,20 @@ impl StateNodeChildrenIterator {
             });
         }
         let parent = state.node(repository.clone(), parent_node_id).await?;
+        Self::from_parent(state, repository, parent_node_id, &parent).await
+    }
+
+    /// Create an iterator from a parent node the caller has already read.
+    ///
+    /// Saves the parent lookup [`Self::new`] performs, for a caller that has just
+    /// inspected the parent — checking that it can take children, say — and is
+    /// about to walk what is under it.
+    pub async fn from_parent(
+        state: Arc<State>,
+        repository: Arc<RepositoryContext>,
+        parent_node_id: NodeID,
+        parent: &Node,
+    ) -> Result<Self, StateError> {
         let first_child = parent.child();
 
         let (block, iblock) = if let Some(child_id) = first_child {
@@ -1737,6 +1751,9 @@ impl State {
     /// find-then-add is a check-then-act at the call site that this cannot close;
     /// callers fanning out across paths must ensure at most one add per
     /// `(parent, name)` (e.g. pre-create shared ancestors sequentially).
+    ///
+    /// Slot allocation is serialized per tree by a single permit, so concurrent
+    /// adds overlap only in the initialize and publish that follow it.
     pub async fn node_add(
         &self,
         repository: Arc<RepositoryContext>,
@@ -1744,7 +1761,21 @@ impl State {
         node: Node,
         name: &str,
     ) -> Result<NodeID, StateError> {
-        let permit = self.unused.acquire().await;
+        // The parent is checked before a slot is allocated: a discarded parent is
+        // itself on the free list, so the allocator would hand its slot straight
+        // back out as the new node's, zeroing the flag that identifies it.
+        self.tree(repository.clone()).await?;
+        let parent_block_index = NodeBlock::index(parent);
+        let parent_block = self.block(repository.clone(), parent_block_index).await?;
+        if parent_block.read().node(Node::index(parent)).is_discarded() {
+            return Err(StateError::internal(
+                "cannot add a child to a discarded node",
+            ));
+        }
+
+        let permit = self.unused.acquire().await.map_err(|error| {
+            StateError::internal(format!("node allocation semaphore is closed: {error}"))
+        })?;
 
         let mut node_id = INVALID_NODE;
         let tree = self.tree(repository.clone()).await?;
@@ -1837,31 +1868,17 @@ impl State {
 
         let block_index = NodeBlock::index(node_id);
         lore_trace!("Block {} node {} added", block_index, Node::index(node_id));
-        let parent_block_index = NodeBlock::index(parent);
-        let parent_block = self.block(repository.clone(), parent_block_index).await?;
 
-        // Initialize the slot fully (except `sibling`) before it is reachable:
-        // `grab_node_unused` left it zeroed, so a concurrent chain walk that
-        // observed it published-but-uninitialized would read `parent`/`sibling`
-        // as 0 and error or truncate. `sibling` is set atomically at publish.
-        let block = self
-            .block_with_nametable(repository.clone(), block_index)
-            .await?;
-        let dirtied = {
-            let mut block_lock = block.write();
-            let (name_offset, name_length) = block_lock
-                .node_name_store(name, 0, 0)
-                .forward::<StateError>("Storing new node name")?;
-            let target_node = block_lock.node(Node::index(node_id));
-            *target_node = node;
-            target_node.parent = parent;
-            target_node.name_offset = name_offset;
-            target_node.name_length = name_length;
-            block_lock.mark_dirty()
+        let block = match self
+            .initialize_node(repository.clone(), node_id, parent, node, name)
+            .await
+        {
+            Ok(block) => block,
+            Err(error) => {
+                self.release_node(repository.clone(), node_id).await;
+                return Err(error);
+            }
         };
-        if dirtied {
-            self.block_modified(block.clone(), block_index);
-        }
 
         // Prepend into the child chain via CAS: stash the current head as our
         // `sibling`, then swap ourselves in as the head. Keeps capture+publish
@@ -1927,6 +1944,68 @@ impl State {
         }
 
         Ok(node_id)
+    }
+
+    /// Fill in every field of a freshly grabbed slot except `sibling`, returning
+    /// the block that holds it.
+    ///
+    /// The slot is initialized fully before it is reachable: `grab_node_unused`
+    /// left it zeroed, so a concurrent chain walk that observed it
+    /// published-but-uninitialized would read `parent`/`sibling` as 0 and error
+    /// or truncate. `sibling` is set atomically at publish.
+    async fn initialize_node(
+        &self,
+        repository: Arc<RepositoryContext>,
+        node_id: NodeID,
+        parent: NodeID,
+        node: Node,
+        name: &str,
+    ) -> Result<Arc<NodeBlock>, StateError> {
+        let block_index = NodeBlock::index(node_id);
+        let block = self
+            .block_with_nametable(repository.clone(), block_index)
+            .await?;
+        let dirtied = {
+            let mut block_lock = block.write();
+            let (name_offset, name_length) = block_lock
+                .node_name_store(name, 0, 0)
+                .forward::<StateError>("Storing new node name")?;
+            let target_node = block_lock.node(Node::index(node_id));
+            *target_node = node;
+            target_node.parent = parent;
+            target_node.name_offset = name_offset;
+            target_node.name_length = name_length;
+            block_lock.mark_dirty()
+        };
+        if dirtied {
+            self.block_modified(block.clone(), block_index);
+        }
+
+        Ok(block)
+    }
+
+    /// Return a grabbed but unpublished node slot to its block's free list.
+    ///
+    /// Initialization runs after the allocator hands the slot out, so a failure
+    /// there would otherwise consume it for the lifetime of the tree: it is
+    /// reachable from no chain, and nothing hands it out a second time. The
+    /// allocation permit is held for the push so it cannot interleave with a
+    /// grab walking the same block.
+    async fn release_node(&self, repository: Arc<RepositoryContext>, node_id: NodeID) {
+        let block_index = NodeBlock::index(node_id);
+        let Ok(block) = self.block(repository, block_index).await else {
+            lore_warn!("Node {node_id} slot lost: its block could not be read back");
+            return;
+        };
+        let _permit = self.unused.acquire().await;
+        let dirtied = {
+            let mut block_writer = block.write();
+            block_writer.discard_node(block_index, Node::index(node_id));
+            block_writer.mark_dirty()
+        };
+        if dirtied {
+            self.block_modified(block, block_index);
+        }
     }
 
     /// Return the most recently allocated block when it still has at least one
@@ -2405,21 +2484,40 @@ impl State {
         parent_node: NodeID,
         name_hash: u64,
     ) -> Result<NodeID, StateError> {
-        let mut iblock = NodeBlock::index(parent_node);
-        let mut inode = Node::index(parent_node);
-        let mut block = self.block(repository.clone(), iblock).await?;
+        let iblock = NodeBlock::index(parent_node);
+        let inode = Node::index(parent_node);
+        let block = self.block(repository.clone(), iblock).await?;
 
         // TODO(mjansson): This does not actually need to grab the whole node
         let node = { *block.read().node(inode) };
-        if !node.is_directory() {
+        self.find_subnode_of(repository, parent_node, &node, name_hash)
+            .await
+    }
+
+    /// Find a child of `parent_node` by name hash, starting from a parent node
+    /// the caller has already read.
+    ///
+    /// Saves the lookup [`Self::find_subnode`] performs, for a caller that has
+    /// just inspected the parent and is about to search under it.
+    pub async fn find_subnode_of(
+        &self,
+        repository: Arc<RepositoryContext>,
+        parent_node: NodeID,
+        parent: &Node,
+        name_hash: u64,
+    ) -> Result<NodeID, StateError> {
+        if !parent.is_directory() {
             return Err(NodeNotFound.into());
         }
 
-        let mut child_node_ref = node.child();
+        let mut iblock = NodeBlock::index(parent_node);
+        let mut block = self.block(repository.clone(), iblock).await?;
+
+        let mut child_node_ref = parent.child();
         let mut cycle = SiblingCycleGuard::new(parent_node);
         while let Some(node_id) = child_node_ref {
             let inextblock = NodeBlock::index(node_id);
-            inode = Node::index(node_id);
+            let inode = Node::index(node_id);
             let node = {
                 if iblock != inextblock {
                     iblock = inextblock;
@@ -2762,6 +2860,13 @@ impl State {
         Err(StateError::internal("Tree not loaded"))
     }
 
+    /// The loaded revision's tree header, installed on first use.
+    ///
+    /// Several callers can miss the cached value before any of them takes the
+    /// write lock, so whichever one installs first wins and the rest adopt its
+    /// tree. A second install would push another placeholder onto the block
+    /// vector and make [`Self::block_count`] report a block the tree does not
+    /// have.
     pub async fn tree(&self, repository: Arc<RepositoryContext>) -> Result<Tree, StateError> {
         {
             let lock = self.runtime.read();
@@ -2780,8 +2885,12 @@ impl State {
                 tree.block_count = 1;
                 {
                     let mut lock = self.runtime.write();
-                    lock.tree = Some(tree);
-                    lock.block.push(Weak::new());
+                    if let Some(current_tree) = &lock.tree {
+                        tree = *current_tree;
+                    } else {
+                        lock.tree = Some(tree);
+                        lock.block.push(Weak::new());
+                    }
                 }
                 tree
             } else {

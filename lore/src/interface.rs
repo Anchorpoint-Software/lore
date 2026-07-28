@@ -7443,3 +7443,40 @@ pub extern "C" fn lore_revision_tree_node_path_async(
         crate::revision_tree::node_path::node_path,
     );
 }
+
+pub type LoreRevisionTreeAddArgs = crate::revision_tree::add::LoreRevisionTreeAddArgs;
+
+/// Add a batch of nodes to a loaded revision tree. An entry parents onto an
+/// existing node or onto an earlier entry, so one call builds a subtree. Every
+/// entry is checked before any node is created, so one bad entry rejects the
+/// call and creates nothing; the reason names the offending entry's batch index,
+/// which a caller leaving `id` at zero has no other way to identify. A failure
+/// after those checks pass is internal and may leave part of the batch created.
+///
+/// A link entry's target revision is not resolved here, so a link naming a
+/// revision that cannot be read is accepted and fails only when something later
+/// reads through it. Entries under separate parents are created concurrently,
+/// but allocating a node slot is serialized per loaded tree.
+///
+/// | Terminal event                            | Payload                                          | Notes                                                    |
+/// |-------------------------------------------|--------------------------------------------------|----------------------------------------------------------|
+/// | `LORE_EVENT_REVISION_TREE_ADD_COMPLETE`   | `lore_revision_tree_add_complete_event_data_t`   | One per entry created or individually rejected           |
+/// | `LORE_EVENT_REVISION_TREE_BATCH_COMPLETE` | `lore_revision_tree_batch_complete_event_data_t` | Exactly one, carrying the call id and the call's outcome |
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_tree_add(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionTreeAddArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(globals, args, callback, crate::revision_tree::add::add)
+}
+
+/// Add a batch of nodes to a loaded revision tree (async variant).
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_tree_add_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionTreeAddArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(globals, args, callback, crate::revision_tree::add::add);
+}

@@ -166,7 +166,25 @@ pub struct LoreRevisionTreeNodePathEventData {
     pub error_code: LoreErrorCode,
 }
 
-/// Terminal per-call event for `add`. On success `node_id` is the
+/// Terminal event for a batch write call as a whole, carrying the call's own id
+/// rather than any entry's.
+///
+/// Every batch write verb emits exactly one of these, after any per-entry
+/// terminals and before `Complete`. The error code is `NONE` when the call did
+/// what it was asked; otherwise it names a failure belonging to the call rather
+/// than to a single entry, such as an unknown or closed handle. A per-entry
+/// failure is reported on that entry's own terminal instead.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoreRevisionTreeBatchCompleteEventData {
+    /// Correlation id of the originating call
+    pub id: u64,
+    /// The outcome of the call as a whole
+    pub error_code: LoreErrorCode,
+}
+
+/// Terminal per-entry event for `add`. On success `node_id` is the
 /// newly-allocated child; on failure `node_id` is undefined.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]

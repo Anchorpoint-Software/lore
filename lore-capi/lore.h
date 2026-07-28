@@ -106,8 +106,12 @@ typedef enum lore_node_type_t {
 // Narrower than the general library error code — events emitted per
 // put/get/copy/etc. item embed this code so a caller can branch on the
 // common cases cheaply without parsing the companion `LORE_EVENT_ERROR`
-// detail. Variants overlap with the general library error code where they
-// share a meaning.
+// detail.
+//
+// Numbered independently of the general library error code that a `Complete`
+// event's status carries: `NONE`, `INVALID_ARGUMENTS` and `ADDRESS_NOT_FOUND`
+// happen to share its values, `INTERNAL` (3 against -1) and `SLOW_DOWN`
+// (4 against 5) do not. Compare a code from an event only against this enum.
 //
 typedef enum lore_error_code_t {
   // No error; the operation succeeded.
@@ -2620,7 +2624,7 @@ typedef struct lore_revision_tree_node_path_event_data_t {
   enum lore_error_code_t error_code;
 } lore_revision_tree_node_path_event_data_t;
 
-// Terminal per-call event for `add`. On success `node_id` is the
+// Terminal per-entry event for `add`. On success `node_id` is the
 // newly-allocated child; on failure `node_id` is undefined.
 typedef struct lore_revision_tree_add_complete_event_data_t {
   // Correlation id of the originating call.
@@ -2838,6 +2842,21 @@ typedef struct lore_compaction_end_event_data_t {
   // Total bytes reclaimed across the pass.
   uint64_t total_compacted_bytes;
 } lore_compaction_end_event_data_t;
+
+// Terminal event for a batch write call as a whole, carrying the call's own id
+// rather than any entry's.
+//
+// Every batch write verb emits exactly one of these, after any per-entry
+// terminals and before `Complete`. The error code is `NONE` when the call did
+// what it was asked; otherwise it names a failure belonging to the call rather
+// than to a single entry, such as an unknown or closed handle. A per-entry
+// failure is reported on that entry's own terminal instead.
+typedef struct lore_revision_tree_batch_complete_event_data_t {
+  // Correlation id of the originating call
+  uint64_t id;
+  // The outcome of the call as a whole
+  enum lore_error_code_t error_code;
+} lore_revision_tree_batch_complete_event_data_t;
 
 // An event delivered to a callback. Each variant names a kind of event and
 // carries the data for that event.
@@ -3295,6 +3314,8 @@ enum lore_event_id_t {
   LORE_EVENT_COMPACTION_PROGRESS,
   // A store compaction pass ended.
   LORE_EVENT_COMPACTION_END,
+  // A batch write call on a revision tree completed as a whole.
+  LORE_EVENT_REVISION_TREE_BATCH_COMPLETE,
 };
 typedef uint32_t lore_event_tag_t;
 
@@ -3527,6 +3548,7 @@ typedef struct lore_event_t {
     struct lore_compaction_begin_event_data_t compaction_begin;
     struct lore_compaction_progress_event_data_t compaction_progress;
     struct lore_compaction_end_event_data_t compaction_end;
+    struct lore_revision_tree_batch_complete_event_data_t revision_tree_batch_complete;
   };
 } lore_event_t;
 
@@ -5112,24 +5134,45 @@ typedef struct lore_revision_tree_node_path_args_t {
   lore_node_id_t node_id;
 } lore_revision_tree_node_path_args_t;
 
-// Arguments for `lore_revision_tree_add`.
-typedef struct lore_revision_tree_add_args_t {
-  // Per-call correlation id echoed back in events
+// One node to add. The parent is `parent_node_id`, or the node created by an
+// earlier entry when `parent_node_id` is the invalid-node sentinel.
+typedef struct lore_revision_tree_add_entry_t {
+  // Caller-chosen id echoed back in this entry's `ADD_COMPLETE`
   uint64_t id;
-  // Loaded revision-tree handle to mutate
-  struct lore_revision_tree_t handle;
-  // Parent node the new child is added under
+  // Parent for the new node; the invalid-node sentinel selects `parent_entry`
   lore_node_id_t parent_node_id;
+  // Index of an earlier entry in this batch whose new node is the parent;
+  // read only when `parent_node_id` is the invalid-node sentinel
+  uint32_t parent_entry;
   // UTF-8 name of the new child within its parent
   struct lore_string_t name;
-  // `NodeKind` encoding: FILE=1, DIRECTORY=2, LINK=3
+  // `LoreNodeType` encoding: `DIRECTORY = 0`, `FILE = 1`, `LINK = 2`
   uint32_t kind;
   // POSIX permission bits for the new node
   uint16_t mode;
-  // Content size in bytes (leaf nodes)
+  // Content size in bytes (leaf nodes); `0` for a directory
   uint64_t size;
   // Content address `(hash, file_id context)` of the new node
   struct lore_address_t address;
+} lore_revision_tree_add_entry_t;
+
+// A contiguous array of elements described by a pointer and a count.
+// Holds zero or more values of the element type laid out one after another.
+typedef struct lore_revision_tree_add_entry_array_t {
+  // Pointer to the first element.
+  const struct lore_revision_tree_add_entry_t *ptr;
+  // Number of elements in the array.
+  uintptr_t count;
+} lore_revision_tree_add_entry_array_t;
+
+// Arguments for `lore_revision_tree_add`.
+typedef struct lore_revision_tree_add_args_t {
+  // Per-call correlation id echoed back in `BATCH_COMPLETE`
+  uint64_t id;
+  // Loaded revision-tree handle to mutate
+  struct lore_revision_tree_t handle;
+  // Nodes to add; each emits its own `ADD_COMPLETE`
+  struct lore_revision_tree_add_entry_array_t entries;
 } lore_revision_tree_add_args_t;
 
 // Arguments for `lore_revision_tree_delete`.
@@ -10817,3 +10860,28 @@ int32_t lore_revision_tree_node_path(const struct lore_global_args_t *globals,
 void lore_revision_tree_node_path_async(const struct lore_global_args_t *globals,
                                         const struct lore_revision_tree_node_path_args_t *args,
                                         struct lore_event_callback_config_t callback);
+
+// Add a batch of nodes to a loaded revision tree. An entry parents onto an
+// existing node or onto an earlier entry, so one call builds a subtree. Every
+// entry is checked before any node is created, so one bad entry rejects the
+// call and creates nothing; the reason names the offending entry's batch index,
+// which a caller leaving `id` at zero has no other way to identify. A failure
+// after those checks pass is internal and may leave part of the batch created.
+//
+// A link entry's target revision is not resolved here, so a link naming a
+// revision that cannot be read is accepted and fails only when something later
+// reads through it. Entries under separate parents are created concurrently,
+// but allocating a node slot is serialized per loaded tree.
+//
+// | Terminal event                            | Payload                                          | Notes                                                    |
+// |-------------------------------------------|--------------------------------------------------|----------------------------------------------------------|
+// | `LORE_EVENT_REVISION_TREE_ADD_COMPLETE`   | `lore_revision_tree_add_complete_event_data_t`   | One per entry created or individually rejected           |
+// | `LORE_EVENT_REVISION_TREE_BATCH_COMPLETE` | `lore_revision_tree_batch_complete_event_data_t` | Exactly one, carrying the call id and the call's outcome |
+int32_t lore_revision_tree_add(const struct lore_global_args_t *globals,
+                               const struct lore_revision_tree_add_args_t *args,
+                               struct lore_event_callback_config_t callback);
+
+// Add a batch of nodes to a loaded revision tree (async variant).
+void lore_revision_tree_add_async(const struct lore_global_args_t *globals,
+                                  const struct lore_revision_tree_add_args_t *args,
+                                  struct lore_event_callback_config_t callback);
