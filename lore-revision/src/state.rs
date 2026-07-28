@@ -5056,6 +5056,12 @@ impl FileDiffContext {
 /// here if it was cleared by stale reconciliation). The compare framework
 /// is bypassed because comparing the filesystem hash against the staged
 /// node's zero address is meaningless for an add.
+///
+/// A dirty-move destination is exempt: it only looks like a node missing from
+/// the current state because the walk matches by name, while the same node is
+/// present in the current revision under its source path. Emitting an add for
+/// it would drop the move provenance and overwrite `DirtyMove` with `DirtyAdd`,
+/// so the move is left to the state diff, which coalesces it by file context.
 #[allow(clippy::too_many_arguments)]
 async fn emit_unstaged_add(
     repository: Arc<RepositoryContext>,
@@ -5067,6 +5073,10 @@ async fn emit_unstaged_add(
     stats: &FilesystemDiffStats,
     filter_mode: FilterMode,
 ) -> Result<(), StateError> {
+    if from_node.is_dirty_move() {
+        lore_trace!("File {file_path} is a dirty move destination, not an unstaged add");
+        return Ok(());
+    }
     if !from_node.is_dirty_add() {
         state
             .node_mark_dirty(repository.clone(), from_node_id, NodeFlags::DirtyAdd, true)

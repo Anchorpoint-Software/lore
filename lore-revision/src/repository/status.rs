@@ -1215,9 +1215,13 @@ pub async fn status(
                     for change in changes.iter() {
                         // When scanning, skip dirty-only changes from the
                         // state diff — the scan section re-detects them from
-                        // the filesystem and handles set/clear inline.
-                        let dominated_by_scan =
-                            show_scan && change.flags.is_dirty() && !change.flags.is_stage();
+                        // the filesystem and handles set/clear inline. Moves
+                        // are exempt: only this diff pairs the add and delete
+                        // by file context to recover the source path.
+                        let dominated_by_scan = show_scan
+                            && change.flags.is_dirty()
+                            && !change.flags.is_stage()
+                            && change.action != FileAction::Move;
                         if dominated_by_scan
                             || !(change.flags.is_stage() || change.flags.is_dirty())
                         {
