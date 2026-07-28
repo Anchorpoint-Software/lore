@@ -6948,8 +6948,7 @@ pub extern "C" fn lore_notification_unsubscribe_async(
 /// was not.
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_log_configure(config: &LoreLogConfig) -> i32 {
-    log::configure(config);
-    0
+    log::configure(config)
 }
 
 /// Shut the library down, stopping its worker threads and releasing the

@@ -2679,6 +2679,7 @@ dependencies = [
 name = "lore-macro"
 version = "0.8.6-nightly"
 dependencies = [
+ "proc-macro2",
  "quote",
  "syn",
 ]

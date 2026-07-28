@@ -27,9 +27,11 @@
 // A string the library produces is a NUL-terminated buffer. A string carried
 // inside an event is valid only while the callback runs; copy its bytes to keep
 // them after the callback returns. A string the caller passes in must be valid
-// UTF-8, which the library does not check. The library copies the bytes, so the
-// caller may free the string once the call returns. See lore_string_t for the
-// layout of the type.
+// UTF-8: the library checks every string an operation carries before it starts
+// the call, and fails the whole call with error code 1 (invalid arguments)
+// naming the offending field if any of them is not. The library copies the
+// bytes, so the caller may free the string once the call returns. See
+// lore_string_t for the layout of the type.
 //
 // Argument lifetime
 //
@@ -157,9 +159,11 @@ typedef struct lore_progress_event_data_t {
 // A string described by a pointer to its character data and a length, holding
 // text as a sequence of bytes.
 //
-// The text is UTF-8. The length field counts the bytes before the trailing
-// NUL. An empty string is a NULL pointer with length 0, and a length of 0
-// means the string is empty.
+// The text is UTF-8 by convention, but the bytes are never validated on
+// construction: a string carrying any other encoding is accepted here and
+// rejected by whichever verb needs to read it as text. The length field counts
+// the bytes before the trailing NUL. An empty string is a NULL pointer with
+// length 0, and a length of 0 means the string is empty.
 typedef struct lore_string_t {
   // Pointer to the start of the character data.
   const char *string;

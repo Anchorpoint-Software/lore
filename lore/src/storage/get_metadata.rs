@@ -31,6 +31,7 @@ use lore_base::types::Hash;
 use lore_base::types::Partition;
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
+use lore_macro::ValidateText;
 use lore_revision::event::EventError;
 use lore_revision::event::LoreErrorCode;
 use lore_revision::event::LoreEvent;
@@ -51,7 +52,7 @@ use crate::storage::store::StoreInternal;
 
 /// One `get_metadata` item — the `(partition, address)` to look up.
 #[repr(C)]
-#[derive(Copy, Clone, Default, Debug, PartialEq, Deserialize, Serialize)]
+#[derive(Copy, Clone, Default, Debug, PartialEq, Deserialize, Serialize, ValidateText)]
 pub struct LoreStorageGetMetadataItem {
     /// Caller-chosen id echoed back in `GET_METADATA_ITEM_COMPLETE`
     pub id: u64,

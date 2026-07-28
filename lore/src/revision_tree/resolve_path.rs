@@ -82,9 +82,10 @@ fn emit_resolve_complete(
 /// carrying the resolved node plus the `(repository, revision)` it belongs to
 /// (which differ from the handle's when the path crosses a link) and
 /// `error_code = NONE`, before `Complete {status: 0}`. An empty path resolves to
-/// the root node. A path that does not resolve to a node — because it does not
-/// exist or is not valid UTF-8 — completes with `error_code = INVALID_ARGUMENTS`.
-/// The verb materializes no bytes to disk.
+/// the root node. A path that does not resolve to a node completes with
+/// `error_code = INVALID_ARGUMENTS`. A path that is not valid UTF-8 never
+/// reaches the verb — the entry point rejects the call before dispatching it, so
+/// no `RESOLVE_PATH_COMPLETE` fires. The verb materializes no bytes to disk.
 pub async fn resolve_path(
     globals: LoreGlobalArgs,
     args: LoreRevisionTreeResolvePathArgs,
@@ -117,18 +118,7 @@ async fn resolve_path_impl(
         },
         async move |internal, args: LoreRevisionTreeResolvePathArgs| {
             let id = args.id;
-            let Ok(path) = std::str::from_utf8(args.path.as_bytes()) else {
-                emit_resolve_complete(
-                    id,
-                    INVALID_NODE,
-                    RepositoryId::default(),
-                    Hash::default(),
-                    LoreErrorCode::InvalidArguments,
-                );
-                return Err(ResolvePathError::from(InvalidArguments {
-                    reason: "path is not valid UTF-8".into(),
-                }));
-            };
+            let path = args.path.as_str();
 
             if path.is_empty() {
                 emit_resolve_complete(
@@ -437,40 +427,6 @@ mod tests {
         assert!(
             events.contains(&CapturedEvent::Complete(1)),
             "missing path must complete with status=1, got {events:?}"
-        );
-
-        release(handle, store_handle_id);
-    }
-
-    #[tokio::test]
-    async fn resolve_non_utf8_path_returns_invalid_arguments() {
-        let (handle, store_handle_id) =
-            load_handle("resolve-non-utf8", Partition::from([0x33u8; 16])).await;
-        let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
-
-        let status = resolve_path(
-            LoreGlobalArgs::default(),
-            LoreRevisionTreeResolvePathArgs {
-                id: 9,
-                handle,
-                path: LoreString::from_bytes(&[0xFF, 0xFE, 0xFD]),
-            },
-            make_callback(sink.clone()),
-        )
-        .await;
-
-        assert_eq!(status, 1, "a non-UTF-8 path must fail");
-        let events = sink.lock().unwrap().clone();
-        let (node_id, _repository, _revision, error_code) =
-            resolve_outcome(&events, 9).expect("ResolvePathComplete must fire for the caller id");
-        assert_eq!(
-            error_code,
-            LoreErrorCode::InvalidArguments,
-            "a non-UTF-8 path must report InvalidArguments, got {events:?}"
-        );
-        assert_eq!(
-            node_id, INVALID_NODE,
-            "a failed resolve must report the invalid-node sentinel, got {events:?}"
         );
 
         release(handle, store_handle_id);
