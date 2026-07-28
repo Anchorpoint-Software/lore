@@ -90,8 +90,10 @@ pub async fn write_fragmented(
     hash_only: bool,
     remote_session: Option<Arc<StorageSession>>,
     tracker: Option<Arc<crate::write_tracker::WriteTracker>>,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> Result<(Address, Fragment), StorageError> {
     let size = buffer.len();
+    let mut read_permit = permit;
     let mut tasks = JoinSet::<Result<(usize, usize, Address), StorageError>>::new();
 
     lore_base::lore_trace!(
@@ -110,6 +112,20 @@ pub async fn write_fragmented(
             size_content: chunk_size as u64,
         };
 
+        // Split the read reservation per fragment (heap), or reserve before the
+        // mmap copy — reserved before allocation either way.
+        let chunk_permit = if hash_only {
+            None
+        } else if flags.clone_buffer {
+            crate::concurrency::acquire_fragment_memory_permit(chunk_size).await
+        } else {
+            let needed = crate::concurrency::fragment_permit_count(chunk_size) as usize;
+            match read_permit.as_mut().and_then(|permit| permit.split(needed)) {
+                Some(permit) => Some(permit),
+                None => crate::concurrency::acquire_fragment_memory_permit(chunk_size).await,
+            }
+        };
+
         if chunk_offset == 0 && chunk_size == size {
             // Everything was put in a single fragment
             let chunk_buffer = if flags.clone_buffer {
@@ -118,8 +134,6 @@ pub async fn write_fragmented(
                 chunk_buffer
             };
             let hash = hash::hash_slice(chunk_buffer.as_ref());
-            let permit =
-                crate::concurrency::acquire_fragment_memory_permit(chunk_buffer.len()).await;
             let result = store_fragment(
                 store,
                 partition,
@@ -129,7 +143,7 @@ pub async fn write_fragmented(
                 flags.local_cache_priority,
                 remote_session,
                 tracker,
-                permit,
+                chunk_permit,
             )
             .await?;
             return Ok((result.address, result.fragment));
@@ -148,8 +162,6 @@ pub async fn write_fragmented(
             let chunk_address = if hash_only {
                 Address { context, hash }
             } else {
-                let permit =
-                    crate::concurrency::acquire_fragment_memory_permit(chunk_buffer.len()).await;
                 let result = store_fragment(
                     store,
                     partition,
@@ -159,7 +171,7 @@ pub async fn write_fragmented(
                     flags.local_cache_priority,
                     session,
                     task_tracker,
-                    permit,
+                    chunk_permit,
                 )
                 .await?;
                 result.address

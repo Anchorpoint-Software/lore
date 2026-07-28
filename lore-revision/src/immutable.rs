@@ -377,6 +377,7 @@ pub async fn write_with_tracker(
         flags,
         session,
         tracker,
+        None,
     )
     .await
     .forward("writing immutable content")

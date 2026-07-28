@@ -4426,6 +4426,7 @@ mod open_tests {
                         WriteOptions::default(),
                         None,
                         None,
+                        None,
                     )
                     .await
                     .expect("direct write_content");

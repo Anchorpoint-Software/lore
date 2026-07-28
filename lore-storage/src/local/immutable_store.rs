@@ -4581,6 +4581,7 @@ mod tests {
                 WriteOptions::default(),
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -4643,6 +4644,7 @@ mod tests {
             context,
             payload.clone(),
             WriteOptions::default(),
+            None,
             None,
             None,
         )
@@ -4827,6 +4829,7 @@ mod tests {
             WriteOptions::default(),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -4839,6 +4842,7 @@ mod tests {
             context,
             Bytes::from(payload.clone()),
             WriteOptions::default(),
+            None,
             None,
             None,
         )
@@ -4913,6 +4917,7 @@ mod tests {
             source_context,
             Bytes::from(payload.clone()),
             WriteOptions::default(),
+            None,
             None,
             None,
         )

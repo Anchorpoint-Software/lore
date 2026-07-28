@@ -222,6 +222,7 @@ async fn resolve_put_item(
         write_options,
         remote_session,
         None,
+        None,
     )
     .await
     {
