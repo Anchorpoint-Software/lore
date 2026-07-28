@@ -112,5 +112,17 @@ mod tests {
 
             verify_jwt_usage_for_remote(&token, "attackerlore.example.com").unwrap_err();
         }
+
+        #[test]
+        fn naked_aud_rejects_mid_label_suffix_domain() {
+            // A dotless `aud` must respect the label boundary.
+            let token = make_jwt_with_audience(vec!["epicgames.net".to_string()]);
+
+            // The apex and true subdomains match.
+            verify_jwt_usage_for_remote(&token, "epicgames.net").unwrap();
+            verify_jwt_usage_for_remote(&token, "lore.epicgames.net").unwrap();
+            // The look-alike registrable domain does not.
+            verify_jwt_usage_for_remote(&token, "evilepicgames.net").unwrap_err();
+        }
     }
 }
