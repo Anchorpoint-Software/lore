@@ -26,6 +26,7 @@ use tracing::info;
 
 use super::health_check;
 use super::presigned;
+use super::security_headers::ContentTypeAllowlist;
 use super::tracing::lore_http_tracing;
 use crate::auth::jwt::JwtVerifier;
 use crate::auth::jwt_axum_middleware::jwt_axum_verify_authorization;
@@ -46,6 +47,10 @@ pub struct PresignConfig {
     pub min_ttl_seconds: u64,
     pub default_ttl_seconds: u64,
     pub max_ttl_seconds: u64,
+    /// Allowlist of `Content-Type` values that redeemed content may be served
+    /// with. Disallowed types are rejected at mint and coerced to
+    /// `application/octet-stream` at redeem. Configured in code (not TOML).
+    pub content_type_allowlist: ContentTypeAllowlist,
 }
 
 #[derive(Clone)]
@@ -173,6 +178,7 @@ fn build_presign_config(settings: &PresignSettings) -> Result<Option<PresignConf
         min_ttl_seconds: settings.min_ttl_seconds,
         default_ttl_seconds: settings.default_ttl_seconds,
         max_ttl_seconds: settings.max_ttl_seconds,
+        content_type_allowlist: ContentTypeAllowlist::default(),
     }))
 }
 
