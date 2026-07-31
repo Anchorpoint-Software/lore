@@ -978,6 +978,11 @@ where
     Ok(())
 }
 
+/// Open an additional stream on the connection and return the index to send on.
+///
+/// `stream_count` is published as the number of open streams, so that `send_command`,
+/// which compares its round-robin index against it, stops asking for more streams once
+/// all `STREAM_COUNT` of them exist.
 async fn add_stream(connection: Arc<QuicConnection>) -> Result<u32, QuicClientError> {
     let last_recv = connection.last_recv.clone();
     let created = connection.created;
@@ -1009,7 +1014,7 @@ async fn add_stream(connection: Arc<QuicConnection>) -> Result<u32, QuicClientEr
 
         connection
             .stream_count
-            .store(stream_index, Ordering::Relaxed);
+            .store(stream_index + 1, Ordering::Relaxed);
 
         Ok(stream_index)
     } else {
