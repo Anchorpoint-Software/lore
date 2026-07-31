@@ -803,6 +803,7 @@ mod tests {
                     repository.clone(),
                     state_current.clone(), // to (same state, but with dirty flag set)
                     None,
+                    None, // graft_view: no grafting
                     &mut sink,
                     lore_revision::filter::FilterMode::Full,
                 )
