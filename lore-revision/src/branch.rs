@@ -3286,6 +3286,10 @@ async fn find_ancestor_walker(
     while revision != Hash::default() {
         if let Ok(state) = state::State::deserialize(repository.clone(), revision).await {
             // Update bookkeeping on revision visits.
+            //
+            // Guard scope is this statement and no arm awaits, so the concurrent
+            // sibling walkers sharing `visited` cannot build a wait cycle.
+            #[allow(clippy::disallowed_methods)]
             let both_visited = match visited.entry(revision) {
                 Entry::Occupied(mut visited) => {
                     let visited = visited.get_mut();

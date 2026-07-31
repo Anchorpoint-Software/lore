@@ -393,11 +393,23 @@ impl QuicConnection {
 
     /// Close the QUIC connection immediately without waiting for streams to drain.
     /// Used in Drop to avoid blocking the runtime during shutdown.
+    ///
+    /// A read guard is enough, since `quinn::Connection::close` takes `&self`, so a
+    /// concurrent reader does not cost the peer its close frame. The guard is still needed:
+    /// a reconnect replaces the inner connection, so a handle cached outside the lock would
+    /// close whichever connection had since been replaced.
+    ///
+    /// Nothing awaits the frame reaching the peer, because `Drop` cannot. It is still
+    /// transmitted, because connections are closed before the runtimes are shut down and the
+    /// endpoint driver is therefore live when this returns.
     pub fn close_immediate(&self) {
-        if let Ok(connection) = self.connection.try_write() {
+        if let Ok(connection) = self.connection.try_read() {
             connection
                 .connection
                 .close(quinn::VarInt::from(0u32), b"terminate");
+        } else {
+            // Unclosed, the peer keeps the session until its idle timeout expires.
+            lore_warn!("QUIC connection busy on close, server not notified");
         }
     }
 
@@ -769,10 +781,36 @@ pub async fn connect(
         } else {
             SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
         };
-        match quinn::Endpoint::client(bind) {
+        // The guard is what registers the UDP socket with net's reactor —
+        // `tokio::net::UdpSocket::from_std` binds to whichever is current — and is scoped to the
+        // synchronous construction, never held across an await. `NetRuntime` covers the drivers
+        // quinn spawns later, here and on reconnect, but not this.
+        //
+        // This is `Endpoint::client` with the runtime supplied. Its dual-stack call is not
+        // reproduced because the bind family is derived from the remote address above, so an
+        // IPv6 socket is only ever used to reach an IPv6 peer.
+        let endpoint = {
+            let _guard = lore_base::runtime::net_runtime().enter();
+            std::net::UdpSocket::bind(bind).and_then(|socket| {
+                quinn::Endpoint::new(
+                    quinn::EndpointConfig::default(),
+                    None,
+                    socket,
+                    Arc::new(crate::quic::net_runtime::NetRuntime),
+                )
+            })
+        };
+        match endpoint {
             Ok(mut endpoint) => {
                 endpoint.set_default_client_config(client_config.clone());
-                match endpoint.connect(remote_addr, server_name) {
+                // `connect` resolves timers and any lazily created state against the current
+                // runtime, so enter net here too rather than relying on the caller's — this is
+                // also the reconnect path.
+                let connect_result = {
+                    let _guard = lore_base::runtime::net_runtime().enter();
+                    endpoint.connect(remote_addr, server_name)
+                };
+                match connect_result {
                     Ok(connecting) => match tokio::time::timeout(
                         Duration::from_secs(HANDSHAKE_TIMEOUT_SECS),
                         connecting,

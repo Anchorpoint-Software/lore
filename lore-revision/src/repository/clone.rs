@@ -307,8 +307,6 @@ pub struct CloneOptions {
     pub virtually: bool,
     /// Use direct file write
     pub direct_file_write: bool,
-    /// Use direct file I/O
-    pub direct_file_io: bool,
     /// File containing list of files to prefetch
     pub prefetch: Option<String>,
     /// Whether to use the shared store and options configuring it if desired
@@ -1951,7 +1949,7 @@ async fn clone_file(
 
         // `read_into_file` returns the file's metadata when its single-fragment
         // path captures it on the open write handle; on that path we skip the
-        // post-write stat entirely. Multi-fragment, mmap, and zero-size paths
+        // post-write stat entirely. Multi-fragment and zero-size paths
         // still need a separate metadata query.
         let captured_metadata = if node.size > 0 {
             let (fragment, metadata) = immutable::read_into_file(
