@@ -1022,14 +1022,41 @@ async fn add_stream(connection: Arc<QuicConnection>) -> Result<u32, QuicClientEr
     }
 }
 
+/// Counts a request as outstanding on a stream for as long as the guard is alive.
+///
+/// The count is what the high priority path of [`select_stream`] balances on, so it has
+/// to come back down on every way out of a send - error returns and a dropped send future
+/// included, not just the successful path.
+struct StreamInflightGuard<'a> {
+    inflight: &'a AtomicU64,
+}
+
+impl<'a> StreamInflightGuard<'a> {
+    fn new(inflight: &'a AtomicU64) -> Self {
+        inflight.fetch_add(1, Ordering::Relaxed);
+        Self { inflight }
+    }
+}
+
+impl Drop for StreamInflightGuard<'_> {
+    fn drop(&mut self) {
+        self.inflight.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// Select stream index based on priority scheduling.
-fn select_stream(connection: &QuicConnection, reader_count: u32, high_priority: bool) -> u32 {
+fn select_stream(
+    stream_inflight: &[AtomicU64],
+    non_priority_counter: &AtomicU32,
+    reader_count: u32,
+    high_priority: bool,
+) -> u32 {
     if high_priority {
         // Pick the stream with fewest outstanding requests
         let mut min_inflight = u64::MAX;
         let mut min_stream = 0u32;
         for i in 0..reader_count {
-            let inflight = connection.stream_inflight[i as usize].load(Ordering::Relaxed);
+            let inflight = stream_inflight[i as usize].load(Ordering::Relaxed);
             if inflight < min_inflight {
                 min_inflight = inflight;
                 min_stream = i;
@@ -1038,9 +1065,7 @@ fn select_stream(connection: &QuicConnection, reader_count: u32, high_priority: 
         min_stream
     } else {
         // Round-robin across streams PRIORITY_STREAM_COUNT..STREAM_COUNT
-        let index = connection
-            .non_priority_counter
-            .fetch_add(1, Ordering::Relaxed);
+        let index = non_priority_counter.fetch_add(1, Ordering::Relaxed);
         if reader_count > PRIORITY_STREAM_COUNT {
             PRIORITY_STREAM_COUNT + (index % (reader_count - PRIORITY_STREAM_COUNT))
         } else {
@@ -1126,7 +1151,7 @@ pub async fn send_command<const HIGH_PRIORITY: bool>(
         Ordering::Relaxed,
     );
 
-    let (command_id, writer, rx) = {
+    let (command_id, writer, rx, _inflight) = {
         let connection_lock = connection.connection.read().await;
         if connection_lock.reader.is_empty() {
             lore_debug!("No quic stream available when sending command");
@@ -1135,14 +1160,19 @@ pub async fn send_command<const HIGH_PRIORITY: bool>(
 
         // Select stream based on priority, computed inside lock to avoid living across await points
         let reader_count = connection_lock.reader.len() as u32;
-        let stream_index = select_stream(&connection, reader_count, HIGH_PRIORITY) as usize
+        let stream_index = select_stream(
+            connection.stream_inflight.as_slice(),
+            &connection.non_priority_counter,
+            reader_count,
+            HIGH_PRIORITY,
+        ) as usize
             % connection_lock.reader.len();
-        connection.stream_inflight[stream_index].fetch_add(1, Ordering::Relaxed);
+        let inflight = StreamInflightGuard::new(&connection.stream_inflight[stream_index]);
 
         let (tx, rx) = oneshot::channel();
         let command_id = connection_lock.reader[stream_index].wait_for(tx)?;
         let writer = connection_lock.writer[stream_index].clone();
-        (command_id, writer, rx)
+        (command_id, writer, rx, inflight)
     };
 
     {
@@ -1166,7 +1196,7 @@ pub async fn send_command<const HIGH_PRIORITY: bool>(
     }
 
     {
-        let mut stream = writer.lock().await;
+        let mut stream = writer.lock_owned().await;
         stream.write_all_chunks(chunks).await.map_err(|err| {
             if let quinn::WriteError::ConnectionLost(_) = err {
                 QuicClientError::Terminated
@@ -1181,4 +1211,78 @@ pub async fn send_command<const HIGH_PRIORITY: bool>(
         lore_warn!("{}: {err}", QuicClientError::Read);
         QuicClientError::Read
     })?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn inflight_counters() -> [AtomicU64; STREAM_COUNT as usize] {
+        std::array::from_fn(|_| AtomicU64::new(0))
+    }
+
+    #[test]
+    fn inflight_guard_counts_a_request_only_while_it_is_outstanding() {
+        let inflight = AtomicU64::new(0);
+
+        {
+            let _first = StreamInflightGuard::new(&inflight);
+            assert_eq!(inflight.load(Ordering::Relaxed), 1);
+
+            let _second = StreamInflightGuard::new(&inflight);
+            assert_eq!(inflight.load(Ordering::Relaxed), 2);
+        }
+
+        assert_eq!(inflight.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn high_priority_spreads_concurrent_requests_over_every_stream() {
+        let inflight = inflight_counters();
+        let non_priority_counter = AtomicU32::new(0);
+
+        let mut guards = Vec::new();
+        let mut selected = Vec::new();
+        for _ in 0..STREAM_COUNT {
+            let stream = select_stream(&inflight, &non_priority_counter, STREAM_COUNT, true);
+            guards.push(StreamInflightGuard::new(&inflight[stream as usize]));
+            selected.push(stream);
+        }
+
+        selected.sort_unstable();
+        assert_eq!(selected, (0..STREAM_COUNT).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn high_priority_reuses_a_stream_once_its_request_completed() {
+        let inflight = inflight_counters();
+        let non_priority_counter = AtomicU32::new(0);
+
+        for _ in 0..STREAM_COUNT * 4 {
+            let stream = select_stream(&inflight, &non_priority_counter, STREAM_COUNT, true);
+            let _guard = StreamInflightGuard::new(&inflight[stream as usize]);
+            assert_eq!(stream, 0);
+        }
+
+        assert!(
+            inflight
+                .iter()
+                .all(|count| count.load(Ordering::Relaxed) == 0)
+        );
+    }
+
+    #[test]
+    fn normal_priority_round_robins_over_the_non_priority_streams() {
+        let inflight = inflight_counters();
+        let non_priority_counter = AtomicU32::new(0);
+
+        let selected: Vec<u32> = (PRIORITY_STREAM_COUNT..STREAM_COUNT)
+            .map(|_| select_stream(&inflight, &non_priority_counter, STREAM_COUNT, false))
+            .collect();
+
+        assert_eq!(
+            selected,
+            (PRIORITY_STREAM_COUNT..STREAM_COUNT).collect::<Vec<_>>()
+        );
+    }
 }
