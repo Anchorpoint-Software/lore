@@ -4137,19 +4137,6 @@ pub enum NodeSource {
     Invalid,
 }
 
-/// Determine which node source to use based on action and node validity.
-pub fn determine_node_source(_action: FileAction, from_valid: bool, to_valid: bool) -> NodeSource {
-    if !to_valid {
-        if from_valid {
-            NodeSource::From
-        } else {
-            NodeSource::Invalid
-        }
-    } else {
-        NodeSource::To
-    }
-}
-
 /// Load a node based on the determined source.
 async fn load_node_for_change(
     source: NodeSource,
@@ -4191,11 +4178,17 @@ async fn add_change(
     // Avoid adding repository root node in case it was to/from an empty repository
     if from.node != ROOT_NODE || to.node != ROOT_NODE {
         // Determine which node to use and load it
-        let source = determine_node_source(
-            action,
-            from.node.is_valid_node_id(),
-            to.node.is_valid_node_id(),
-        );
+        let source = match (from.node.is_valid_node_id(), to.node.is_valid_node_id()) {
+            (_, true) => NodeSource::To,
+            (true, false) => NodeSource::From,
+            (false, false) => NodeSource::Invalid,
+        };
+        // Determine if a different node should be used for early checking recursion.
+        let recursion_source = if action == change::FileAction::Delete {
+            Some(NodeSource::From)
+        } else {
+            None
+        };
 
         // Only add (file system path not in merkle tree) should end up here for Invalid source
         debug_assert!(source != NodeSource::Invalid || action == FileAction::Add);
@@ -4203,6 +4196,12 @@ async fn add_change(
         let Some(node) = load_node_for_change(source, &from, &to).await else {
             return Ok(());
         };
+        let recursion_node_storage = if let Some(recursion_source) = recursion_source {
+            load_node_for_change(recursion_source, &from, &to).await
+        } else {
+            None
+        };
+        let recursion_node = recursion_node_storage.as_ref().unwrap_or(&node);
 
         // Compute flags and create change record
         let flags = compute_change_flags(&node, action, to.node.is_valid_node_id());
@@ -4217,8 +4216,7 @@ async fn add_change(
         })
         .await?;
 
-        // Recursion happens in caller for directories and links
-        if node.is_file() {
+        if recursion_node.is_file() {
             return Ok(());
         }
     }
