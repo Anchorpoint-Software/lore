@@ -3084,34 +3084,73 @@ impl State {
         Ok(entries)
     }
 
-    pub async fn link_list(
+    /// The link registry as the state was last serialized with, ignoring the runtime copy.
+    async fn serialized_link_list(
         &self,
         repository: Arc<RepositoryContext>,
     ) -> Result<Vec<LinkReference>, StateError> {
         let list_hash = { self.data.read().hash_link };
+        if list_hash.is_zero() {
+            return Ok(vec![]);
+        }
 
-        let link_list = if !list_hash.is_zero() {
-            let data = immutable::read(
-                repository.clone(),
-                Address::zero_context_hash(list_hash),
-                None,
-                immutable::read_options_from_repository(&repository)
-                    .with_cache()
-                    .with_priority(),
-            )
-            .await
-            .internal("Failed to read state data")?
-            .to_aligned::<LinkReference>();
+        let data = immutable::read(
+            repository.clone(),
+            Address::zero_context_hash(list_hash),
+            None,
+            immutable::read_options_from_repository(&repository)
+                .with_cache()
+                .with_priority(),
+        )
+        .await
+        .internal("Failed to read state data")?
+        .to_aligned::<LinkReference>();
 
-            data.as_type_slice::<LinkReference>().to_vec()
-        } else {
+        Ok(data.as_type_slice::<LinkReference>().to_vec())
+    }
+
+    /// The link registry: the runtime copy once anything has edited it, and what the state was
+    /// serialized with until then.
+    ///
+    /// Callers get a copy. The runtime copy stays where it is: it is the working set the mutators
+    /// below edit in place, and [`State::serialize`] writes a new link list only while it is
+    /// present, so it has to outlive every reader for the edits to reach the serialized state.
+    pub async fn link_list(
+        &self,
+        repository: Arc<RepositoryContext>,
+    ) -> Result<Vec<LinkReference>, StateError> {
+        {
+            let runtime = self.runtime.read();
+            if let Some(link_list) = runtime.link_list.as_ref() {
+                return Ok(link_list.clone());
+            }
+        }
+
+        self.serialized_link_list(repository).await
+    }
+
+    /// Applies `edit` to the runtime link registry, holding the lock across the whole
+    /// read-modify-write.
+    ///
+    /// A commit edits one link per task against one shared state, so an edit that released the
+    /// lock between finding its entry and storing the result would lose whatever another edit
+    /// stored in the meantime. The serialized list is loaded before the lock is taken, because
+    /// reading it awaits; an edit that then finds the registry already populated discards what it
+    /// loaded, since the populated copy is the one carrying edits.
+    async fn edit_link_list(
+        &self,
+        repository: Arc<RepositoryContext>,
+        edit: impl FnOnce(&mut Vec<LinkReference>) -> Result<(), StateError>,
+    ) -> Result<(), StateError> {
+        let populated = self.runtime.read().link_list.is_some();
+        let loaded = if populated {
             vec![]
+        } else {
+            self.serialized_link_list(repository).await?
         };
 
         let mut runtime = self.runtime.write();
-        let link_list = runtime.link_list.take().unwrap_or(link_list);
-
-        Ok(link_list)
+        edit(runtime.link_list.get_or_insert(loaded))
     }
 
     pub async fn link_find(
@@ -3166,33 +3205,31 @@ impl State {
         local_node: NodeID,
         link_flags: LinkFlags,
     ) -> Result<(), StateError> {
-        let mut link_list = self.link_list(repository.clone()).await?;
-
-        let mut runtime = self.runtime.write();
-
-        // Ensure link is not referenced by other revision anywhere
-        for link in link_list.iter_mut() {
-            if link.repository == link_id && link.signature != signature {
-                // TODO(vri): Link revision divergence
-                return Err(StateError::internal("Link divergence"));
+        self.edit_link_list(repository, |link_list| {
+            // Ensure link is not referenced by other revision anywhere
+            for link in link_list.iter_mut() {
+                if link.repository == link_id && link.signature != signature {
+                    // TODO(vri): Link revision divergence
+                    return Err(StateError::internal("Link divergence"));
+                }
+                if link.repository == link_id && link.local_node == local_node {
+                    link.signature = signature;
+                    return Ok(());
+                }
             }
-            if link.repository == link_id && link.local_node == local_node {
-                link.signature = signature;
-                return Ok(());
-            }
-        }
 
-        link_list.push(LinkReference {
-            repository: link_id,
-            branch,
-            signature,
-            local_node,
-            flags: link_flags.into(),
-            ..Default::default()
-        });
-        runtime.link_list = Some(link_list);
+            link_list.push(LinkReference {
+                repository: link_id,
+                branch,
+                signature,
+                local_node,
+                flags: link_flags.into(),
+                ..Default::default()
+            });
 
-        Ok(())
+            Ok(())
+        })
+        .await
     }
 
     pub async fn link_update(
@@ -3207,20 +3244,18 @@ impl State {
             "Update link with ID {link_id}, local node {local_node}, new signature {signature}, new branch {branch}"
         );
 
-        let mut link_list = self.link_list(repository.clone()).await?;
-
-        let mut runtime = self.runtime.write();
-
-        for link in link_list.iter_mut() {
-            if link.repository == link_id && link.local_node == local_node {
-                link.branch = branch;
-                link.signature = signature;
-                runtime.link_list = Some(link_list);
-                return Ok(());
+        self.edit_link_list(repository, |link_list| {
+            for link in link_list.iter_mut() {
+                if link.repository == link_id && link.local_node == local_node {
+                    link.branch = branch;
+                    link.signature = signature;
+                    return Ok(());
+                }
             }
-        }
 
-        Err(LinkNotFound.into())
+            Err(LinkNotFound.into())
+        })
+        .await
     }
 
     pub async fn link_remove(
@@ -3230,20 +3265,19 @@ impl State {
         local_node: NodeID,
     ) -> Result<(), StateError> {
         lore_debug!("Remove link with ID {link_id}, local node {local_node}");
-        let mut link_list = self.link_list(repository.clone()).await?;
 
-        let mut runtime = self.runtime.write();
+        self.edit_link_list(repository, |link_list| {
+            if let Some(index) = link_list
+                .iter()
+                .position(|link| link.repository == link_id && link.local_node == local_node)
+            {
+                link_list.remove(index);
+                return Ok(());
+            }
 
-        if let Some(index) = link_list
-            .iter()
-            .position(|link| link.repository == link_id && link.local_node == local_node)
-        {
-            link_list.remove(index);
-            runtime.link_list = Some(link_list.clone());
-            return Ok(());
-        }
-
-        Err(LinkNotFound.into())
+            Err(LinkNotFound.into())
+        })
+        .await
     }
 
     pub fn force_rehash_names(&self) {
@@ -7930,5 +7964,98 @@ mod tests {
         };
         let parent = BranchId::from([1u8; 16]);
         assert_eq!(link_ref.resolve_branch(parent), own_branch);
+    }
+
+    /// A state with no serialized link list, so the registry lives only in the runtime copy and
+    /// every read has to come from there.
+    async fn null_repository() -> Arc<RepositoryContext> {
+        let immutable_store = lore_storage::local::immutable_store::create(
+            None::<&str>,
+            lore_storage::local::immutable_store::ImmutableStoreCreateOptions::none(),
+            false,
+            lore_storage::ImmutableStoreSettings::default(),
+        )
+        .await
+        .expect("in-memory immutable store");
+        let mutable_store = lore_storage::local::mutable_store::create(
+            None::<&str>,
+            lore_storage::MutableStoreSettings::default(),
+            immutable_store.clone(),
+        )
+        .await
+        .expect("in-memory mutable store");
+
+        Arc::new(RepositoryContext::new_null_context(
+            immutable_store,
+            mutable_store,
+        ))
+    }
+
+    fn link_id(byte: u8) -> RepositoryId {
+        RepositoryId::from([byte; 16])
+    }
+
+    /// An update made after the registry was read applies to the entry it names and leaves the
+    /// other entries as they were.
+    #[tokio::test]
+    async fn reading_the_link_list_leaves_it_editable() {
+        let repository = null_repository().await;
+        let state = State::new();
+
+        state
+            .link_add(
+                repository.clone(),
+                link_id(1),
+                BranchId::default(),
+                Hash::from([1u8; 32]),
+                2,
+                LinkFlags::NoFlags,
+            )
+            .await
+            .expect("adding the first link");
+        state
+            .link_add(
+                repository.clone(),
+                link_id(2),
+                BranchId::default(),
+                Hash::from([2u8; 32]),
+                3,
+                LinkFlags::NoFlags,
+            )
+            .await
+            .expect("adding the second link");
+
+        let read = state
+            .link_list(repository.clone())
+            .await
+            .expect("reading the registry");
+        assert_eq!(read.len(), 2, "both links must be registered");
+
+        state
+            .link_update(
+                repository.clone(),
+                link_id(1),
+                BranchId::default(),
+                Hash::from([9u8; 32]),
+                2,
+            )
+            .await
+            .expect("updating a link after the registry was read");
+
+        let updated = state
+            .link_list(repository)
+            .await
+            .expect("re-reading the registry");
+        assert_eq!(updated.len(), 2, "the update must not drop the other link");
+        assert_eq!(
+            updated[0].signature,
+            Hash::from([9u8; 32]),
+            "the update must be visible"
+        );
+        assert_eq!(
+            updated[1].signature,
+            Hash::from([2u8; 32]),
+            "the untouched link must keep its signature"
+        );
     }
 }
