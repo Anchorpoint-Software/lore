@@ -452,6 +452,12 @@ impl LinkReference {
             self.branch
         }
     }
+
+    /// Whether the link tracks its parent's branch (zero branch) rather than
+    /// being pinned to an explicit one.
+    pub fn is_tracking(&self) -> bool {
+        self.branch.is_zero()
+    }
 }
 
 /// Tracks a single link's merge state for rollback.
@@ -3531,6 +3537,9 @@ pub struct TreePath {
     pub path: RelativePath,
     pub address: Option<Address>,
     pub flags: NodeFlags,
+    /// True when a link node tracks its parent's branch; false for pinned
+    /// links and all non-link nodes.
+    pub tracking: bool,
 }
 
 pub type CanReadRepository = Arc<dyn Fn(RepositoryId) -> bool + Send + Sync>;
@@ -3690,10 +3699,21 @@ async fn gather_tree_paths_node(
     } else {
         NodeFlags::NoFlags
     };
+    // An unresolvable link reference falls back to pinned.
+    let tracking = if node.is_link() {
+        let link = node.linked_node();
+        state
+            .link_find(repository.clone(), link.repository, node_id)
+            .await
+            .is_ok_and(|link_ref| link_ref.is_tracking())
+    } else {
+        false
+    };
     result.push(TreePath {
         path: node_path.clone(),
         address,
         flags,
+        tracking,
     });
 
     let depth_remaining = max_depth == 0 || depth + 1 < max_depth;
