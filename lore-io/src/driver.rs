@@ -35,7 +35,11 @@ use bytes::Bytes;
 use crate::buffer::StableBuf;
 use crate::file::IoFile;
 use crate::file::OpenOptions;
+#[cfg(target_family = "windows")]
+use crate::iocp::IocpDriver;
 use crate::psync::PsyncDriver;
+#[cfg(target_os = "linux")]
+use crate::uring::UringDriver;
 
 /// Largest file the whole-file operations accept.
 ///
@@ -70,10 +74,60 @@ pub enum BackendKind {
     Auto,
     /// Positional syscalls on the bounded syscall pool.
     Psync,
+    /// Completion-based operations on sharded `io_uring` instances.
+    #[cfg(target_os = "linux")]
+    Uring,
+    /// Windows only. Overlapped operations on an I/O completion port.
+    #[cfg(target_family = "windows")]
+    Iocp,
 }
 
 pub(crate) enum DriverInner {
     Psync(PsyncDriver),
+    #[cfg(target_os = "linux")]
+    Uring(UringDriver),
+    #[cfg(target_family = "windows")]
+    Iocp(IocpDriver),
+}
+
+/// The backend names [`backend_kind_from_value`] accepts, for the error it reports when a value
+/// is not one of them.
+#[cfg(target_os = "linux")]
+const SUPPORTED_BACKENDS: &str = "auto, psync, uring";
+#[cfg(target_family = "windows")]
+const SUPPORTED_BACKENDS: &str = "auto, psync, iocp";
+#[cfg(not(any(target_os = "linux", target_family = "windows")))]
+const SUPPORTED_BACKENDS: &str = "auto, psync";
+
+/// The best backend this machine can run, for [`BackendKind::Auto`].
+///
+/// A ring that cannot be created — an older kernel, a seccomp policy or a container that blocks
+/// `io_uring_setup` — falls back rather than failing, because the caller asked for the best
+/// available backend and not for a specific one. [`BackendKind::Uring`] is how a caller says the
+/// ring is the point and a failure to get one should surface.
+///
+/// On Windows the probe prefers [`BackendKind::Iocp`], and what settles it is threads rather than
+/// throughput. Two threads carry there what thirty-two parked in `GetOverlappedResult` carry on
+/// the pool, because a positional operation on this platform defers and `psync` holds a thread
+/// across the wait; this crate shares a process-wide budget with a host application's own
+/// populations, so a backend that reaches higher throughput on a fraction of the threads is the
+/// one to hand out unasked.
+///
+/// It is not a clean win and the cost is known: throughput falls off as the number of tasks
+/// driving the backend rises past sixteen, which costs 0.72× on the commit-shaped read phase where
+/// one task per core drives it. `lore-io/BENCHMARKS.md` has the shape of that and the sweep behind
+/// it. [`BackendKind::Psync`] is how a caller whose workload has that shape takes the other side,
+/// and it stays the portable baseline and the semantic reference everywhere.
+fn probe() -> DriverInner {
+    #[cfg(target_os = "linux")]
+    if let Ok(driver) = UringDriver::new() {
+        return DriverInner::Uring(driver);
+    }
+    #[cfg(target_family = "windows")]
+    if let Ok(driver) = IocpDriver::new() {
+        return DriverInner::Iocp(driver);
+    }
+    DriverInner::Psync(PsyncDriver)
 }
 
 /// Parses a `LORE_IO_BACKEND` value. Separate from reading the variable so the accepted set and
@@ -82,9 +136,13 @@ fn backend_kind_from_value(value: &str) -> std::io::Result<BackendKind> {
     match value.to_ascii_lowercase().as_str() {
         "" | "auto" => Ok(BackendKind::Auto),
         "psync" => Ok(BackendKind::Psync),
+        #[cfg(target_os = "linux")]
+        "uring" => Ok(BackendKind::Uring),
+        #[cfg(target_family = "windows")]
+        "iocp" => Ok(BackendKind::Iocp),
         other => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!("unsupported LORE_IO_BACKEND \"{other}\" (supported: auto, psync)"),
+            format!("unsupported LORE_IO_BACKEND \"{other}\" (supported: {SUPPORTED_BACKENDS})"),
         )),
     }
 }
@@ -110,7 +168,12 @@ impl std::fmt::Debug for IoDriver {
 impl IoDriver {
     pub fn new(kind: BackendKind) -> std::io::Result<IoDriver> {
         let inner = match kind {
-            BackendKind::Auto | BackendKind::Psync => DriverInner::Psync(PsyncDriver),
+            BackendKind::Auto => probe(),
+            BackendKind::Psync => DriverInner::Psync(PsyncDriver),
+            #[cfg(target_os = "linux")]
+            BackendKind::Uring => DriverInner::Uring(UringDriver::new()?),
+            #[cfg(target_family = "windows")]
+            BackendKind::Iocp => DriverInner::Iocp(IocpDriver::new()?),
         };
         Ok(IoDriver {
             inner: Arc::new(inner),
@@ -118,7 +181,7 @@ impl IoDriver {
     }
 
     /// Constructs a driver honoring the `LORE_IO_BACKEND` environment
-    /// variable (`auto` | `psync`), failing on an unrecognised value.
+    /// variable, failing on an unrecognised value.
     pub fn from_env() -> std::io::Result<IoDriver> {
         let kind = match std::env::var("LORE_IO_BACKEND") {
             Ok(value) => backend_kind_from_value(&value)?,
@@ -144,10 +207,32 @@ impl IoDriver {
         })
     }
 
+    /// Ring statistics when this driver is on the `uring` backend, `None` otherwise.
+    #[cfg(target_os = "linux")]
+    pub fn uring_stats(&self) -> Option<crate::uring::UringStats> {
+        match &*self.inner {
+            DriverInner::Psync(_) => None,
+            DriverInner::Uring(driver) => Some(driver.stats()),
+        }
+    }
+
     /// The name of the selected backend, for logs and benchmarks.
+    /// Completion-port statistics when this driver is on the `iocp` backend, `None` otherwise.
+    #[cfg(target_family = "windows")]
+    pub fn iocp_stats(&self) -> Option<crate::iocp::IocpStats> {
+        match &*self.inner {
+            DriverInner::Psync(_) => None,
+            DriverInner::Iocp(driver) => Some(driver.stats()),
+        }
+    }
+
     pub fn backend_name(&self) -> &'static str {
         match &*self.inner {
             DriverInner::Psync(_) => "psync",
+            #[cfg(target_os = "linux")]
+            DriverInner::Uring(_) => "uring",
+            #[cfg(target_family = "windows")]
+            DriverInner::Iocp(_) => "iocp",
         }
     }
 
@@ -160,6 +245,10 @@ impl IoDriver {
         let path = path.as_ref().to_path_buf();
         let file = match &*self.inner {
             DriverInner::Psync(driver) => driver.open(std_options, path).await?,
+            #[cfg(target_os = "linux")]
+            DriverInner::Uring(driver) => driver.open(std_options, path).await?,
+            #[cfg(target_family = "windows")]
+            DriverInner::Iocp(driver) => driver.open(std_options, path).await?,
         };
         Ok(IoFile::new(self.clone(), Arc::new(file)))
     }
@@ -168,6 +257,10 @@ impl IoDriver {
         let path = path.as_ref().to_path_buf();
         match &*self.inner {
             DriverInner::Psync(driver) => driver.metadata(path).await,
+            #[cfg(target_os = "linux")]
+            DriverInner::Uring(driver) => driver.metadata(path).await,
+            #[cfg(target_family = "windows")]
+            DriverInner::Iocp(driver) => driver.metadata(path).await,
         }
     }
 
@@ -180,6 +273,10 @@ impl IoDriver {
         let to = to.as_ref().to_path_buf();
         match &*self.inner {
             DriverInner::Psync(driver) => driver.rename(from, to).await,
+            #[cfg(target_os = "linux")]
+            DriverInner::Uring(driver) => driver.rename(from, to).await,
+            #[cfg(target_family = "windows")]
+            DriverInner::Iocp(driver) => driver.rename(from, to).await,
         }
     }
 
@@ -187,6 +284,10 @@ impl IoDriver {
         let path = path.as_ref().to_path_buf();
         match &*self.inner {
             DriverInner::Psync(driver) => driver.remove_file(path).await,
+            #[cfg(target_os = "linux")]
+            DriverInner::Uring(driver) => driver.remove_file(path).await,
+            #[cfg(target_family = "windows")]
+            DriverInner::Iocp(driver) => driver.remove_file(path).await,
         }
     }
 
@@ -194,6 +295,10 @@ impl IoDriver {
         let path = path.as_ref().to_path_buf();
         match &*self.inner {
             DriverInner::Psync(driver) => driver.create_dir_all(path).await,
+            #[cfg(target_os = "linux")]
+            DriverInner::Uring(driver) => driver.create_dir_all(path).await,
+            #[cfg(target_family = "windows")]
+            DriverInner::Iocp(driver) => driver.create_dir_all(path).await,
         }
     }
 
@@ -203,12 +308,20 @@ impl IoDriver {
     ) -> std::io::Result<std::fs::Metadata> {
         match &*self.inner {
             DriverInner::Psync(driver) => driver.file_metadata(file).await,
+            #[cfg(target_os = "linux")]
+            DriverInner::Uring(driver) => driver.file_metadata(file).await,
+            #[cfg(target_family = "windows")]
+            DriverInner::Iocp(driver) => driver.file_metadata(file).await,
         }
     }
 
     pub(crate) async fn set_len_raw(&self, file: Arc<File>, len: u64) -> std::io::Result<()> {
         match &*self.inner {
             DriverInner::Psync(driver) => driver.set_len(file, len).await,
+            #[cfg(target_os = "linux")]
+            DriverInner::Uring(driver) => driver.set_len(file, len).await,
+            #[cfg(target_family = "windows")]
+            DriverInner::Iocp(driver) => driver.set_len(file, len).await,
         }
     }
 
@@ -226,6 +339,10 @@ impl IoDriver {
         let path = path.as_ref().to_path_buf();
         match &*self.inner {
             DriverInner::Psync(driver) => driver.read_file_bytes(path).await,
+            #[cfg(target_os = "linux")]
+            DriverInner::Uring(driver) => driver.read_file_bytes(path).await,
+            #[cfg(target_family = "windows")]
+            DriverInner::Iocp(driver) => driver.read_file_bytes(path).await,
         }
     }
 
@@ -249,6 +366,10 @@ impl IoDriver {
         let path = path.as_ref().to_path_buf();
         match &*self.inner {
             DriverInner::Psync(driver) => driver.write_file_bytes(path, data, durable).await,
+            #[cfg(target_os = "linux")]
+            DriverInner::Uring(driver) => driver.write_file_bytes(path, data, durable).await,
+            #[cfg(target_family = "windows")]
+            DriverInner::Iocp(driver) => driver.write_file_bytes(path, data, durable).await,
         }
     }
 
@@ -260,6 +381,10 @@ impl IoDriver {
     ) -> std::io::Result<Bytes> {
         match &*self.inner {
             DriverInner::Psync(driver) => driver.read_at(file, max_len, offset).await,
+            #[cfg(target_os = "linux")]
+            DriverInner::Uring(driver) => driver.read_at(file, max_len, offset).await,
+            #[cfg(target_family = "windows")]
+            DriverInner::Iocp(driver) => driver.read_at(file, max_len, offset).await,
         }
     }
 
@@ -271,6 +396,10 @@ impl IoDriver {
     ) -> std::io::Result<Bytes> {
         match &*self.inner {
             DriverInner::Psync(driver) => driver.read_exact_at(file, len, offset).await,
+            #[cfg(target_os = "linux")]
+            DriverInner::Uring(driver) => driver.read_exact_at(file, len, offset).await,
+            #[cfg(target_family = "windows")]
+            DriverInner::Iocp(driver) => driver.read_exact_at(file, len, offset).await,
         }
     }
 
@@ -283,6 +412,10 @@ impl IoDriver {
     ) -> std::io::Result<B> {
         match &*self.inner {
             DriverInner::Psync(driver) => driver.write_all_at(file, buffer, len, offset).await,
+            #[cfg(target_os = "linux")]
+            DriverInner::Uring(driver) => driver.write_all_at(file, buffer, len, offset).await,
+            #[cfg(target_family = "windows")]
+            DriverInner::Iocp(driver) => driver.write_all_at(file, buffer, len, offset).await,
         }
     }
 
@@ -300,12 +433,28 @@ impl IoDriver {
                     .write_at(file, buffer, buffer_offset, len, offset)
                     .await
             }
+            #[cfg(target_os = "linux")]
+            DriverInner::Uring(driver) => {
+                driver
+                    .write_at(file, buffer, buffer_offset, len, offset)
+                    .await
+            }
+            #[cfg(target_family = "windows")]
+            DriverInner::Iocp(driver) => {
+                driver
+                    .write_at(file, buffer, buffer_offset, len, offset)
+                    .await
+            }
         }
     }
 
     pub(crate) async fn sync_raw(&self, file: Arc<File>, data_only: bool) -> std::io::Result<()> {
         match &*self.inner {
             DriverInner::Psync(driver) => driver.sync(file, data_only).await,
+            #[cfg(target_os = "linux")]
+            DriverInner::Uring(driver) => driver.sync(file, data_only).await,
+            #[cfg(target_family = "windows")]
+            DriverInner::Iocp(driver) => driver.sync(file, data_only).await,
         }
     }
 }
@@ -326,24 +475,69 @@ mod tests {
         );
         assert_eq!(backend_kind_from_value("auto").unwrap(), BackendKind::Auto);
         assert_eq!(backend_kind_from_value("").unwrap(), BackendKind::Auto);
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            backend_kind_from_value("uring").unwrap(),
+            BackendKind::Uring
+        );
+        #[cfg(target_family = "windows")]
+        assert_eq!(backend_kind_from_value("iocp").unwrap(), BackendKind::Iocp);
+    }
+
+    /// A backend this build has no code for is rejected rather than silently falling back, so a
+    /// value that works on one platform does not quietly mean something else on another.
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn a_backend_absent_from_this_build_is_rejected() {
+        let error = backend_kind_from_value("uring")
+            .expect_err("a backend this platform has no code for must not be accepted");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    /// The mirror of the case above: the Windows completion backend must not be selectable on a
+    /// platform that has no code for it either.
+    #[test]
+    #[cfg(not(target_family = "windows"))]
+    fn the_completion_port_backend_is_rejected_off_windows() {
+        let error = backend_kind_from_value("iocp")
+            .expect_err("a backend this platform has no code for must not be accepted");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     }
 
     /// The value names the accepted set, because the caller reaching for this variable is
     /// diagnosing something and a bare rejection tells them nothing.
     #[test]
     fn an_unrecognised_backend_value_is_a_reportable_error() {
-        let error = backend_kind_from_value("uring")
-            .expect_err("a backend that does not exist yet must not be accepted");
+        let error = backend_kind_from_value("iouring")
+            .expect_err("a backend that does not exist must not be accepted");
 
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         let message = format!("{error}");
-        assert!(message.contains("uring"), "{message}");
-        assert!(message.contains("supported: auto, psync"), "{message}");
+        assert!(message.contains("iouring"), "{message}");
+        assert!(
+            message.contains(&format!("supported: {SUPPORTED_BACKENDS}")),
+            "{message}"
+        );
     }
 
     /// Whatever the environment holds, the process-wide driver resolves rather than panicking.
+    /// Which backend it lands on depends on the machine, so the name is only checked against the
+    /// set this build can produce.
     #[test]
     fn the_global_driver_always_resolves() {
-        assert_eq!(IoDriver::global().backend_name(), "psync");
+        let name = IoDriver::global().backend_name();
+        assert!(["psync", "uring", "iocp"].contains(&name), "{name}");
+    }
+
+    /// The probe never fails: a machine that cannot give it a ring gets the portable backend.
+    #[test]
+    fn the_probe_always_yields_a_backend() {
+        let driver = IoDriver::new(BackendKind::Auto).expect("auto must always resolve");
+        assert!(
+            ["psync", "uring", "iocp"].contains(&driver.backend_name()),
+            "{driver:?}"
+        );
     }
 }

@@ -40,8 +40,23 @@ impl Drop for TempDir {
     }
 }
 
+/// Every backend this build has, skipping one the machine cannot run. A kernel without
+/// `io_uring`, or a container that blocks `io_uring_setup`, must not fail the suite — but the
+/// skip is announced, because a silent skip reads exactly like a pass.
 fn drivers() -> Vec<IoDriver> {
-    vec![IoDriver::new(BackendKind::Psync).expect("psync backend is always available")]
+    let mut drivers =
+        vec![IoDriver::new(BackendKind::Psync).expect("psync backend is always available")];
+    #[cfg(target_os = "linux")]
+    match IoDriver::new(BackendKind::Uring) {
+        Ok(driver) => drivers.push(driver),
+        Err(error) => eprintln!("skipping the uring backend: {error}"),
+    }
+    #[cfg(target_family = "windows")]
+    match IoDriver::new(BackendKind::Iocp) {
+        Ok(driver) => drivers.push(driver),
+        Err(error) => eprintln!("skipping the iocp backend: {error}"),
+    }
+    drivers
 }
 
 fn rw_create() -> OpenOptions {

@@ -2,34 +2,54 @@
 // SPDX-License-Identifier: MIT
 //! Completion-based asynchronous file I/O.
 //!
-//! This crate provides positional, owned-buffer file operations whose
-//! futures are runtime-independent: they suspend on wakers only and never
-//! require a specific async runtime to be driving them. Operations take
-//! ownership of their buffer and hand it back on completion, the contract
-//! required by completion-based backends (`io_uring`, overlapped I/O)
+//! This crate provides positional file operations whose futures are
+//! runtime-independent: they suspend on wakers only and never require a
+//! specific async runtime to be driving them. The memory an operation
+//! exposes to the kernel belongs to the operation for its whole lifetime —
+//! a write takes ownership of the caller's buffer and hands it back, and a
+//! read allocates its own and returns it as [`bytes::Bytes`]. That is the
+//! contract completion-based backends (`io_uring`, overlapped I/O) require,
 //! where the kernel holds a pointer into the buffer while an operation is
-//! in flight.
+//! in flight and an abandoned future must not free it.
 //!
-//! Backends implement one driver trait surface:
+//! Backends are selected once and dispatched statically:
 //!
 //! - `psync` — positional syscalls executed on a dedicated bounded syscall
 //!   pool (`min(2 × cores, 16)` threads, idle-reaped). The portable
 //!   baseline backend and the semantic reference for all others.
-//!
-//! `io_uring` (Linux) and overlapped I/O (Windows) backends are planned
-//! to slot in behind the same API. See the enhancement proposal
-//! `2026-07-24-tokio-runtime-split-and-async-io` for the design.
+//! - `uring` (Linux 5.6+) — data-plane operations submitted to sharded
+//!   `io_uring` instances; synchronously-completing operations resolve on
+//!   the submitting thread, pending ones through a single reaper thread.
+//!   Control-plane operations run on the syscall pool.
+//! - `iocp` (Windows) — positional reads and writes issued as overlapped
+//!   I/O against one completion port, on the calling thread; operations the
+//!   kernel finishes during the issuing call never reach the port, and the
+//!   rest are completed by a single reaper. Control-plane operations run on
+//!   the syscall pool.
 
 mod buffer;
 mod driver;
 mod file;
 #[cfg(target_family = "windows")]
+mod iocp;
+#[cfg(target_family = "windows")]
 mod overlapped;
 mod pool;
 mod psync;
+#[cfg(target_os = "linux")]
+mod uring;
 
 pub use buffer::StableBuf;
+pub use driver::BackendKind;
+pub use driver::IoDriver;
+pub use driver::WHOLE_FILE_LIMIT;
+pub use file::IoFile;
+pub use file::OpenOptions;
+#[cfg(target_family = "windows")]
+pub use iocp::IocpStats;
 pub use pool::PoolStats;
+#[cfg(target_os = "linux")]
+pub use uring::UringStats;
 
 /// A snapshot of the process-wide syscall pool, which every driver and every backend shares.
 ///
@@ -39,8 +59,3 @@ pub use pool::PoolStats;
 pub fn pool_stats() -> PoolStats {
     pool::SyscallPool::global().stats()
 }
-pub use driver::BackendKind;
-pub use driver::IoDriver;
-pub use driver::WHOLE_FILE_LIMIT;
-pub use file::IoFile;
-pub use file::OpenOptions;

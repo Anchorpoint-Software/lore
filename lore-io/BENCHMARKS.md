@@ -1,8 +1,9 @@
 # lore-io benchmarks
 
-`lore-io/examples/bench.rs` compares three ways of doing file I/O from async Rust on identical
+`lore-io/examples/bench.rs` compares four ways of doing file I/O from async Rust on identical
 workloads: what does routing an operation through the dedicated syscall pool cost or save against
-the alternatives.
+the alternatives. The fourth engine is whichever completion backend the platform has — `uring` on
+Linux, `iocp` on Windows — and elsewhere there are three.
 
 ## What it compares
 
@@ -11,6 +12,8 @@ the alternatives.
 | `blocking` | `tokio::task::spawn_blocking` around a positional syscall (`pread`/`pwrite` on Unix, `seek_read`/`seek_write` on Windows), or `std::fs::read` for whole files. This is what `lore_spawn_blocking!` plus `FileExt::read_at` does in `lore-storage/src/chunker.rs` today — the strongest form of the current path. |
 | `tokiofs` | `tokio::fs`. Reads and writes seek then transfer; whole-file work uses `tokio::fs::read`/`write`. |
 | `loreio` | The `psync` backend: the same syscalls issued through `IoDriver` onto the bounded `lore-io` syscall pool. |
+| `uring` | The `io_uring` backend, through the same `IoDriver` API. Linux only, and skipped with a printed reason where a ring cannot be created. |
+| `iocp` | The completion-port backend, through the same `IoDriver` API. Windows only. Positional reads and writes are issued on the calling thread and completed by one reaper draining the port; everything else runs on the syscall pool, as it does on the ring. |
 
 `tokio::fs::File` is `AsyncSeek` + `AsyncRead`, so there is no positional read: an offset is reached
 by seeking, and the file offset belongs to the file description. `try_clone` is a `dup`, which
@@ -24,18 +27,37 @@ Every engine allocates a fresh buffer per read, on the thread that receives the 
 
 | Workload | Operation | Size | Ops | Concurrency |
 | --- | --- | --- | --- | --- |
-| `read-64KiB-warm-c64` | Random positional reads in one 256 MiB file | 64 KiB | 524,288 | 64 |
-| `read-4KiB-warm-c128` | Random positional reads in one 256 MiB file | 4 KiB | 786,432 | 128 |
+| `read-64KiB-warm-c64` | Random positional reads over 256 MiB, spread across 64 files | 64 KiB | 1,572,864 | 64 |
+| `read-4KiB-warm-c128` | Random positional reads over 256 MiB, spread across 64 files | 4 KiB | 6,291,456 | 128 |
 | `write-256KiB-seq-c32+sync` | Sequential positional writes, then one `sync_data` | 256 KiB | 16,384 | 32 |
-| `small-files-4KiB-wr+rd-c64` | Whole-file create then whole-file read, 16,384 files | 4 KiB | 32,768 | 64 |
-| `read-64KiB-cold-c64` | Permuted reads over a 256 MiB file, each block read once | 64 KiB | 4096 | 64 |
-| `read-4KiB-cold-rec-c128` | Permuted reads over a 512 MiB file, one block per 128 KiB region | 4 KiB | 4096 | 128 |
+| `small-files-4KiB-wr+rd-c64` | Whole-file create then whole-file read, 65,536 files | 4 KiB | 131,072 | 64 |
+| `commit-read-mixed-scattered` | Scattered reads over a heterogeneous set of 2048 files; whole-file below 32 KiB | 32–256 KiB, normal | ~410,000 | 20×4 |
+| `sync-write-mixed-scattered` | The same set and shape, written rather than read | 32–256 KiB, normal | ~410,000 | 20×4 |
+| `read-64KiB-cold-c64` | Permuted reads over one file, each block read once | 64 KiB | derived | 64 |
+| `read-4KiB-cold-rec-c128` | Permuted reads over one file, one block per 128 KiB region | 4 KiB | derived | 128 |
 | `small-files-4KiB-rd-cold-c64` | Whole-file reads of 16,384 evicted files | 4 KiB | 16,384 | 64 |
 
+The two mixed phases are the repository-shaped ones and the most representative of real work: a
+commit reads a working tree of highly uneven file sizes from every core at once, and a sync writes
+one. Their file sizes are 60% below 32 KiB drawn log-uniformly from 64 bytes — handled whole, in
+one operation, as the storage layer handles a small object — then 30% to 1 MiB, 9% to 8 MiB and 1%
+to 32 MiB. Larger
+files are reached at scattered offsets in chunks drawn from a normal distribution clamped to
+32–256 KiB, which is how a fragment store reaches its contents. The operation list is generated
+from fixed seeds and shuffled, so every engine does identical work in identical order. Concurrency
+is one driver task per core, at least 16, with four operations in flight each.
+
 Warm phases are sized to run about a second each; a phase of tens of milliseconds measures
-frequency ramp and cache state instead. The cold phases are fixed at 4096 operations, which is
-about a second on a SATA SSD and 86–118 ms on an NVMe — under that floor, and the harness warns
-when a phase falls below 250 ms.
+frequency ramp and cache state instead. Cold phase sizes are derived rather than fixed, because a
+cold phase reads each block once and its duration is therefore the data set size divided by what
+the device gives: `prepare-cold` measures that rate and sizes both large-file phases for about a
+second, recording the result in a manifest every engine then reads. The harness warns when a phase
+falls below 250 ms, and again when one reads faster than the rate that sized it, which means it was
+not cold.
+
+The cold phases read a single file each and ignore `LORE_BENCH_READ_SPREAD`, which applies to the
+warm read phases only. Spreading a cold phase would read copies made from the data file, and those
+are in cache as soon as they exist.
 
 The 4 KiB cold reads are strided 128 KiB apart because ZFS caches whole records: a second 4 KiB
 read inside a record already in the ARC is a cache hit. The spacing also defeats readahead on
@@ -49,12 +71,13 @@ live threads against the cap and the thread and queue high-water marks.
 
 | Mode | Effect |
 | --- | --- |
-| `warm` | All four warm phases. No engine argument runs all three engines, one child process each. |
+| `warm` | All six warm phases. No engine argument runs every engine, one child process each. |
 | `read` | The two read phases only, for one engine. What to run under `perf`. |
-| `prepare-cold` | Writes the cold data sets and clears any previous ones. About 2.3 GiB. |
-| `cold` | The cold phases. No engine argument runs all three, one process each. |
-| `warm-suite` / `cold-suite` | That suite for N rounds (default 6), engine order alternated, then a median, a range and a position control. `cold-suite` also rotates which data set each engine reads and runs `cold-baseline`. Give it a round count divisible by three or the rotation is unbalanced, which it reports. |
-| `cold-baseline` | Each engine's cold data set read by plain threads, one per in-flight request, no engine in the path. The rate a dispatch layer can reach and not beat. |
+| `prepare-cold` | Checks eviction, measures the device, sizes the cold phases from it, and writes the data sets and their manifest, clearing any previous ones. Bounded by `LORE_BENCH_COLD_BUDGET_GIB`. |
+| `cold` | The cold phases, at the sizes the manifest records. No engine argument runs every engine, one process each. |
+| `warm-suite` / `cold-suite` | That suite for N rounds (default 6), engine order alternated, then a median, a range and a position control. `cold-suite` also rotates which data set each engine reads and runs `cold-baseline`. Give it a round count divisible by the engine count or the rotation is unbalanced, which it reports. |
+| `cold-baseline` | Each engine's cold data set read by plain threads, one per in-flight request with a handle each, no engine in the path. |
+| `check-eviction` | Whether `evict_from_page_cache` works on this filesystem, without preparing anything. Exits non-zero when it does not. Run it before trusting a cold sitting. |
 
 ```sh
 # Warm, the full protocol
@@ -70,7 +93,7 @@ Use the suite modes for anything a conclusion rests on. A single round cannot se
 difference from where the round sat; *Experiments* records what that cost.
 
 One process per engine is deliberate. Page cache, thread pools and allocator state carry between
-engines in a shared process, and sharing one was worth 3×. Run a single engine when profiling.
+engines in a shared process, which measured a 3× difference. Run a single engine when profiling.
 
 ### Cache eviction by platform
 
@@ -79,11 +102,17 @@ engines in a shared process, and sharing one was worth 3×. Run a single engine 
 | ext4, xfs | `posix_fadvise(POSIX_FADV_DONTNEED)` | No — verified within 1–2% on eight of nine cells against a `drop_caches` run |
 | ZFS | none; the ARC ignores `posix_fadvise` | Yes, `drop_caches` as root |
 | macOS | `msync(MS_INVALIDATE)` over a mapping of the file | No |
-| Windows | open with `FILE_FLAG_NO_BUFFERING`, which flushes and purges the file's section | No |
+| Windows | open with `FILE_FLAG_NO_BUFFERING`, which flushes and purges the file's section | No, where it works — see below |
 
 The macOS and Windows mechanisms were verified rather than assumed; see *Experiments*. Neither
 needs privilege. On Windows there is also no `sync` between children, because `FlushFileBuffers`
 on a volume handle wants administrator rights; the settle still runs.
+
+The Windows mechanism is per-file and not every volume honours it: of the two measured on Host C's
+machine, the 8 TB SATA volume evicts and the 4 TB one does not, on the same OS and filesystem
+type. `check-eviction` reports which, and `prepare-cold` runs it before sizing anything, because a
+probe against a file that was not evicted measures cache and would size every phase from it. Run it
+on a volume before trusting a cold sitting there.
 
 ### Variables and scripts
 
@@ -92,8 +121,12 @@ on a volume handle wants administrator rights; the settle still runs.
 | `LORE_BENCH_DIR` | Directory for benchmark files. Defaults to the system temp directory. Set it to put the data on the filesystem under test. |
 | `LORE_BENCH_ALLOC_OUTSIDE` | Moves the `blocking` engine's buffer allocation from its closure to the calling task, isolating which thread allocates. |
 | `LORE_BENCH_BLOCKING_THREADS` | The `blocking` engine's tokio pool, overriding `min(2 × (cores + 1), 128)`. The baseline's counterpart to `LORE_IO_POOL_THREADS`, which makes a cap sweep's control runnable. |
-| `LORE_IO_BACKEND` | Backend the driver selects (`auto`, `psync`). `auto` resolves to `psync` today. |
+| `LORE_BENCH_DRIVERS` | Long-lived driver tasks for the two synthetic read phases, so submission runs on many worker threads rather than the one driving `buffer_unordered`. Default 16. At one it measures the driver rather than the backend, for any engine that completes on the submitting thread. |
+| `LORE_BENCH_READ_SPREAD` | Files the two synthetic *warm* read phases spread over, each holding `1/N` of the data so the working set does not change with the count. Default 64, the larger phase's concurrency. At one it measures `io_uring`'s per-inode serialization and little else. The cold phases always read one file; see *Harness defects*. |
+| `LORE_IO_BACKEND` | Backend the driver selects (`auto`, `psync`, `uring` on Linux, `iocp` on Windows). `auto` takes the platform's completion backend where it can create one and falls back to `psync`. The benchmark selects backends by engine tag instead, so this only matters when profiling something else in the process. |
 | `LORE_IO_POOL_THREADS` | Syscall pool cap, overriding `min(2 × cores, 16)`. Rejects zero and anything above 128. |
+| `LORE_IO_IOCP_REAPERS` | Threads draining the Windows completion port, overriding the default of one. Accepts 1 to 64. For re-running the sweep below on another machine, not for sizing a deployment. |
+| `LORE_BENCH_COLD_BUDGET_GIB` | Total disk the cold data sets may occupy across every engine and both large-file phases. Default 32. `prepare-cold` sizes each phase to run for about a second at the rate it measures, and this caps the result; where the cap binds, the projected phase duration is reported and warned about if it falls under the 0.25 s floor. |
 | `LORE_ALLOCATOR` | Read by `lore-base`, which the benchmark links for its global allocator. `system` swaps rpmalloc for `std::alloc::System`. |
 
 | Script | What it runs |
@@ -240,6 +273,49 @@ which measures distance to the hardware rather than to another engine:
 | `read-4KiB-cold-rec-c128` | 0.86 | 0.48 | 0.87 | 1.49× |
 | `small-files-4KiB-rd-cold-c64` | 0.80 | 0.82 | 0.83 | 1.32× |
 
+### Four engines, both filesystems
+
+Host A, `warm-suite 6`: six rounds, a discarded warm-up round first, engine order alternated, one
+process per engine, medians. The synthetic read phases spread over 64 files and are driven by 16
+tasks — the same shape for every engine — because a single-file, single-driver phase measures the
+harness rather than the backend.
+
+**ext4** (loopback image):
+
+| Workload | `blocking` | `tokiofs` | `loreio` | `uring` | uring / loreio |
+| --- | --- | --- | --- | --- | --- |
+| `read-64KiB-warm-c64` | 547,310 | 172,640 | 994,288 | **1,213,316** | 1.22× |
+| `read-4KiB-warm-c128` | 609,968 | 192,534 | 791,862 | **5,163,049** | 6.52× |
+| `write-256KiB-seq-c32+sync` | 14,112 | 13,778 | 14,420 | **16,850** | 1.17× |
+| `small-files-4KiB-wr+rd-c64` | 160,164 | 159,062 | 162,376 | **166,414** | 1.02× |
+| `commit-read-mixed-scattered` | 226,394 | 112,448 | 261,949 | **418,090** | 1.60× |
+| `sync-write-mixed-scattered` | 180,341 | 111,160 | **274,479** | 192,714 | 0.70× |
+
+**ZFS**:
+
+| Workload | `blocking` | `tokiofs` | `loreio` | `uring` | uring / loreio |
+| --- | --- | --- | --- | --- | --- |
+| `read-64KiB-warm-c64` | 518,554 | 160,040 | **917,846** | 457,970 | 0.50× |
+| `read-4KiB-warm-c128` | 568,566 | 174,082 | 668,450 | **952,172** | 1.42× |
+| `write-256KiB-seq-c32+sync` | **52,022** | 39,482 | 49,231 | 28,046 | 0.57× |
+| `small-files-4KiB-wr+rd-c64` | 115,190 | 117,688 | 125,071 | **127,416** | 1.02× |
+| `commit-read-mixed-scattered` | 107,250 | 69,292 | **119,967** | 107,838 | 0.90× |
+| `sync-write-mixed-scattered` | 81,624 | 61,749 | **75,761** | 66,824 | 0.88× |
+
+Position control is 0.97–1.04 throughout except ZFS's `uring` 4 KiB reads at 0.89, which also has
+the widest range in either table (822,641–1,271,400) and is the one row not to quote closely.
+Everything else sits within a few percent of its median.
+
+**The repository-shaped phases are the most representative, and they run opposite to the synthetic
+ones.** `uring` measures 1.60× on commit-shaped reads on ext4 and is behind on sync-shaped writes on
+both filesystems, 0.70× and 0.88×; on ZFS it is behind on both phases. The synthetic 6.52× at 4 KiB
+does not carry over to a repository-shaped workload: opens, whole-file operations on small objects
+and a spread of sizes reduce a dispatch advantage to approximately 1.6× at best, and to a deficit on
+writes.
+
+**Scattered writes are the ring's weakest workload, consistently.** It is behind at every size and
+on every filesystem measured here, while ahead on the sequential 256 KiB write phase on ext4.
+
 ## Conclusions
 
 **`lore-io` matches or beats the path it replaces on every warm phase, on all four hosts**, while
@@ -247,6 +323,24 @@ running fewer threads than the pool it replaces — 32 against 42 on Host A, 32 
 Host B, 16 against 18 on Host D. Host A: 1.10× on 64 KiB reads, 1.09× on writes, 1.02× on
 whole-file work, parity at 4 KiB. Host B: 1.16×, 1.17× and 1.15×. Host D: 1.19× at 4 KiB and
 parity elsewhere.
+
+**The `uring` backend's advantage depends on the filesystem and on the workload shape.** It
+measures 1.60× the syscall pool on commit-shaped reads on ext4 and 0.70× to 0.90× on the other
+three repository-shaped cases, so the case for it rests on read-heavy work on a filesystem that
+completes cached reads during the submit syscall. Where completion is inline the synthetic margins
+reach 6.5× at 4 KiB; where the filesystem punts to a kernel worker, as ZFS does, no configuration
+recovers them. Scattered writes are behind on every filesystem measured.
+
+**The `iocp` backend's advantage is primarily in thread count.** It runs two threads against a
+syscall pool saturated at thirty-two and measures 1.76× and 4.80× on the synthetic warm read
+phases, because a positional operation on Windows defers and `psync` holds a thread across the
+wait. It measures 0.72× on the commit-shaped read phase, where the driver-task count exceeds the
+point at which this backend peaks. Cold, it takes the 4 KiB phase by 2.27× and ties the 64 KiB
+phase, where both backends saturate the device. See *Windows: the completion-port backend*.
+
+**`auto` prefers a completion backend on both platforms that have one.** Neither preference is a
+settled throughput win, and both are provisional: the migration is internal and nothing depends on
+the engine, so exposure is what will surface the remaining problems.
 
 **No single warm phase wins on every host.** The 64 KiB read is the best result on Hosts A, B and
 C — 1.10×, 1.16×, 2.87× — and 0.99× on Host D with overlapping ranges. The 4 KiB read runs the
@@ -295,10 +389,10 @@ phase logged `threads 32/32` with a queue high-water up to 97.
 each. Host B takes 216 ms, 13 µs each, and responds to I/O concurrency, which a cache-resident
 phase would not.
 
-**Host C's margins are the largest here and measure a Windows property**, not an engine one — see
-below.
+**Host C's margins are the largest recorded here and measure a Windows property** rather than an
+engine one; see below.
 
-## Windows: one shared handle
+## Windows: handle mode and the single-file ceiling
 
 A Windows file handle opened without `FILE_FLAG_OVERLAPPED` is a synchronous file object, and the
 I/O manager serializes every operation issued on it. This API is built on the opposite: one shared
@@ -329,31 +423,15 @@ slow at concurrent I/O against a single file, which is the shape of the read pha
 shape of the storage layer's reads, which hash-distribute over 256 pack-file groups whose files
 roll at 3 GiB. macOS has no equivalent ceiling; see below.
 
-**The fix is that the data path owns its `OVERLAPPED`.** `std`'s `seek_read`/`seek_write` cannot be
-used on an overlapped handle: they pass no event and report `ERROR_IO_PENDING` as an ordinary
-error, after which the caller frees a buffer the kernel is still writing into.
-`src/overlapped.rs` issues `ReadFile`/`WriteFile` with its own `OVERLAPPED` and a per-thread event,
-and waits out a pending operation before returning. The wait blocks, which is what the syscall pool
-exists for. Measured as an interleaved A/B of the two builds, with `blocking` as the noise floor:
-
-| Workload | Synchronous handle | Overlapped | Ratio | `blocking` control |
-| --- | --- | --- | --- | --- |
-| `read-64KiB-warm-c64` | 33,987 | 80,332 | **2.36×** | 0.99× |
-| `read-4KiB-warm-c128` | 66,726 | 139,832 | **2.10×** | 1.01× |
-| `write-256KiB-seq-c32+sync` | 1,259 | 1,476 | 1.17× | 1.00× |
-| `small-files-4KiB-wr+rd-c64` | 9,636 | 9,560 | 0.99× | 1.00× |
-
-Small files at 0.99× is the expected null: that phase runs whole-file composites, which open their
-own handle per file and never shared one. Cold is where it matters most, because a serialized
-handle cannot keep requests in flight — `loreio` is 3.03× and 3.87× ahead of `blocking` on Host C's
-cold reads.
-
-**The margin is the handle mode, not the dispatch architecture.** The same engine with synchronous
-handles was 2.36× slower, so Host C's 2.87× measures `FILE_FLAG_OVERLAPPED` plus a correct
-completion wait — which the existing `spawn_blocking` path could adopt without this crate.
-`lore-io` is where that fix lives and is tested. The baseline is still the right comparison,
-because `lore-storage` does what `blocking` does today, and `lore-storage/src/defragment.rs`
-documents why it stopped short of overlapped handles.
+**The data path therefore owns its `OVERLAPPED`.** `std`'s `seek_read`/`seek_write` cannot be used
+on an overlapped handle: they pass no event and report `ERROR_IO_PENDING` as an ordinary error,
+after which the caller frees a buffer the kernel is still writing into. `src/overlapped.rs` issues
+`ReadFile`/`WriteFile` with its own `OVERLAPPED` and a per-thread event, and waits out a pending
+operation before returning. That wait is taken on every operation; see *Windows: the completion-port
+backend*. Handle mode is worth 2.36× and 2.10× on the two warm read phases against an otherwise
+identical build, measured under *Experiments*, so Host C's margins against `blocking` are the handle
+mode rather than the dispatch architecture. The baseline remains the right comparison, because
+`lore-storage` does what `blocking` does today.
 
 **An open of a cached file costs about 29 µs on Host C**, whether of the same file or of 4096
 distinct ones. Per-open cost is not what sinks `tokiofs` there: 29 µs against 17,945 ops/s at
@@ -362,7 +440,166 @@ file contending is the term that fits — reopening one file per operation measu
 32 threads against 35,139 sequentially, within 5% of what `tokiofs` reports for the phase whose
 every operation is exactly that.
 
-## macOS: cores that are not interchangeable
+## Windows: the completion-port backend
+
+This section is one sitting on Host C's machine, 2026-08-02. Its absolutes are not comparable with
+the rest of this file: the benchmark directory is on the 4 TB NTFS volume inside the scanning
+exclusion rather than the 8 TB SATA SSD the 2026-08-01 rows used, and `blocking` measures 148,339 on
+the 64 KiB read phase here against 28,308 there. Read this section's ratios rather than its ops/s,
+and do not combine its figures with Host C's.
+
+Protocol as elsewhere: `warm-suite 6`, one process per engine, engine order alternated, a discarded
+warm-up round first, pool cap 32, `blocking` pool 128.
+
+### Deferred completion
+
+The `iocp` counters report 0% inline on every round: all 7.86 million reads returned
+`ERROR_IO_PENDING` and completed through the port. The behaviour is not a property of the port. A
+probe outside the engine, issuing the same `ReadFile` against an overlapped handle with a per-thread
+event and no completion port — `overlapped.rs` reduced to a counter — reports the same:
+
+| Reads | Threads | ops/s | inline | pending |
+| --- | --- | --- | --- | --- |
+| 64 KiB | 1 | 43,252 | 0 | 100% |
+| 64 KiB | 32 | 84,591 | 0 | 100% |
+| 4 KiB | 128 | 130,019 | 0 | 100% |
+
+A buffered read on an overlapped handle therefore defers on this platform in every case measured,
+warm and single-threaded included. Each backend has one consequence. On `psync` the
+`GetOverlappedResult` wait runs on every operation and parks a pool thread for its duration, so the
+pool cap bounds how many reads are in flight. On `iocp` every completion arrives through the port
+and crosses a thread. Pool occupancy during the read phases:
+
+| Engine | Read-phase pool occupancy |
+| --- | --- |
+| `loreio` (psync) | `threads 32/32 peak 32`, queue peak 39–49 at 64 KiB and 97–99 at 4 KiB |
+| `iocp` | `threads 1/32 peak 1`, queue peak 1 — the pool serves the open only |
+
+### Warm suite
+
+| Workload | `blocking` | `tokiofs` | `loreio` | `iocp` | iocp / loreio |
+| --- | --- | --- | --- | --- | --- |
+| `read-64KiB-warm-c64` | 148,339 | 48,316 | 233,156 | **411,460** | 1.76× |
+| `read-4KiB-warm-c128` | 153,140 | 49,766 | 217,134 | **1,042,119** | 4.80× |
+| `write-256KiB-seq-c32+sync` | **3,137** | 2,277 | 2,668 | 3,000 | 1.12× |
+| `small-files-4KiB-wr+rd-c64` | 9,253 | 9,233 | 9,610 | **9,994** | 1.04× |
+| `commit-read-mixed-scattered` | 184,886 | 60,034 | **208,700** | 149,472 | **0.72×** |
+| `sync-write-mixed-scattered` | 55,933 | 8,194 | **62,170** | 58,126 | 0.93× |
+
+Round-to-round ranges, which determine whether a difference is readable:
+
+| Workload | `blocking` | `tokiofs` | `loreio` | `iocp` |
+| --- | --- | --- | --- | --- |
+| `read-64KiB-warm-c64` | 143k–153k | 47.0k–50.4k | 218k–237k | 395k–423k |
+| `read-4KiB-warm-c128` | 150k–160k | 47.5k–52.2k | 207k–223k | 1021k–1062k |
+| `write-256KiB-seq-c32+sync` | 2772–3423 | 1918–2379 | 2506–2826 | 2847–3118 |
+| `small-files-4KiB-wr+rd-c64` | 7764–9338 | 6667–9425 | 9102–10251 | 9272–10242 |
+| `commit-read-mixed-scattered` | 169k–204k | 55.0k–61.9k | 203k–215k | 139k–158k |
+| `sync-write-mixed-scattered` | 52.8k–61.2k | 7185–8268 | 61.8k–64.3k | 54.8k–62.7k |
+
+Position control is 0.94×–1.08× throughout except `blocking`'s write row at 0.87×, the SLC artefact
+described under *Experiments*.
+
+**The two synthetic read phases carry the thread ceiling, and they are where the difference is.**
+1.76× and 4.80×, with ranges that do not overlap, against a `psync` saturated at 32 threads with a
+queue up to 99 deep. Writes and whole-file work are within a few percent, which is the expected
+null: the write phase is device-bound, and the small-file phase runs whole-file composites that do
+not reach either backend's data path.
+
+**`commit-read-mixed-scattered` measures 0.72×, and it is the repository-shaped phase.** Its range,
+139k–158k against 203k–215k, does not overlap. The direction matches the ring's result on Linux:
+the synthetic phases favour a completion backend and the repository-shaped ones do not.
+
+### Sensitivity to driver-task count
+
+The two synthetic read phases are driven by `LORE_BENCH_DRIVERS` tasks; the repository-shaped phases
+use one per core, 64 on this host. Sweeping the driver count separates dispatch cost from fan-out
+cost. Single runs, so the shape carries rather than the individual figures:
+
+| Driver tasks | 1 | 16 | 64 |
+| --- | --- | --- | --- |
+| `psync`, 64 KiB | 139,418 | 251,500 | 235,242 |
+| `psync`, 4 KiB | 157,040 | 223,699 | 236,465 |
+| `iocp`, 64 KiB | 34,649 | **394,961** | 257,884 |
+| `iocp`, 4 KiB | 76,284 | **1,039,862** | 773,792 |
+
+`psync` is flat from 16 tasks on, which serves as the control: its parallelism comes from the pool
+rather than from the caller, so the number of submitting tasks has little effect. `iocp` peaks at 16
+and loses approximately a third by 64, and one task per core is what the commit-shaped phase runs.
+At one driver task it measures 4× below `psync`, which is the same property observed from the other
+end: this backend's concurrency is the caller's task count, because nothing else holds an operation
+in flight.
+
+The direction matches the ring's result that spreading submission over many tasks reduces its
+throughput. It is not a property of the dispatch path: at 16 tasks the same code measures 1.6×
+`psync` on the same phase shape. Reducing the sensitivity is outstanding work.
+
+### Reaper count
+
+Adding reaper threads to carry the completions reduces throughput. `read` mode, one run per cell:
+
+| Reapers | 1 | 2 | 4 | 8 | 16 |
+| --- | --- | --- | --- | --- | --- |
+| 16 drivers, 64 KiB | **421,663** | 384,491 | 246,400 | 244,404 | — |
+| 16 drivers, 4 KiB | **1,029,659** | 973,404 | 272,045 | 248,401 | — |
+| 64 drivers, 64 KiB | **309,383** | 278,753 | 205,357 | 188,760 | 194,922 |
+| 64 drivers, 4 KiB | 784,453 | **899,041** | 267,440 | 219,692 | 227,592 |
+
+Two reapers measure inside the noise of one; four cost 42% and 74%. The mechanism is the batched
+drain: `GetQueuedCompletionStatusEx` takes up to 64 packets per syscall, and threads sharing a port
+divide the arriving packets between them, so each wakes for a partial batch and the syscall count
+rises with the thread count while the total work does not. One reaper is therefore both the fastest
+and the cheapest configuration, and the default does not scale with the machine.
+
+### Cold suite
+
+`cold-suite 8` with the data-set rotation, 2026-08-02, on the machine's 8 TB SATA volume: the other
+volume does not honour the eviction, which `check-eviction` reports. This one does, 74,970 ops/s
+cached against 7,810 after the purge, and 7,810 × 64 KiB is 488 MiB/s, the drive's sequential rate.
+It sits outside the scanning exclusion where the warm figures above are inside it, so the two tables
+are not comparable to each other; every engine pays the same terms within each.
+
+One limitation belongs with these figures: the plain-threads baseline is bounded on Windows by the
+platform's behaviour for concurrent access to a single file, so it is not the device ceiling there
+and an engine may exceed it without reading cache.
+
+| Workload | `blocking` | `tokiofs` | `loreio` | `iocp` | iocp / loreio |
+| --- | --- | --- | --- | --- | --- |
+| `read-64KiB-cold-c64` | 2,626 | 4,619 | 7,787 | 7,790 | 1.00× |
+| `read-4KiB-cold-rec-c128` | 4,824 | 9,620 | 18,265 | **41,453** | **2.27×** |
+| `small-files-4KiB-rd-cold-c64` | 44,886 | 45,489 | 45,644 | 46,610 | 1.02× |
+
+Each engine over what plain threads get from the same data sets, with the rotation cancelling which
+copy it read:
+
+| Workload | `blocking` | `tokiofs` | `loreio` | `iocp` | spread across copies |
+| --- | --- | --- | --- | --- | --- |
+| `read-64KiB-cold-c64` | 0.36 | 0.63 | 1.07 | 1.07 | 1.37× |
+| `read-4KiB-cold-rec-c128` | 0.09 | 0.17 | 0.33 | 0.74 | 1.09× |
+| `small-files-4KiB-rd-cold-c64` | 1.06 | 1.07 | 1.07 | 1.10 | 1.02× |
+
+**The 64 KiB phase is the device and nothing else.** Both backends reach 488 MiB/s, this drive's
+sequential rate, and their medians differ by 3 ops/s. That is the expected result and a check on the
+warm figures: when a read waits on a SATA device, what dispatched it stops mattering. `blocking`
+reaches 0.36 of the same ceiling and `tokiofs` 0.63, so the phase does discriminate — it is the two
+`lore-io` backends that have stopped being the bottleneck.
+
+**The 4 KiB phase is not bandwidth-bound, and `iocp` takes it by 2.27×**, 40,569–41,996 against
+18,130–18,391 over eight rounds with no overlap. 140 MiB moved in 0.87 s is 161 MiB/s, a third of
+what the drive gives sequentially, so the phase is bound by requests in flight rather than by bytes.
+That is the bound `psync` meets when every operation parks a pool thread and the one a completion
+port removes, and it is the same property the warm 4 KiB phase reports at 4.80× — at a third the
+margin here, because the device now costs something.
+
+**Whole-file reads are a null at 1.02×**, as they are warm: that phase runs whole-file composites,
+which both backends forward to the syscall pool.
+
+Round-to-round ranges on the 64 KiB row are wide by construction — 5,714–7,837 for `loreio` and
+5,698–7,827 for `iocp` — because the rotation makes each engine read all four copies and the copies
+span 1.37×. The median is what carries there, and the baseline-normalized table is the cleaner
+reading. The 4 KiB and small-file rows are tight.
+
+## macOS: heterogeneous cores
 
 `available_parallelism()` reports 8 on Host D; `hw.perflevel0.logicalcpu` reports 4 performance
 cores and `hw.perflevel1.logicalcpu` 4 efficiency cores. Cached reads there peak at four threads
@@ -516,15 +753,30 @@ design rests on the allocator caching spans per thread, which glibc malloc does 
 benchmark on glibc malloc tests a program whose premise does not hold. Dev-only, so the library's
 graph is unchanged. Host A predates this.
 
-**The `blocking` engine is `spawn_blocking` plus a positional syscall**, not `tokio::fs` — the
-strongest form of what exists today, so the comparison is not flattered.
+**The `blocking` engine is `spawn_blocking` plus a positional syscall**, not `tokio::fs`. It is the
+strongest form of the path that exists today, so the comparison is not favourably biased.
 
 **Phase sizes are fixed in the source** rather than tunable, so two people running the suite
 compare the same thing.
 
 **Each engine gets its own cold data set**, so no engine's child process can delete or warm what
-another needs, and one cache drop serves all three. The copies are not equivalent, so the
+another needs, and one cache drop serves all of them. The copies are not equivalent, so the
 assignment rotates by round.
+
+**Cold phase sizes are derived from a measured device rate, not fixed in the source.** They are the
+one exception to the rule above, and the reason is that a cold phase reads each block once, so its
+duration is the data set size divided by what the device gives. A fixed operation count fixes the
+duration only for one device speed: 4096 permuted 64 KiB reads are about a second on a SATA SSD and
+under 20 ms on a fast NVMe volume, far below the floor at which a phase measures anything.
+`prepare-cold` measures the rate, sizes the phases for about a second, and records the result in a
+manifest beside the data. Every engine in the suite then reads the sizes the manifest names, so a
+suite is internally comparable even though two machines' suites are not — which was already true of
+cold absolutes.
+
+**The cold baseline opens a handle per thread.** A shared handle is a serialization point on
+Windows, where the I/O manager runs one operation at a time on a synchronous file object, so
+sharing one measured 3,174 ops/s against 53,428 for a handle each and made every ratio taken
+against it meaningless.
 
 ## Experiments
 
@@ -627,6 +879,22 @@ order-alternated A/B using the identical engine in both builds as a noise-floor 
 - **Forced `mmap` allocation** (`MALLOC_MMAP_THRESHOLD_`). Made every engine several times slower
   and swamped the variable it was meant to isolate.
 
+### Handle mode on Windows
+
+An interleaved A/B of two builds of the same engine, one opening synchronous handles and one
+opening overlapped handles, with `blocking` as the noise floor:
+
+| Workload | Synchronous handle | Overlapped | Ratio | `blocking` control |
+| --- | --- | --- | --- | --- |
+| `read-64KiB-warm-c64` | 33,987 | 80,332 | **2.36×** | 0.99× |
+| `read-4KiB-warm-c128` | 66,726 | 139,832 | **2.10×** | 1.01× |
+| `write-256KiB-seq-c32+sync` | 1,259 | 1,476 | 1.17× | 1.00× |
+| `small-files-4KiB-wr+rd-c64` | 9,636 | 9,560 | 0.99× | 1.00× |
+
+Small files at 0.99× is the expected null: that phase runs whole-file composites, which open their
+own handle per file and never share one. The effect is largest cold, because a serialized handle
+cannot keep requests in flight.
+
 ### Withdrawn results
 
 **A `perf` profile.** One pair of `perf stat` runs showed `lore-io` at half the IPC, double the
@@ -648,8 +916,9 @@ cold data set, interleaved, in one sitting:
 
 Everything within 2%: no cap effect, no handle-mode effect, no gap between the engine and plain
 threads. The 1.62× step, the 31k ceiling and the latency gap inferred from them are withdrawn. What
-survives is narrower: cold buffered reads complete inline even on an overlapped handle, and handle
-mode costs nothing cold.
+survives is narrower still than it was written: handle mode costs nothing cold. The other half of
+that sentence — that cold buffered reads complete inline on an overlapped handle — is itself now
+withdrawn, by a counter rather than an inference; see *Windows: the completion-port backend*.
 
 **A cap sweep that measured a bug.** Host C's warm sweep was run before and after the overlapped
 fix. Before it, submissions piled onto a serializing handle only add queueing, so the sweep
@@ -711,12 +980,36 @@ through a compile error to the previous build and produced plausible numbers.
 
 ### Harness defects
 
-**The pending-completion path is untested.** Every Windows measurement recorded zero
-`ERROR_IO_PENDING`: buffered reads complete inline on that host, warm and cold. So
-`overlapped.rs`'s `GetOverlappedResult` wait and its cancel-and-wait-again recovery have never
-executed, and that is the path where a mistake corrupts memory rather than returning a wrong
-number. The status is reachable on SMB shares, on sparse and compressed files, and behind filter
-drivers that punt. A test that forces it is owed before the migration puts callers on it.
+**The cold phases spread their reads, which made them warm.** `read_phase` is shared by the warm
+and cold phases and read `LORE_BENCH_READ_SPREAD` itself, so a cold phase evicted `data64k-<tag>`
+and then read 64 `.spread64-N` copies of it — files `spread_files` creates by copying the data file,
+and therefore in cache the moment they exist. The offset remapping that accompanies a spread is the
+second half of it: offsets are folded into one part's span, so a phase sized to read each block once
+instead read a fraction of the data set several times over, which is a cache hit whatever the
+eviction did.
+
+Every cold figure this file carried before 2026-08-02 was produced that way and none of them is a
+cold measurement. The phase measured 124,000 ops/s where the same phase measures 7,800 after the
+fix, on a device whose ceiling is 488 MiB/s. `read_phase` now takes the spread as an argument and
+the cold callers pass one; a phase that reads faster than the probe rate that sized it now says so
+on its own line, which is what caught this.
+
+Two smaller ones the same change surfaced. `write_random_file` wrote whole 1 MiB chunks and dropped
+the remainder, which no fixed 256 MiB data set ever exposed and every derived size does — a short
+file ends a phase in `UnexpectedEof`. And it filled every byte from the generator, which costs more
+than the write once a data set is tens of gigabytes.
+
+**The pending-completion path was reported as untested, and the report was wrong.** This entry
+used to read that every Windows measurement recorded zero `ERROR_IO_PENDING`, so `overlapped.rs`'s
+`GetOverlappedResult` wait had never executed. Counting instead of inferring says the opposite:
+100% of buffered reads on an overlapped handle defer, so the wait runs on every operation and
+always has. The cancel-and-wait-again recovery inside it is still untested, since that needs the
+wait itself to fail.
+
+Worth keeping as a method note rather than deleting. The claim was plausible, was repeated in three
+places, and was never measured — it came from reading throughput figures that a fully-inline path
+would also have produced. `lore-io/src/iocp.rs` grew a counter for its own reasons and contradicted
+it immediately.
 
 **Two that only Windows could surface.** The `tokiofs` write phase opened the file read-only to
 `sync_data` it, which `fdatasync` accepts and `FlushFileBuffers` refuses, taking the engine child
@@ -727,6 +1020,179 @@ measured cache at full speed and reported it as cold without failing.
 not exist on Darwin, so the example failed to compile on the platform where `psync` is the
 permanent backend. `examples/pool-sweep.sh` had the mirror image, defaulting `BENCH_BIN` to
 `bench.exe`. Both come from writing a `#[cfg(unix)]` arm against Linux.
+
+### The io_uring investigation
+
+Preliminary: single runs of the `read` mode rather than medians of the full suite, so the direction
+carries and the magnitude does not.
+
+| Workload | Filesystem | `loreio` (psync) | `uring` |
+| --- | --- | --- | --- |
+| `read-64KiB-warm-c64` | ZFS | 645,569 | 197,668 |
+| `read-4KiB-warm-c128` | ZFS | 697,681 | 247,091 |
+| `read-64KiB-warm-c64` | tmpfs | 630,420 | 225,679 |
+| `read-4KiB-warm-c128` | tmpfs | 859,352 | 831,505 |
+
+**On ZFS the kernel cannot complete a ring read inline, so it punts every one to an `io-wq`
+worker.** Sampling the process's threads during a run shows 55 `iou-wrk-*` kernel workers on ZFS
+against 2 on tmpfs. That is the extra thread hop `psync` does not pay: its pool thread performs
+the ARC copy itself and returns. The 4 KiB row is the clean demonstration — 0.35× on ZFS, parity
+on tmpfs, same code.
+
+**The 64 KiB deficit has a different cause, and it is the important one: the ring serializes
+concurrent reads of a single file.** `io_uring` hashes buffered work on a regular file by inode,
+and io-wq runs only one worker per hash at a time, so 64 concurrent reads of one file execute one
+after another on one kernel thread. Three independent signals agree:
+
+- Thread sampling during the 64 KiB phase shows a single `iou-wrk` worker at 101% CPU, where
+  `psync` has 16 pool threads at ~108% each.
+- `perf stat` over the read phases: 1.94 CPUs utilized for `uring` against 7.8 for `psync`.
+- The throughput is single-core `memcpy` bandwidth. 7.7 GB/s is what one core copies; `psync`'s
+  48–54 GB/s is seven or eight cores of it.
+
+Spreading the same workload over more files confirms it directly — only the inode count changes:
+
+| Files the reads are spread over | `uring` ops/s |
+| --- | --- |
+| 1 | 107,534 |
+| 4 | 547,428 |
+| 8 | 419,534 |
+
+**One file is a worst case, and not the one the storage layer presents.** Addresses are
+hash-distributed over 256 pack-file groups — `group_index` is the first byte of the content hash —
+and each group's pack files roll at 3 GiB, so a server holds thousands of them and concurrent
+reads scatter across inodes. `LORE_BENCH_READ_SPREAD` measures that shape. Holding the working set
+constant at 256 MiB so that a wider spread does not also mean a colder one:
+
+| Reads spread over | `uring` ops/s | `psync` ops/s | ratio |
+| --- | --- | --- | --- |
+| 1 file | 181,810 | 915,773 | 0.20× |
+| 4 files | 511,946 | 796,551 | 0.64× |
+| 16 files | 554,136 | 785,898 | 0.71× |
+| 64 files | 611,581 | 803,281 | 0.76× |
+
+`psync` is flat across the sweep, which is the control: it has no inode sensitivity, so the
+movement is entirely the ring's. The serialization penalty is severe at one inode and mostly gone
+by four. So the 5× figure is an artefact of a benchmark that reads one file, while a real deficit
+survives at realistic spread.
+
+That deficit does not close with more files — it turns over. Two passes with the engine order
+reversed between them, so the shape is not position bias:
+
+| Spread | `uring` / `psync` pass 1 | pass 2 |
+| --- | --- | --- |
+| 64 | 0.77× | 0.81× |
+| 128 | 0.64× | 0.56× |
+| 256 | 0.65× | 0.60× |
+
+The peak sits at a spread equal to the workload's concurrency, which is where every in-flight read
+has an inode to itself; past that, extra files buy nothing and something starts costing. One
+confound to name: holding the working set constant means spread 128 is 2 MiB per file and spread
+256 is 1 MiB, so "more files" and "smaller files" are entangled at the top end and this experiment
+cannot separate them.
+
+Holding the working set constant matters more than it sounds. An earlier version of this sweep
+grew it with the file count, and both engines converged on ~285,000 ops/s at spread 32 — which
+looks like parity and is really both of them becoming device-bound.
+
+`O_DIRECT` is the kernel escape from the hash, since work on an `O_DIRECT` file is not hashed, but
+it bypasses the cache and so trades this for a worse problem on warm reads. Untested here.
+
+**Registered files do not explain the residual.** `IORING_REGISTER_FILES` with `IOSQE_FIXED_FILE`
+removes the per-operation `fget`/`fput` on the descriptor, which is the one per-op kernel cost
+`psync` does not pay — it holds an `Arc<File>`. Three rounds at spread 64 with the order
+alternated: plain 610,278 / 496,408 / 529,469, fixed 557,566 / 523,562 / 591,972. Medians 529,469
+against 557,566 with the ranges overlapping across most of their width, so there is no effect to
+report. The descriptor path is not where the deficit lives.
+
+**On ext4 the ring wins, and the deficit above is a ZFS story.** ext4 implements `IOCB_NOWAIT`, so
+a cached read completes during the submit syscall: zero `iou-wrk` workers appear and the ring
+reports 100% of completions drained by submitting threads. That changes which resource is scarce.
+The copy now runs on the submitting thread, so throughput is bounded by how many threads can be
+inside a ring — the driver count and the shard count — rather than by kernel workers.
+
+Both bounds had to be lifted, and each looks like a dead end until the other moves:
+
+| ext4, 64 KiB, spread 64 | `uring` | `psync` |
+| --- | --- | --- |
+| 1 driver, 5 shards | 200,753 | 980,121 |
+| 16 drivers, 5 shards | 538,988 | 816,894 |
+| 16 drivers, 16 shards | 1,017,672 | — |
+| 16 drivers, 32 shards | 1,029,863 | — |
+
+Interleaved with the order alternated, each engine at its best configuration: `uring` 1,006,508 /
+1,035,959 / 1,054,981 against `psync` 935,842 / 911,086 / 954,033 — medians 1,035,959 and 935,842,
+**1.11×**, with the ranges not overlapping.
+
+The shard count was the larger lever and it was mis-tuned, because it was tuned here. On ZFS the
+submitting thread copies nothing — a kernel worker does — so shards barely register, and
+`clamp(cores / 4, 2, 8)` looked fine. On ext4 it costs half the throughput. The default is now one
+shard per core, and on ZFS the wider count measures slightly better rather than worse, so nothing
+trades against it.
+
+These are the measurements that drove the shard count to one per core; the current figures for
+both filesystems are in *Results* above, and are lower than the 1.11× here because the suite now
+includes the repository-shaped phases. What remains true of ZFS is that with the punt in place no
+configuration moves the ring, because the ceiling is kernel-side. Per-thread sampling of that
+case:
+
+
+during a spread-64 run accounts for it:
+
+| Thread | CPU% |
+| --- | --- |
+| the thread driving the reads | 86.0 |
+| 5 × `iou-wrk` | ~78 each |
+| `lore-io-uring` (reaper) | 46.5 |
+| 20 × `tokio-rt-worker` | 0.0 |
+
+Five io-wq workers do all the copying — about four cores against the pool's sixteen threads — and
+that is the ceiling. The default bounded worker cap is roughly the core count, so at five the cap
+is not what binds: io-wq grows its pool when a worker *blocks*, and a cache hit never blocks, so
+for warm reads it stays at a handful however deep the queue gets. `psync` has sixteen threads
+standing by because this crate sized them.
+
+Two things follow that are easy to get backwards. The ring is not inefficient — the same accounting
+gives it roughly 9 µcore-seconds per operation against 19 for `psync`, so it does about half the
+work per read and loses only because it will not use the machine. And the reaper is not the
+problem either, at 46.5% of one core.
+
+Neither is the submission side, though the sample above makes it look that way. The reads are
+driven by `buffer_unordered` on the `block_on` thread, so every `io_uring_enter` is issued by that
+one thread at 86% while the tokio workers sit idle. Spreading the drive over long-lived tasks so
+submission lands on many worker threads makes `uring` *worse* — 594,334 ops/s at one driver,
+423,467 at four, 363,401 at sixteen — while `psync` stays flat at 759,698 / 701,247 / 706,897.
+More submitters contend on the per-shard submission and completion locks without adding copy
+workers, which are what is scarce.
+
+**Removing the ring's per-operation payload allocation changed nothing measurable**, which is
+what the io-wq ceiling predicts and is recorded so the result is not rediscovered. Each operation
+used to erase its payload behind `Box<dyn Any>` — a second heap allocation and a downcast on top of
+the entry's own `Arc` — where the syscall pool had already been cut to one allocation and no type
+erasure. Naming the completion function in a `repr(C)` header instead removes both. An interleaved
+A/B of the two builds, four rounds with the order alternated: boxed 561,540 / 657,244 / 526,731 /
+745,120, thin 534,328 / 579,761 / 676,373 / 629,050 — medians 609,392 and 604,406, ranges
+overlapping across nearly their whole width. Kept because it is less work and less code per
+operation, not because it is faster.
+
+A cross-batch look at the same change said 656,708 against 529,469 and looked like a 24% win. It
+was drift between sittings. This is the third time in this file that a plausible number came from
+comparing runs that were not interleaved.
+
+**Three further hypotheses that were tested and refuted**, kept because re-running them is not
+free. The per-ring submit lock, *on ZFS*: raising the shard count from 5 to 20 and lowering it to 2
+both measured worse than 5 — a reading that later failed to reproduce and that the ext4 result
+contradicts outright. Those runs came from different batches, which is the one mistake this file
+keeps recording; the shard count was in fact the single largest lever available, and dismissing it
+here cost several rounds of looking elsewhere. Submission batching: an elimination protocol that lets one thread
+enter on behalf of everything queued never fired, because on this workload submissions do not
+overlap — each task awaits its own read, so the submit path is rarely occupied by two threads at
+once, and the measured rate stayed at 1.0 operations per `io_uring_enter` with throughput
+unchanged. The io-wq worker cap: `IORING_REGISTER_IOWQ_MAX_WORKERS` raised to 16 and 64 changed
+nothing, because the limit that binds is the per-inode hash, not the worker ceiling.
+
+Note that one syscall per operation is not itself the problem: `psync` also costs one syscall per
+operation and is faster, so syscall count cannot be what separates them.
 
 ## See also
 
