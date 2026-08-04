@@ -2568,9 +2568,6 @@ dependencies = [
  "clap_complete",
  "libc",
  "lore",
- "lore-base",
- "lore-error-set",
- "lore-revision",
  "parking_lot",
  "serde",
  "serde_json",
@@ -2673,6 +2670,20 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "zerocopy",
+]
+
+[[package]]
+name = "lore-io"
+version = "0.8.7-nightly"
+dependencies = [
+ "bytes",
+ "crossbeam",
+ "futures",
+ "libc",
+ "lore-base",
+ "parking_lot",
+ "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
