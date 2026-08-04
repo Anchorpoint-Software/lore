@@ -1122,6 +1122,7 @@ async fn configure_local_mutable_store(
             flush_delay_seconds: settings.flush_delay_seconds as u64,
             initial_fan_out_level: lore_storage::local::fan_out::FAN_OUT_LEVEL_MAX, /* Server mode, full 256-bucket layout from the start */
             fan_out_threshold: lore_storage::local::fan_out::FAN_OUT_THRESHOLD_DEFAULT,
+            authoritative: true, /* Server local store is the source of truth, not a cache */
         },
         immutable_store,
     )
