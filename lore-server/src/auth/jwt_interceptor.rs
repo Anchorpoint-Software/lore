@@ -46,7 +46,7 @@ impl Interceptor for JWTInterceptor {
 
         let repository = get_repository(request.metadata()).unwrap_or_default();
         verify_authorization(&authorization, repository)
-            .map_err(|_err| tonic::Status::permission_denied("Unauthorized"))?;
+            .map_err(|_err| crate::grpc::no_repository_access_status())?;
 
         request.extensions_mut().insert(authorization);
 
