@@ -3537,6 +3537,8 @@ pub struct TreePath {
     pub path: RelativePath,
     pub address: Option<Address>,
     pub flags: NodeFlags,
+    pub size: u64,
+    pub mode: u64,
     /// True when a link node tracks its parent's branch; false for pinned
     /// links and all non-link nodes.
     pub tracking: bool,
@@ -3713,6 +3715,8 @@ async fn gather_tree_paths_node(
         path: node_path.clone(),
         address,
         flags,
+        size: node.size,
+        mode: node.mode as u64,
         tracking,
     });
 
