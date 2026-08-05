@@ -39,6 +39,7 @@ use tokio::sync::Semaphore;
 use tokio::sync::SemaphorePermit;
 use tokio::sync::oneshot;
 use url::Url;
+use webpki_roots::TLS_SERVER_ROOTS;
 
 use super::MAX_RTT_MS;
 use super::PACKET_THRESHOLD;
@@ -627,12 +628,16 @@ fn client_crypto_config(
     } else {
         let mut cert_store = RootCertStore::empty();
 
+        // load built in webpki certs
+        cert_store.extend(TLS_SERVER_ROOTS.iter().cloned());
+
         // load native certs
         let native_certs = load_native_certs();
         if native_certs.certs.is_empty() {
-            return Err(ProtocolError::internal(
-                "failed to load native certificates",
-            ));
+            lore_warn!(
+                "no certificates loaded from the OS trust store, continuing with the built-in webpki roots: {:?}",
+                native_certs.errors
+            );
         }
         for cert in native_certs.certs {
             let _ = cert_store.add(cert);

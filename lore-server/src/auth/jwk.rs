@@ -109,6 +109,9 @@ impl JwkServiceImpl {
             })?
         } else {
             let client = reqwest::Client::builder()
+                .use_rustls_tls()
+                .tls_built_in_webpki_certs(true)
+                .tls_built_in_native_certs(true)
                 .user_agent(user_agent())
                 .build()
                 .map_err(|e| {

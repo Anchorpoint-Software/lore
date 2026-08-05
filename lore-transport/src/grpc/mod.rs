@@ -566,6 +566,7 @@ async fn connect_to_endpoint(remote: &str) -> Result<Channel, ProtocolError> {
             .tls_config(
                 ClientTlsConfig::new()
                     .assume_http2(true)
+                    .with_webpki_roots()
                     .with_native_roots(),
             )
             .internal_with(|| format!("configuring TLS for {remote}"))?;

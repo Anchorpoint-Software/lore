@@ -2960,6 +2960,7 @@ dependencies = [
  "tonic",
  "tower",
  "url",
+ "webpki-roots",
  "zerocopy",
 ]
 
@@ -3864,6 +3865,7 @@ dependencies = [
  "pin-project-lite",
  "quinn",
  "rustls",
+ "rustls-native-certs",
  "rustls-pki-types",
  "serde",
  "serde_json",
@@ -4821,6 +4823,7 @@ dependencies = [
  "tower-layer",
  "tower-service",
  "tracing",
+ "webpki-roots",
 ]
 
 [[package]]
