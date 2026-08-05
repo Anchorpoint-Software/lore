@@ -16,6 +16,8 @@ pub struct OpenOptions {
     create: bool,
     create_new: bool,
     truncate: bool,
+    #[cfg(target_family = "windows")]
+    share_mode: Option<u32>,
 }
 
 impl OpenOptions {
@@ -48,6 +50,14 @@ impl OpenOptions {
         self
     }
 
+    /// Overrides the Windows share mode (`FILE_SHARE_*` flags), mirroring
+    /// `std::os::windows::fs::OpenOptionsExt::share_mode`.
+    #[cfg(target_family = "windows")]
+    pub fn share_mode(mut self, share_mode: u32) -> OpenOptions {
+        self.share_mode = Some(share_mode);
+        self
+    }
+
     pub(crate) fn to_std(&self) -> std::fs::OpenOptions {
         let mut options = std::fs::OpenOptions::new();
         options
@@ -64,6 +74,9 @@ impl OpenOptions {
         {
             use std::os::windows::fs::OpenOptionsExt;
             options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED);
+            if let Some(share_mode) = self.share_mode {
+                options.share_mode(share_mode);
+            }
         }
         options
     }

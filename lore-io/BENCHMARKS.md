@@ -123,7 +123,7 @@ on a volume before trusting a cold sitting there.
 | `LORE_BENCH_BLOCKING_THREADS` | The `blocking` engine's tokio pool, overriding `min(2 × (cores + 1), 128)`. The baseline's counterpart to `LORE_IO_POOL_THREADS`, which makes a cap sweep's control runnable. |
 | `LORE_BENCH_DRIVERS` | Long-lived driver tasks for the two synthetic read phases, so submission runs on many worker threads rather than the one driving `buffer_unordered`. Default 16. At one it measures the driver rather than the backend, for any engine that completes on the submitting thread. |
 | `LORE_BENCH_READ_SPREAD` | Files the two synthetic *warm* read phases spread over, each holding `1/N` of the data so the working set does not change with the count. Default 64, the larger phase's concurrency. At one it measures `io_uring`'s per-inode serialization and little else. The cold phases always read one file; see *Harness defects*. |
-| `LORE_IO_BACKEND` | Backend the driver selects (`auto`, `psync`, `uring` on Linux, `iocp` on Windows). `auto` takes the platform's completion backend where it can create one and falls back to `psync`. The benchmark selects backends by engine tag instead, so this only matters when profiling something else in the process. |
+| `LORE_IO_BACKEND` | Backend the driver selects (`auto`, `psync`, `uring` on Linux, `iocp` on Windows). `auto` selects `psync` on every platform, so this is how a completion backend is chosen outside the benchmark. The benchmark selects backends by engine tag instead, so this only matters when profiling something else in the process. |
 | `LORE_IO_POOL_THREADS` | Syscall pool cap, overriding `min(2 × cores, 16)`. Rejects zero and anything above 128. |
 | `LORE_IO_IOCP_REAPERS` | Threads draining the Windows completion port, overriding the default of one. Accepts 1 to 64. For re-running the sweep below on another machine, not for sizing a deployment. |
 | `LORE_BENCH_COLD_BUDGET_GIB` | Total disk the cold data sets may occupy across every engine and both large-file phases. Default 32. `prepare-cold` sizes each phase to run for about a second at the rate it measures, and this caps the result; where the cap binds, the projected phase duration is reported and warned about if it falls under the 0.25 s floor. |
@@ -338,9 +338,12 @@ wait. It measures 0.72× on the commit-shaped read phase, where the driver-task 
 point at which this backend peaks. Cold, it takes the 4 KiB phase by 2.27× and ties the 64 KiB
 phase, where both backends saturate the device. See *Windows: the completion-port backend*.
 
-**`auto` prefers a completion backend on both platforms that have one.** Neither preference is a
-settled throughput win, and both are provisional: the migration is internal and nothing depends on
-the engine, so exposure is what will surface the remaining problems.
+**`auto` selects `psync` on every platform, against everything above.** The phases here are
+synthetic, and the smoke suite is not: driving the real call sites end to end, it measured a
+regression under the completion backends and recovered under `psync`. A whole-workload result
+outranks a per-operation one, so the completion backends became opt-in. The disagreement between the
+two measurements is unexplained and nothing here explains it — these numbers say what the mechanism
+can do per operation, not what a repository operation costs.
 
 **No single warm phase wins on every host.** The 64 KiB read is the best result on Hosts A, B and
 C — 1.10×, 1.16×, 2.87× — and 0.99× on Host D with overlapping ranges. The 4 KiB read runs the

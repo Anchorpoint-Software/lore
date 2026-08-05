@@ -99,34 +99,22 @@ const SUPPORTED_BACKENDS: &str = "auto, psync, iocp";
 #[cfg(not(any(target_os = "linux", target_family = "windows")))]
 const SUPPORTED_BACKENDS: &str = "auto, psync";
 
-/// The best backend this machine can run, for [`BackendKind::Auto`].
+/// The backend [`BackendKind::Auto`] hands out: `psync`, on every platform.
 ///
-/// A ring that cannot be created — an older kernel, a seccomp policy or a container that blocks
-/// `io_uring_setup` — falls back rather than failing, because the caller asked for the best
-/// available backend and not for a specific one. [`BackendKind::Uring`] is how a caller says the
-/// ring is the point and a failure to get one should surface.
+/// The completion backends take most of the synthetic phases, and the earlier rule preferred them
+/// wherever one could be created. What overrode that is the smoke suite, which drives the real call
+/// sites end to end: it measured a regression under the completion backends and recovered under
+/// `psync`. A whole-workload result outranks a per-operation one, and `psync` is also the semantic
+/// reference the other two are conformance-tested against, so it is what a caller expressing no
+/// preference should get.
 ///
-/// On Windows the probe prefers [`BackendKind::Iocp`], and what settles it is threads rather than
-/// throughput. Two threads carry there what thirty-two parked in `GetOverlappedResult` carry on
-/// the pool, because a positional operation on this platform defers and `psync` holds a thread
-/// across the wait; this crate shares a process-wide budget with a host application's own
-/// populations, so a backend that reaches higher throughput on a fraction of the threads is the
-/// one to hand out unasked.
-///
-/// It is not a clean win and the cost is known: throughput falls off as the number of tasks
-/// driving the backend rises past sixteen, which costs 0.72× on the commit-shaped read phase where
-/// one task per core drives it. `lore-io/BENCHMARKS.md` has the shape of that and the sweep behind
-/// it. [`BackendKind::Psync`] is how a caller whose workload has that shape takes the other side,
-/// and it stays the portable baseline and the semantic reference everywhere.
+/// This is a default, not a verdict on the mechanism. Where the end-to-end cost sits is still
+/// unmeasured — the synthetic phases and the suite disagree, and neither the ring's submission path
+/// nor the completion port's has been profiled under the suite's access pattern.
+/// [`BackendKind::Uring`], [`BackendKind::Iocp`] and `LORE_IO_BACKEND` select them explicitly, which
+/// is how that investigation gets its A/B without a code change. `lore-io/BENCHMARKS.md` has the
+/// per-case numbers.
 fn probe() -> DriverInner {
-    #[cfg(target_os = "linux")]
-    if let Ok(driver) = UringDriver::new() {
-        return DriverInner::Uring(driver);
-    }
-    #[cfg(target_family = "windows")]
-    if let Ok(driver) = IocpDriver::new() {
-        return DriverInner::Iocp(driver);
-    }
     DriverInner::Psync(PsyncDriver)
 }
 
