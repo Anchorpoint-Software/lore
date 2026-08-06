@@ -2527,6 +2527,7 @@ version = "0.8.7-nightly"
 dependencies = [
  "anyhow",
  "backtrace",
+ "bitcode",
  "bitflags",
  "blake3",
  "bytes",

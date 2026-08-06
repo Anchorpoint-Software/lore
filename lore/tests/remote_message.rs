@@ -8,6 +8,12 @@ use lore::remote::message::V1Header;
 use lore::remote::message::blocking_read_v1_message;
 use lore::remote::message::write_v1_message;
 use lore::repository::LoreRepositoryStatusArgs;
+use lore::revision_tree::add::LoreRevisionTreeAddArgs;
+use lore::revision_tree::add::LoreRevisionTreeAddEntry;
+use lore::revision_tree::handle::LoreRevisionTree;
+use lore_base::types::Address;
+use lore_base::types::Context;
+use lore_base::types::Hash;
 use lore_revision::interface::LoreArray;
 use lore_revision::interface::LoreGlobalArgs;
 use lore_revision::interface::LoreString;
@@ -69,6 +75,60 @@ async fn message_to_server_to_and_from_bytes() {
         }
         _ => {
             panic!("Unexpected command");
+        }
+    }
+}
+
+/// A command carrying an address must survive both wire encodings. Bincode is
+/// the one that used to fail: `Hash`, `Context` and `Address` were read with
+/// `deserialize_any`, which a non-self-describing format cannot answer, so every
+/// such command was unreadable however it was written.
+#[tokio::test]
+async fn a_command_carrying_an_address_survives_both_serializations() {
+    let address = Address {
+        hash: Hash::from([0x37u8; 32]),
+        context: Context::from([0x73u8; 16]),
+    };
+    let args = LoreRevisionTreeAddArgs {
+        id: 900,
+        handle: LoreRevisionTree { handle_id: 5 },
+        entries: LoreArray::from_vec(vec![LoreRevisionTreeAddEntry {
+            id: 1,
+            parent_node_id: 0,
+            parent_entry: 0,
+            name: LoreString::from_str("payload.bin"),
+            kind: 1,
+            mode: 0o644,
+            size: 4096,
+            address,
+        }]),
+    };
+
+    for (serialization, label) in [
+        (SerializationType::Json, "json"),
+        (SerializationType::Bincode, "bincode"),
+    ] {
+        let message = MessageToServer {
+            globals: LoreGlobalArgs::default(),
+            command: LoreCommand::RevisionTreeAdd(args.clone()),
+        };
+        let message_bytes = write_v1_message(message, serialization).unwrap();
+        let processed: Result<Option<(V1Header, MessageToServer)>, MessageError> =
+            blocking_read_v1_message(&mut message_bytes.as_slice());
+        let processed = processed
+            .unwrap_or_else(|error| panic!("{label} must read back: {error:?}"))
+            .expect("a whole message must be present");
+
+        match processed.1.command {
+            LoreCommand::RevisionTreeAdd(read_back) => {
+                assert_eq!(
+                    read_back.entries.as_slice()[0].address,
+                    address,
+                    "{label} must carry the address unchanged"
+                );
+                assert_eq!(read_back.entries.as_slice(), args.entries.as_slice());
+            }
+            _ => panic!("Unexpected command"),
         }
     }
 }
