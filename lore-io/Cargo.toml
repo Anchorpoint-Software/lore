@@ -14,6 +14,8 @@ parking_lot = { workspace = true }
 # The uring backend is the only part of the library that calls libc, for eventfd and poll.
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = { workspace = true }
+
+[target.'cfg(target_family = "unix")'.dependencies]
 libc = { workspace = true }
 
 # Windows only, and load-bearing rather than convenience: handles opened here are overlapped, so
@@ -45,10 +47,6 @@ windows-sys = { workspace = true, features = [
 futures = { workspace = true }
 lore-base = { workspace = true }
 tokio = { workspace = true }
-
-# The benchmark example uses libc for cache eviction and sync on every unix, not only Linux.
-[target.'cfg(target_family = "unix")'.dev-dependencies]
-libc = { workspace = true }
 
 # A named pipe is the only thing a unit test can make defer on demand, and deferring is the whole
 # of what the completion-port backend is for. See `iocp::tests::overlapped_pipe_pair`.
