@@ -26,6 +26,9 @@ use io_uring::types;
 use parking_lot::Mutex;
 
 use crate::buffer::StableBuf;
+use crate::buffer::StableBufList;
+use crate::buffer::StableBufListMut;
+use crate::psync::MAX_IO_SEGMENTS;
 use crate::psync::PsyncDriver;
 
 const RING_ENTRIES: u32 = 256;
@@ -126,6 +129,72 @@ unsafe fn complete_typed<P>(header: *const OpHeader, result: i32) {
 struct OpPayload<B> {
     buffer: B,
     _file: Arc<File>,
+}
+
+/// Iovec array owned by a vectored operation's payload so the kernel can
+/// read it for the whole flight of the SQE.
+struct OwnedIovecs(Vec<libc::iovec>);
+
+// Safety: the iovec pointers target segments of the StableBuf list moved
+// into the same payload, which is itself Send; the pointers are only
+// dereferenced by the kernel
+unsafe impl Send for OwnedIovecs {}
+
+struct VectoredPayload<B> {
+    buffers: B,
+    _iovecs: OwnedIovecs,
+    _file: Arc<File>,
+}
+
+// The iovec builders are plain functions so the raw `Vec<libc::iovec>`
+// (not Send) never exists as a local in the async fns, whose futures must
+// stay Send; the Send-asserting OwnedIovecs wrapper is built here.
+fn prepare_read_iovecs<B: StableBufListMut>(buffers: &mut B, skip: usize) -> OwnedIovecs {
+    let mut iovecs: Vec<libc::iovec> = Vec::new();
+    let mut remaining_skip = skip;
+    for segment in buffers.byte_segments_mut() {
+        if iovecs.len() == MAX_IO_SEGMENTS {
+            break;
+        }
+        let len = segment.len();
+        if remaining_skip >= len {
+            remaining_skip -= len;
+            continue;
+        }
+        iovecs.push(libc::iovec {
+            // Safety: remaining_skip is within the segment bounds
+            iov_base: unsafe { segment.as_mut_ptr().add(remaining_skip) }.cast(),
+            iov_len: len - remaining_skip,
+        });
+        remaining_skip = 0;
+    }
+    OwnedIovecs(iovecs)
+}
+
+fn prepare_write_iovecs<B: StableBufList>(buffers: &B, skip: usize) -> OwnedIovecs {
+    let mut iovecs: Vec<libc::iovec> = Vec::new();
+    let mut remaining_skip = skip;
+    for segment in buffers.byte_segments() {
+        if iovecs.len() == MAX_IO_SEGMENTS {
+            break;
+        }
+        let len = segment.len();
+        if remaining_skip >= len {
+            remaining_skip -= len;
+            continue;
+        }
+        iovecs.push(libc::iovec {
+            // Safety: remaining_skip is within the segment bounds; writes
+            // only read through the pointer, so the const-to-mut cast that
+            // the iovec layout requires never mutates the segment
+            iov_base: unsafe { segment.as_ptr().add(remaining_skip) }
+                .cast_mut()
+                .cast(),
+            iov_len: len - remaining_skip,
+        });
+        remaining_skip = 0;
+    }
+    OwnedIovecs(iovecs)
 }
 
 struct RingShard {
@@ -344,6 +413,69 @@ impl UringDriver {
         Ok(buffer)
     }
 
+    /// Scatters one read across the segments, returning how many bytes it filled.
+    ///
+    /// The iovec array is rebuilt for every pass because it travels into the op entry with the
+    /// segments, and a pass that made partial progress needs a different array anyway: the skip
+    /// moves and the leading segments drop out.
+    pub(crate) async fn read_vectored_at<B: StableBufListMut>(
+        &self,
+        file: Arc<File>,
+        buffers: B,
+        skip: usize,
+        offset: u64,
+    ) -> std::io::Result<(B, usize)> {
+        let mut buffers = buffers;
+        loop {
+            let iovecs = prepare_read_iovecs(&mut buffers, skip);
+            if iovecs.0.is_empty() {
+                return Ok((buffers, 0));
+            }
+            let entry = readv_entry(&file, &iovecs, offset);
+            let payload = VectoredPayload {
+                buffers,
+                _iovecs: iovecs,
+                _file: Arc::clone(&file),
+            };
+            let (payload, result) = self.submit(entry, payload)?.await;
+            buffers = payload.buffers;
+            match interpret(result)? {
+                Progress::Interrupted => {}
+                Progress::Bytes(read) => return Ok((buffers, read)),
+            }
+        }
+    }
+
+    /// Gathers one write from the segments, returning how many bytes it consumed. See
+    /// [`Self::read_vectored_at`] for why the iovec array is rebuilt per pass.
+    pub(crate) async fn write_vectored_at<B: StableBufList>(
+        &self,
+        file: Arc<File>,
+        buffers: B,
+        skip: usize,
+        offset: u64,
+    ) -> std::io::Result<(B, usize)> {
+        let mut buffers = buffers;
+        loop {
+            let iovecs = prepare_write_iovecs(&buffers, skip);
+            if iovecs.0.is_empty() {
+                return Ok((buffers, 0));
+            }
+            let entry = writev_entry(&file, &iovecs, offset);
+            let payload = VectoredPayload {
+                buffers,
+                _iovecs: iovecs,
+                _file: Arc::clone(&file),
+            };
+            let (payload, result) = self.submit(entry, payload)?.await;
+            buffers = payload.buffers;
+            match interpret(result)? {
+                Progress::Interrupted => {}
+                Progress::Bytes(written) => return Ok((buffers, written)),
+            }
+        }
+    }
+
     pub(crate) async fn sync(&self, file: Arc<File>, data_only: bool) -> std::io::Result<()> {
         let fd = types::Fd(file.as_raw_fd());
         let mut fsync = opcode::Fsync::new(fd);
@@ -368,6 +500,15 @@ impl UringDriver {
         PsyncDriver.open(options, path).await
     }
 
+    pub(crate) async fn open_read_head(
+        &self,
+        options: std::fs::OpenOptions,
+        path: PathBuf,
+        head_len: usize,
+    ) -> std::io::Result<(File, std::fs::Metadata, Bytes)> {
+        PsyncDriver.open_read_head(options, path, head_len).await
+    }
+
     pub(crate) async fn read_file_bytes(&self, path: PathBuf) -> std::io::Result<Bytes> {
         PsyncDriver.read_file_bytes(path).await
     }
@@ -379,6 +520,30 @@ impl UringDriver {
         durable: bool,
     ) -> std::io::Result<std::fs::Metadata> {
         PsyncDriver.write_file_bytes(path, data, durable).await
+    }
+
+    pub(crate) async fn write_file_segments<B: StableBufList>(
+        &self,
+        options: std::fs::OpenOptions,
+        path: PathBuf,
+        buffers: B,
+        durable: bool,
+    ) -> std::io::Result<()> {
+        PsyncDriver
+            .write_file_segments(options, path, buffers, durable)
+            .await
+    }
+
+    pub(crate) async fn write_file_segments_atomic<B: StableBufList>(
+        &self,
+        options: std::fs::OpenOptions,
+        temporary_path: PathBuf,
+        final_path: PathBuf,
+        buffers: B,
+    ) -> std::io::Result<()> {
+        PsyncDriver
+            .write_file_segments_atomic(options, temporary_path, final_path, buffers)
+            .await
     }
 
     pub(crate) async fn metadata(&self, path: PathBuf) -> std::io::Result<std::fs::Metadata> {
@@ -544,6 +709,32 @@ fn write_entry(file: &File, buffer: &[u8], at: usize, len: usize, offset: u64) -
     opcode::Write::new(types::Fd(file.as_raw_fd()), pointer, len as u32)
         .offset(offset)
         .build()
+}
+
+/// Builds a scattering read into the segments the iovecs point at.
+fn readv_entry(file: &File, iovecs: &OwnedIovecs, offset: u64) -> squeue::Entry {
+    // Safety: the segments and the iovec array both live in the op entry until the completion
+    // arrives — `StableBufListMut` keeps the segment memory in place, and moving the vector into
+    // the payload does not move its heap allocation
+    opcode::Readv::new(
+        types::Fd(file.as_raw_fd()),
+        iovecs.0.as_ptr(),
+        iovecs.0.len() as u32,
+    )
+    .offset(offset)
+    .build()
+}
+
+/// Builds a gathering write from the segments the iovecs point at.
+fn writev_entry(file: &File, iovecs: &OwnedIovecs, offset: u64) -> squeue::Entry {
+    // Safety: as in `readv_entry`, with `StableBufList` providing the segment stability
+    opcode::Writev::new(
+        types::Fd(file.as_raw_fd()),
+        iovecs.0.as_ptr(),
+        iovecs.0.len() as u32,
+    )
+    .offset(offset)
+    .build()
 }
 
 fn new_event_fd() -> std::io::Result<OwnedFd> {

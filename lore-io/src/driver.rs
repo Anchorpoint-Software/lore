@@ -3,9 +3,11 @@
 //! Driver construction and backend dispatch.
 //!
 //! The backend surface is the set of operations [`DriverInner`]'s match arms call: `open`,
-//! `read_at`, `read_exact_at`, `write_at`, `write_all_at`, `read_file_bytes`, `write_file_bytes`,
-//! `sync`, `metadata`, `file_metadata`, `set_len`, `rename`, `remove_file` and `create_dir_all`.
-//! A backend implements all fourteen as inherent methods on its own type.
+//! `read_at`, `read_exact_at`, `read_vectored_at`, `write_at`, `write_all_at`,
+//! `write_vectored_at`, `open_read_head`, `read_file_bytes`, `write_file_bytes`,
+//! `write_file_segments`, `write_file_segments_atomic`, `sync`, `metadata`, `file_metadata`,
+//! `set_len`, `rename`, `remove_file` and `create_dir_all`. A backend implements all nineteen as
+//! inherent methods on its own type.
 //!
 //! Every operation dispatches, including the metadata ones a completion backend will keep on the
 //! syscall pool anyway — a ring-submitted `statx` is punted to a kernel worker making the same
@@ -33,6 +35,8 @@ use std::sync::OnceLock;
 use bytes::Bytes;
 
 use crate::buffer::StableBuf;
+use crate::buffer::StableBufList;
+use crate::buffer::StableBufListMut;
 use crate::file::IoFile;
 use crate::file::OpenOptions;
 #[cfg(target_family = "windows")]
@@ -241,6 +245,118 @@ impl IoDriver {
         Ok(IoFile::new(self.clone(), Arc::new(file)))
     }
 
+    /// Opens a file and reads its first `head_len` bytes (or the whole
+    /// file when smaller) in a single backend dispatch — open, stat,
+    /// read. Returns the open file, its metadata, and the head bytes.
+    ///
+    /// For header-then-body access patterns: when the file fits in the
+    /// head, the caller is done after one dispatch; otherwise the
+    /// returned handle serves the follow-up positional reads.
+    pub async fn open_read_head(
+        &self,
+        path: impl AsRef<Path>,
+        options: &OpenOptions,
+        head_len: usize,
+    ) -> std::io::Result<(IoFile, std::fs::Metadata, Bytes)> {
+        let std_options = options.to_std();
+        let path = path.as_ref().to_path_buf();
+        let (file, metadata, head) = match &*self.inner {
+            DriverInner::Psync(driver) => {
+                driver.open_read_head(std_options, path, head_len).await?
+            }
+            #[cfg(target_os = "linux")]
+            DriverInner::Uring(driver) => {
+                driver.open_read_head(std_options, path, head_len).await?
+            }
+            #[cfg(target_family = "windows")]
+            DriverInner::Iocp(driver) => driver.open_read_head(std_options, path, head_len).await?,
+        };
+        Ok((IoFile::new(self.clone(), Arc::new(file)), metadata, head))
+    }
+
+    /// The storage layer's atomic durable whole-file write as a single
+    /// backend dispatch: creates `temporary_path` (per `options`), writes
+    /// the gathered contents of all segments, syncs file data and
+    /// metadata, renames over `final_path`, and best-effort syncs the
+    /// parent directory.
+    ///
+    /// On error the temporary file may be left behind; callers own its
+    /// cleanup.
+    ///
+    /// The segments are consumed rather than handed back, and dropped as soon as the kernel has
+    /// the bytes — before the sync and the rename, which touch the page cache and the directory
+    /// rather than the caller's memory. A caller holding a lock to keep the segments stable
+    /// therefore holds it across the gather alone. The drop happens on the thread running the
+    /// operation, so anything it releases is released there.
+    pub async fn write_file_segments_atomic<B: StableBufList>(
+        &self,
+        temporary_path: impl AsRef<Path>,
+        final_path: impl AsRef<Path>,
+        options: &OpenOptions,
+        buffers: B,
+    ) -> std::io::Result<()> {
+        let std_options = options.to_std();
+        let temporary_path = temporary_path.as_ref().to_path_buf();
+        let final_path = final_path.as_ref().to_path_buf();
+        match &*self.inner {
+            DriverInner::Psync(driver) => {
+                driver
+                    .write_file_segments_atomic(std_options, temporary_path, final_path, buffers)
+                    .await
+            }
+            #[cfg(target_os = "linux")]
+            DriverInner::Uring(driver) => {
+                driver
+                    .write_file_segments_atomic(std_options, temporary_path, final_path, buffers)
+                    .await
+            }
+            #[cfg(target_family = "windows")]
+            DriverInner::Iocp(driver) => {
+                driver
+                    .write_file_segments_atomic(std_options, temporary_path, final_path, buffers)
+                    .await
+            }
+        }
+    }
+
+    /// Creates (or truncates, per `options`) `path` and writes the
+    /// gathered contents of all segments in a single backend dispatch —
+    /// open, vectored write, optional sync-all, close. The whole-file
+    /// write twin of [`open_read_head`](Self::open_read_head) for
+    /// multi-segment payloads.
+    ///
+    /// Releases the segments after the gather, as
+    /// [`write_file_segments_atomic`](Self::write_file_segments_atomic) does.
+    pub async fn write_file_segments<B: StableBufList>(
+        &self,
+        path: impl AsRef<Path>,
+        options: &OpenOptions,
+        buffers: B,
+        durable: bool,
+    ) -> std::io::Result<()> {
+        let std_options = options.to_std();
+        let path = path.as_ref().to_path_buf();
+        match &*self.inner {
+            DriverInner::Psync(driver) => {
+                driver
+                    .write_file_segments(std_options, path, buffers, durable)
+                    .await
+            }
+            #[cfg(target_os = "linux")]
+            DriverInner::Uring(driver) => {
+                driver
+                    .write_file_segments(std_options, path, buffers, durable)
+                    .await
+            }
+            #[cfg(target_family = "windows")]
+            DriverInner::Iocp(driver) => {
+                driver
+                    .write_file_segments(std_options, path, buffers, durable)
+                    .await
+            }
+        }
+    }
+
     pub async fn metadata(&self, path: impl AsRef<Path>) -> std::io::Result<std::fs::Metadata> {
         let path = path.as_ref().to_path_buf();
         match &*self.inner {
@@ -432,6 +548,48 @@ impl IoDriver {
                 driver
                     .write_at(file, buffer, buffer_offset, len, offset)
                     .await
+            }
+        }
+    }
+
+    pub(crate) async fn read_vectored_at_raw<B: StableBufListMut>(
+        &self,
+        file: Arc<File>,
+        buffers: B,
+        skip: usize,
+        offset: u64,
+    ) -> std::io::Result<(B, usize)> {
+        match &*self.inner {
+            DriverInner::Psync(driver) => {
+                driver.read_vectored_at(file, buffers, skip, offset).await
+            }
+            #[cfg(target_os = "linux")]
+            DriverInner::Uring(driver) => {
+                driver.read_vectored_at(file, buffers, skip, offset).await
+            }
+            #[cfg(target_family = "windows")]
+            DriverInner::Iocp(driver) => driver.read_vectored_at(file, buffers, skip, offset).await,
+        }
+    }
+
+    pub(crate) async fn write_vectored_at_raw<B: StableBufList>(
+        &self,
+        file: Arc<File>,
+        buffers: B,
+        skip: usize,
+        offset: u64,
+    ) -> std::io::Result<(B, usize)> {
+        match &*self.inner {
+            DriverInner::Psync(driver) => {
+                driver.write_vectored_at(file, buffers, skip, offset).await
+            }
+            #[cfg(target_os = "linux")]
+            DriverInner::Uring(driver) => {
+                driver.write_vectored_at(file, buffers, skip, offset).await
+            }
+            #[cfg(target_family = "windows")]
+            DriverInner::Iocp(driver) => {
+                driver.write_vectored_at(file, buffers, skip, offset).await
             }
         }
     }

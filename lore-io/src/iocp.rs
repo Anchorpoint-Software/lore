@@ -74,6 +74,8 @@ use windows_sys::Win32::System::WindowsProgramming::FILE_SKIP_COMPLETION_PORT_ON
 use windows_sys::Win32::System::WindowsProgramming::FILE_SKIP_SET_EVENT_ON_HANDLE;
 
 use crate::buffer::StableBuf;
+use crate::buffer::StableBufList;
+use crate::buffer::StableBufListMut;
 use crate::psync::PsyncDriver;
 
 /// Completion packets taken per `GetQueuedCompletionStatusEx` call, so a burst costs one syscall
@@ -453,6 +455,134 @@ impl IocpDriver {
         Ok(buffer)
     }
 
+    /// Scatters a read across the segments, one segment per operation.
+    ///
+    /// Windows has no positional scatter/gather call for an ordinary handle — `ReadFileScatter`
+    /// takes page-aligned, sector-sized segments only — so a segment list becomes a sequence of
+    /// operations however it is issued. Issuing them here rather than forwarding to
+    /// [`PsyncDriver`] is what keeps them off the pool: the psync backend walks the segments with
+    /// blocking positional calls inside one dispatch, holding a thread for the whole list.
+    ///
+    /// Forwarding would also be unsound. Every operation on a handle registered with the port
+    /// queues a packet to it, and the psync path issues its own `OVERLAPPED` from the stack, so the
+    /// reaper would take a foreign pointer for an operation entry. The composites below forward
+    /// safely because each opens its own handle, which is never registered.
+    pub(crate) async fn read_vectored_at<B: StableBufListMut>(
+        &self,
+        file: Arc<File>,
+        buffers: B,
+        skip: usize,
+        offset: u64,
+    ) -> std::io::Result<(B, usize)> {
+        match self.read_segment(&file, buffers, skip, offset) {
+            Ok(operation) => {
+                let (payload, result) = operation.await;
+                Ok((payload.buffer, at_eof(result)?))
+            }
+            Err(buffers) => Ok((buffers, 0)),
+        }
+    }
+
+    /// Gathers a write from the segments, one segment per operation. See
+    /// [`Self::read_vectored_at`].
+    pub(crate) async fn write_vectored_at<B: StableBufList>(
+        &self,
+        file: Arc<File>,
+        buffers: B,
+        skip: usize,
+        offset: u64,
+    ) -> std::io::Result<(B, usize)> {
+        match self.write_segment(&file, buffers, skip, offset) {
+            Ok(operation) => {
+                let (payload, result) = operation.await;
+                Ok((payload.buffer, result?))
+            }
+            Err(buffers) => Ok((buffers, 0)),
+        }
+    }
+
+    /// Issues one read into the first segment `skip` does not cover, handing the segments straight
+    /// back when it covers them all.
+    ///
+    /// Building the operation outside the `async fn` keeps the raw pointer out of the future, which
+    /// has to stay `Send`; it is the same reason the ring backend builds its iovec array in a plain
+    /// function.
+    fn read_segment<B: StableBufListMut>(
+        &self,
+        file: &Arc<File>,
+        mut buffers: B,
+        skip: usize,
+        offset: u64,
+    ) -> Result<OpFuture<OpPayload<B>>, B> {
+        let mut remaining = skip;
+        let mut target = None;
+        for segment in buffers.byte_segments_mut() {
+            let len = segment.len();
+            if remaining >= len {
+                remaining -= len;
+                continue;
+            }
+            // SAFETY: `remaining` is within the segment's bounds, having failed the test above.
+            target = Some((
+                unsafe { segment.as_mut_ptr().add(remaining) },
+                len - remaining,
+            ));
+            break;
+        }
+        let Some((pointer, len)) = target else {
+            return Err(buffers);
+        };
+        let len = transfer_len(len);
+        let handle: HANDLE = file.as_raw_handle();
+        Ok(self.submit(
+            handle,
+            offset,
+            payload(buffers, file),
+            |handle, transferred, overlapped| {
+                // SAFETY: Calling OS functions. `pointer` and `len` describe segment memory the
+                // entry owns for the operation's whole kernel lifetime — moving the segment list
+                // into the payload does not move the segments themselves.
+                unsafe { ReadFile(handle, pointer, len, transferred, overlapped) }
+            },
+        ))
+    }
+
+    /// Issues one write from the first segment `skip` does not cover. See [`Self::read_segment`].
+    fn write_segment<B: StableBufList>(
+        &self,
+        file: &Arc<File>,
+        buffers: B,
+        skip: usize,
+        offset: u64,
+    ) -> Result<OpFuture<OpPayload<B>>, B> {
+        let mut remaining = skip;
+        let mut target = None;
+        for segment in buffers.byte_segments() {
+            let len = segment.len();
+            if remaining >= len {
+                remaining -= len;
+                continue;
+            }
+            // SAFETY: `remaining` is within the segment's bounds, having failed the test above.
+            target = Some((unsafe { segment.as_ptr().add(remaining) }, len - remaining));
+            break;
+        }
+        let Some((pointer, len)) = target else {
+            return Err(buffers);
+        };
+        let len = transfer_len(len);
+        let handle: HANDLE = file.as_raw_handle();
+        Ok(self.submit(
+            handle,
+            offset,
+            payload(buffers, file),
+            |handle, transferred, overlapped| {
+                // SAFETY: Calling OS functions, as in `read_segment`.
+                unsafe { WriteFile(handle, pointer, len, transferred, overlapped) }
+            },
+        ))
+    }
+
     /// Issues one read of `len` bytes into `buffer` at `at`.
     ///
     /// The pointer is taken before the buffer moves into the payload, which is the same order the
@@ -595,6 +725,20 @@ impl IocpDriver {
         PsyncDriver.sync(file, data_only).await
     }
 
+    /// Opens through the syscall pool and registers the handle, so the positional reads the caller
+    /// makes on it afterwards go through the port. The head itself is read before registration, by
+    /// the pool thread that opened the file.
+    pub(crate) async fn open_read_head(
+        &self,
+        options: std::fs::OpenOptions,
+        path: PathBuf,
+        head_len: usize,
+    ) -> std::io::Result<(File, std::fs::Metadata, Bytes)> {
+        let (file, metadata, head) = PsyncDriver.open_read_head(options, path, head_len).await?;
+        self.register(&file)?;
+        Ok((file, metadata, head))
+    }
+
     pub(crate) async fn read_file_bytes(&self, path: PathBuf) -> std::io::Result<Bytes> {
         PsyncDriver.read_file_bytes(path).await
     }
@@ -606,6 +750,30 @@ impl IocpDriver {
         durable: bool,
     ) -> std::io::Result<std::fs::Metadata> {
         PsyncDriver.write_file_bytes(path, data, durable).await
+    }
+
+    pub(crate) async fn write_file_segments<B: StableBufList>(
+        &self,
+        options: std::fs::OpenOptions,
+        path: PathBuf,
+        buffers: B,
+        durable: bool,
+    ) -> std::io::Result<()> {
+        PsyncDriver
+            .write_file_segments(options, path, buffers, durable)
+            .await
+    }
+
+    pub(crate) async fn write_file_segments_atomic<B: StableBufList>(
+        &self,
+        options: std::fs::OpenOptions,
+        temporary_path: PathBuf,
+        final_path: PathBuf,
+        buffers: B,
+    ) -> std::io::Result<()> {
+        PsyncDriver
+            .write_file_segments_atomic(options, temporary_path, final_path, buffers)
+            .await
     }
 
     pub(crate) async fn metadata(&self, path: PathBuf) -> std::io::Result<std::fs::Metadata> {

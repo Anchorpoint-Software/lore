@@ -496,6 +496,226 @@ async fn the_pool_still_serves_work_after_a_cancellation() {
 }
 
 #[tokio::test]
+async fn open_read_head_covers_small_files() {
+    for driver in drivers() {
+        let dir = TempDir::new("head-small");
+        let data = pattern(100, 11);
+        driver
+            .write_file_bytes(dir.file("data"), Bytes::copy_from_slice(&data), false)
+            .await
+            .unwrap();
+        let (_file, metadata, head) = driver
+            .open_read_head(dir.file("data"), &OpenOptions::new().read(true), 4096)
+            .await
+            .unwrap();
+        assert_eq!(metadata.len(), 100);
+        assert_eq!(&head[..], &data[..]);
+    }
+}
+
+#[tokio::test]
+async fn open_read_head_serves_follow_up_reads() {
+    for driver in drivers() {
+        let dir = TempDir::new("head-large");
+        let data = pattern(8192, 13);
+        driver
+            .write_file_bytes(dir.file("data"), Bytes::copy_from_slice(&data), false)
+            .await
+            .unwrap();
+        let (file, metadata, head) = driver
+            .open_read_head(dir.file("data"), &OpenOptions::new().read(true), 4096)
+            .await
+            .unwrap();
+        assert_eq!(metadata.len(), 8192);
+        assert_eq!(&head[..], &data[..4096]);
+        let rest = file.read_exact_at(4096, 4096).await.unwrap();
+        assert_eq!(&rest[..], &data[4096..]);
+    }
+}
+
+#[tokio::test]
+async fn open_read_head_missing_file_fails_not_found() {
+    for driver in drivers() {
+        let dir = TempDir::new("head-missing");
+        let error = driver
+            .open_read_head(dir.file("absent"), &OpenOptions::new().read(true), 4096)
+            .await
+            .expect_err("opening a missing file must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    }
+}
+
+#[tokio::test]
+async fn write_file_segments_roundtrip() {
+    for driver in drivers() {
+        let dir = TempDir::new("write-segments");
+        let segments: Vec<Vec<u8>> = vec![pattern(16, 21), pattern(4096, 22), pattern(33, 23)];
+        let flat: Vec<u8> = segments.concat();
+        driver
+            .write_file_segments(
+                dir.file("data"),
+                &OpenOptions::new().write(true).create(true).truncate(true),
+                segments,
+                true,
+            )
+            .await
+            .unwrap();
+        let read = driver.read_file_bytes(dir.file("data")).await.unwrap();
+        assert_eq!(&read[..], &flat[..]);
+    }
+}
+
+#[tokio::test]
+async fn write_file_segments_atomic_replaces_target() {
+    for driver in drivers() {
+        let dir = TempDir::new("write-atomic");
+        let previous = pattern(64, 31);
+        driver
+            .write_file_bytes(dir.file("data"), Bytes::copy_from_slice(&previous), false)
+            .await
+            .unwrap();
+
+        let segments: Vec<Vec<u8>> = vec![pattern(16, 32), pattern(2048, 33)];
+        let flat: Vec<u8> = segments.concat();
+        driver
+            .write_file_segments_atomic(
+                dir.file("data.tmp"),
+                dir.file("data"),
+                &OpenOptions::new().write(true).create(true).truncate(true),
+                segments,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !dir.file("data.tmp").exists(),
+            "temporary file must be renamed away"
+        );
+        let read = driver.read_file_bytes(dir.file("data")).await.unwrap();
+        assert_eq!(&read[..], &flat[..]);
+    }
+}
+
+/// The segments are released once the kernel has the bytes, so a caller holding a lock to keep
+/// them stable is not held across the sync and the rename. Observed through a guard the segment
+/// list owns: it has to be dropped by the time the call returns, and the file has to be complete.
+#[tokio::test]
+async fn segments_are_released_before_the_call_returns() {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+
+    struct Guarded {
+        data: Vec<u8>,
+        released: Arc<AtomicBool>,
+    }
+
+    impl Drop for Guarded {
+        fn drop(&mut self) {
+            self.released.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl lore_io::StableBufList for Guarded {
+        fn byte_segments(&self) -> impl Iterator<Item = &[u8]> {
+            std::iter::once(self.data.as_slice())
+        }
+    }
+
+    for driver in drivers() {
+        let dir = TempDir::new("segments-released");
+        let data = pattern(4096, 41);
+        let released = Arc::new(AtomicBool::new(false));
+
+        driver
+            .write_file_segments_atomic(
+                dir.file("data.tmp"),
+                dir.file("data"),
+                &OpenOptions::new().write(true).create(true).truncate(true),
+                Guarded {
+                    data: data.clone(),
+                    released: Arc::clone(&released),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            released.load(Ordering::SeqCst),
+            "the segments must not outlive the call"
+        );
+        let read = driver.read_file_bytes(dir.file("data")).await.unwrap();
+        assert_eq!(&read[..], &data[..]);
+    }
+}
+
+#[tokio::test]
+async fn vectored_write_read_roundtrip() {
+    for driver in drivers() {
+        let dir = TempDir::new("vectored");
+        let file = driver.open(dir.file("data"), &rw_create()).await.unwrap();
+        let segments: Vec<Vec<u8>> = vec![
+            pattern(7, 1),
+            pattern(4096, 2),
+            pattern(64 * 1024 + 13, 3),
+            pattern(1, 4),
+            vec![],
+            pattern(257, 5),
+        ];
+        let flat: Vec<u8> = segments.concat();
+        let segments = file.write_all_vectored_at(segments, 5).await.unwrap();
+
+        let read = file.read_exact_at(flat.len(), 5).await.unwrap();
+        assert_eq!(&read[..], &flat[..]);
+
+        let targets: Vec<Vec<u8>> = segments
+            .iter()
+            .map(|segment| vec![0u8; segment.len()])
+            .collect();
+        let targets = file.read_exact_vectored_at(targets, 5).await.unwrap();
+        assert_eq!(targets, segments);
+    }
+}
+
+#[tokio::test]
+async fn vectored_read_past_eof_fails() {
+    for driver in drivers() {
+        let dir = TempDir::new("vectored-eof");
+        let file = driver.open(dir.file("data"), &rw_create()).await.unwrap();
+        file.write_all_at(pattern(100, 9), 0).await.unwrap();
+
+        let targets: Vec<Vec<u8>> = vec![vec![0u8; 64], vec![0u8; 136]];
+        let error = file
+            .read_exact_vectored_at(targets, 0)
+            .await
+            .expect_err("vectored read past EOF must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+}
+
+/// 1500 segments exceed the 1024-iovec syscall cap, so the operation
+/// completes through the exact-loop continuation with a byte skip.
+#[tokio::test]
+async fn vectored_io_handles_many_segments() {
+    for driver in drivers() {
+        let dir = TempDir::new("vectored-many");
+        let file = driver.open(dir.file("data"), &rw_create()).await.unwrap();
+        let segments: Vec<Vec<u8>> = (0..1500).map(|i| pattern(9, i as u8)).collect();
+        let flat: Vec<u8> = segments.concat();
+        let segments = file.write_all_vectored_at(segments, 0).await.unwrap();
+
+        let read = file.read_exact_at(flat.len(), 0).await.unwrap();
+        assert_eq!(&read[..], &flat[..]);
+
+        let targets: Vec<Vec<u8>> = segments
+            .iter()
+            .map(|segment| vec![0u8; segment.len()])
+            .collect();
+        let targets = file.read_exact_vectored_at(targets, 0).await.unwrap();
+        assert_eq!(targets, segments);
+    }
+}
+
+#[tokio::test]
 async fn many_concurrent_reads_complete() {
     for driver in drivers() {
         let dir = TempDir::new("stress");

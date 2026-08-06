@@ -6,6 +6,8 @@ use std::sync::Arc;
 use bytes::Bytes;
 
 use crate::buffer::StableBuf;
+use crate::buffer::StableBufList;
+use crate::buffer::StableBufListMut;
 use crate::driver::IoDriver;
 
 /// Options for opening a file, mirroring `std::fs::OpenOptions`.
@@ -151,6 +153,64 @@ impl IoFile {
         self.driver
             .write_all_at_raw(Arc::clone(&self.file), buffer, len, offset)
             .await
+    }
+
+    /// Reads exactly the combined byte length of all segments at `offset`,
+    /// scattering directly into the segments with no intermediate buffer.
+    /// Fails with `UnexpectedEof` if the file ends first.
+    pub async fn read_exact_vectored_at<B: StableBufListMut>(
+        &self,
+        buffers: B,
+        offset: u64,
+    ) -> std::io::Result<B> {
+        let mut buffers = buffers;
+        let total: usize = buffers
+            .byte_segments_mut()
+            .map(|segment| segment.len())
+            .sum();
+        let mut done = 0;
+        while done < total {
+            let (returned, read) = self
+                .driver
+                .read_vectored_at_raw(Arc::clone(&self.file), buffers, done, offset + done as u64)
+                .await?;
+            buffers = returned;
+            if read == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "file ended before the requested read length",
+                ));
+            }
+            done += read;
+        }
+        Ok(buffers)
+    }
+
+    /// Writes the combined contents of all segments at `offset`, gathering
+    /// directly from the segments with no intermediate buffer.
+    pub async fn write_all_vectored_at<B: StableBufList>(
+        &self,
+        buffers: B,
+        offset: u64,
+    ) -> std::io::Result<B> {
+        let mut buffers = buffers;
+        let total: usize = buffers.byte_segments().map(|segment| segment.len()).sum();
+        let mut done = 0;
+        while done < total {
+            let (returned, written) = self
+                .driver
+                .write_vectored_at_raw(Arc::clone(&self.file), buffers, done, offset + done as u64)
+                .await?;
+            buffers = returned;
+            if written == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "file refused further writes",
+                ));
+            }
+            done += written;
+        }
+        Ok(buffers)
     }
 
     /// Syncs file data (not necessarily metadata) to disk.

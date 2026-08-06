@@ -15,6 +15,41 @@ pub trait StableBuf: AsRef<[u8]> + Send + 'static {}
 impl StableBuf for Bytes {}
 impl StableBuf for Vec<u8> {}
 
+/// Owned multi-segment memory that vectored write operations gather from.
+///
+/// The [`StableBuf`] contract applies to every segment: the segment
+/// memory must not move for the value's lifetime, since a backend holds
+/// raw pointers into each segment while an operation is in flight.
+/// Moving the value itself must not move the segments (heap-allocated
+/// segments behind pointers satisfy this).
+pub trait StableBufList: Send + 'static {
+    fn byte_segments(&self) -> impl Iterator<Item = &[u8]>;
+}
+
+/// Owned multi-segment memory that vectored read operations scatter into.
+///
+/// Same stability contract as [`StableBufList`]. Segment contents are
+/// unspecified until the read fills them.
+///
+/// A scattering read is the one case where a read does not allocate its own memory: the caller
+/// already owns the structure the bytes belong in, and the point of the operation is to land them
+/// there without a staging copy.
+pub trait StableBufListMut: Send + 'static {
+    fn byte_segments_mut(&mut self) -> impl Iterator<Item = &mut [u8]>;
+}
+
+impl StableBufList for Vec<Vec<u8>> {
+    fn byte_segments(&self) -> impl Iterator<Item = &[u8]> {
+        self.iter().map(|segment| segment.as_slice())
+    }
+}
+
+impl StableBufListMut for Vec<Vec<u8>> {
+    fn byte_segments_mut(&mut self) -> impl Iterator<Item = &mut [u8]> {
+        self.iter_mut().map(|segment| segment.as_mut_slice())
+    }
+}
+
 /// Allocates `len` bytes for a read to fill, without zeroing them.
 ///
 /// The kernel overwrites what it fills and the caller only ever sees the filled prefix — every
