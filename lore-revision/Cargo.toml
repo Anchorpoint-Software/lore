@@ -74,7 +74,12 @@ trybuild = { workspace = true }
 default = []
 oodle = ["lore-storage/oodle"]
 integration_tests = []
+compile_fail_tests = []
 failure_generator = []
 seeding = []
 trace_log = ["lore-base/trace_log"]
 vfs = []
+
+[[test]]
+name = "compile_fail"
+required-features = ["compile_fail_tests"]
