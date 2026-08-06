@@ -72,6 +72,11 @@ use crate::store::object_metadata::ObjectMetadataError;
 use crate::store::object_metadata::from_object_metadata;
 use crate::store::object_metadata::to_object_metadata;
 
+enum QueryResultSource {
+    LegacyMetadata(Fragment),
+    State,
+}
+
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 struct FragmentsEntry {
     hash: Hash,
@@ -899,32 +904,63 @@ impl AwsImmutableStore {
         repository: Context,
         address: Address,
         match_requested: StoreMatch,
-    ) -> Result<StoreQueryResult, StoreError> {
+    ) -> Result<(QueryResultSource, StoreQueryResult), StoreError> {
         let (match_made, state) = tokio::join!(
             self.lookup(repository, address, match_requested),
             self.load_state(address.hash)
         );
 
         let match_made = match_made?;
-        let miss = Ok(StoreQueryResult {
-            fragment: Fragment::default(),
-            match_made: StoreMatch::MatchNone,
-        });
+        let miss = Ok((
+            QueryResultSource::State,
+            StoreQueryResult {
+                fragment: Fragment::default(),
+                match_made: StoreMatch::MatchNone,
+            },
+        ));
 
         if match_made == StoreMatch::MatchNone {
             return miss;
         }
 
         match state? {
-            Some(FragmentState::Stored) => Ok(StoreQueryResult {
-                fragment: stored_durable(Fragment::default()),
-                match_made,
-            }),
+            Some(FragmentState::Stored) => Ok((
+                QueryResultSource::State,
+                StoreQueryResult {
+                    fragment: stored_durable(Fragment::default()),
+                    match_made,
+                },
+            )),
             Some(FragmentState::Obliterating | FragmentState::Obliterated) => {
                 debug!("Query found obliterated fragment at address {address}");
                 miss
             }
             None => {
+                // if not in the `state` table then it could be a legacy fragment
+                // that only exists in the metadata table
+                if self.fragment_metadata_table_name.is_some()
+                    && let Some(fragment) = self.fragment_from_metadata_table(address.hash).await?
+                {
+                    let legacy_fragment_state = FragmentState::from_bits(fragment.flags);
+
+                    return match legacy_fragment_state {
+                        FragmentState::Stored => {
+                            let fragment = stored_durable(fragment);
+                            Ok((
+                                QueryResultSource::LegacyMetadata(fragment),
+                                StoreQueryResult {
+                                    fragment,
+                                    match_made,
+                                },
+                            ))
+                        }
+                        FragmentState::Obliterating | FragmentState::Obliterated => {
+                            debug!("Query found obliterated legacy fragment at address {address}");
+                            miss
+                        }
+                    };
+                }
+
                 debug!("Query found an association at {address} with no stored payload");
                 miss
             }
@@ -1342,7 +1378,16 @@ impl AwsImmutableStore {
 
         let fragment = match from_object_metadata(output.metadata()) {
             Ok(fragment) => fragment,
-            Err(ObjectMetadataError::Absent) => self.fragment_from_metadata_table(hash).await?,
+            Err(ObjectMetadataError::Absent) => {
+                let legacy_metadata = self.fragment_from_metadata_table(hash).await?;
+                legacy_metadata.ok_or_else(|| {
+                    warn!(
+                        %hash,
+                        "Stored object carries no fragment metadata and no legacy row describes it"
+                    );
+                    StoreError::internal("S3 object carries no fragment metadata")
+                })?
+            }
             Err(e) => {
                 warn!(%hash, "Stored object carries unusable fragment metadata: {e}");
                 return Err(StoreError::internal_with_context(
@@ -1408,7 +1453,10 @@ impl AwsImmutableStore {
     ///
     /// With no legacy table configured there is nothing to fall back to, and nothing that should
     /// be: the deployment has declared it never wrote such an object.
-    async fn fragment_from_metadata_table(&self, hash: Hash) -> Result<Fragment, StoreError> {
+    async fn fragment_from_metadata_table(
+        &self,
+        hash: Hash,
+    ) -> Result<Option<Fragment>, StoreError> {
         let Some(table_name) = self.fragment_metadata_table_name.as_ref() else {
             warn!(
                 %hash,
@@ -1448,13 +1496,7 @@ impl AwsImmutableStore {
                 StoreError::internal_with_context(e, "Fragment metadata row is unreadable")
             })?;
 
-        entry.and_then(|entry| entry.fragment).ok_or_else(|| {
-            warn!(
-                %hash,
-                "Stored object carries no fragment metadata and no legacy row describes it"
-            );
-            StoreError::internal("S3 object carries no fragment metadata")
-        })
+        Ok(entry.and_then(|entry| entry.fragment))
     }
 
     async fn get_s3_object_contents(
@@ -1544,7 +1586,16 @@ impl AwsImmutableStore {
 
         let fragment = match s3_contents.fragment {
             Ok(fragment) => fragment,
-            Err(ObjectMetadataError::Absent) => self.fragment_from_metadata_table(hash).await?,
+            Err(ObjectMetadataError::Absent) => {
+                let legacy_metadata = self.fragment_from_metadata_table(hash).await?;
+                legacy_metadata.ok_or_else(|| {
+                    warn!(
+                        %hash,
+                        "Stored object carries no fragment metadata and no legacy row describes it"
+                    );
+                    StoreError::internal("S3 object carries no fragment metadata")
+                })?
+            }
             Err(e) => {
                 warn!(%hash, "Stored object carries unusable fragment metadata: {e}");
                 return Err(StoreError::internal_with_context(
@@ -1697,7 +1748,9 @@ impl ImmutableStoreTrait for AwsImmutableStore {
     ) -> Result<StoreQueryResult, StoreError> {
         let repository: Context = partition.into();
         timed!(self.latency_histogram, &self.labels_query, {
-            Box::pin(self.do_query(repository, address, match_requested)).await
+            let (_, query_result) =
+                Box::pin(self.do_query(repository, address, match_requested)).await?;
+            Ok(query_result)
         })
         .into()
     }
@@ -1719,24 +1772,30 @@ impl ImmutableStoreTrait for AwsImmutableStore {
                 match_made: StoreMatch::MatchNone,
             };
 
-            let match_made = Box::pin(self.do_query(repository, address, StoreMatch::MatchFull))
-                .await?
-                .match_made;
+            let (query_source, query_result) =
+                Box::pin(self.do_query(repository, address, StoreMatch::MatchFull)).await?;
+            let match_made = query_result.match_made;
 
             if match_made == StoreMatch::MatchNone {
                 return Ok(miss);
             }
 
-            match self.head_fragment(address.hash).await {
-                Ok(fragment) => Ok(StoreQueryResult {
+            match query_source {
+                QueryResultSource::LegacyMetadata(fragment) => Ok(StoreQueryResult {
                     fragment,
                     match_made,
                 }),
-                Err(e) if e.is_address_not_found() => {
-                    self.report_missing_payload(address).await;
-                    Ok(miss)
-                }
-                Err(e) => Err(e),
+                QueryResultSource::State => match self.head_fragment(address.hash).await {
+                    Ok(fragment) => Ok(StoreQueryResult {
+                        fragment,
+                        match_made,
+                    }),
+                    Err(e) if e.is_address_not_found() => {
+                        self.report_missing_payload(address).await;
+                        Ok(miss)
+                    }
+                    Err(e) => Err(e),
+                },
             }
         })
         .into()
@@ -2081,6 +2140,9 @@ mod test {
     const BUCKET: &str = "test-bucket";
     const FRAGMENTS_TABLE_NAME: &str = "fragments";
     const FRAGMENT_STATE_TABLE_NAME: &str = "fragment-state";
+    /// A separate table name for legacy fragment metadata, distinct from the state table. Used
+    /// to test the `do_query` path that falls back to the metadata table when no state row exists.
+    const FRAGMENT_METADATA_TABLE_NAME: &str = "fragment-metadata";
 
     fn aws_error<E>(error: E, status: u16) -> AwsError<SdkError<E, HttpResponse>> {
         AwsError::AwsSdkError(SdkError::ServiceError(
@@ -2136,6 +2198,10 @@ mod test {
         objects: HashMap<Vec<u8>, StoredObject>,
         associations: HashMap<(Vec<u8>, Vec<u8>), HashMap<String, AttributeValue>>,
         state: HashMap<Vec<u8>, HashMap<String, AttributeValue>>,
+        /// Rows in the legacy fragment metadata table (separate from the state table). Only
+        /// populated by `set_legacy_metadata_row`, which is used by tests that need to exercise
+        /// the `do_query` path where no state row exists but a legacy metadata row does.
+        legacy_metadata: HashMap<Vec<u8>, HashMap<String, AttributeValue>>,
     }
 
     #[derive(Clone, Default)]
@@ -2223,6 +2289,36 @@ mod test {
             ]);
 
             self.lock().state.insert(hash.data().to_vec(), item);
+        }
+
+        /// Write a legacy fragment metadata row into the *separate* metadata table (keyed by
+        /// `FRAGMENT_METADATA_TABLE_NAME`). Unlike `set_fragment_metadata_row`, this does NOT
+        /// touch `storage.state`, so `load_state` returns `None` for the same hash, letting tests
+        /// exercise the `do_query` branch that falls back to the metadata table when there is no
+        /// state row.
+        fn set_legacy_metadata_row(&self, hash: Hash, fragment: Fragment) {
+            let item = HashMap::from([
+                (
+                    "hash".to_owned(),
+                    AttributeValue::B(Blob::new(hash.data().to_vec())),
+                ),
+                (
+                    "flags".to_owned(),
+                    AttributeValue::N(fragment.flags.to_string()),
+                ),
+                (
+                    "size_payload".to_owned(),
+                    AttributeValue::N(fragment.size_payload.to_string()),
+                ),
+                (
+                    "size_content".to_owned(),
+                    AttributeValue::N(fragment.size_content.to_string()),
+                ),
+            ]);
+
+            self.lock()
+                .legacy_metadata
+                .insert(hash.data().to_vec(), item);
         }
 
         /// Delete an object while leaving every reference to it in place, as an obliteration
@@ -2383,6 +2479,8 @@ mod test {
                 let storage = f.lock();
                 let found = if &**table == FRAGMENT_STATE_TABLE_NAME {
                     storage.state.get(&blob(&item, "hash")).cloned()
+                } else if &**table == FRAGMENT_METADATA_TABLE_NAME {
+                    storage.legacy_metadata.get(&blob(&item, "hash")).cloned()
                 } else {
                     storage
                         .associations
@@ -2604,6 +2702,39 @@ mod test {
     /// them, and so is configured to read the rows describing those.
     async fn migrated_store(fake: &Fake) -> Arc<AwsImmutableStore> {
         store_with(fake, false, true).await
+    }
+
+    /// A store whose state table and legacy-metadata table are two distinct ddb tables.
+    ///
+    /// `migrated_store` points both at `FRAGMENT_STATE_TABLE_NAME`, which means the same storage
+    /// map backs both. That collapses the scenario where no state row exists but a metadata row
+    /// does — `load_state` would find and interpret the metadata row as `Stored`. This helper uses
+    /// `FRAGMENT_METADATA_TABLE_NAME` for the metadata table so the two maps are independent,
+    /// enabling tests for the `do_query` path that falls back to the metadata table when there is
+    /// genuinely no state row.
+    async fn store_with_separate_metadata_table(fake: &Fake) -> Arc<AwsImmutableStore> {
+        let (s3, dynamodb) = wire(fake);
+        let mut dynamodb_settings = DynamoDbImmutableStoreSettings::new(
+            FRAGMENTS_TABLE_NAME.to_string(),
+            FRAGMENT_STATE_TABLE_NAME.to_string(),
+        );
+        dynamodb_settings.timeout_millis = 1;
+        dynamodb_settings = dynamodb_settings
+            .with_fragment_metadata_table(FRAGMENT_METADATA_TABLE_NAME.to_string());
+
+        let settings = AwsImmutableStoreSettings {
+            s3: S3StoreSettings::new(BUCKET.to_string()),
+            dynamodb: dynamodb_settings,
+            force_write: false,
+            batch_exist_submission_limit: 1000,
+        };
+
+        let execution = setup_execution("test".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                Arc::new(AwsImmutableStore::new(s3, dynamodb, &settings))
+            })
+            .await
     }
 
     /// A payload and the fragment that correctly describes it.
@@ -3115,6 +3246,190 @@ mod test {
             .get(repository.into(), address, StoreMatch::MatchFull)
             .await
             .expect_err("a damaged object must not be described by a legacy row");
+    }
+
+    mod separate_metadata_table {
+        use super::*;
+
+        /// When the metadata table IS configured but holds no row for a hash that has an
+        /// association but no state row, `query` must still return a miss. The metadata-table
+        /// check in `do_query` must not turn a genuine miss into a phantom match.
+        #[tokio::test]
+        async fn query_misses_when_no_state_or_legacy_row() {
+            let fake = Fake::default();
+            let address = Address {
+                hash: random(),
+                context: random(),
+            };
+            let repository: Context = random();
+            fake.add_association(repository, address);
+            // No state row, no legacy metadata row.
+
+            let result = store_with_separate_metadata_table(&fake)
+                .await
+                .query(repository.into(), address, StoreMatch::MatchFull)
+                .await
+                .expect("query should succeed even when no row is found");
+
+            assert_eq!(result.match_made, StoreMatch::MatchNone);
+        }
+
+        /// A legacy fragment whose flags carry obliteration bits must not be returned as a match.
+        /// The state table has no row (pre-state-table era), but the metadata row records that the
+        /// fragment was obliterated — `do_query` must treat it the same as a state-row obliteration.
+        #[tokio::test]
+        async fn query_misses_for_an_obliterated_legacy_fragment() {
+            let fake = Fake::default();
+            let address = Address {
+                hash: random(),
+                context: random(),
+            };
+            let repository: Context = random();
+            let obliterated = Fragment {
+                flags: FragmentFlags::PayloadObliterated.bits(),
+                size_payload: 64,
+                size_content: 256,
+            };
+
+            fake.add_association(repository, address);
+            fake.set_legacy_metadata_row(address.hash, obliterated);
+            // No state row — the obliteration bit lives only in the legacy metadata flags.
+
+            let result = store_with_separate_metadata_table(&fake)
+                .await
+                .query(repository.into(), address, StoreMatch::MatchFull)
+                .await
+                .expect("query should succeed");
+
+            assert_eq!(result.match_made, StoreMatch::MatchNone);
+        }
+
+        /// A fragment stored before the state table existed: an association exists, no state row,
+        /// but the metadata table holds the legacy fragment description. `query` must report a
+        /// match — the new `None` branch in `do_query` exists precisely for this scenario.
+        #[tokio::test]
+        async fn query_matches_a_legacy_fragment_with_no_state_row() {
+            let fake = Fake::default();
+            let address = Address {
+                hash: random(),
+                context: random(),
+            };
+            let repository: Context = random();
+            let (fragment, _) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
+
+            fake.add_association(repository, address);
+            fake.set_legacy_metadata_row(address.hash, fragment);
+            // No state row — `load_state` returns `Ok(None)`.
+
+            let result = store_with_separate_metadata_table(&fake)
+                .await
+                .query(repository.into(), address, StoreMatch::MatchFull)
+                .await
+                .expect("a legacy fragment with no state row must be queryable");
+
+            assert_eq!(result.match_made, StoreMatch::MatchFull);
+        }
+
+        /// When `do_query` returns `QueryResultSource::LegacyMetadata`, `get_metadata` must use
+        /// the fragment it already obtained from the metadata table rather than reading S3. An
+        /// object read here would be redundant and penalise every `get_metadata` call for
+        /// pre-cutover data.
+        ///
+        /// The returned fragment must carry `PayloadStoredDurable` (set by `do_query` when it
+        /// takes the `LegacyMetadata` branch) and must preserve the original flags from the
+        /// metadata row.
+        #[tokio::test]
+        async fn get_metadata_uses_legacy_metadata_without_reading_s3() {
+            let fake = Fake::default();
+            let address = Address {
+                hash: random(),
+                context: random(),
+            };
+            let repository: Context = random();
+            let (mut fragment, payload) =
+                representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
+            fragment.flags |= FragmentFlags::PayloadDoNotReplicate;
+
+            fake.add_association(repository, address);
+            fake.set_legacy_metadata_row(address.hash, fragment);
+            fake.put_object_without_metadata(address.hash, payload.as_ref());
+            // No state row — `do_query` returns `QueryResultSource::LegacyMetadata`.
+
+            let result = store_with_separate_metadata_table(&fake)
+                .await
+                .get_metadata(repository.into(), address)
+                .await
+                .expect("get_metadata must succeed for a legacy fragment");
+
+            assert_eq!(result.match_made, StoreMatch::MatchFull);
+            assert_eq!(result.fragment.size_payload, fragment.size_payload);
+            assert_eq!(result.fragment.size_content, fragment.size_content);
+            assert_eq!(
+                result.fragment.flags & FragmentFlags::PayloadStoredDurable,
+                FragmentFlags::PayloadStoredDurable,
+                "do_query must mark legacy metadata fragments as durably stored"
+            );
+            assert_eq!(
+                result.fragment.flags & FragmentFlags::PayloadDoNotReplicate,
+                FragmentFlags::PayloadDoNotReplicate,
+                "original flags from the metadata row must be preserved"
+            );
+            assert_eq!(
+                fake.object_reads(),
+                0,
+                "S3 must not be read when the fragment came from the metadata table"
+            );
+        }
+
+        /// When `head_fragment` falls back to `fragment_from_metadata_table` and finds no row
+        /// (`Ok(None)`), `get_metadata` must return an error. This covers the caller-side
+        /// `ok_or_else` added in `head_fragment`.
+        #[tokio::test]
+        async fn get_metadata_fails_when_object_has_no_s3_metadata_and_no_legacy_row() {
+            let fake = Fake::default();
+            let address = Address {
+                hash: random(),
+                context: random(),
+            };
+            let repository: Context = random();
+            let (_, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
+
+            fake.add_association(repository, address);
+            fake.set_state(address.hash, FragmentState::Stored);
+            fake.put_object_without_metadata(address.hash, payload.as_ref());
+            // No metadata row — `fragment_from_metadata_table` returns `Ok(None)`.
+
+            store_with_separate_metadata_table(&fake)
+                .await
+                .get_metadata(repository.into(), address)
+                .await
+                .expect_err("an object with no S3 metadata and no legacy row must not be returned");
+        }
+
+        /// The same `ok_or_else` guard on the `get_s3_object_contents` path: when `get` reads an
+        /// object with no S3 metadata and the metadata table holds no row either, it must fail.
+        #[tokio::test]
+        async fn get_fails_when_object_has_no_s3_metadata_and_no_legacy_row() {
+            let fake = Fake::default();
+            let address = Address {
+                hash: random(),
+                context: random(),
+            };
+            let repository: Context = random();
+            let (_, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
+
+            fake.add_association(repository, address);
+            fake.set_state(address.hash, FragmentState::Stored);
+            fake.put_object_without_metadata(address.hash, payload.as_ref());
+            // No legacy row — `fragment_from_metadata_table` returns `Ok(None)`, which
+            // `get_s3_object_contents` maps to an error.
+
+            store_with_separate_metadata_table(&fake)
+                .await
+                .get(repository.into(), address, StoreMatch::MatchFull)
+                .await
+                .expect_err("an object with no S3 metadata and no legacy row must not be returned");
+        }
     }
 
     /// A lost payload must not stay lost. Clearing the state row is what lets the next put stop
