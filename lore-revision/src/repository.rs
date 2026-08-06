@@ -35,7 +35,6 @@ use futures::FutureExt;
 use futures::future::BoxFuture;
 use futures::future::Shared;
 use lore_base::lore_spawn;
-use lore_base::lore_spawn_blocking;
 use lore_base::lore_spawn_guarded;
 use lore_error_set::prelude::*;
 use lore_transport::Connection;
@@ -1349,12 +1348,10 @@ pub(crate) async fn get_or_create_repository_lock(
         return Ok(holder);
     }
 
-    // Pin to core: `runtime()` follows the current runtime, and an untimed flock
-    // on net would occupy its single blocking thread.
-    let path_for_lock = dot_path.clone();
-    let lock = lore_spawn_blocking!(move || FSLock::acquire_directory_lock(path_for_lock))
+    // The OS flock is taken with non-blocking attempts and async retries,
+    // so a contended lock never stalls a runtime thread.
+    let lock = Box::pin(FSLock::acquire_directory_lock(dot_path.clone()))
         .await
-        .internal("Failed to get exclusive access to repository")?
         .internal("Failed to get exclusive access to repository")?;
 
     let holder = Arc::new(RepositoryLock { _lock: lock });

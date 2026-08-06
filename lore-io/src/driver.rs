@@ -6,8 +6,8 @@
 //! `read_at`, `read_exact_at`, `read_vectored_at`, `write_at`, `write_all_at`,
 //! `write_vectored_at`, `open_read_head`, `read_file_bytes`, `write_file_bytes`,
 //! `write_file_segments`, `write_file_segments_atomic`, `sync`, `metadata`, `file_metadata`,
-//! `set_len`, `rename`, `remove_file` and `create_dir_all`. A backend implements all nineteen as
-//! inherent methods on its own type.
+//! `set_len`, `rename`, `remove_file`, `create_dir_all` and `remove_dir_all`. A backend implements
+//! all twenty as inherent methods on its own type.
 //!
 //! Every operation dispatches, including the metadata ones a completion backend will keep on the
 //! syscall pool anyway — a ring-submitted `statx` is punted to a kernel worker making the same
@@ -403,6 +403,17 @@ impl IoDriver {
             DriverInner::Uring(driver) => driver.create_dir_all(path).await,
             #[cfg(target_family = "windows")]
             DriverInner::Iocp(driver) => driver.create_dir_all(path).await,
+        }
+    }
+
+    pub async fn remove_dir_all(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
+        let path = path.as_ref().to_path_buf();
+        match &*self.inner {
+            DriverInner::Psync(driver) => driver.remove_dir_all(path).await,
+            #[cfg(target_os = "linux")]
+            DriverInner::Uring(driver) => driver.remove_dir_all(path).await,
+            #[cfg(target_family = "windows")]
+            DriverInner::Iocp(driver) => driver.remove_dir_all(path).await,
         }
     }
 

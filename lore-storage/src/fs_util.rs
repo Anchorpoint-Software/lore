@@ -57,15 +57,18 @@ pub fn sync_dir<P: AsRef<Path>>(_path: P) -> std::io::Result<()> {
 pub async fn unlink_recursive<P: AsRef<Path>>(absolute_path: P) -> tokio::io::Result<()> {
     let absolute_path = absolute_path.as_ref();
     lore_base::lore_trace!("Deleting {}", absolute_path.display());
-    let metadata = tokio::fs::metadata(absolute_path).await;
+    let driver = lore_io::IoDriver::global();
+    let metadata = match driver.metadata(absolute_path).await {
+        Ok(metadata) => metadata,
+        // Nothing to delete is a delete that has already happened. Any other failure — a
+        // permission error on the parent, for one — is reported rather than read as absence,
+        // which would report a successful delete of something still there.
+        Err(err) if err.kind() == tokio::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
 
-    if let Err(_err) = metadata {
-        return Ok(());
-    }
-
-    let metadata = metadata.unwrap();
     if metadata.is_dir() {
-        if let Err(err) = tokio::fs::remove_dir_all(absolute_path).await {
+        if let Err(err) = driver.remove_dir_all(absolute_path).await {
             if err.kind() == tokio::io::ErrorKind::NotFound {
                 return Ok(());
             }
@@ -78,15 +81,17 @@ pub async fn unlink_recursive<P: AsRef<Path>>(absolute_path: P) -> tokio::io::Re
             let mut permissions = metadata.permissions();
             #[allow(clippy::permissions_set_readonly_false)]
             permissions.set_readonly(false);
-            let _ = tokio::fs::set_permissions(absolute_path, permissions).await;
-            if let Err(err) = tokio::fs::remove_dir_all(absolute_path).await {
+            // Blocking on purpose: the driver has no permissions operation, and this runs only
+            // after a delete has already failed, so it is bounded to the retry path.
+            let _ = std::fs::set_permissions(absolute_path, permissions);
+            if let Err(err) = driver.remove_dir_all(absolute_path).await {
                 if err.kind() == tokio::io::ErrorKind::NotFound {
                     return Ok(());
                 }
                 return Err(err);
             }
         }
-    } else if let Err(err) = tokio::fs::remove_file(absolute_path).await {
+    } else if let Err(err) = driver.remove_file(absolute_path).await {
         if err.kind() == tokio::io::ErrorKind::NotFound {
             return Ok(());
         }
@@ -94,8 +99,9 @@ pub async fn unlink_recursive<P: AsRef<Path>>(absolute_path: P) -> tokio::io::Re
         let mut permissions = metadata.permissions();
         #[allow(clippy::permissions_set_readonly_false)]
         permissions.set_readonly(false);
-        let _ = tokio::fs::set_permissions(absolute_path, permissions).await;
-        if let Err(err) = tokio::fs::remove_file(absolute_path).await {
+        // Blocking for the same reason as the directory retry above.
+        let _ = std::fs::set_permissions(absolute_path, permissions);
+        if let Err(err) = driver.remove_file(absolute_path).await {
             if err.kind() == tokio::io::ErrorKind::NotFound {
                 return Ok(());
             }

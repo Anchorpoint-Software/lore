@@ -6,7 +6,6 @@ use std::path::PathBuf;
 
 use lore_base::directories::project_directory;
 use lore_base::fs::lock::FSLock;
-use lore_base::lore_spawn_blocking;
 use lore_error_set::prelude::*;
 use serde::Deserialize;
 use serde::Serialize;
@@ -189,15 +188,9 @@ pub enum LoadConfigError {}
 pub async fn load_config_with_lock<ConfigType: Default + Serialize + for<'a> Deserialize<'a>>(
     path: impl AsRef<Path> + Copy,
 ) -> Result<(ConfigType, FSLock), LoadConfigError> {
-    let path_buf = path.as_ref().to_owned();
-    // Pin to core: a bare `spawn_blocking` follows the current runtime, and an
-    // untimed flock on net would occupy its single blocking thread.
-    let lock = lore_spawn_blocking!(|| {
-        FSLock::acquire_file_lock(path_buf)
-            .map_err(|err| LoadConfigError::internal(format!("Failed acquiring lock {err}")))
-    })
-    .await
-    .internal("Failed to acquire file lock")??;
+    let lock = FSLock::acquire_file_lock(path)
+        .await
+        .map_err(|err| LoadConfigError::internal(format!("Failed acquiring lock {err}")))?;
     let config = load_config(path).await?;
     Ok((config, lock))
 }

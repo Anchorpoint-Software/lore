@@ -353,6 +353,12 @@ impl PsyncDriver {
             .await
     }
 
+    pub(crate) async fn remove_dir_all(&self, path: PathBuf) -> std::io::Result<()> {
+        SyscallPool::global()
+            .submit(move || std::fs::remove_dir_all(path))
+            .await
+    }
+
     pub(crate) async fn sync(&self, file: Arc<File>, data_only: bool) -> std::io::Result<()> {
         SyscallPool::global()
             .submit(move || {

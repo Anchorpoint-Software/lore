@@ -3,8 +3,6 @@
 use std::cmp::PartialEq;
 use std::io;
 use std::io::ErrorKind;
-use std::io::Read;
-use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -700,17 +698,6 @@ impl MutableStoreBucket {
     }
 }
 
-fn read_u32(file: &mut std::fs::File) -> io::Result<u32> {
-    let mut buf = [0u8; 4];
-    file.read_exact(&mut buf)?;
-    Ok(u32::from_ne_bytes(buf))
-}
-
-fn write_u32(mut file: &std::fs::File, value: u32) -> io::Result<()> {
-    let buf = u32::to_ne_bytes(value);
-    file.write_all(&buf)
-}
-
 impl LocalMutableStore {
     pub async fn new(
         path: Option<impl AsRef<Path>>,
@@ -728,28 +715,29 @@ impl LocalMutableStore {
         let mut needs_upgrade = false;
         let mut version = MutableStoreVersion::Initial;
         let lock = if let Some(path) = mutable_path.as_deref() {
-            let lock_path = path.clone();
-            let lock = lore_base::lore_spawn_blocking!(|| {
-                if !lock_path.exists() {
-                    let _ = std::fs::create_dir_all(lock_path.as_path());
-                }
-                FSLock::acquire_directory_lock(lock_path)
-            })
-            .await
-            .map_err(|err| io::Error::other(format!("Store lock task failed: {err}")))
-            .flatten()
-            .internal("acquiring mutable store lock")?;
+            if !path.exists() {
+                let _ = lore_io::IoDriver::global()
+                    .create_dir_all(path.as_path())
+                    .await;
+            }
+            let lock = FSLock::acquire_directory_lock(path.as_path())
+                .await
+                .internal("acquiring mutable store lock")?;
 
             let index_existed = std::fs::exists(path.join("index")).unwrap_or_default();
 
             // Check store version
             let version_path = path.join("version");
-            if let Ok(mut version_file) = std::fs::OpenOptions::new()
-                .read(true)
-                .write(false)
-                .open(&version_path)
+            if let Ok(bytes) = lore_io::IoDriver::global()
+                .read_file_bytes(&version_path)
+                .await
             {
-                match read_u32(&mut version_file).unwrap_or_default() {
+                let stored = bytes
+                    .as_ref()
+                    .get(..4)
+                    .map(|value| u32::from_ne_bytes(value.try_into().expect("4 bytes")))
+                    .unwrap_or_default();
+                match stored {
                     x if x == MutableStoreVersion::LazyFanOut as u32 => {
                         version = MutableStoreVersion::LazyFanOut;
                     }
@@ -763,52 +751,27 @@ impl LocalMutableStore {
             };
 
             if version == MutableStoreVersion::Initial {
-                if index_existed {
-                    // Pre-existing store needs migration — defer until remote is available
+                // Pre-existing stores need migration (defer until remote is
+                // available); brand new stores write LazyFanOut directly.
+                let stored_version = if index_existed {
                     needs_upgrade = true;
-
-                    // Write in-progress version marker
-                    let version_file = std::fs::OpenOptions::new()
-                        .write(true)
-                        .truncate(true)
-                        .create(true)
-                        .open(&version_path)
-                        .map_err(|err| {
-                            LocalMutableStoreError::internal_with_context(
-                                err,
-                                "Failed to upgrade mutable store",
-                            )
-                        })?;
-
-                    write_u32(&version_file, version as u32).map_err(|err| {
+                    version as u32
+                } else {
+                    MutableStoreVersion::LazyFanOut as u32
+                };
+                lore_io::IoDriver::global()
+                    .write_file_bytes(
+                        &version_path,
+                        bytes::Bytes::copy_from_slice(&stored_version.to_ne_bytes()),
+                        false,
+                    )
+                    .await
+                    .map_err(|err| {
                         LocalMutableStoreError::internal_with_context(
                             err,
                             "Failed to upgrade mutable store",
                         )
                     })?;
-                } else {
-                    // Brand new store — write LazyFanOut directly, no migration needed.
-                    let version_file = std::fs::OpenOptions::new()
-                        .write(true)
-                        .truncate(true)
-                        .create(true)
-                        .open(&version_path)
-                        .map_err(|err| {
-                            LocalMutableStoreError::internal_with_context(
-                                err,
-                                "Failed to upgrade mutable store",
-                            )
-                        })?;
-
-                    write_u32(&version_file, MutableStoreVersion::LazyFanOut as u32).map_err(
-                        |err| {
-                            LocalMutableStoreError::internal_with_context(
-                                err,
-                                "Failed to upgrade mutable store",
-                            )
-                        },
-                    )?;
-                }
             }
             Some(lock)
         } else {
@@ -836,7 +799,7 @@ impl LocalMutableStore {
                 // Roll forward any pending fan-out commit before reading the marker. After this returns the marker reflects the post-recovery state.
                 if group_path.exists()
                     && let Err(err) =
-                        crate::local::fan_out::recover_level_transition(&group_path, false)
+                        crate::local::fan_out::recover_level_transition(&group_path, false).await
                 {
                     return Err(LocalMutableStoreError::internal_with_context(
                         err,
@@ -1078,6 +1041,7 @@ impl LocalMutableStore {
                                 active_buckets,
                                 sync_data,
                             )
+                            .await
                             .map_err(|e| {
                                 LocalMutableStoreError::internal_with_context(
                                     e,
@@ -1100,6 +1064,7 @@ impl LocalMutableStore {
                                 active_buckets,
                                 sync_data,
                             )
+                            .await
                             .map_err(|e| {
                                 LocalMutableStoreError::internal_with_context(
                                     e,
@@ -1139,6 +1104,7 @@ impl LocalMutableStore {
                                 active_buckets,
                                 sync_data,
                             )
+                            .await
                             .map_err(|e| {
                                 LocalMutableStoreError::internal_with_context(
                                     e,
@@ -1150,15 +1116,15 @@ impl LocalMutableStore {
                         }
 
                         if first_err.is_none()
-                            && let Err(err) = crate::local::fan_out::delete_level_pending(
-                                &group_path,
-                            )
-                            .map_err(|e| {
-                                LocalMutableStoreError::internal_with_context(
-                                    e,
-                                    "Failed to delete level.pending",
-                                )
-                            })
+                            && let Err(err) =
+                                crate::local::fan_out::delete_level_pending(&group_path)
+                                    .await
+                                    .map_err(|e| {
+                                        LocalMutableStoreError::internal_with_context(
+                                            e,
+                                            "Failed to delete level.pending",
+                                        )
+                                    })
                         {
                             first_err = Some(err);
                         }

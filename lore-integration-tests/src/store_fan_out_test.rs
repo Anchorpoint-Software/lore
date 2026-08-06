@@ -1463,7 +1463,9 @@ mod tests {
                 std::fs::copy(&path, &new_path).unwrap();
             }
         }
-        lore_storage::local::fan_out::write_level_pending(&group_dir, 32, false).unwrap();
+        lore_storage::local::fan_out::write_level_pending(&group_dir, 32, false)
+            .await
+            .unwrap();
 
         verify_all_keys_findable_and_drop(&store_path, &keys).await;
 
@@ -1511,7 +1513,9 @@ mod tests {
                 }
             }
         }
-        lore_storage::local::fan_out::write_level_pending(&group_dir, 32, false).unwrap();
+        lore_storage::local::fan_out::write_level_pending(&group_dir, 32, false)
+            .await
+            .unwrap();
 
         verify_all_keys_findable_and_drop(&store_path, &keys).await;
 
@@ -1546,7 +1550,9 @@ mod tests {
         let (store_path, group_dir, keys) = setup_post_fan_out_to_level_32(0xAA04, 200).await;
 
         // Construct: write pending=32, leave everything else alone (final files at level-32, marker=32).
-        lore_storage::local::fan_out::write_level_pending(&group_dir, 32, false).unwrap();
+        lore_storage::local::fan_out::write_level_pending(&group_dir, 32, false)
+            .await
+            .unwrap();
 
         verify_all_keys_findable_and_drop(&store_path, &keys).await;
 
@@ -1647,7 +1653,9 @@ mod tests {
                 std::fs::copy(&path, &new_path).unwrap();
             }
         }
-        lore_storage::local::fan_out::write_level_pending(&group_dir, 32, false).unwrap();
+        lore_storage::local::fan_out::write_level_pending(&group_dir, 32, false)
+            .await
+            .unwrap();
 
         // First open: recovery runs.
         verify_all_keys_findable_and_drop(&store_path, &keys).await;

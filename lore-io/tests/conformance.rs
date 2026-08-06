@@ -329,6 +329,38 @@ async fn rename_remove_and_create_dir_all() {
     }
 }
 
+/// Recursive removal takes the whole tree, and reports `NotFound` for a path that is already
+/// gone. Callers translate that status into success — a delete that finds nothing to delete has
+/// done its job — so it is part of the operation's contract rather than an incidental errno.
+#[tokio::test]
+async fn remove_dir_all_takes_the_tree_and_reports_a_missing_one() {
+    for driver in drivers() {
+        let dir = TempDir::new("removetree");
+        let root = dir.file("tree");
+        let nested = root.join("a/b/c");
+        driver.create_dir_all(&nested).await.unwrap();
+        for name in ["one", "two"] {
+            driver
+                .write_file_bytes(nested.join(name), Bytes::from_static(b"leaf"), false)
+                .await
+                .unwrap();
+        }
+
+        driver.remove_dir_all(&root).await.unwrap();
+
+        assert!(
+            driver.metadata(&root).await.is_err(),
+            "the tree must be gone"
+        );
+
+        let missing = driver
+            .remove_dir_all(&root)
+            .await
+            .expect_err("removing a missing tree must report it");
+        assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
+    }
+}
+
 #[tokio::test]
 async fn concurrent_disjoint_writes_share_one_handle() {
     for driver in drivers() {

@@ -803,6 +803,10 @@ impl IocpDriver {
         PsyncDriver.create_dir_all(path).await
     }
 
+    pub(crate) async fn remove_dir_all(&self, path: PathBuf) -> std::io::Result<()> {
+        PsyncDriver.remove_dir_all(path).await
+    }
+
     pub(crate) fn stats(&self) -> IocpStats {
         IocpStats {
             submits: self.inner.counts.submits.load(Ordering::Relaxed),

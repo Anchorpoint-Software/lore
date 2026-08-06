@@ -992,17 +992,12 @@ impl LocalImmutableStore {
         };
 
         let lock = if let Some(path) = immutable_path.as_deref() {
-            let path = path.clone();
-            let lock = lore_base::lore_spawn_blocking!(|| {
-                if !path.exists() {
-                    let _ = std::fs::create_dir_all(path.as_path());
-                }
-                FSLock::acquire_directory_lock(path)
-            })
-            .await
-            .map_err(|err| io::Error::other(format!("Store lock task failed: {err}")))
-            .flatten()
-            .internal("Failed to acquire store lock")?;
+            if !path.exists() {
+                let _ = lore_io::IoDriver::global().create_dir_all(path).await;
+            }
+            let lock = FSLock::acquire_directory_lock(path)
+                .await
+                .internal("Failed to acquire store lock")?;
             Some(lock)
         } else {
             None
@@ -1050,7 +1045,7 @@ impl LocalImmutableStore {
                 // Roll forward any pending fan-out commit before reading the marker. After this returns the marker reflects the post-recovery state.
                 if group_path.exists()
                     && let Err(err) =
-                        crate::local::fan_out::recover_level_transition(&group_path, false)
+                        crate::local::fan_out::recover_level_transition(&group_path, false).await
                 {
                     return Err(LocalImmutableStoreError::internal_with_context(
                         err,
@@ -2921,6 +2916,7 @@ impl LocalImmutableStore {
                                 active_buckets,
                                 sync_data,
                             )
+                            .await
                             .map_err(|e| {
                                 LocalImmutableStoreError::internal_with_context(
                                     e,
@@ -2943,6 +2939,7 @@ impl LocalImmutableStore {
                                 active_buckets,
                                 sync_data,
                             )
+                            .await
                             .map_err(|e| {
                                 LocalImmutableStoreError::internal_with_context(
                                     e,
@@ -2982,6 +2979,7 @@ impl LocalImmutableStore {
                                 active_buckets,
                                 sync_data,
                             )
+                            .await
                             .map_err(|e| {
                                 LocalImmutableStoreError::internal_with_context(
                                     e,
@@ -2993,15 +2991,15 @@ impl LocalImmutableStore {
                         }
 
                         if first_err.is_none()
-                            && let Err(err) = crate::local::fan_out::delete_level_pending(
-                                &group_path,
-                            )
-                            .map_err(|e| {
-                                LocalImmutableStoreError::internal_with_context(
-                                    e,
-                                    "Failed to delete level.pending",
-                                )
-                            })
+                            && let Err(err) =
+                                crate::local::fan_out::delete_level_pending(&group_path)
+                                    .await
+                                    .map_err(|e| {
+                                        LocalImmutableStoreError::internal_with_context(
+                                            e,
+                                            "Failed to delete level.pending",
+                                        )
+                                    })
                         {
                             first_err = Some(err);
                         }
