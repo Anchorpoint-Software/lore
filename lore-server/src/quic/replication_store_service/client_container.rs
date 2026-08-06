@@ -280,6 +280,8 @@ mod tests {
             async fn local_exists_batch(&self, request: ExistsBatch) -> Result<ExistsBatchResponse, ReplicationStoreClientError>;
             async fn local_get(&self, request: Get) -> Result<GetResponse, ReplicationStoreClientError>;
             async fn local_query(&self, request: Query) -> Result<QueryResponse, ReplicationStoreClientError>;
+            async fn get_metadata(&self, request: Query) -> Result<QueryResponse, ReplicationStoreClientError>;
+            async fn local_get_metadata(&self, request: Query) -> Result<QueryResponse, ReplicationStoreClientError>;
         }
     }
 

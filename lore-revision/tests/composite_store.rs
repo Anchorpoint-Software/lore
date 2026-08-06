@@ -163,10 +163,19 @@ mod tests {
     impl lore_storage::ImmutableStore for TestStore<'static> {
         async fn get_metadata(
             self: Arc<Self>,
-            partition: Partition,
-            address: Address,
+            _partition: Partition,
+            _address: Address,
         ) -> Result<StoreQueryResult, StoreError> {
-            self.query(partition, address, StoreMatch::MatchFull).await
+            self.track_invocation("get_metadata");
+
+            if self.succeed {
+                Ok(StoreQueryResult {
+                    fragment: Fragment::default(),
+                    match_made: StoreMatch::MatchFull,
+                })
+            } else {
+                Err(StoreError::internal("Mock store failure"))
+            }
         }
 
         async fn exist(
@@ -476,6 +485,166 @@ mod tests {
                 assert_eq!(*store1.invocations.read().unwrap().get("query").unwrap(), 1);
 
                 assert!(store2.invocations.read().unwrap().get("query").is_none());
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn get_metadata_local_hit_short_circuits() {
+        let store1 = Arc::new(TestStore::succeeding());
+        let store2 = Arc::new(TestStore::succeeding());
+
+        let execution = setup_test_execution();
+        LORE_CONTEXT
+            .scope(execution.clone(), async move {
+                let repository: Partition = random::<RepositoryId>();
+                let address = Address {
+                    hash: random::<Hash>(),
+                    context: random::<Context>(),
+                };
+
+                let store = CompositeStoreBuilder::default()
+                    .with_local("successful, local".to_string(), store1.clone())
+                    .expect("Failed add local")
+                    .with_durable("successful, durable".to_string(), store2.clone())
+                    .expect("Failed add durable")
+                    .build()
+                    .expect("Failed store build");
+                let store = Arc::new(store);
+
+                store
+                    .clone()
+                    .get_metadata(repository, address)
+                    .await
+                    .expect("get_metadata should succeed");
+
+                assert_eq!(
+                    *store1
+                        .invocations
+                        .read()
+                        .unwrap()
+                        .get("get_metadata")
+                        .unwrap(),
+                    1
+                );
+                // durable should not be consulted when local hits
+                assert!(
+                    store2
+                        .invocations
+                        .read()
+                        .unwrap()
+                        .get("get_metadata")
+                        .is_none()
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn get_metadata_falls_back_to_durable_when_local_misses() {
+        let store1 = Arc::new(TestStore::failing());
+        let store2 = Arc::new(TestStore::succeeding());
+
+        let execution = setup_test_execution();
+        LORE_CONTEXT
+            .scope(execution.clone(), async move {
+                let repository: Partition = random::<RepositoryId>();
+                let address = Address {
+                    hash: random::<Hash>(),
+                    context: random::<Context>(),
+                };
+
+                let store = CompositeStoreBuilder::default()
+                    .with_local("failing, local".to_string(), store1.clone())
+                    .expect("Failed add local")
+                    .with_durable("successful, durable".to_string(), store2.clone())
+                    .expect("Failed add durable")
+                    .build()
+                    .expect("Failed store build");
+                let store = Arc::new(store);
+
+                store
+                    .clone()
+                    .get_metadata(repository, address)
+                    .await
+                    .expect("get_metadata should succeed via durable");
+
+                assert_eq!(
+                    *store1
+                        .invocations
+                        .read()
+                        .unwrap()
+                        .get("get_metadata")
+                        .unwrap(),
+                    1
+                );
+                assert_eq!(
+                    *store2
+                        .invocations
+                        .read()
+                        .unwrap()
+                        .get("get_metadata")
+                        .unwrap(),
+                    1
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn get_metadata_consults_replica_when_local_misses() {
+        let local = Arc::new(TestStore::failing());
+        let durable = Arc::new(TestStore::failing());
+        let replica = Arc::new(TestStore::succeeding());
+
+        let execution = setup_test_execution();
+        LORE_CONTEXT
+            .scope(execution.clone(), async move {
+                let repository: Partition = random::<RepositoryId>();
+                let address = Address {
+                    hash: random::<Hash>(),
+                    context: random::<Context>(),
+                };
+
+                let store = CompositeStoreBuilder::default()
+                    .with_local("failing, local".to_string(), local.clone())
+                    .expect("Failed add local")
+                    .with_durable("failing, durable".to_string(), durable.clone())
+                    .expect("Failed add durable")
+                    .with_replica(
+                        "successful, replica".to_string(),
+                        replica.clone(),
+                        true,
+                        false,
+                    )
+                    .build()
+                    .expect("Failed store build");
+                let store = Arc::new(store);
+
+                store
+                    .clone()
+                    .get_metadata(repository, address)
+                    .await
+                    .expect("get_metadata should succeed via replica");
+
+                assert_eq!(
+                    *local
+                        .invocations
+                        .read()
+                        .unwrap()
+                        .get("get_metadata")
+                        .unwrap(),
+                    1
+                );
+                assert_eq!(
+                    *replica
+                        .invocations
+                        .read()
+                        .unwrap()
+                        .get("get_metadata")
+                        .unwrap(),
+                    1
+                );
             })
             .await;
     }

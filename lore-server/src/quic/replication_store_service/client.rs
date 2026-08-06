@@ -133,6 +133,12 @@ pub trait StoreClient: Send + Sync + Sized + 'static {
     /// Request an Immutable `Query` on the server
     async fn query(&self, request: Query) -> Result<QueryResponse, ReplicationStoreClientError>;
 
+    /// Request an Immutable `GetMetadata` on the server
+    async fn get_metadata(
+        &self,
+        request: Query,
+    ) -> Result<QueryResponse, ReplicationStoreClientError>;
+
     /// Request an Immutable `Put` on the server's local store
     async fn local_put(&self, request: Put) -> Result<(), ReplicationStoreClientError>;
 
@@ -147,6 +153,12 @@ pub trait StoreClient: Send + Sync + Sized + 'static {
 
     /// Request an Immutable `Query` on the server's local store
     async fn local_query(
+        &self,
+        request: Query,
+    ) -> Result<QueryResponse, ReplicationStoreClientError>;
+
+    /// Request an Immutable `GetMetadata` on the server's local store
+    async fn local_get_metadata(
         &self,
         request: Query,
     ) -> Result<QueryResponse, ReplicationStoreClientError>;
@@ -331,6 +343,14 @@ impl StoreClient for ReplicationStoreClient {
         self.send_query(request, Command::ImmutableQuery).await
     }
 
+    async fn get_metadata(
+        &self,
+        request: Query,
+    ) -> Result<QueryResponse, ReplicationStoreClientError> {
+        self.send_query(request, Command::ImmutableGetMetadata)
+            .await
+    }
+
     async fn local_put(&self, request: Put) -> Result<(), ReplicationStoreClientError> {
         self.send_put(request, Command::ImmutableLocalPut).await
     }
@@ -352,6 +372,14 @@ impl StoreClient for ReplicationStoreClient {
         request: Query,
     ) -> Result<QueryResponse, ReplicationStoreClientError> {
         self.send_query(request, Command::ImmutableLocalQuery).await
+    }
+
+    async fn local_get_metadata(
+        &self,
+        request: Query,
+    ) -> Result<QueryResponse, ReplicationStoreClientError> {
+        self.send_query(request, Command::ImmutableLocalGetMetadata)
+            .await
     }
 }
 
