@@ -3,18 +3,18 @@
 //! Integration tests for the memory-based revision control API.
 //!
 //! Drives the public `lore_revision_tree_*` surface over a real in-memory
-//! storage handle, covering batch add fan-out onto shared parents, the fields
-//! an entry carries into the tree, and every way a batch is rejected.
+//! storage handle, covering each batch verb's fan-out, the fields an entry
+//! carries into the tree, and every way a batch is rejected. One module per
+//! verb over the shared [`support`] scaffolding.
 
+/// Scaffolding shared by every verb's tests: the event sink, a loaded handle
+/// over a real in-memory store, and the read verbs a write test checks itself
+/// against.
 #[cfg(test)]
-mod add_tests {
-    use std::collections::HashSet;
+mod support {
     use std::sync::Arc;
     use std::sync::Mutex;
 
-    use lore::revision_tree::add::LoreRevisionTreeAddArgs;
-    use lore::revision_tree::add::LoreRevisionTreeAddEntry;
-    use lore::revision_tree::add::add;
     use lore::revision_tree::close::LoreRevisionTreeCloseArgs;
     use lore::revision_tree::close::close;
     use lore::revision_tree::handle::LoreRevisionTree;
@@ -26,41 +26,31 @@ mod add_tests {
     use lore::revision_tree::node_info::node_info;
     use lore::storage::open;
     use lore::storage::open::LoreStorageOpenArgs;
-    use lore_base::lore_spawn;
-    use lore_base::types::Address;
-    use lore_base::types::Context;
     use lore_base::types::Hash;
     use lore_base::types::Partition;
     use lore_revision::event::LoreErrorCode;
     use lore_revision::event::LoreEvent;
     use lore_revision::event::revision_tree::LoreRevisionTreeNodeInfoEventData;
-    use lore_revision::interface::LoreArray;
     use lore_revision::interface::LoreError;
     use lore_revision::interface::LoreEventCallback;
     use lore_revision::interface::LoreGlobalArgs;
-    use lore_revision::interface::LoreNodeType;
-    use lore_revision::interface::LoreString;
-    use lore_revision::node::BLOCK_NODE_COUNT;
-    use lore_revision::node::INVALID_NODE;
-    use lore_revision::node::MAX_NODE_NAME_LEN;
     use lore_revision::node::NodeID;
-    use lore_revision::node::ROOT_NODE;
-    use tokio::task::JoinSet;
 
     /// Call-level id every test batch is submitted under, distinct from the
     /// per-entry ids so the two cannot be confused in an assertion.
-    const CALL_ID: u64 = 900;
+    pub(super) const CALL_ID: u64 = 900;
 
     /// The status a batch rejected during validation completes with. Asserted
     /// exactly rather than as "not zero", so a rejection that instead blew up in
-    /// the apply phase — leaving part of the batch created — fails the test.
-    const REJECTED_STATUS: i32 = LoreError::InvalidArguments as i32;
+    /// the apply phase — leaving part of the batch applied — fails the test.
+    pub(super) const REJECTED_STATUS: i32 = LoreError::InvalidArguments as i32;
 
     #[derive(Debug, Clone, PartialEq)]
-    enum Captured {
+    pub(super) enum Captured {
         Opened(u64),
         Loaded(u64),
         AddComplete(u64, NodeID, LoreErrorCode),
+        ModifyComplete(u64, NodeID, LoreErrorCode),
         BatchComplete(u64, LoreErrorCode),
         NodeInfo(Box<LoreRevisionTreeNodeInfoEventData>),
         Child(NodeID, String),
@@ -68,7 +58,7 @@ mod add_tests {
         Other,
     }
 
-    fn make_sink() -> (Arc<Mutex<Vec<Captured>>>, LoreEventCallback) {
+    pub(super) fn make_sink() -> (Arc<Mutex<Vec<Captured>>>, LoreEventCallback) {
         let sink: Arc<Mutex<Vec<Captured>>> = Arc::new(Mutex::new(Vec::new()));
         let sink_for_cb = sink.clone();
         let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
@@ -77,6 +67,9 @@ mod add_tests {
                 LoreEvent::RevisionTreeLoaded(data) => Captured::Loaded(data.handle_id),
                 LoreEvent::RevisionTreeAddComplete(data) => {
                     Captured::AddComplete(data.id, data.node_id, data.error_code)
+                }
+                LoreEvent::RevisionTreeModifyComplete(data) => {
+                    Captured::ModifyComplete(data.id, data.node_id, data.error_code)
                 }
                 LoreEvent::RevisionTreeBatchComplete(data) => {
                     Captured::BatchComplete(data.id, data.error_code)
@@ -94,7 +87,7 @@ mod add_tests {
     }
 
     /// Open an in-memory store and load an empty revision tree handle on it.
-    async fn load_handle(repository: Partition) -> LoreRevisionTree {
+    pub(super) async fn load_handle(repository: Partition) -> LoreRevisionTree {
         let (sink, callback) = make_sink();
         let status = open::open(
             LoreGlobalArgs::default(),
@@ -141,6 +134,121 @@ mod add_tests {
             .expect("load must emit RevisionTreeLoaded");
         LoreRevisionTree { handle_id }
     }
+
+    /// Every batch terminal in emission order, so a test can pin that exactly one
+    /// fired and what it carried.
+    pub(super) fn batch_outcomes(events: &[Captured]) -> Vec<(u64, LoreErrorCode)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Captured::BatchComplete(id, code) => Some((*id, *code)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub(super) async fn child_names(
+        handle: LoreRevisionTree,
+        parent_node_id: NodeID,
+    ) -> Vec<String> {
+        let (sink, callback) = make_sink();
+        let status = list_children(
+            LoreGlobalArgs::default(),
+            LoreRevisionTreeListChildrenArgs {
+                id: 1,
+                handle,
+                parent_node_id,
+            },
+            callback,
+        )
+        .await;
+        assert_eq!(status, 0, "listing children must succeed");
+        let mut names: Vec<String> = sink
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                Captured::Child(_, name) => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    pub(super) async fn node_info_of(
+        handle: LoreRevisionTree,
+        node_id: NodeID,
+    ) -> LoreRevisionTreeNodeInfoEventData {
+        let (sink, callback) = make_sink();
+        let status = node_info(
+            LoreGlobalArgs::default(),
+            LoreRevisionTreeNodeInfoArgs {
+                id: 1,
+                handle,
+                node_id,
+            },
+            callback,
+        )
+        .await;
+        assert_eq!(status, 0, "node info must succeed");
+        sink.lock()
+            .unwrap()
+            .iter()
+            .find_map(|event| match event {
+                Captured::NodeInfo(data) if data.node_id == node_id => Some((**data).clone()),
+                _ => None,
+            })
+            .expect("node info must report the node")
+    }
+
+    pub(super) async fn parent_of(handle: LoreRevisionTree, node_id: NodeID) -> NodeID {
+        node_info_of(handle, node_id).await.parent_id
+    }
+
+    pub(super) async fn close_handle(handle: LoreRevisionTree) {
+        let (sink, callback) = make_sink();
+        let status = close(
+            LoreGlobalArgs::default(),
+            LoreRevisionTreeCloseArgs { id: 1, handle },
+            callback,
+        )
+        .await;
+        assert_eq!(
+            status,
+            0,
+            "closing a loaded handle must succeed, got {:?}",
+            sink.lock().unwrap()
+        );
+    }
+}
+
+#[cfg(test)]
+mod add_tests {
+    use std::collections::HashSet;
+
+    use lore::revision_tree::add::LoreRevisionTreeAddArgs;
+    use lore::revision_tree::add::LoreRevisionTreeAddEntry;
+    use lore::revision_tree::add::add;
+    use lore::revision_tree::handle::LoreRevisionTree;
+    use lore_base::lore_spawn;
+    use lore_base::types::Address;
+    use lore_base::types::Context;
+    use lore_base::types::Hash;
+    use lore_base::types::Partition;
+    use lore_revision::event::LoreErrorCode;
+    use lore_revision::interface::LoreArray;
+    use lore_revision::interface::LoreGlobalArgs;
+    use lore_revision::interface::LoreNodeType;
+    use lore_revision::interface::LoreString;
+    use lore_revision::node::BLOCK_NODE_COUNT;
+    use lore_revision::node::INVALID_NODE;
+    use lore_revision::node::MAX_NODE_NAME_LEN;
+    use lore_revision::node::NodeID;
+    use lore_revision::node::ROOT_NODE;
+    use tokio::task::JoinSet;
+
+    use super::support::*;
 
     fn entry(
         id: u64,
@@ -220,90 +328,6 @@ mod add_tests {
     /// The single rejected entry a failed batch is expected to report.
     fn rejected(id: u64) -> Vec<(u64, NodeID, LoreErrorCode)> {
         vec![(id, INVALID_NODE, LoreErrorCode::InvalidArguments)]
-    }
-
-    /// Every batch terminal in emission order, so a test can pin that exactly one
-    /// fired and what it carried.
-    fn batch_outcomes(events: &[Captured]) -> Vec<(u64, LoreErrorCode)> {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Captured::BatchComplete(id, code) => Some((*id, *code)),
-                _ => None,
-            })
-            .collect()
-    }
-
-    async fn child_names(handle: LoreRevisionTree, parent_node_id: NodeID) -> Vec<String> {
-        let (sink, callback) = make_sink();
-        let status = list_children(
-            LoreGlobalArgs::default(),
-            LoreRevisionTreeListChildrenArgs {
-                id: 1,
-                handle,
-                parent_node_id,
-            },
-            callback,
-        )
-        .await;
-        assert_eq!(status, 0, "listing children must succeed");
-        let mut names: Vec<String> = sink
-            .lock()
-            .unwrap()
-            .iter()
-            .filter_map(|event| match event {
-                Captured::Child(_, name) => Some(name.clone()),
-                _ => None,
-            })
-            .collect();
-        names.sort();
-        names
-    }
-
-    async fn node_info_of(
-        handle: LoreRevisionTree,
-        node_id: NodeID,
-    ) -> LoreRevisionTreeNodeInfoEventData {
-        let (sink, callback) = make_sink();
-        let status = node_info(
-            LoreGlobalArgs::default(),
-            LoreRevisionTreeNodeInfoArgs {
-                id: 1,
-                handle,
-                node_id,
-            },
-            callback,
-        )
-        .await;
-        assert_eq!(status, 0, "node info must succeed");
-        sink.lock()
-            .unwrap()
-            .iter()
-            .find_map(|event| match event {
-                Captured::NodeInfo(data) if data.node_id == node_id => Some((**data).clone()),
-                _ => None,
-            })
-            .expect("node info must report the node")
-    }
-
-    async fn parent_of(handle: LoreRevisionTree, node_id: NodeID) -> NodeID {
-        node_info_of(handle, node_id).await.parent_id
-    }
-
-    async fn close_handle(handle: LoreRevisionTree) {
-        let (sink, callback) = make_sink();
-        let status = close(
-            LoreGlobalArgs::default(),
-            LoreRevisionTreeCloseArgs { id: 1, handle },
-            callback,
-        )
-        .await;
-        assert_eq!(
-            status,
-            0,
-            "closing a loaded handle must succeed, got {:?}",
-            sink.lock().unwrap()
-        );
     }
 
     /// Many siblings landing under one parent that an earlier call created, so
@@ -974,6 +998,659 @@ mod add_tests {
         assert!(
             child_names(handle, ROOT_NODE).await == vec!["target".to_string()],
             "the rejected batch adds nothing"
+        );
+    }
+}
+
+#[cfg(test)]
+mod modify_tests {
+    use lore::revision_tree::add::LoreRevisionTreeAddArgs;
+    use lore::revision_tree::add::LoreRevisionTreeAddEntry;
+    use lore::revision_tree::add::add;
+    use lore::revision_tree::handle::LoreRevisionTree;
+    use lore::revision_tree::modify::LoreRevisionTreeModifyArgs;
+    use lore::revision_tree::modify::LoreRevisionTreeModifyEntry;
+    use lore::revision_tree::modify::modify;
+    use lore_base::lore_spawn;
+    use lore_base::types::Address;
+    use lore_base::types::Context;
+    use lore_base::types::Hash;
+    use lore_base::types::Partition;
+    use lore_revision::event::LoreErrorCode;
+    use lore_revision::interface::LoreArray;
+    use lore_revision::interface::LoreGlobalArgs;
+    use lore_revision::interface::LoreNodeType;
+    use lore_revision::interface::LoreString;
+    use lore_revision::node::BLOCK_NODE_COUNT;
+    use lore_revision::node::INVALID_NODE;
+    use lore_revision::node::NodeID;
+    use lore_revision::node::ROOT_NODE;
+    use tokio::task::JoinSet;
+
+    use super::support::*;
+
+    /// A content address distinct per `seed`, so a test can tell which value a
+    /// node holds without threading the expected hash through every helper.
+    fn address(hash: u64, context: Context) -> Address {
+        Address {
+            hash: Hash::from_u64(hash),
+            context,
+        }
+    }
+
+    fn file_id() -> Context {
+        Context::from(uuid::Uuid::now_v7())
+    }
+
+    fn modify_entry(id: u64, node_id: NodeID) -> LoreRevisionTreeModifyEntry {
+        LoreRevisionTreeModifyEntry {
+            id,
+            node_id,
+            mode: 0o600,
+            size: 4096,
+            address: address(2, Context::default()),
+        }
+    }
+
+    /// Add `name` under `parent` and return its node id.
+    async fn seed(
+        handle: LoreRevisionTree,
+        parent: NodeID,
+        name: &str,
+        kind: LoreNodeType,
+        address: Address,
+    ) -> NodeID {
+        let (sink, callback) = make_sink();
+        let status = add(
+            LoreGlobalArgs::default(),
+            LoreRevisionTreeAddArgs {
+                id: 1,
+                handle,
+                entries: LoreArray::from_vec(vec![LoreRevisionTreeAddEntry {
+                    id: 1,
+                    parent_node_id: parent,
+                    parent_entry: 0,
+                    name: LoreString::from_str(name),
+                    kind: kind as u32,
+                    mode: 0o644,
+                    size: 10,
+                    address,
+                }]),
+            },
+            callback,
+        )
+        .await;
+        let events = sink.lock().unwrap().clone();
+        assert_eq!(status, 0, "seeding {name} must succeed, got {events:?}");
+        events
+            .iter()
+            .find_map(|event| match event {
+                Captured::AddComplete(_, node_id, LoreErrorCode::None) => Some(*node_id),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("seeding {name} must report a node id, got {events:?}"))
+    }
+
+    async fn run_modify(
+        handle: LoreRevisionTree,
+        entries: Vec<LoreRevisionTreeModifyEntry>,
+    ) -> (i32, Vec<Captured>) {
+        let (sink, callback) = make_sink();
+        let status = modify(
+            LoreGlobalArgs::default(),
+            LoreRevisionTreeModifyArgs {
+                id: CALL_ID,
+                handle,
+                entries: LoreArray::from_vec(entries),
+            },
+            callback,
+        )
+        .await;
+        let events = sink.lock().unwrap().clone();
+        (status, events)
+    }
+
+    /// Every per-entry terminal in emission order, so a test can pin which
+    /// entries reported and which stayed silent.
+    fn modify_completes(events: &[Captured]) -> Vec<(u64, NodeID, LoreErrorCode)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Captured::ModifyComplete(id, node_id, code) => Some((*id, *node_id, *code)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The single rejected entry a failed batch is expected to report.
+    fn rejected(id: u64) -> Vec<(u64, NodeID, LoreErrorCode)> {
+        vec![(id, INVALID_NODE, LoreErrorCode::InvalidArguments)]
+    }
+
+    /// The content fields a test compares before and after an attempt.
+    async fn content_of(handle: LoreRevisionTree, node_id: NodeID) -> (u16, u64, Address) {
+        let info = node_info_of(handle, node_id).await;
+        (info.mode, info.size, info.address)
+    }
+
+    /// Many independent files rewritten in one call. Every entry must land its
+    /// own values regardless of which task ran it, and none may disturb its
+    /// neighbours' fields, names, or place in the tree.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn modify_rewrites_every_entry_in_one_batch() {
+        let handle = load_handle(Partition::from([0xC1u8; 16])).await;
+        let parent = seed(
+            handle,
+            ROOT_NODE,
+            "dir",
+            LoreNodeType::Directory,
+            Address::default(),
+        )
+        .await;
+
+        const FILES: u64 = 64;
+        let mut nodes = Vec::new();
+        for index in 0..FILES {
+            nodes.push(
+                seed(
+                    handle,
+                    parent,
+                    &format!("f{index}"),
+                    LoreNodeType::File,
+                    address(1, file_id()),
+                )
+                .await,
+            );
+        }
+
+        let entries: Vec<_> = nodes
+            .iter()
+            .enumerate()
+            .map(|(index, node_id)| LoreRevisionTreeModifyEntry {
+                mode: 0o600,
+                size: index as u64,
+                address: address(100 + index as u64, Context::default()),
+                ..modify_entry(index as u64 + 1, *node_id)
+            })
+            .collect();
+
+        let (status, events) = run_modify(handle, entries).await;
+        assert_eq!(status, 0, "got {events:?}");
+        let mut reported = modify_completes(&events);
+        reported.sort_by_key(|(id, _, _)| *id);
+        let expected: Vec<_> = nodes
+            .iter()
+            .enumerate()
+            .map(|(index, node_id)| (index as u64 + 1, *node_id, LoreErrorCode::None))
+            .collect();
+        assert_eq!(
+            reported, expected,
+            "every entry must report its own node exactly once"
+        );
+
+        for (index, node_id) in nodes.iter().enumerate() {
+            let info = node_info_of(handle, *node_id).await;
+            assert_eq!(
+                (info.size, info.address.hash),
+                (index as u64, Hash::from_u64(100 + index as u64)),
+                "entry {index} must have landed its own values, got {info:?}"
+            );
+            assert_eq!(
+                info.name.as_str(),
+                format!("f{index}"),
+                "modify must not disturb a node's name"
+            );
+            assert_eq!(
+                info.parent_id, parent,
+                "modify must not move a node between parents"
+            );
+        }
+
+        let mut expected_names: Vec<String> = (0..FILES).map(|index| format!("f{index}")).collect();
+        expected_names.sort();
+        assert_eq!(
+            child_names(handle, parent).await,
+            expected_names,
+            "modify touches no sibling chain, so the parent's children are unchanged"
+        );
+    }
+
+    /// Node ids are allocated sequentially and a block holds a bounded number of
+    /// them, so only a batch past that bound rewrites nodes lying in different
+    /// blocks — which is the case where each entry's write takes a different
+    /// block's lock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn modify_rewrites_nodes_across_several_node_blocks() {
+        let handle = load_handle(Partition::from([0xCAu8; 16])).await;
+
+        let count = BLOCK_NODE_COUNT * 3;
+        let add_entries: Vec<LoreRevisionTreeAddEntry> = (0..count)
+            .map(|index| LoreRevisionTreeAddEntry {
+                id: index as u64 + 1,
+                parent_node_id: ROOT_NODE,
+                parent_entry: 0,
+                name: LoreString::from_str(&format!("f-{index:05}")),
+                kind: LoreNodeType::File as u32,
+                mode: 0o644,
+                size: 10,
+                address: address(1, file_id()),
+            })
+            .collect();
+        let (sink, callback) = make_sink();
+        let status = add(
+            LoreGlobalArgs::default(),
+            LoreRevisionTreeAddArgs {
+                id: 1,
+                handle,
+                entries: LoreArray::from_vec(add_entries),
+            },
+            callback,
+        )
+        .await;
+        assert_eq!(status, 0, "seeding three blocks of files must succeed");
+        let mut nodes: Vec<(u64, NodeID)> = sink
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                Captured::AddComplete(id, node_id, LoreErrorCode::None) => Some((*id, *node_id)),
+                _ => None,
+            })
+            .collect();
+        nodes.sort_by_key(|(id, _)| *id);
+        assert_eq!(nodes.len(), count, "every seeded file must report");
+        assert!(
+            nodes.iter().any(|(_, node_id)| *node_id >= 512),
+            "the seed must span more than one node block"
+        );
+
+        let entries: Vec<_> = nodes
+            .iter()
+            .enumerate()
+            .map(|(index, (_, node_id))| LoreRevisionTreeModifyEntry {
+                size: index as u64,
+                address: address(1000 + index as u64, Context::default()),
+                ..modify_entry(index as u64 + 1, *node_id)
+            })
+            .collect();
+
+        let (status, events) = run_modify(handle, entries).await;
+        assert_eq!(status, 0, "got {:?}", batch_outcomes(&events));
+        assert_eq!(
+            modify_completes(&events).len(),
+            count,
+            "every entry across every block must report"
+        );
+
+        for (index, (_, node_id)) in nodes.iter().enumerate() {
+            let info = node_info_of(handle, *node_id).await;
+            assert_eq!(
+                (info.size, info.address.hash),
+                (index as u64, Hash::from_u64(1000 + index as u64)),
+                "entry {index} in block {} must hold its own values",
+                node_id >> 9
+            );
+        }
+    }
+
+    /// Separate calls rewriting separate nodes run concurrently. Each node must
+    /// end on its own call's values, with no write landing on another's target.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_batches_on_distinct_nodes_each_land() {
+        let handle = load_handle(Partition::from([0xC2u8; 16])).await;
+
+        const BATCHES: u64 = 4;
+        const PER_BATCH: u64 = 16;
+        let mut nodes = Vec::new();
+        for index in 0..(BATCHES * PER_BATCH) {
+            nodes.push(
+                seed(
+                    handle,
+                    ROOT_NODE,
+                    &format!("f{index}"),
+                    LoreNodeType::File,
+                    address(1, file_id()),
+                )
+                .await,
+            );
+        }
+
+        let mut tasks: JoinSet<i32> = JoinSet::new();
+        for batch in 0..BATCHES {
+            let batch_nodes: Vec<NodeID> =
+                nodes[(batch * PER_BATCH) as usize..((batch + 1) * PER_BATCH) as usize].to_vec();
+            lore_spawn!(tasks, async move {
+                let entries: Vec<_> = batch_nodes
+                    .iter()
+                    .enumerate()
+                    .map(|(index, node_id)| {
+                        let global = batch * PER_BATCH + index as u64;
+                        LoreRevisionTreeModifyEntry {
+                            size: global,
+                            address: address(200 + global, Context::default()),
+                            ..modify_entry(global + 1, *node_id)
+                        }
+                    })
+                    .collect();
+                run_modify(handle, entries).await.0
+            });
+        }
+        while let Some(result) = tasks.join_next().await {
+            assert_eq!(
+                result.expect("batch task must not panic"),
+                0,
+                "every concurrent batch must succeed"
+            );
+        }
+
+        for (index, node_id) in nodes.iter().enumerate() {
+            let info = node_info_of(handle, *node_id).await;
+            assert_eq!(
+                (info.size, info.address.hash),
+                (index as u64, Hash::from_u64(200 + index as u64)),
+                "node {index} must hold the values its own batch wrote, got {info:?}"
+            );
+        }
+    }
+
+    /// The file id is the node's identity across revisions, so an edit that
+    /// supplies none must keep it — generating one, as `add` does, would record
+    /// the edit as a move.
+    #[tokio::test]
+    async fn modify_preserves_the_file_id_unless_the_caller_supplies_one() {
+        let handle = load_handle(Partition::from([0xC3u8; 16])).await;
+
+        let original = file_id();
+        let kept = seed(
+            handle,
+            ROOT_NODE,
+            "kept.bin",
+            LoreNodeType::File,
+            address(1, original),
+        )
+        .await;
+        let replaced = seed(
+            handle,
+            ROOT_NODE,
+            "replaced.bin",
+            LoreNodeType::File,
+            address(1, file_id()),
+        )
+        .await;
+
+        let supplied = file_id();
+        let (status, events) = run_modify(
+            handle,
+            vec![
+                modify_entry(1, kept),
+                LoreRevisionTreeModifyEntry {
+                    address: address(2, supplied),
+                    ..modify_entry(2, replaced)
+                },
+            ],
+        )
+        .await;
+        assert_eq!(status, 0, "got {events:?}");
+
+        assert_eq!(
+            node_info_of(handle, kept).await.file_id,
+            original,
+            "a zero context must preserve the file id"
+        );
+        assert_eq!(
+            node_info_of(handle, replaced).await.file_id,
+            supplied,
+            "a supplied file id must replace the existing one"
+        );
+    }
+
+    /// One invalid entry rejects the whole batch: the valid entries ahead of it
+    /// are not rewritten, only the offending entry reports, and the handle keeps
+    /// working for the next batch.
+    #[tokio::test]
+    async fn a_rejected_batch_rewrites_nothing_and_leaves_the_handle_usable() {
+        let handle = load_handle(Partition::from([0xC4u8; 16])).await;
+        let first = seed(
+            handle,
+            ROOT_NODE,
+            "a.bin",
+            LoreNodeType::File,
+            address(1, file_id()),
+        )
+        .await;
+        let second = seed(
+            handle,
+            ROOT_NODE,
+            "b.bin",
+            LoreNodeType::File,
+            address(1, file_id()),
+        )
+        .await;
+        let before = content_of(handle, first).await;
+
+        let (status, events) = run_modify(
+            handle,
+            vec![
+                modify_entry(1, first),
+                modify_entry(2, second),
+                modify_entry(3, INVALID_NODE),
+            ],
+        )
+        .await;
+        assert_eq!(status, REJECTED_STATUS, "got {events:?}");
+        assert_eq!(modify_completes(&events), rejected(3), "got {events:?}");
+        assert_eq!(
+            batch_outcomes(&events),
+            vec![(CALL_ID, LoreErrorCode::InvalidArguments)],
+            "got {events:?}"
+        );
+        assert_eq!(
+            content_of(handle, first).await,
+            before,
+            "an entry ahead of the rejected one must not have been applied"
+        );
+
+        let (status, events) = run_modify(handle, vec![modify_entry(4, first)]).await;
+        assert_eq!(
+            status, 0,
+            "the handle must stay usable after a rejection, got {events:?}"
+        );
+    }
+
+    /// Every way an entry names something it may not rewrite. Each is asserted on
+    /// the exact rejection status, so a case that instead failed part-way through
+    /// the apply phase fails the test.
+    #[tokio::test]
+    async fn modify_rejects_unknown_unallocated_and_non_file_targets() {
+        let handle = load_handle(Partition::from([0xC5u8; 16])).await;
+        let directory = seed(
+            handle,
+            ROOT_NODE,
+            "dir",
+            LoreNodeType::Directory,
+            Address::default(),
+        )
+        .await;
+        let link = seed(
+            handle,
+            ROOT_NODE,
+            "link",
+            LoreNodeType::Link,
+            address(3, file_id()),
+        )
+        .await;
+
+        for (node_id, what) in [
+            (INVALID_NODE, "the invalid sentinel"),
+            (400, "an unallocated slot"),
+            (ROOT_NODE, "the root"),
+            (directory, "a directory"),
+            (link, "a link"),
+        ] {
+            let (status, events) = run_modify(handle, vec![modify_entry(9, node_id)]).await;
+            assert_eq!(
+                status, REJECTED_STATUS,
+                "{what} must be rejected, got {events:?}"
+            );
+            assert_eq!(modify_completes(&events), rejected(9), "got {events:?}");
+        }
+
+        for (node_id, what) in [(directory, "a directory"), (link, "a link")] {
+            let info = node_info_of(handle, node_id).await;
+            assert_eq!(
+                (info.mode, info.size),
+                (0o644, 0),
+                "{what} must be untouched by the refused attempts, got {info:?}"
+            );
+        }
+    }
+
+    /// Two entries naming one node do not say which value the caller meant, and a
+    /// repeated non-zero caller id would make a reported id ambiguous. Both reject
+    /// the batch rather than picking a winner.
+    #[tokio::test]
+    async fn modify_rejects_a_repeated_node_id_and_a_repeated_caller_id() {
+        let handle = load_handle(Partition::from([0xC6u8; 16])).await;
+        let first = seed(
+            handle,
+            ROOT_NODE,
+            "a.bin",
+            LoreNodeType::File,
+            address(1, file_id()),
+        )
+        .await;
+        let second = seed(
+            handle,
+            ROOT_NODE,
+            "b.bin",
+            LoreNodeType::File,
+            address(1, file_id()),
+        )
+        .await;
+        let before = content_of(handle, first).await;
+
+        let (status, events) =
+            run_modify(handle, vec![modify_entry(1, first), modify_entry(2, first)]).await;
+        assert_eq!(status, REJECTED_STATUS, "got {events:?}");
+        assert_eq!(modify_completes(&events), rejected(2), "got {events:?}");
+        assert_eq!(
+            content_of(handle, first).await,
+            before,
+            "a rejected batch must leave every field unchanged"
+        );
+
+        let (status, events) = run_modify(
+            handle,
+            vec![modify_entry(5, first), modify_entry(5, second)],
+        )
+        .await;
+        assert_eq!(status, REJECTED_STATUS, "got {events:?}");
+        assert_eq!(modify_completes(&events), rejected(5), "got {events:?}");
+
+        // Zero is an explicit "not correlating this entry", so it may repeat.
+        let (status, events) = run_modify(
+            handle,
+            vec![modify_entry(0, first), modify_entry(0, second)],
+        )
+        .await;
+        assert_eq!(status, 0, "got {events:?}");
+        assert_eq!(
+            modify_completes(&events).len(),
+            2,
+            "both entries must report under the shared zero id, got {events:?}"
+        );
+    }
+
+    /// A closed handle is the call's failure, not any entry's: it reports on the
+    /// batch terminal, which carries the call id, and leaves every entry silent.
+    #[tokio::test]
+    async fn modify_on_a_closed_handle_reports_only_the_batch_terminal() {
+        let handle = load_handle(Partition::from([0xC7u8; 16])).await;
+        let node_id = seed(
+            handle,
+            ROOT_NODE,
+            "a.bin",
+            LoreNodeType::File,
+            address(1, file_id()),
+        )
+        .await;
+        close_handle(handle).await;
+
+        let (status, events) = run_modify(
+            handle,
+            vec![modify_entry(7, node_id), modify_entry(8, node_id)],
+        )
+        .await;
+
+        assert_ne!(status, 0, "a closed handle must fail the call");
+        assert!(
+            modify_completes(&events).is_empty(),
+            "no entry may report when the call itself failed, got {events:?}"
+        );
+        assert_eq!(
+            batch_outcomes(&events),
+            vec![(CALL_ID, LoreErrorCode::InvalidArguments)],
+            "got {events:?}"
+        );
+        assert!(events.contains(&Captured::Complete(status)));
+    }
+
+    /// An empty batch is a no-op, but the call still reports once so a caller
+    /// waiting on the batch terminal is not left hanging.
+    #[tokio::test]
+    async fn modify_with_no_entries_reports_the_batch_terminal() {
+        let handle = load_handle(Partition::from([0xC8u8; 16])).await;
+
+        let (status, events) = run_modify(handle, Vec::new()).await;
+        assert_eq!(status, 0, "got {events:?}");
+        assert!(
+            modify_completes(&events).is_empty(),
+            "no entry terminal may fire for an empty batch, got {events:?}"
+        );
+        assert_eq!(
+            batch_outcomes(&events),
+            vec![(CALL_ID, LoreErrorCode::None)],
+            "got {events:?}"
+        );
+    }
+
+    /// Adding a file and rewriting it in the same handle is the canonical
+    /// pipeline shape, and the node must carry the second call's content while
+    /// keeping the identity the first gave it.
+    #[tokio::test]
+    async fn a_file_added_then_modified_reads_back_with_the_new_content() {
+        let handle = load_handle(Partition::from([0xC9u8; 16])).await;
+        let node_id = seed(
+            handle,
+            ROOT_NODE,
+            "payload.bin",
+            LoreNodeType::File,
+            Address::default(),
+        )
+        .await;
+
+        let generated = node_info_of(handle, node_id).await.file_id;
+        assert_ne!(
+            generated,
+            Context::default(),
+            "add must have assigned a file id"
+        );
+
+        let (status, events) = run_modify(handle, vec![modify_entry(1, node_id)]).await;
+        assert_eq!(status, 0, "got {events:?}");
+
+        let info = node_info_of(handle, node_id).await;
+        assert_eq!(info.mode, 0o600, "got {info:?}");
+        assert_eq!(info.size, 4096, "got {info:?}");
+        assert_eq!(info.address.hash, Hash::from_u64(2), "got {info:?}");
+        assert_eq!(
+            info.file_id, generated,
+            "the file id add generated must survive the rewrite"
+        );
+        assert_eq!(
+            parent_of(handle, node_id).await,
+            ROOT_NODE,
+            "the node must stay where add put it"
         );
     }
 }

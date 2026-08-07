@@ -11,6 +11,8 @@ use lore::repository::LoreRepositoryStatusArgs;
 use lore::revision_tree::add::LoreRevisionTreeAddArgs;
 use lore::revision_tree::add::LoreRevisionTreeAddEntry;
 use lore::revision_tree::handle::LoreRevisionTree;
+use lore::revision_tree::modify::LoreRevisionTreeModifyArgs;
+use lore::revision_tree::modify::LoreRevisionTreeModifyEntry;
 use lore_base::types::Address;
 use lore_base::types::Context;
 use lore_base::types::Hash;
@@ -129,6 +131,66 @@ async fn a_command_carrying_an_address_survives_both_serializations() {
                 assert_eq!(read_back.entries.as_slice(), args.entries.as_slice());
             }
             _ => panic!("Unexpected command"),
+        }
+    }
+}
+
+/// A batch verb reaches the service as an array of entries rather than a flat
+/// argument set, so every entry field has to survive the wire — including the
+/// address bytes, which no other command carries in an array element.
+#[tokio::test]
+async fn revision_tree_modify_batch_survives_the_wire() {
+    let entries = LoreArray::from_vec(vec![
+        LoreRevisionTreeModifyEntry {
+            id: 7,
+            node_id: 42,
+            mode: 0o600,
+            size: 4096,
+            address: Address {
+                hash: Hash::from_u64(0xfeed),
+                context: Context::from(uuid::Uuid::now_v7()),
+            },
+        },
+        LoreRevisionTreeModifyEntry {
+            id: 0,
+            node_id: 43,
+            mode: 0o644,
+            size: 0,
+            address: Address::default(),
+        },
+    ]);
+    let args = LoreRevisionTreeModifyArgs {
+        id: 900,
+        handle: LoreRevisionTree { handle_id: 5 },
+        entries: entries.clone(),
+    };
+
+    for (serialization, label) in [
+        (SerializationType::Json, "json"),
+        (SerializationType::Bincode, "bincode"),
+    ] {
+        let message = MessageToServer {
+            globals: LoreGlobalArgs::default(),
+            command: LoreCommand::RevisionTreeModify(args.clone()),
+        };
+        let message_bytes = write_v1_message(message, serialization).unwrap();
+        let processed: Result<Option<(V1Header, MessageToServer)>, MessageError> =
+            blocking_read_v1_message(&mut message_bytes.as_slice());
+        let processed = processed
+            .unwrap_or_else(|error| panic!("{label} must read back: {error:?}"))
+            .expect("a whole message must be present");
+
+        match processed.1.command {
+            LoreCommand::RevisionTreeModify(read_back) => {
+                assert_eq!(read_back.id, args.id, "{label}");
+                assert_eq!(read_back.handle.handle_id, args.handle.handle_id, "{label}");
+                assert_eq!(
+                    read_back.entries.as_slice(),
+                    entries.as_slice(),
+                    "{label} must carry every entry field unchanged"
+                );
+            }
+            other => panic!("Unexpected command: {other:?}"),
         }
     }
 }

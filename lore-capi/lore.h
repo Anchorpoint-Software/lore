@@ -2643,8 +2643,10 @@ typedef struct lore_revision_tree_delete_complete_event_data_t {
   enum lore_error_code_t error_code;
 } lore_revision_tree_delete_complete_event_data_t;
 
-// Terminal per-call event for `modify`. `node_id` echoes the modified
-// node so the caller can chain operations without re-resolving.
+// Terminal per-entry event for `modify`. On success `node_id` echoes the
+// rewritten node so the caller can chain operations without re-resolving; on
+// failure it is the invalid-node sentinel, since nothing was rewritten. The
+// call as a whole reports separately on `RevisionTreeBatchComplete`.
 typedef struct lore_revision_tree_modify_complete_event_data_t {
   // Correlation id of the originating call.
   uint64_t id;
@@ -5173,6 +5175,39 @@ typedef struct lore_revision_tree_add_args_t {
   struct lore_revision_tree_add_entry_array_t entries;
 } lore_revision_tree_add_args_t;
 
+// One node to rewrite. The node must already exist and be a file.
+typedef struct lore_revision_tree_modify_entry_t {
+  // Caller-chosen id echoed back in this entry's `MODIFY_COMPLETE`
+  uint64_t id;
+  // Leaf node to rewrite; non-leaf targets are rejected
+  lore_node_id_t node_id;
+  // New POSIX permission bits
+  uint16_t mode;
+  // New content size in bytes
+  uint64_t size;
+  // New content address; a zero `context` preserves the node's file id
+  struct lore_address_t address;
+} lore_revision_tree_modify_entry_t;
+
+// A contiguous array of elements described by a pointer and a count.
+// Holds zero or more values of the element type laid out one after another.
+typedef struct lore_revision_tree_modify_entry_array_t {
+  // Pointer to the first element.
+  const struct lore_revision_tree_modify_entry_t *ptr;
+  // Number of elements in the array.
+  uintptr_t count;
+} lore_revision_tree_modify_entry_array_t;
+
+// Arguments for `lore_revision_tree_modify`.
+typedef struct lore_revision_tree_modify_args_t {
+  // Per-call correlation id echoed back in `BATCH_COMPLETE`
+  uint64_t id;
+  // Loaded revision-tree handle to mutate
+  struct lore_revision_tree_t handle;
+  // Nodes to rewrite; each emits its own `MODIFY_COMPLETE`
+  struct lore_revision_tree_modify_entry_array_t entries;
+} lore_revision_tree_modify_args_t;
+
 // Arguments for `lore_revision_tree_delete`.
 typedef struct lore_revision_tree_delete_args_t {
   // Per-call correlation id echoed back in events
@@ -5182,22 +5217,6 @@ typedef struct lore_revision_tree_delete_args_t {
   // Subtree root to mark deleted, including its transitive children
   lore_node_id_t node_id;
 } lore_revision_tree_delete_args_t;
-
-// Arguments for `lore_revision_tree_modify`.
-typedef struct lore_revision_tree_modify_args_t {
-  // Per-call correlation id echoed back in events
-  uint64_t id;
-  // Loaded revision-tree handle to mutate
-  struct lore_revision_tree_t handle;
-  // Leaf node to update; non-leaf targets are rejected
-  lore_node_id_t node_id;
-  // New POSIX permission bits
-  uint16_t mode;
-  // New content size in bytes
-  uint64_t size;
-  // New content address; the existing `file_id` context is preserved
-  struct lore_address_t address;
-} lore_revision_tree_modify_args_t;
 
 // Arguments for `lore_revision_tree_move`.
 typedef struct lore_revision_tree_move_args_t {
@@ -10884,3 +10903,30 @@ int32_t lore_revision_tree_add(const struct lore_global_args_t *globals,
 void lore_revision_tree_add_async(const struct lore_global_args_t *globals,
                                   const struct lore_revision_tree_add_args_t *args,
                                   struct lore_event_callback_config_t callback);
+
+// Rewrite a batch of file nodes' `mode`, `size` and `address` in a loaded
+// revision tree. Every entry is checked before any node is rewritten, so one bad
+// entry rejects the call and leaves every target untouched; the reason names the
+// offending entry's batch index, which a caller leaving `id` at zero has no
+// other way to identify. A failure after those checks pass is internal and may
+// leave part of the batch rewritten.
+//
+// Only a file is modifiable: a directory's size and address are derived at
+// commit and a link's address is its target. A zero `address.context` preserves
+// the node's existing file id rather than generating one, which is the opposite
+// of `lore_revision_tree_add` — the node already has an identity, and replacing
+// it would record the edit as a move. Entries touch no parent or sibling chain,
+// so the whole batch applies concurrently.
+//
+// | Terminal event                              | Payload                                           | Notes                                                    |
+// |---------------------------------------------|---------------------------------------------------|----------------------------------------------------------|
+// | `LORE_EVENT_REVISION_TREE_MODIFY_COMPLETE`  | `lore_revision_tree_modify_complete_event_data_t` | One per entry rewritten or individually rejected         |
+// | `LORE_EVENT_REVISION_TREE_BATCH_COMPLETE`   | `lore_revision_tree_batch_complete_event_data_t`  | Exactly one, carrying the call id and the call's outcome |
+int32_t lore_revision_tree_modify(const struct lore_global_args_t *globals,
+                                  const struct lore_revision_tree_modify_args_t *args,
+                                  struct lore_event_callback_config_t callback);
+
+// Rewrite a batch of file nodes in a loaded revision tree (async variant).
+void lore_revision_tree_modify_async(const struct lore_global_args_t *globals,
+                                     const struct lore_revision_tree_modify_args_t *args,
+                                     struct lore_event_callback_config_t callback);

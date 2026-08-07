@@ -89,6 +89,16 @@ enum AddError {
     InvalidArguments,
 }
 
+impl AddError {
+    /// A rejection the arguments earned, alongside the generated `internal`
+    /// constructor for a failure of ours.
+    fn invalid(reason: impl Into<String>) -> Self {
+        Self::from(InvalidArguments {
+            reason: reason.into(),
+        })
+    }
+}
+
 impl EventError for AddError {
     fn translated(&self) -> LoreError {
         match self {
@@ -100,12 +110,6 @@ impl EventError for AddError {
     fn inner(&self) -> String {
         self.to_string()
     }
-}
-
-fn invalid(reason: &str) -> AddError {
-    AddError::from(InvalidArguments {
-        reason: reason.into(),
-    })
 }
 
 fn emit_add_complete(id: u64, node_id: NodeID, error_code: LoreErrorCode) {
@@ -208,7 +212,7 @@ fn resolve_parent(parent: ParentRef, created: &[NodeID]) -> NodeID {
 /// not say which entry was at fault.
 fn reject(id: u64, entry: usize, reason: &str) -> AddError {
     emit_add_error(id, LoreErrorCode::InvalidArguments);
-    invalid(&format!("entry {entry}: {reason}"))
+    AddError::invalid(format!("entry {entry}: {reason}"))
 }
 
 /// Reject the whole batch because the tree could not be read, keeping the

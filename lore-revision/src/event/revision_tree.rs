@@ -209,8 +209,10 @@ pub struct LoreRevisionTreeDeleteCompleteEventData {
     pub error_code: LoreErrorCode,
 }
 
-/// Terminal per-call event for `modify`. `node_id` echoes the modified
-/// node so the caller can chain operations without re-resolving.
+/// Terminal per-entry event for `modify`. On success `node_id` echoes the
+/// rewritten node so the caller can chain operations without re-resolving; on
+/// failure it is the invalid-node sentinel, since nothing was rewritten. The
+/// call as a whole reports separately on `RevisionTreeBatchComplete`.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

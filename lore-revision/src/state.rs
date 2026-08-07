@@ -37,6 +37,7 @@ use crate::change;
 use crate::change::FileAction;
 use crate::change::NodeChange;
 use crate::change::NodeChangeState;
+use crate::errors::InvalidArguments;
 use crate::errors::LinkNotFound;
 use crate::errors::NodeNotFound;
 use crate::errors::NotFound;
@@ -2095,6 +2096,68 @@ impl State {
         if newly_dirty {
             self.block_modified(block.clone(), block_index);
         }
+    }
+
+    /// Rewrite a file node's `mode`, `size` and `address` in place.
+    ///
+    /// A zero `address.context` preserves the node's existing file id. The node
+    /// already carries an identity, and replacing it would record the edit as a
+    /// move.
+    ///
+    /// Only a file is modifiable: a directory's size and address are derived
+    /// when the revision is committed, and a link's address is its target, so
+    /// neither holds content this can rewrite. A discarded slot is refused
+    /// under its own reason — it carries neither the file nor the link flag, so
+    /// it would otherwise read back as an ordinary directory.
+    ///
+    /// # Concurrency
+    ///
+    /// The kind check and the rewrite share one block write lock, so a node
+    /// discarded concurrently is never rewritten after the fact. Nothing here
+    /// touches a parent or sibling chain, so modifications of distinct nodes are
+    /// independent even within one block.
+    pub async fn node_modify(
+        &self,
+        repository: Arc<RepositoryContext>,
+        node_id: NodeID,
+        mode: u16,
+        size: u64,
+        address: Address,
+    ) -> Result<(), StateError> {
+        if !node_id.is_valid_node_id() {
+            return Err(StateError::from(InvalidArguments {
+                reason: "node id does not name a modifiable node".into(),
+            }));
+        }
+        let block_index = NodeBlock::index(node_id);
+        let block = self.block(repository, block_index).await?;
+        let dirtied = {
+            let mut block_writer = block.write();
+            let node = block_writer.node(Node::index(node_id));
+            if node.is_discarded() {
+                return Err(StateError::from(InvalidArguments {
+                    reason: "cannot modify a deleted node".into(),
+                }));
+            }
+            if !node.is_file() {
+                return Err(StateError::from(InvalidArguments {
+                    reason: "only a file node carries content to modify".into(),
+                }));
+            }
+            let file_id = node.address.context;
+            node.mode = mode;
+            node.size = size;
+            node.address = address;
+            if node.address.context.is_zero() {
+                node.address.context = file_id;
+            }
+            block_writer.mark_dirty()
+        };
+        if dirtied {
+            self.block_modified(block, block_index);
+            self.mark_dirty();
+        }
+        Ok(())
     }
 
     pub async fn node_children(
