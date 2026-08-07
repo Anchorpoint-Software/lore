@@ -265,7 +265,8 @@ mod tests {
         {
             let path = entry.path();
             if path.is_dir()
-                && let Ok(Some(level)) = lore_storage::local::fan_out::read_level_marker(&path)
+                && let Ok(Some(level)) =
+                    lore_storage::local::fan_out::read_level_marker(&path).await
             {
                 assert_eq!(level, 1, "Marker should record initial level 1");
                 found_marker = true;
@@ -327,7 +328,8 @@ mod tests {
         {
             let path = entry.path();
             if path.is_dir()
-                && let Ok(Some(level)) = lore_storage::local::fan_out::read_level_marker(&path)
+                && let Ok(Some(level)) =
+                    lore_storage::local::fan_out::read_level_marker(&path).await
             {
                 assert_eq!(level, 256, "Marker should record level 256");
                 found_marker_at_256 = true;
@@ -788,6 +790,7 @@ mod tests {
             .join("index")
             .join(format!("{group_index:02x}"));
         let marker_level = lore_storage::local::fan_out::read_level_marker(&marker_path)
+            .await
             .unwrap()
             .expect("Marker should exist after fan-out");
         assert_eq!(marker_level, 32, "Marker level mismatches in-memory level");
@@ -866,6 +869,7 @@ mod tests {
             .join("index")
             .join(format!("{group_index:02x}"));
         let marker_level = lore_storage::local::fan_out::read_level_marker(&marker_path)
+            .await
             .unwrap()
             .expect("Marker should exist after fan-out");
         assert_eq!(marker_level, 32, "Marker level mismatches in-memory level");
@@ -1484,7 +1488,9 @@ mod tests {
             );
         }
         assert_eq!(
-            lore_storage::local::fan_out::read_level_marker(&group_dir).unwrap(),
+            lore_storage::local::fan_out::read_level_marker(&group_dir)
+                .await
+                .unwrap(),
             Some(32)
         );
 
@@ -1534,7 +1540,9 @@ mod tests {
                 .exists()
         );
         assert_eq!(
-            lore_storage::local::fan_out::read_level_marker(&group_dir).unwrap(),
+            lore_storage::local::fan_out::read_level_marker(&group_dir)
+                .await
+                .unwrap(),
             Some(32)
         );
 
@@ -1563,7 +1571,9 @@ mod tests {
                 .exists()
         );
         assert_eq!(
-            lore_storage::local::fan_out::read_level_marker(&group_dir).unwrap(),
+            lore_storage::local::fan_out::read_level_marker(&group_dir)
+                .await
+                .unwrap(),
             Some(32)
         );
 

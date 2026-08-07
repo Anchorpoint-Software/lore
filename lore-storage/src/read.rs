@@ -747,13 +747,11 @@ pub async fn read_into_file(
             .await?;
 
             if options.sync_data {
-                let sync_file = file.clone();
-                lore_base::lore_spawn_blocking!(move || sync_file.sync_data())
+                file.sync_data()
                     .await
-                    .map_err(|e| StorageError::internal_with_context(e, "flush task"))?
                     .map_err(|e| StorageError::internal_with_context(e, "flush file"))?;
             }
-            // std::fs::File has no userspace buffer, so there is nothing to flush.
+            // The handle holds no userspace buffer, so there is nothing to flush.
             drop(file);
 
             if !options.direct_write {
@@ -795,46 +793,36 @@ pub async fn read_into_file(
     Ok((fragment, None))
 }
 
+/// Writes `buffer` as the whole contents of `path` and returns the resulting metadata.
+///
+/// One driver dispatch covers open, write, optional sync and stat, so the caller needs no
+/// separate stat round-trip and the metadata comes off the open handle rather than from a second
+/// path resolve. The whole-file operation refuses anything above `lore_io::WHOLE_FILE_LIMIT`,
+/// which the content written here cannot reach: an unfragmented fragment's content is bounded by
+/// `FRAGMENT_SIZE_THRESHOLD`.
 pub async fn write_all_to_file(
     path: impl AsRef<Path>,
     buffer: Bytes,
     sync_data: bool,
 ) -> Result<std::fs::Metadata, std::io::Error> {
-    // One spawn_blocking trip for open+write+(sync)+stat+close. Saves the caller a separate stat round-trip and keeps the metadata fetch on the open handle (no path resolve, FS cache warm). std::fs::File has no userspace buffer, so flush would be a no-op for unbuffered writes and is omitted in the non-sync path.
-    let path_buf = path.as_ref().to_path_buf();
+    let path = path.as_ref().to_path_buf();
     let buffer_len = buffer.len();
-    let path_display_for_trace = path_buf.clone();
-    let join_result =
-        lore_base::lore_spawn_blocking!(move || -> std::io::Result<std::fs::Metadata> {
-            use std::io::Write;
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(true)
-                .read(true)
-                .write(true)
-                .open(&path_buf)?;
-            file.write_all(buffer.as_ref())?;
-            if sync_data {
-                file.sync_data()?;
-            }
-            file.metadata()
-        })
-        .await;
-    let metadata = match join_result {
-        Ok(io_result) => io_result?,
-        Err(join_err) => {
-            return Err(std::io::Error::other(format!(
-                "spawn_blocking join error writing {}: {join_err}",
-                path_display_for_trace.display()
-            )));
-        }
-    };
 
-    lore_base::lore_trace!(
-        "Wrote {} bytes to {}",
-        buffer_len,
-        path_display_for_trace.display()
-    );
+    // Reissued while the open fails transiently: a reader of this path grants no write access
+    // for as long as it is open, so on Windows a write landing on a file being hashed or
+    // fragmented waits for that scan rather than failing the materialization.
+    let metadata = crate::fs_util::retry_transient(|| {
+        let path = path.clone();
+        let buffer = buffer.clone();
+        async move {
+            lore_io::IoDriver::global()
+                .write_file_bytes(path, buffer, sync_data)
+                .await
+        }
+    })
+    .await?;
+
+    lore_base::lore_trace!("Wrote {} bytes to {}", buffer_len, path.display());
 
     Ok(metadata)
 }

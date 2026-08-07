@@ -59,12 +59,13 @@ impl StableBufListMut for Vec<Vec<u8>> {
 ///
 /// # Safety
 ///
-/// The returned vector's contents are uninitialised. Callers must fill a prefix and truncate to
-/// it before exposing any of it.
-pub(crate) unsafe fn uninit_buffer(len: usize) -> bytes::BytesMut {
+/// The returned buffer's contents are uninitialised. No byte may be read before it is written:
+/// the reads here fill a prefix and truncate to it, and a caller reading into a buffer it holds
+/// across reads must confine itself to the region those reads filled.
+pub unsafe fn uninit_buffer(len: usize) -> bytes::BytesMut {
     let mut buffer = bytes::BytesMut::with_capacity(len);
-    // SAFETY: `with_capacity` guarantees the allocation, and the caller truncates to what it
-    // fills before any byte is read.
+    // SAFETY: `with_capacity` guarantees the allocation, and the caller only reads bytes it has
+    // written.
     unsafe { buffer.set_len(len) };
     buffer
 }

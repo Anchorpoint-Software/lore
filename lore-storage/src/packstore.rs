@@ -32,109 +32,16 @@ struct PackFile {
     dirty: AtomicBool,
 }
 
-/// First wait between attempts at a transiently failed packfile operation, in milliseconds.
-const RETRY_START_MILLIS: u64 = 10;
-
-/// Longest wait the backoff grows to, in milliseconds.
-const RETRY_MAXIMUM_MILLIS: u64 = 10_000;
-
-/// Attempts before a transient failure is reported. With the schedule above this spends roughly
-/// fifteen minutes on an operation that keeps failing, which is a deliberate budget: the process
-/// holding the file is expected to let go, and failing the read would fail the caller's whole
-/// operation.
-const RETRY_LIMIT: usize = 100;
-
-struct Retry {
-    current: u64,
-    maximum: u64,
-    counter: usize,
-    limit: usize,
-}
-
-impl Retry {
-    fn new(start: u64, maximum: u64, limit: usize) -> Self {
-        Retry {
-            current: start,
-            maximum,
-            counter: 0,
-            limit,
-        }
-    }
-
-    async fn wait(&mut self) -> bool {
-        tokio::time::sleep(std::time::Duration::from_millis(self.current)).await;
-        self.current = std::cmp::min(self.current * 2, self.maximum);
-        self.counter += 1;
-        self.counter < self.limit
-    }
-}
-
-/// Whether the operation is worth reissuing rather than reporting.
-///
-/// Positional reads and writes are idempotent, so reissuing is always safe. What the set buys is
-/// the other direction: a permanent failure — a short read from a truncated packfile, an offset
-/// past the end, a permission problem — is reported at once instead of after the whole retry
-/// budget above.
-fn is_transient(error: &std::io::Error) -> bool {
-    matches!(
-        error.kind(),
-        std::io::ErrorKind::Interrupted
-            | std::io::ErrorKind::WouldBlock
-            | std::io::ErrorKind::TimedOut
-    ) || is_transient_for_platform(error)
-}
-
-/// Another process holding the file, or a byte range inside it, fails an operation that succeeds
-/// as soon as it lets go — a virus scanner or a search indexer walking the store. A sharing
-/// violation is raised when a handle is opened and a lock violation against a handle already open,
-/// and both belong here because the packstore does both.
-#[cfg(target_family = "windows")]
-fn is_transient_for_platform(error: &std::io::Error) -> bool {
-    matches!(
-        error.raw_os_error(),
-        Some(code)
-            if code == windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION as i32
-                || code == windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION as i32
+async fn packfile_read(file: &IoFile, offset: usize, size: usize) -> Result<Bytes, PackfileError> {
+    Ok(
+        crate::fs_util::retry_transient(|| file.read_exact_at(size, offset as u64))
+            .await
+            .internal("Failed reading from packstore file")?,
     )
 }
 
-/// No platform-specific transient conditions: no kernel here fails a positional operation because
-/// another process holds the file open.
-#[cfg(not(target_family = "windows"))]
-fn is_transient_for_platform(_error: &std::io::Error) -> bool {
-    false
-}
-
-/// Runs `operation`, reissuing it with backoff for as long as it fails transiently.
-///
-/// Takes a plain closure returning a future rather than an `AsyncFnMut`: the latter's
-/// higher-ranked lifetime defeats `Send` inference for the callers that spawn these operations.
-async fn retry_transient<T, F, O>(mut operation: F) -> std::io::Result<T>
-where
-    F: FnMut() -> O,
-    O: Future<Output = std::io::Result<T>>,
-{
-    let mut retry = Retry::new(RETRY_START_MILLIS, RETRY_MAXIMUM_MILLIS, RETRY_LIMIT);
-    loop {
-        match operation().await {
-            Ok(value) => return Ok(value),
-            Err(error) => {
-                if !is_transient(&error) || !retry.wait().await {
-                    return Err(error);
-                }
-            }
-        }
-    }
-}
-
-async fn packfile_read(file: &IoFile, offset: usize, size: usize) -> Result<Bytes, PackfileError> {
-    Ok(retry_transient(|| file.read_exact_at(size, offset as u64))
-        .await
-        .internal("Failed reading from packstore file")?)
-}
-
 async fn packfile_write(file: &IoFile, buffer: Bytes, offset: usize) -> Result<(), PackfileError> {
-    retry_transient(|| file.write_all_at(buffer.clone(), offset as u64))
+    crate::fs_util::retry_transient(|| file.write_all_at(buffer.clone(), offset as u64))
         .await
         .internal("Failed writing to packstore file")?;
     Ok(())
@@ -231,7 +138,9 @@ impl PackStore {
                 let file_id = index + 1;
                 let file_path = path.join(file_id.to_string());
                 let file_options = OpenOptions::new().read(true).write(true);
-                // Prevent any other process from writing the file
+                // A packfile is the store's own, and nothing outside this process may write one
+                // while it is open here. Stated at the call site because the driver shares by
+                // default, most of what it opens being files Lore does not own.
                 #[cfg(target_family = "windows")]
                 let file_options = file_options
                     .share_mode(windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ);
@@ -321,7 +230,7 @@ impl PackStore {
                     .write(true)
                     .create(true)
                     .truncate(true);
-                // Prevent any other process from writing the file
+                // The store's own file, as above.
                 #[cfg(target_family = "windows")]
                 let file_options = file_options
                     .share_mode(windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ);

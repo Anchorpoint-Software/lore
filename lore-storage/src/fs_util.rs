@@ -111,3 +111,73 @@ pub async fn unlink_recursive<P: AsRef<Path>>(absolute_path: P) -> tokio::io::Re
 
     Ok(())
 }
+
+/// First wait between attempts at a transiently failed file operation, in milliseconds.
+const RETRY_START_MILLIS: u64 = 10;
+
+/// Longest wait the backoff grows to, in milliseconds.
+const RETRY_MAXIMUM_MILLIS: u64 = 10_000;
+
+/// Attempts before a transient failure is reported. With the schedule above this spends roughly
+/// fifteen minutes on an operation that keeps failing, which is a deliberate budget: whoever holds
+/// the file is expected to let go, and failing would fail the caller's whole operation.
+const RETRY_LIMIT: usize = 100;
+
+/// Whether the operation is worth reissuing rather than reporting.
+///
+/// Positional reads and writes are idempotent, so reissuing is always safe. What the set buys is
+/// the other direction: a permanent failure — a short read from a truncated file, an offset past
+/// the end, a permission problem — is reported at once instead of after the whole retry budget
+/// above.
+pub(crate) fn is_transient(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::TimedOut
+    ) || is_transient_for_platform(error)
+}
+
+/// Another process holding the file, or a byte range inside it, fails an operation that succeeds
+/// as soon as it lets go — a virus scanner or a search indexer walking the store, or one of this
+/// process's own readers, which grant no write access for as long as they are open. A sharing
+/// violation is raised when a handle is opened and a lock violation against a handle already open,
+/// and both belong here.
+#[cfg(target_family = "windows")]
+fn is_transient_for_platform(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(code)
+            if code == windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION as i32
+                || code == windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION as i32
+    )
+}
+
+/// No platform-specific transient conditions: no kernel here fails a file operation because
+/// another process holds the file open.
+#[cfg(not(target_family = "windows"))]
+fn is_transient_for_platform(_error: &std::io::Error) -> bool {
+    false
+}
+
+/// Runs `operation`, reissuing it with backoff for as long as it fails transiently.
+///
+/// Takes a plain closure returning a future rather than an `AsyncFnMut`: the latter's
+/// higher-ranked lifetime defeats `Send` inference for the callers that spawn these operations.
+pub(crate) async fn retry_transient<T, F, O>(mut operation: F) -> std::io::Result<T>
+where
+    F: FnMut() -> O,
+    O: std::future::Future<Output = std::io::Result<T>>,
+{
+    let mut retry = crate::retry(RETRY_START_MILLIS, RETRY_MAXIMUM_MILLIS, RETRY_LIMIT);
+    loop {
+        match operation().await {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                if !is_transient(&error) || !retry.wait().await {
+                    return Err(error);
+                }
+            }
+        }
+    }
+}

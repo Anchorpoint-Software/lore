@@ -42,6 +42,7 @@ mod uring;
 pub use buffer::StableBuf;
 pub use buffer::StableBufList;
 pub use buffer::StableBufListMut;
+pub use buffer::uninit_buffer;
 pub use driver::BackendKind;
 pub use driver::IoDriver;
 pub use driver::WHOLE_FILE_LIMIT;

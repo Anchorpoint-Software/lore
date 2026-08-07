@@ -3,7 +3,6 @@
 //! Fan-out helpers for the lazy progressive bucket layout used by
 //! `LocalImmutableStore` and `LocalMutableStore`.
 
-use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -138,8 +137,8 @@ pub fn level_for(current_level: usize, b_max: usize, threshold: usize) -> usize 
 /// # Invariants
 /// * The marker file is always exactly `size_of::<LevelMarkerHeader>()` bytes.
 /// * A successfully-parsed marker has `magic == MARKER_MAGIC` and `version == MARKER_VERSION`.
-pub fn read_level_marker(group_path: &Path) -> std::io::Result<Option<usize>> {
-    read_level_header_file(&group_path.join(MARKER_FILENAME))
+pub async fn read_level_marker(group_path: &Path) -> std::io::Result<Option<usize>> {
+    read_level_header_file(&group_path.join(MARKER_FILENAME)).await
 }
 
 /// Write the level marker file in `group_path`, recording the current bucket count.
@@ -192,8 +191,8 @@ pub fn bucket_new_path(group_path: &Path, bucket_index: usize) -> PathBuf {
 /// * `Ok(None)` when no pending file exists.
 /// * `Ok(Some(level))` when present and well-formed.
 /// * `Err(io::Error)` for I/O failures, truncation, mismatched magic, or unsupported version.
-pub fn read_level_pending(group_path: &Path) -> std::io::Result<Option<usize>> {
-    read_level_header_file(&group_path.join(LEVEL_PENDING_FILENAME))
+pub async fn read_level_pending(group_path: &Path) -> std::io::Result<Option<usize>> {
+    read_level_header_file(&group_path.join(LEVEL_PENDING_FILENAME)).await
 }
 
 /// Write the `level.pending` sentinel in `group_path` with the recorded target bucket count.
@@ -218,15 +217,26 @@ pub async fn delete_level_pending(group_path: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Read a level-header file (marker or pending) from an explicit path. Shared format helper.
-fn read_level_header_file(path: &Path) -> std::io::Result<Option<usize>> {
-    let mut file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e),
+/// Read a level-header file (marker or pending) from an explicit path. Shared format helper;
+/// one backend dispatch covering open, read and close, the file being the header itself.
+async fn read_level_header_file(path: &Path) -> std::io::Result<Option<usize>> {
+    let bytes = match lore_io::IoDriver::global().read_file_bytes(path).await {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
     };
     let mut header = LevelMarkerHeader::new_zeroed();
-    file.read_exact(header.as_mut_bytes())?;
+    let expected = size_of::<LevelMarkerHeader>();
+    if bytes.len() < expected {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!(
+                "level header file is {} bytes, expected {expected}",
+                bytes.len()
+            ),
+        ));
+    }
+    header.as_mut_bytes().copy_from_slice(&bytes[..expected]);
     if header.magic != MARKER_MAGIC {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -310,7 +320,7 @@ pub async fn recover_level_transition(
     group_path: &Path,
     sync_data: bool,
 ) -> std::io::Result<Option<usize>> {
-    let target = match read_level_pending(group_path)? {
+    let target = match read_level_pending(group_path).await? {
         Some(level) => level,
         None => return Ok(None),
     };
@@ -474,10 +484,10 @@ mod tests {
         crate::test_util::TempDir::new("fan_out_marker_")
     }
 
-    #[test]
-    fn read_level_marker_missing_returns_none() {
+    #[tokio::test]
+    async fn read_level_marker_missing_returns_none() {
         let dir = temp_group_dir();
-        assert_eq!(read_level_marker(dir.path()).unwrap(), None);
+        assert_eq!(read_level_marker(dir.path()).await.unwrap(), None);
     }
 
     #[tokio::test]
@@ -485,12 +495,12 @@ mod tests {
         for &level in &LEVEL_LADDER {
             let dir = temp_group_dir();
             write_level_marker(dir.path(), level, true).await.unwrap();
-            assert_eq!(read_level_marker(dir.path()).unwrap(), Some(level));
+            assert_eq!(read_level_marker(dir.path()).await.unwrap(), Some(level));
         }
     }
 
-    #[test]
-    fn read_level_marker_with_corrupt_magic_errors() {
+    #[tokio::test]
+    async fn read_level_marker_with_corrupt_magic_errors() {
         let dir = temp_group_dir();
         let marker = dir.path().join(MARKER_FILENAME);
         std::fs::write(
@@ -498,21 +508,21 @@ mod tests {
             [0xDE, 0xAD, 0xBE, 0xEF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
         )
         .unwrap();
-        let err = read_level_marker(dir.path()).unwrap_err();
+        let err = read_level_marker(dir.path()).await.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
-    #[test]
-    fn read_level_marker_truncated_errors() {
+    #[tokio::test]
+    async fn read_level_marker_truncated_errors() {
         let dir = temp_group_dir();
         let marker = dir.path().join(MARKER_FILENAME);
         std::fs::write(&marker, [b'L', b'V', b'N', b'O', 1, 0, 0, 0]).unwrap();
-        let err = read_level_marker(dir.path()).unwrap_err();
+        let err = read_level_marker(dir.path()).await.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 
-    #[test]
-    fn read_level_marker_unsupported_version_errors() {
+    #[tokio::test]
+    async fn read_level_marker_unsupported_version_errors() {
         let dir = temp_group_dir();
         let marker = dir.path().join(MARKER_FILENAME);
         let mut bytes = vec![];
@@ -521,7 +531,7 @@ mod tests {
         bytes.extend_from_slice(&32u32.to_le_bytes());
         bytes.extend_from_slice(&0u32.to_le_bytes());
         std::fs::write(&marker, bytes).unwrap();
-        let err = read_level_marker(dir.path()).unwrap_err();
+        let err = read_level_marker(dir.path()).await.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
@@ -530,7 +540,7 @@ mod tests {
         let dir = temp_group_dir();
         write_level_marker(dir.path(), 1, false).await.unwrap();
         write_level_marker(dir.path(), 64, false).await.unwrap();
-        assert_eq!(read_level_marker(dir.path()).unwrap(), Some(64));
+        assert_eq!(read_level_marker(dir.path()).await.unwrap(), Some(64));
     }
 
     #[tokio::test]
@@ -541,10 +551,10 @@ mod tests {
         assert_eq!(metadata.len(), 16);
     }
 
-    #[test]
-    fn read_level_pending_missing_returns_none() {
+    #[tokio::test]
+    async fn read_level_pending_missing_returns_none() {
         let dir = temp_group_dir();
-        assert_eq!(read_level_pending(dir.path()).unwrap(), None);
+        assert_eq!(read_level_pending(dir.path()).await.unwrap(), None);
     }
 
     #[tokio::test]
@@ -552,7 +562,7 @@ mod tests {
         for &level in &LEVEL_LADDER {
             let dir = temp_group_dir();
             write_level_pending(dir.path(), level, false).await.unwrap();
-            assert_eq!(read_level_pending(dir.path()).unwrap(), Some(level));
+            assert_eq!(read_level_pending(dir.path()).await.unwrap(), Some(level));
         }
     }
 
@@ -564,7 +574,7 @@ mod tests {
         // Delete after write removes it.
         write_level_pending(dir.path(), 32, false).await.unwrap();
         delete_level_pending(dir.path()).await.unwrap();
-        assert_eq!(read_level_pending(dir.path()).unwrap(), None);
+        assert_eq!(read_level_pending(dir.path()).await.unwrap(), None);
         // Second delete is also fine.
         delete_level_pending(dir.path()).await.unwrap();
     }
@@ -603,7 +613,7 @@ mod tests {
             None
         );
         // No marker should be created when there's nothing to recover.
-        assert_eq!(read_level_marker(dir.path()).unwrap(), None);
+        assert_eq!(read_level_marker(dir.path()).await.unwrap(), None);
     }
 
     #[tokio::test]
@@ -625,7 +635,7 @@ mod tests {
             assert_eq!(bytes, vec![bb as u8; 8]);
         }
         // Marker reflects target.
-        assert_eq!(read_level_marker(dir.path()).unwrap(), Some(4));
+        assert_eq!(read_level_marker(dir.path()).await.unwrap(), Some(4));
         // Pending deleted.
         assert!(!dir.path().join(LEVEL_PENDING_FILENAME).exists());
     }
@@ -647,7 +657,7 @@ mod tests {
         );
         assert_eq!(std::fs::read(bucket_path(dir.path(), 1)).unwrap(), b"new-1");
         assert!(!bucket_new_path(dir.path(), 1).exists());
-        assert_eq!(read_level_marker(dir.path()).unwrap(), Some(2));
+        assert_eq!(read_level_marker(dir.path()).await.unwrap(), Some(2));
         assert!(!dir.path().join(LEVEL_PENDING_FILENAME).exists());
     }
 
@@ -664,6 +674,6 @@ mod tests {
         // First run rolls forward; second run is a no-op since pending is gone.
         assert_eq!(first, Some(2));
         assert_eq!(second, None);
-        assert_eq!(read_level_marker(dir.path()).unwrap(), Some(2));
+        assert_eq!(read_level_marker(dir.path()).await.unwrap(), Some(2));
     }
 }

@@ -1,6 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -8,6 +7,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
+use bytes::BytesMut;
 use dashmap::DashMap;
 use dashmap::Entry;
 use lore_error_set::prelude::*;
@@ -826,11 +826,9 @@ pub async fn write_from_file(
     let size = size as usize;
     if size <= crate::compress::FRAGMENT_SIZE_THRESHOLD {
         let read_permit = crate::concurrency::acquire_fragment_memory_permit(size).await;
-        let buffer = crate::chunker::read_range(file, 0, size)
-            .await
-            .map_err(|e| {
-                StorageError::internal_with_context(e, &format!("read file: {}", path.display()))
-            })?;
+        let buffer = file.read_exact_at(size, 0).await.map_err(|e| {
+            StorageError::internal_with_context(e, &format!("read file: {}", path.display()))
+        })?;
         let address = write_content(
             store,
             partition,
@@ -878,7 +876,7 @@ pub async fn hash_file(
         .forward::<StorageError>("permit failed")?;
 
     let path = path.as_ref();
-    let Ok(metadata) = tokio::fs::metadata(path).await else {
+    let Ok(metadata) = lore_io::IoDriver::global().metadata(path).await else {
         return Err(StorageError::internal(format!(
             "failed to query file metadata: {}",
             path.display()
@@ -894,10 +892,13 @@ pub async fn hash_file(
         return Ok(Hash::new_zeroed());
     }
     if file_size <= crate::compress::FRAGMENT_SIZE_THRESHOLD {
-        let data = tokio::fs::read(path).await.map_err(|e| {
-            StorageError::internal_with_context(e, &format!("read file: {}", path.display()))
-        })?;
-        return Ok(Hash::hash_buffer(data.as_slice()));
+        let data = lore_io::IoDriver::global()
+            .read_file_bytes(path)
+            .await
+            .map_err(|e| {
+                StorageError::internal_with_context(e, &format!("read file: {}", path.display()))
+            })?;
+        return Ok(Hash::hash_buffer(&data));
     }
 
     // Large files: try loading previous fragmentation to compare chunk hashes.
@@ -933,10 +934,14 @@ pub async fn hash_file(
 
     // Chunks are read on demand, so a mismatch early in the list stops after reading only
     // the chunks it compared.
+    // Opened rather than measured again: the size above is the one the chunker is opened at.
     let mut retry = crate::retry(10, 10_000, 10);
-    let (file, _size) = loop {
-        match crate::chunker::open_read(path).await {
-            Ok(result) => break result,
+    let file = loop {
+        match lore_io::IoDriver::global()
+            .open(path, &lore_io::OpenOptions::new().read(true))
+            .await
+        {
+            Ok(file) => break file,
             Err(err) => {
                 if !retry.wait().await {
                     return Err(StorageError::internal_with_context(
@@ -996,7 +1001,46 @@ const HASH_WINDOW_SIZE: usize = 2 * crate::compress::FRAGMENT_SIZE_THRESHOLD;
 /// Bytes of the file that are resident, and where they start in it.
 struct HashWindow {
     offset: u64,
-    data: Bytes,
+    data: BytesMut,
+}
+
+/// The buffer for a read of `want` bytes: the window just retired, or a fresh one sized to the
+/// largest this file needs. `capacity` bounds every window, so a retired one always fits.
+fn take_window(spare: &mut Option<BytesMut>, capacity: usize, want: usize) -> BytesMut {
+    let mut buffer = spare
+        .take()
+        // SAFETY: the read below fills the buffer before anything reads a byte of it.
+        .unwrap_or_else(|| unsafe { lore_io::uninit_buffer(capacity) });
+    debug_assert!(buffer.capacity() >= want, "window smaller than the read");
+    // SAFETY: capacity covers `want`, and the read fills all of it before it is hashed.
+    unsafe { buffer.set_len(want) };
+    buffer
+}
+
+/// Start a window read without waiting for it, so it overlaps the hashing of the window
+/// already held. The buffer is filled whole, the walk having no headroom to carry, and the read
+/// hands it back. Dropping the handle detaches the read, which the engine completes and then
+/// frees its buffer.
+fn start_window_read(
+    file: &lore_io::IoFile,
+    buffer: BytesMut,
+    offset: u64,
+) -> JoinHandle<std::io::Result<BytesMut>> {
+    let file = file.clone();
+    let want = buffer.len();
+    lore_base::lore_spawn!(async move {
+        let window = file
+            .read_exact_vectored_at(
+                crate::chunker::WindowRead {
+                    buffer,
+                    start: 0,
+                    want,
+                },
+                offset,
+            )
+            .await?;
+        Ok(window.buffer)
+    })
 }
 
 impl HashWindow {
@@ -1074,7 +1118,7 @@ struct SublistSource<'a> {
 async fn previous_chunks_still_match(
     sublists: SublistSource<'_>,
     path: &Path,
-    file: &Arc<File>,
+    file: &lore_io::IoFile,
     file_size: u64,
     previous_fragmentation: &[FragmentReference],
 ) -> Result<bool, StorageError> {
@@ -1091,16 +1135,11 @@ async fn previous_chunks_still_match(
     };
     let _reservation = crate::concurrency::acquire_fragment_memory_permit(windows * capacity).await;
 
-    let read_at = |offset: u64| {
-        crate::chunker::start_read_range(
-            Arc::clone(file),
-            offset,
-            (file_size - offset).min(HASH_WINDOW_SIZE as u64) as usize,
-        )
-    };
+    let window_length = |offset: u64| (file_size - offset).min(HASH_WINDOW_SIZE as u64) as usize;
 
     let mut window: Option<HashWindow> = None;
-    let mut pending: Option<(JoinHandle<std::io::Result<Bytes>>, u64)> = None;
+    let mut pending: Option<(JoinHandle<std::io::Result<BytesMut>>, u64)> = None;
+    let mut spare: Option<BytesMut> = None;
     let mut index = 0;
 
     while index < chunks.len() {
@@ -1173,15 +1212,20 @@ async fn previous_chunks_still_match(
         let resident = match window.take() {
             Some(resident) if resident.holds(start, end) => resident,
             stale_window => {
-                drop(stale_window);
+                // The window it held is the one the next read fills.
+                if let Some(stale) = stale_window {
+                    spare = Some(stale.data);
+                }
                 let read = match pending.take() {
                     Some((task, offset)) if offset == start => task,
                     other => {
                         // Unreachable while the list ascends, since a spliced sublist tiles
                         // the range it replaces. Kept because the failure it would allow is
-                        // silent: "unchanged" for a file never compared.
+                        // silent: "unchanged" for a file never compared. The detached read
+                        // takes its buffer with it, so this one starts from a fresh window.
                         drop(other);
-                        read_at(start)
+                        let buffer = take_window(&mut spare, capacity, window_length(start));
+                        start_window_read(file, buffer, start)
                     }
                 };
                 let data = read
@@ -1203,7 +1247,8 @@ async fn previous_chunks_still_match(
                 // Started before anything in this window is hashed, so the two overlap.
                 if let Some(offset) = next_window_offset(&chunks, index, resident.end(), file_size)
                 {
-                    pending = Some((read_at(offset), offset));
+                    let buffer = take_window(&mut spare, capacity, window_length(offset));
+                    pending = Some((start_window_read(file, buffer, offset), offset));
                 }
                 resident
             }

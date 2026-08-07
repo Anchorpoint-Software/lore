@@ -200,7 +200,7 @@ pub async fn write_fragmented_from_file(
     store: Arc<dyn ImmutableStore>,
     partition: Partition,
     context: Context,
-    file: Arc<std::fs::File>,
+    file: lore_io::IoFile,
     size: usize,
     flags: WriteOptions,
     hash_only: bool,
@@ -663,16 +663,16 @@ mod tests {
     }
 
     /// A file holding less than the size it was measured at is the truncation race: the size
-    /// comes from `metadata()`, taken before the chunker ever opens the file, so the chunker
-    /// can find nothing to cut. Zero-length content is the zero hash and no fragment list
-    /// stands in for nothing, so this has to fail rather than describe content that was never
-    /// written.
+    /// comes from `metadata()`, taken before the chunker ever opens the file. The chunker reads
+    /// exactly the length that size promises, so the read itself rejects the file. Either way it
+    /// has to fail rather than describe content that was never written, since zero-length
+    /// content is the zero hash and no fragment list stands in for nothing.
     #[tokio::test]
     async fn a_file_holding_less_than_its_measured_size_is_rejected() {
         let dir = crate::test_util::TempDir::new("lore-storage-truncated-");
         let path = std::path::Path::new(dir.as_ref()).join("truncated");
         std::fs::write(&path, b"").expect("create empty file");
-        let file = Arc::new(std::fs::File::open(&path).expect("open file"));
+        let (file, _) = crate::chunker::open_read(&path).await.expect("open file");
         let store = crate::local::immutable_store::LocalImmutableStore::new(
             Some(std::path::PathBuf::from(dir.as_ref())),
             crate::local::immutable_store::ImmutableStoreSettings::default(),
@@ -695,7 +695,7 @@ mod tests {
         .expect_err("a fragment list with no entries must not be written");
 
         assert!(
-            format!("{err}").contains("no chunks were written"),
+            format!("{err}").contains("file ended before the requested read length"),
             "unexpected failure: {err}"
         );
     }

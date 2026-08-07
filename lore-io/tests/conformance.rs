@@ -771,3 +771,113 @@ async fn many_concurrent_reads_complete() {
         join_all(reads).await;
     }
 }
+
+/// The default shares as `std` does, so a handle open for reading admits both another reader and
+/// a writer. Most files opened here are files Lore does not own, and Windows refuses an open whose
+/// share mode omits a right an existing handle holds — a narrower default would fail an ordinary
+/// read of a working-tree file whenever an editor or a build tool had it open.
+#[cfg(target_family = "windows")]
+#[tokio::test]
+async fn a_read_handle_admits_readers_and_writers() {
+    for driver in drivers() {
+        let dir = TempDir::new("sharemode");
+        let path = dir.file("shared");
+        driver
+            .write_file_bytes(&path, Bytes::from_static(b"shared content"), false)
+            .await
+            .unwrap();
+
+        let _reader = driver
+            .open(&path, &OpenOptions::new().read(true))
+            .await
+            .expect("opening the file for reading");
+
+        driver
+            .open(&path, &OpenOptions::new().read(true))
+            .await
+            .expect("a second reader shares with the first");
+
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("a writer shares with a reader");
+    }
+}
+
+/// Exclusion is the call site's to claim, which is what the pack store's opens do: with the share
+/// mode narrowed to reads, a writer is refused for as long as the handle is open.
+#[cfg(target_family = "windows")]
+#[tokio::test]
+async fn a_narrowed_share_mode_refuses_writers() {
+    for driver in drivers() {
+        let dir = TempDir::new("sharemode-narrow");
+        let path = dir.file("guarded");
+        driver
+            .write_file_bytes(&path, Bytes::from_static(b"guarded content"), false)
+            .await
+            .unwrap();
+
+        let _owner = driver
+            .open(
+                &path,
+                &OpenOptions::new()
+                    .read(true)
+                    .share_mode(windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ),
+            )
+            .await
+            .expect("opening the file with reads shared");
+
+        driver
+            .open(&path, &OpenOptions::new().read(true))
+            .await
+            .expect("a reader is still admitted");
+
+        let refused = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect_err("a writer must not open a file claimed for reads only");
+        assert_eq!(
+            refused.raw_os_error(),
+            Some(windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION as i32),
+            "expected a sharing violation, got: {refused}"
+        );
+    }
+}
+
+/// Readers share deletion, which is what lets the storage layer replace a file by rename while
+/// one is open. The reader goes on reading the bytes it opened, which is the whole reason the
+/// replace is safe to allow.
+#[cfg(target_family = "windows")]
+#[tokio::test]
+async fn a_read_handle_permits_replace_by_rename() {
+    for driver in drivers() {
+        let dir = TempDir::new("sharerename");
+        let path = dir.file("replaced");
+        let temporary = dir.file("replaced.tmp");
+        let original = Bytes::from_static(b"the bytes the reader opened");
+        driver
+            .write_file_bytes(&path, original.clone(), false)
+            .await
+            .unwrap();
+        driver
+            .write_file_bytes(&temporary, Bytes::from_static(b"the replacement"), false)
+            .await
+            .unwrap();
+
+        let reader = driver
+            .open(&path, &OpenOptions::new().read(true))
+            .await
+            .expect("opening the file for reading");
+
+        driver
+            .rename(&temporary, &path)
+            .await
+            .expect("replacing a file that is being read");
+
+        let read = reader
+            .read_exact_at(original.len(), 0)
+            .await
+            .expect("reading through the handle after the replace");
+        assert_eq!(read, original, "the reader must keep the bytes it opened");
+    }
+}

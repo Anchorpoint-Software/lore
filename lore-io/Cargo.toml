@@ -49,6 +49,12 @@ lore-base = { workspace = true }
 tokio = { workspace = true }
 
 # A named pipe is the only thing a unit test can make defer on demand, and deferring is the whole
-# of what the completion-port backend is for. See `iocp::tests::overlapped_pipe_pair`.
+# of what the completion-port backend is for. See `iocp::tests::overlapped_pipe_pair`. The
+# conformance suite names `ERROR_SHARING_VIOLATION` and `FILE_SHARE_READ` when it pins the share
+# modes, hence the foundation and filesystem modules here as well.
 [target.'cfg(target_family = "windows")'.dev-dependencies]
-windows-sys = { workspace = true, features = ["Win32_System_Pipes"] }
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Pipes",
+] }

@@ -52,15 +52,39 @@ impl OpenOptions {
         self
     }
 
-    /// Overrides the Windows share mode (`FILE_SHARE_*` flags), mirroring
-    /// `std::os::windows::fs::OpenOptionsExt::share_mode`.
+    /// Restricts the Windows share mode (`FILE_SHARE_*` flags), mirroring
+    /// `std::os::windows::fs::OpenOptionsExt::share_mode`. Unset, a handle shares read, write and
+    /// deletion, as `std` does; a file the store owns names the narrower mode it wants here.
     #[cfg(target_family = "windows")]
     pub fn share_mode(mut self, share_mode: u32) -> OpenOptions {
         self.share_mode = Some(share_mode);
         self
     }
 
+    /// The options for a handle the data path drives with its own `OVERLAPPED`.
+    ///
+    /// A synchronous Windows handle serializes every operation issued on it, whatever the caller
+    /// does, and this API exists to run many at once on one shared handle. So the handle is
+    /// overlapped and the data path issues its own `OVERLAPPED`; `crate::overlapped` records why
+    /// `std`'s positional calls cannot be used on such a handle.
     pub(crate) fn to_std(&self) -> std::fs::OpenOptions {
+        #[cfg(not(target_family = "windows"))]
+        return self.to_std_blocking();
+
+        #[cfg(target_family = "windows")]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+
+            let mut options = self.to_std_blocking();
+            options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED);
+            options
+        }
+    }
+
+    /// The options for a handle a pool thread drives with ordinary synchronous calls, which an
+    /// overlapped handle cannot serve. Carries the same share modes as [`to_std`](Self::to_std),
+    /// so a one-shot whole-file operation guards the file exactly as a long-lived handle does.
+    pub(crate) fn to_std_blocking(&self) -> std::fs::OpenOptions {
         let mut options = std::fs::OpenOptions::new();
         options
             .read(self.read)
@@ -68,17 +92,27 @@ impl OpenOptions {
             .create(self.create)
             .create_new(self.create_new)
             .truncate(self.truncate);
-        // A synchronous Windows handle serializes every operation issued on it, whatever the
-        // caller does, and this API exists to run many at once on one shared handle. So the handle
-        // is overlapped and the data path issues its own `OVERLAPPED`; `crate::overlapped` records
-        // why `std`'s positional calls cannot be used on such a handle.
         #[cfg(target_family = "windows")]
         {
             use std::os::windows::fs::OpenOptionsExt;
-            options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED);
-            if let Some(share_mode) = self.share_mode {
-                options.share_mode(share_mode);
-            }
+
+            use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_DELETE;
+            use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+            use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE;
+
+            // `CreateFileW` opens exclusive by default; `std` shares read, write and deletion on
+            // every handle, and so does this. Most files Lore opens are files it does not own —
+            // working-tree files an editor, an engine or a scanner holds at the same moment — and
+            // a handle refusing them fails the operation over something Lore has no say in.
+            // Sharing is checked both ways, so a mode omitting a right also refuses to coexist
+            // with a handle already granted it, which makes a narrow default fail opens that have
+            // nothing to do with the file's contents. A file the store owns states the narrower
+            // mode at its own call site, where the exclusion it needs is a local claim rather
+            // than a rule imposed on every path.
+            options.share_mode(
+                self.share_mode
+                    .unwrap_or(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE),
+            );
         }
         options
     }

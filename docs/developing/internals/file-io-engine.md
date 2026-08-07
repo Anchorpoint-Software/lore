@@ -1,6 +1,6 @@
 # File I/O engine
 
-The `lore-io` crate is Lore's file I/O engine: positional, owned-buffer file operations whose futures suspend on wakers alone and are therefore independent of the runtime driving them. It is the intended replacement for every `std::fs` and `tokio::fs` call inside the library. The crate is a workspace member with no dependents, so it is currently exercised only by its own conformance suite and benchmark example.
+The `lore-io` crate is Lore's file I/O engine: positional, owned-buffer file operations whose futures suspend on wakers alone and are therefore independent of the runtime driving them. It is the intended replacement for every `std::fs` and `tokio::fs` call inside the library. `lore-storage` is the only crate depending on it so far, so beyond that crate's paths it is exercised by its own conformance suite and benchmark example.
 
 Measurements quoted here are summaries. `lore-io/BENCHMARKS.md` holds the results, the protocol, and the experiments behind them.
 
@@ -34,6 +34,16 @@ A handle opened without the flag is a synchronous file object, and the I/O manag
 The wait blocks, which is the purpose of the syscall pool. It runs on every operation: a buffered read on an overlapped handle reports `ERROR_IO_PENDING` in every case measured, at every thread count. Each positional operation therefore parks a pool thread until the kernel completes it, and the pool cap bounds how many can be in flight. Removing that bound is what the `iocp` backend does.
 
 Two further consequences. Overlapped handles maintain no file cursor, so `positional_reads_have_no_cursor` in the conformance suite pins a property of the handle as well as of the API. And these operations work on synchronous handles, which they must, because the whole-file composites open their own.
+
+## Share modes are the call site's
+
+`CreateFileW` opens exclusive by default. `std` passes `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE` on every handle, so a Rust program on Windows behaves like a Unix one, and the driver's default does the same. Exclusion is opt-in, stated by the call site that needs it through `OpenOptions::share_mode`.
+
+That direction is the one the platform's rule makes safe. Windows checks sharing both ways: an open fails when the access it requests is outside an existing handle's share mode, and equally when its own share mode omits a right an existing handle was already granted. The second half is the one that catches you out, because it fails opens that have nothing to do with what the file contains — a read-only open declaring only `FILE_SHARE_READ | FILE_SHARE_DELETE` is refused whenever anything else holds the file with write access. Most files Lore opens are files it does not own: working-tree files an editor, a build tool or the engine holds at the same moment. A narrow default therefore turns an ordinary stage, commit or reset into a failure over a handle Lore has no say in, and — since `ERROR_SHARING_VIOLATION` is what the transient classifier exists for — only after the full retry budget. Sharing by default and excluding deliberately puts the platform-specific failure where someone chose it.
+
+The pack store is where it is chosen. A packfile is the store's own and no other process may write one while Lore holds it open, so both opens in `packstore.rs` name `FILE_SHARE_READ`. The race a strict reader would have prevented elsewhere is caught rather than prevented, by reads that ask for an exact length and fail short — `a_file_shorter_than_its_measured_size_fails` pins that, and it is the mechanism the chunker's exact reads exist to provide.
+
+The whole-file composites build their options through `to_std_blocking`, which carries the share modes without the overlapped flag those synchronous handles cannot use.
 
 One ceiling remains. Concurrent reads against a single file plateau near 91k ops/s on Windows regardless of handle or thread count, while the same reads across distinct files scale to 477k. That is a cache-manager property no backend can avoid, and it bounds any single-file workload on the platform. The storage layer's reads are not of that shape: addresses are hash-distributed over 256 pack-file groups whose files roll at 3 GiB, so a server holds thousands of files and concurrent reads scatter across them. The ceiling is specific to Windows; on macOS, spreading the same reads over one file per thread raises throughput rather than lifting a plateau.
 
@@ -84,6 +94,8 @@ Two driver operations complete a whole file in a single backend dispatch, matchi
 - `read_file_bytes(path)` — open, stat, read to the stat length, close. Returns `Bytes` without copying. A file that shrinks mid-read fails with `UnexpectedEof`.
 - `write_file_bytes(path, data, durable)` — create or truncate, write, `fdatasync` when `durable` is set, stat, close. Returns the resulting `Metadata`.
 
+Their callers are the shapes they were built for: `write_file_bytes` writes an unfragmented fragment's content in the materialization path, and `read_file_bytes` reads a fan-out level marker, a file that is one 16-byte header.
+
 Both are bounded by `WHOLE_FILE_LIMIT`, 8 MiB, and fail with `InvalidInput` above it. Each holds a pool thread and the whole file resident for its duration, so a large file would occupy one of at most `min(2 × cores, 16)` threads for the transfer; such a caller wants `open` with `read_exact_at` or `write_all_at`. The write's size check runs before the open, so a rejected call cannot have truncated an existing file.
 
 ## Syscall pool
@@ -128,13 +140,13 @@ A file operation in Lore is currently either a `tokio::fs` call or a `lore_spawn
 
 The proposal's survey found 34 distinct file I/O sites across `lore-storage`, `lore-revision`, and `lore-base`, none of which leak file types across a public API boundary. The migration is therefore entirely internal, and lands per subsystem — pack store, local stores, defragment, fragment engine, revision file operations — each slice green against the full test suite before the next.
 
-Most sites are mechanical: the pack store already uses positional I/O and maps one-to-one onto `read_at` and `write_at`. Three require a structural decision:
+Most sites are mechanical: the pack store already uses positional I/O and maps one-to-one onto `read_at` and `write_at`. Three required a structural decision, and all three have landed:
 
-- **Defragment data path** — the mutex-plus-seek file sink becomes concurrent `write_at` to disjoint offsets, and the parallel memory-mapped read and write variants are deleted rather than ported, which removes a dual-path sink and the page-fault stalls memory mapping hides from the scheduler.
-- **Bucket deserialization** — three position-dependent sequential reads become one positional read of the bucket followed by in-memory parsing.
-- **Whole-file read-then-hash** — a whole-file mapping feeding a single hash call becomes a chunked read loop feeding an incremental hasher, double-buffered so the next read is in flight while the current chunk hashes. `lore-storage/src/chunker.rs` already streams fixed windows through blocking positional reads, so moving it onto `IoFile::read_at` is a substitution rather than a redesign.
+- **Defragment data path** — the mutex-plus-seek file sink became concurrent positional writes to disjoint offsets on one shared `IoFile`, and the parallel memory-mapped read and write variants were deleted rather than ported, which removed a dual-path sink and the page-fault stalls memory mapping hides from the scheduler. On Windows the sink used to require a synchronous handle, because `seek_write` is defined only for one, so the kernel serialized the writes it issued concurrently; the driver's handles are overlapped and carry their own `OVERLAPPED`, so those writes now overlap on that platform as they always did on Unix. The output is still sized up front with `set_len`, and the sink's byte-count check is what turns an uncovered range from a silent zero-filled hole into a failure.
+- **Bucket deserialization** — the position-dependent sequential reads became one `open_read_head` that returns the handle, the size and the head bytes together, with a vectored scatter straight into the bucket's `GrowVec` chunks for anything the head does not cover.
+- **Whole-file read-then-hash** — a whole-file mapping feeding a single hash call became `lore-storage/src/chunker.rs`, which streams windows and cuts content-defined boundaries identical to running `FastCDC` over the whole file. Its reads are `IoFile::read_exact_vectored_at` scatters into the window they fill, so the window travels into the operation and comes back with it rather than being read into by a blocking call.
 
-File locking changes mechanism rather than structure: blocking `flock` with thread-sleep retries becomes `LOCK_NB` with async retry. Directory enumeration stays as inline syscalls, because `io_uring` has no `getdents` operation and page-cached directory walks are microsecond-scale.
+File locking changed mechanism rather than structure: blocking `flock` with thread-sleep retries became `LOCK_NB` with async retry, so no lock acquisition occupies a pool thread. Directory enumeration stays as inline syscalls, because `io_uring` has no `getdents` operation and page-cached directory walks are microsecond-scale; the driver does own `remove_dir_all`, which the recursive delete path uses.
 
 Two constraints bound the replacement. Operations with no asynchronous form — OS keyring access, AWS SDK initialization, service IPC pipe reads — stay on a residual blocking pool of approximately four threads, core-count-independent because nothing that scales with load runs there. And `std::fs` remains correct in tests, build scripts, and CLI-process code outside the library thread model; the target is the library's own I/O paths.
 
@@ -143,10 +155,12 @@ Progress is observable as a shrinking match count. These are raw line counts ove
 | Crate | `tokio::fs` | `std::fs::` |
 | --- | --- | --- |
 | `lore-revision` | 114 | 41 |
-| `lore-storage` | 11 | 99 |
+| `lore-storage` | — | 52 |
 | `lore-server` | 2 | 30 |
 | `lore` | 3 | — |
-| `lore-base` | 1 | 8 |
+| `lore-base` | 1 | 13 |
+
+`lore-storage` is where the migration has run, and the trend shows it: `tokio::fs` from 11 to none and `std::fs::` from 99 to 52, most of what is left being test modules. The library sites that remain are the directory walks that have no driver operation, the two `Drop` implementations that remove a temporary file where nothing can be awaited, the blocking `exists` and `metadata` probes the store open paths take before creating a directory, the bucket-version probe in `local/immutable_store.rs`, and the rename and permission helpers in `fs_util.rs`. The other crates are untouched so far, so their counts are the starting line rather than a measurement.
 
 When the migration completes, clippy `disallowed-methods` fences hold the line against direct `std::fs` and `tokio::fs` calls in library code, the same mechanism that excludes direct `tokio::spawn`.
 

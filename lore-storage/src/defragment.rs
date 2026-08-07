@@ -1,15 +1,14 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::ops::Range;
-#[cfg(target_family = "unix")]
-use std::os::unix::fs::FileExt;
-#[cfg(target_family = "windows")]
-use std::os::windows::fs::FileExt;
 use std::path::Path;
 use std::sync::Arc;
 
 use bytes::Bytes;
 use bytes::BytesMut;
+use lore_io::IoDriver;
+use lore_io::IoFile;
+use lore_io::OpenOptions;
 use lore_transport::StorageSession;
 use tokio::sync::Semaphore;
 use tokio::sync::SemaphorePermit;
@@ -41,10 +40,7 @@ use crate::types::Partition;
 pub enum DefragmentSink {
     /// Write at offset to a file (unordered, concurrent positional writes).
     /// `size` is the expected content length, used to reject out-of-range offsets.
-    File {
-        file: Arc<std::fs::File>,
-        size: usize,
-    },
+    File { file: IoFile, size: usize },
     /// Stream buffers in content order to a caller-provided channel.
     Stream { sender: Sender<Bytes> },
 }
@@ -757,10 +753,10 @@ async fn write_to_sink(sink: DefragmentSink, data_rx: DataReceiver) -> Result<()
 ///
 /// Positional writes carry their own offset, so concurrent writes to disjoint ranges
 /// need no lock — the previous seek-plus-write sink had to serialize behind a mutex
-/// because the pair is not atomic. Each write is one blocking task, so the syscall
-/// never stalls a runtime worker and independent writes overlap. Completed writes are
-/// reaped each iteration; the rest are joined after the channel closes, including
-/// after an early error break.
+/// because the pair is not atomic. Each write is one task awaiting a driver operation,
+/// so no runtime worker blocks on the syscall and independent writes overlap. Completed
+/// writes are reaped each iteration; the rest are joined after the channel closes,
+/// including after an early error break.
 ///
 /// Each message carries the fragment memory permit for its payload, released only when
 /// the write task ends. That keeps the payload accounted for its whole life rather than
@@ -782,7 +778,7 @@ async fn write_to_sink(sink: DefragmentSink, data_rx: DataReceiver) -> Result<()
 /// passes through here, which makes this the one place that can see the total. The walker's
 /// tiling checks mean it should never fire, which is the point of having it.
 async fn write_to_sink_file(
-    file: Arc<std::fs::File>,
+    file: IoFile,
     size: usize,
     mut data_rx: DataReceiver,
 ) -> Result<(), StorageError> {
@@ -808,9 +804,11 @@ async fn write_to_sink_file(
         written += payload.len();
 
         let file = file.clone();
-        lore_base::lore_spawn_blocking!(tasks, move || {
+        lore_base::lore_spawn!(tasks, async move {
             let _permit = permit;
-            write_all_at(&file, payload.as_ref(), offset as u64)
+            file.write_all_at(payload, offset as u64)
+                .await
+                .map(|_returned| ())
                 .map_err(|e| StorageError::internal_with_context(e, "write to file"))
         });
 
@@ -841,60 +839,6 @@ async fn write_to_sink_file(
     }
 
     result
-}
-
-/// Read the whole file into `buffer`, returning the byte count. Test-only readback for
-/// the write sink.
-#[cfg(test)]
-fn read_all_at_for_test(file: &std::fs::File, buffer: &mut [u8]) -> usize {
-    let mut read = 0;
-    while read < buffer.len() {
-        #[cfg(target_family = "unix")]
-        let count = file
-            .read_at(&mut buffer[read..], read as u64)
-            .expect("read");
-        #[cfg(target_family = "windows")]
-        let count = file
-            .seek_read(&mut buffer[read..], read as u64)
-            .expect("read");
-        if count == 0 {
-            break;
-        }
-        read += count;
-    }
-    read
-}
-
-/// Write every byte at `offset`, retrying interrupted calls. On Windows `seek_write`
-/// also moves the file cursor, which is harmless because no caller of this sink reads
-/// the cursor; note the handle is not opened overlapped, so concurrent writes to it are
-/// serialized by the kernel there even though each carries its own offset.
-fn write_all_at(file: &std::fs::File, buffer: &[u8], offset: u64) -> std::io::Result<()> {
-    #[cfg(target_family = "unix")]
-    {
-        file.write_all_at(buffer, offset)
-    }
-    #[cfg(target_family = "windows")]
-    {
-        let mut written = 0;
-        while written < buffer.len() {
-            match file.seek_write(&buffer[written..], offset + written as u64) {
-                Ok(0) => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::WriteZero,
-                        format!(
-                            "wrote {written} of {} bytes at offset {offset}",
-                            buffer.len()
-                        ),
-                    ));
-                }
-                Ok(count) => written += count,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(())
-    }
 }
 
 /// Unified streaming defragmentation pipeline.
@@ -1168,33 +1112,25 @@ fn read_defragment_subread(
     })
 }
 
-/// Open (creating if needed) and size a file for positional writes. The handle is
-/// shared: positional writes carry their own offset, so concurrent writers to disjoint
-/// ranges need no exclusion.
 /// Opens a file for positional writing and sizes it to the whole content up front.
 ///
-/// On Windows the handle is deliberately **not** overlapped. `seek_write` issues a synchronous
-/// `WriteFile` with the offset in an `OVERLAPPED` and no event, which is only defined for a
-/// synchronous handle; against an overlapped one it can report `ERROR_IO_PENDING` while the
-/// kernel still holds the buffer. So `FILE_FLAG_OVERLAPPED` is not a way to parallelise these
-/// writes, even though the handle being synchronous is what serializes them.
+/// The handle is shared: positional writes carry their own offset, so concurrent writers to
+/// disjoint ranges need no exclusion. Clones of the returned handle share it.
+///
+/// The size is set rather than the file truncated, so a range no payload covers reads as zeros
+/// instead of shortening the file — which is what the sink's byte-count check exists to catch.
 pub async fn open_file_write(
     path: impl AsRef<Path>,
     size: usize,
-) -> Result<Arc<std::fs::File>, std::io::Error> {
-    let path = path.as_ref().to_path_buf();
-    lore_base::lore_spawn_blocking!(move || -> std::io::Result<Arc<std::fs::File>> {
-        let file = std::fs::File::options()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&path)?;
-        file.set_len(size as u64)?;
-        Ok(Arc::new(file))
-    })
-    .await
-    .map_err(std::io::Error::other)?
+) -> Result<IoFile, std::io::Error> {
+    let file = IoDriver::global()
+        .open(
+            path,
+            &OpenOptions::new().read(true).write(true).create(true),
+        )
+        .await?;
+    file.set_len(size as u64).await?;
+    Ok(file)
 }
 
 #[cfg(test)]
@@ -1329,18 +1265,11 @@ mod tests {
 
         const SIZE: usize = 100;
 
-        /// A sized target file plus a channel wired to the sink.
-        fn target(dir: &TempDir, name: &str) -> Arc<std::fs::File> {
-            let path = dir.path().join(name);
-            let file = std::fs::File::options()
-                .create(true)
-                .truncate(false)
-                .read(true)
-                .write(true)
-                .open(&path)
-                .expect("create target file");
-            file.set_len(SIZE as u64).expect("size target file");
-            Arc::new(file)
+        /// A sized target file, opened the way the materialization path opens one.
+        async fn target(dir: &TempDir, name: &str) -> IoFile {
+            super::super::open_file_write(dir.path().join(name), SIZE)
+                .await
+                .expect("create target file")
         }
 
         /// Send one message carrying a permit, as the fetch pool does.
@@ -1355,7 +1284,7 @@ mod tests {
         #[tokio::test]
         async fn accepts_in_bounds_write() {
             let dir = TempDir::new("lore-storage-sink-test-");
-            let file = target(&dir, "in-bounds");
+            let file = target(&dir, "in-bounds").await;
             let (tx, rx) = channel::<DataMessage>(4);
             send_one(&tx, 0, Bytes::from(vec![0xCD; 10])).await;
             send_one(&tx, 10, Bytes::from(vec![0xAB; 20])).await;
@@ -1366,10 +1295,8 @@ mod tests {
                 .await
                 .expect("in-bounds write");
 
-            let mut buf = vec![0u8; SIZE];
-            let read = super::super::read_all_at_for_test(&file, &mut buf);
-            assert_eq!(read, SIZE);
-            assert_eq!(&buf[10..30], &[0xAB; 20]);
+            let contents = file.read_exact_at(SIZE, 0).await.expect("read back");
+            assert_eq!(&contents[10..30], &[0xAB; 20]);
         }
 
         /// Payloads that stay in bounds but do not add up to the file: the target is
@@ -1378,7 +1305,7 @@ mod tests {
         #[tokio::test]
         async fn rejects_payloads_that_do_not_cover_the_file() {
             let dir = TempDir::new("lore-storage-sink-test-");
-            let file = target(&dir, "hole");
+            let file = target(&dir, "hole").await;
             let (tx, rx) = channel::<DataMessage>(4);
             send_one(&tx, 0, Bytes::from(vec![0xAB; 20])).await;
             send_one(&tx, 40, Bytes::from(vec![0xAB; SIZE - 40])).await;
@@ -1396,7 +1323,7 @@ mod tests {
         #[tokio::test]
         async fn rejects_offset_plus_length_past_end() {
             let dir = TempDir::new("lore-storage-sink-test-");
-            let file = target(&dir, "past-end");
+            let file = target(&dir, "past-end").await;
             let (tx, rx) = channel::<DataMessage>(4);
             send_one(&tx, 95, Bytes::from(vec![0u8; 10])).await; // 95 + 10 > 100
             drop(tx);
@@ -1413,7 +1340,7 @@ mod tests {
         #[tokio::test]
         async fn rejects_offset_at_exact_end_with_nonzero_length() {
             let dir = TempDir::new("lore-storage-sink-test-");
-            let file = target(&dir, "exact-end");
+            let file = target(&dir, "exact-end").await;
             let (tx, rx) = channel::<DataMessage>(4);
             send_one(&tx, SIZE, Bytes::from(vec![0u8; 1])).await;
             drop(tx);
@@ -1426,7 +1353,7 @@ mod tests {
         #[tokio::test]
         async fn rejects_arithmetic_overflow() {
             let dir = TempDir::new("lore-storage-sink-test-");
-            let file = target(&dir, "overflow");
+            let file = target(&dir, "overflow").await;
             let (tx, rx) = channel::<DataMessage>(4);
             send_one(&tx, usize::MAX - 5, Bytes::from(vec![0u8; 10])).await;
             drop(tx);

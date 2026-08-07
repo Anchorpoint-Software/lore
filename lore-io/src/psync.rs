@@ -139,7 +139,10 @@ impl PsyncDriver {
     pub(crate) async fn read_file_bytes(&self, path: PathBuf) -> std::io::Result<Bytes> {
         SyscallPool::global()
             .submit(move || {
-                let file = File::open(path)?;
+                let file = crate::file::OpenOptions::new()
+                    .read(true)
+                    .to_std_blocking()
+                    .open(path)?;
                 let len = file.metadata()?.len() as usize;
                 crate::driver::check_whole_file_len(len)?;
                 // SAFETY: every byte up to `len` is filled before returning, and a file that
@@ -170,11 +173,12 @@ impl PsyncDriver {
         SyscallPool::global()
             .submit(move || {
                 use std::io::Write;
-                let mut file = std::fs::OpenOptions::new()
+                let mut file = crate::file::OpenOptions::new()
                     .read(true)
                     .write(true)
                     .create(true)
                     .truncate(true)
+                    .to_std_blocking()
                     .open(path)?;
                 file.write_all(data.as_ref())?;
                 if durable {

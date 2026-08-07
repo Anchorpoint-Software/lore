@@ -775,10 +775,6 @@ impl ImmutableStoreBucket {
             .write(true)
             .create(true)
             .truncate(true);
-        // Prevent any other process from writing the file
-        #[cfg(target_family = "windows")]
-        let file_options =
-            file_options.share_mode(windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ);
         if let Some(mut guard) = temporary_guard.take() {
             lore_io::IoDriver::global()
                 .write_file_segments_atomic(&temporary_path, &path, &file_options, segments)
@@ -1032,51 +1028,63 @@ impl LocalImmutableStore {
         let index_existed_on_disk = immutable_path
             .as_ref()
             .is_some_and(|p| p.join("index").exists());
+        // Every group is read at once. Each group is one recovery check and one marker read, and
+        // awaiting them in turn puts a whole store open behind `GROUP_COUNT` round trips to the
+        // I/O engine — a cost every process that opens a store pays before it does any work. The
+        // groups are independent directories, so the reads overlap and the engine's thread budget
+        // is what paces them. Completions arrive in whatever order the reads finish, so each task
+        // carries the group it answers for.
+        let initial_fan_out_level = store.settings.initial_fan_out_level;
+        let mut levels = vec![(initial_fan_out_level, 0usize, false); GROUP_COUNT];
+        if let Some(path) = immutable_path.as_deref() {
+            let index_path = path.as_path().join("index");
+            let mut tasks = JoinSet::new();
+            for group_index in 0..GROUP_COUNT {
+                let group_path = index_path.join(format!("{:02x}", group_index as u8));
+                lore_base::lore_spawn!(tasks, async move {
+                    // Roll forward any pending fan-out commit before reading the marker. After this returns the marker reflects the post-recovery state.
+                    if group_path.exists()
+                        && let Err(err) =
+                            crate::local::fan_out::recover_level_transition(&group_path, false)
+                                .await
+                    {
+                        return (
+                            group_index,
+                            Err(LocalImmutableStoreError::internal_with_context(
+                                err,
+                                "Failed to recover pending level transition for group",
+                            )),
+                        );
+                    }
+
+                    let level = match crate::local::fan_out::read_level_marker(&group_path).await {
+                        Ok(Some(level)) => Ok((level, level, true)),
+                        Ok(None) if index_existed_on_disk => Ok((BUCKET_COUNT, 0, false)),
+                        Ok(None) => Ok((initial_fan_out_level, 0, false)),
+                        Err(err) => Err(LocalImmutableStoreError::internal_with_context(
+                            err,
+                            "Failed to read level marker for group",
+                        )),
+                    };
+                    (group_index, level)
+                });
+            }
+
+            while let Some(joined) = tasks.join_next().await {
+                let (group_index, level) = joined.map_err(|err| {
+                    LocalImmutableStoreError::internal_with_context(err, "level marker task")
+                })?;
+                levels[group_index] = level?;
+            }
+        }
+
         let mut bucket_counts: Vec<usize> = Vec::with_capacity(GROUP_COUNT);
         let mut committed_levels: Vec<usize> = Vec::with_capacity(GROUP_COUNT);
         let mut any_marker_seen = false;
-        for group_index in 0..GROUP_COUNT {
-            let (initial, committed) = if let Some(path) = immutable_path.as_deref() {
-                let mut group_path: PathBuf = path.as_path().to_path_buf();
-                group_path.push("index");
-                let group_hex = format!("{:02x}", group_index as u8);
-                group_path.push(&group_hex);
-
-                // Roll forward any pending fan-out commit before reading the marker. After this returns the marker reflects the post-recovery state.
-                if group_path.exists()
-                    && let Err(err) =
-                        crate::local::fan_out::recover_level_transition(&group_path, false).await
-                {
-                    return Err(LocalImmutableStoreError::internal_with_context(
-                        err,
-                        "Failed to recover pending level transition for group",
-                    ));
-                }
-
-                match crate::local::fan_out::read_level_marker(&group_path) {
-                    Ok(Some(level)) => {
-                        any_marker_seen = true;
-                        (level, level)
-                    }
-                    Ok(None) => {
-                        if index_existed_on_disk {
-                            (BUCKET_COUNT, 0)
-                        } else {
-                            (store.settings.initial_fan_out_level, 0)
-                        }
-                    }
-                    Err(err) => {
-                        return Err(LocalImmutableStoreError::internal_with_context(
-                            err,
-                            "Failed to read level marker for group",
-                        ));
-                    }
-                }
-            } else {
-                (store.settings.initial_fan_out_level, 0)
-            };
+        for (initial, committed, marker_seen) in levels {
             bucket_counts.push(initial);
             committed_levels.push(committed);
+            any_marker_seen |= marker_seen;
         }
 
         // Determine serialize_version per Decision 8. Fresh stores, stores with markers, and
