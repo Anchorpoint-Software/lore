@@ -232,7 +232,7 @@ mod tests {
                 LoreEvent::Complete(data) => Self::Complete(data.status),
                 LoreEvent::RevisionTreeLoaded(data) => Self::RevisionTreeLoaded(data.handle_id),
                 LoreEvent::RevisionTreeAddComplete(data) => {
-                    Self::AddComplete(data.id, data.node_id, data.error_code)
+                    Self::AddComplete(data.entry_id, data.node_id, data.error_code)
                 }
                 LoreEvent::RevisionTreeResolvePathComplete(data) => Self::ResolvePathComplete(
                     data.id,
@@ -405,17 +405,18 @@ mod tests {
     /// Build `a/b/c.txt` in one batch add. Returns the node ids of `a`, `a/b`
     /// and `a/b/c.txt`.
     async fn build_nested_tree(handle: LoreRevisionTree) -> (NodeID, NodeID, NodeID) {
-        let directory =
-            |id: u64, parent_entry: u32, name: &str, nested: bool| LoreRevisionTreeAddEntry {
-                id,
+        let directory = |entry_id: u64, parent_entry_index: u32, name: &str, nested: bool| {
+            LoreRevisionTreeAddEntry {
+                entry_id,
                 parent_node_id: if nested { INVALID_NODE } else { ROOT_NODE },
-                parent_entry,
+                parent_entry_index,
                 name: LoreString::from_str(name),
                 kind: LoreNodeType::Directory as u32,
                 mode: 0o755,
                 size: 0,
                 address: Address::default(),
-            };
+            }
+        };
         let entries = vec![
             directory(1, 0, "a", false),
             directory(2, 0, "b", true),
@@ -431,7 +432,7 @@ mod tests {
         let status = add(
             LoreGlobalArgs::default(),
             LoreRevisionTreeAddArgs {
-                id: 100,
+                batch_id: 100,
                 handle,
                 entries: LoreArray::from_vec(entries),
             },

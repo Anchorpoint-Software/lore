@@ -42,8 +42,8 @@ use crate::revision_tree::handle::RevisionTreeInternal;
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Deserialize, Serialize, ValidateText)]
 pub struct LoreRevisionTreeModifyEntry {
-    /// Caller-chosen id echoed back in this entry's `MODIFY_COMPLETE`
-    pub id: u64,
+    /// Caller-chosen id echoed back as `entry_id` on this entry's `MODIFY_COMPLETE`
+    pub entry_id: u64,
     /// Leaf node to rewrite; non-leaf targets are rejected
     pub node_id: NodeID,
     /// New POSIX permission bits
@@ -59,8 +59,8 @@ pub struct LoreRevisionTreeModifyEntry {
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize, LoreArgs)]
 #[handler(modify_impl)]
 pub struct LoreRevisionTreeModifyArgs {
-    /// Per-call correlation id echoed back in `BATCH_COMPLETE`
-    pub id: u64,
+    /// Caller-chosen id echoed back as `batch_id` on `BATCH_COMPLETE`
+    pub batch_id: u64,
     /// Loaded revision-tree handle to mutate
     pub handle: LoreRevisionTree,
     /// Nodes to rewrite; each emits its own `MODIFY_COMPLETE`
@@ -95,24 +95,27 @@ impl EventError for ModifyError {
     }
 }
 
-fn emit_modify_complete(id: u64, node_id: NodeID, error_code: LoreErrorCode) {
+fn emit_modify_complete(entry_id: u64, node_id: NodeID, error_code: LoreErrorCode) {
     LoreEvent::RevisionTreeModifyComplete(LoreRevisionTreeModifyCompleteEventData {
-        id,
+        entry_id,
         node_id,
         error_code,
     })
     .send();
 }
 
-/// Emit the id-carrying terminal for a failed entry.
-fn emit_modify_error(id: u64, error_code: LoreErrorCode) {
-    emit_modify_complete(id, INVALID_NODE, error_code);
+/// Emit the `entry_id`-carrying terminal for a failed entry.
+fn emit_modify_error(entry_id: u64, error_code: LoreErrorCode) {
+    emit_modify_complete(entry_id, INVALID_NODE, error_code);
 }
 
-/// Emit the terminal for the call as a whole, carrying the call's own id.
-fn emit_batch_complete(id: u64, error_code: LoreErrorCode) {
-    LoreEvent::RevisionTreeBatchComplete(LoreRevisionTreeBatchCompleteEventData { id, error_code })
-        .send();
+/// Emit the terminal for the call as a whole, carrying its `batch_id`.
+fn emit_batch_complete(batch_id: u64, error_code: LoreErrorCode) {
+    LoreEvent::RevisionTreeBatchComplete(LoreRevisionTreeBatchCompleteEventData {
+        batch_id,
+        error_code,
+    })
+    .send();
 }
 
 /// The code the batch terminal reports for a finished call.
@@ -124,20 +127,20 @@ fn batch_error_code(result: &Result<(), ModifyError>) -> LoreErrorCode {
     }
 }
 
-/// Reject the whole batch as a bad argument, attributing it to `id`.
+/// Reject the whole batch as a bad argument, attributing it to `entry_id`.
 ///
-/// The batch index goes into the reason as well, because a caller may leave `id`
-/// at zero — which any number of entries may share — so the id on its own need
-/// not say which entry was at fault.
-fn reject(id: u64, entry: usize, reason: &str) -> ModifyError {
-    emit_modify_error(id, LoreErrorCode::InvalidArguments);
-    ModifyError::invalid(format!("entry {entry}: {reason}"))
+/// The batch index goes into the reason as well, because a caller may leave
+/// `entry_id` at zero — which any number of entries may share — so the id on its
+/// own need not say which entry was at fault.
+fn reject(entry_id: u64, entry_index: usize, reason: &str) -> ModifyError {
+    emit_modify_error(entry_id, LoreErrorCode::InvalidArguments);
+    ModifyError::invalid(format!("entry {entry_index}: {reason}"))
 }
 
 /// A validated entry, ready to apply without further checks.
 #[derive(Clone, Copy)]
 struct Planned {
-    id: u64,
+    entry_id: u64,
     node_id: NodeID,
     mode: u16,
     size: u64,
@@ -157,47 +160,47 @@ async fn plan_entries(
     let mut ids: HashSet<u64> = HashSet::with_capacity(entries.len());
 
     for (index, entry) in entries.iter().enumerate() {
-        let id = entry.id;
-        if id != 0 && !ids.insert(id) {
-            return Err(reject(id, index, "two entries share one caller id"));
+        let entry_id = entry.entry_id;
+        if entry_id != 0 && !ids.insert(entry_id) {
+            return Err(reject(entry_id, index, "two entries share one caller id"));
         }
         if !targets.insert(entry.node_id) {
             return Err(reject(
-                id,
+                entry_id,
                 index,
                 "two entries modify one node; send the intended final value once",
             ));
         }
 
         let Ok(node) = state.node(context.clone(), entry.node_id).await else {
-            return Err(reject(id, index, "node id is unknown"));
+            return Err(reject(entry_id, index, "node id is unknown"));
         };
         // A discarded slot carries neither the file nor the link flag, so it
         // reads back as an ordinary directory. The kind check below refuses it
         // too, but as the wrong kind rather than as a deleted node.
         if node.is_discarded() {
-            return Err(reject(id, index, "node has been deleted"));
+            return Err(reject(entry_id, index, "node has been deleted"));
         }
         // A slot the allocator never handed out reads back zeroed, which is a
         // perfectly ordinary directory. Every allocated node has a name, so a
         // zero length is what separates the two.
         if entry.node_id != ROOT_NODE && node.name_length == 0 {
             return Err(reject(
-                id,
+                entry_id,
                 index,
                 "node id does not resolve to a named node",
             ));
         }
         if !node.is_file() {
             return Err(reject(
-                id,
+                entry_id,
                 index,
                 "only a file carries content to modify: a directory's is derived at commit, and a link's address is its target",
             ));
         }
 
         planned.push(Planned {
-            id,
+            entry_id,
             node_id: entry.node_id,
             mode: entry.mode,
             size: entry.size,
@@ -249,10 +252,10 @@ async fn apply_plan(
                     .await
                 {
                     Ok(()) => {
-                        emit_modify_complete(item.id, item.node_id, LoreErrorCode::None);
+                        emit_modify_complete(item.entry_id, item.node_id, LoreErrorCode::None);
                         applied += 1;
                     }
-                    Err(_) => emit_modify_error(item.id, LoreErrorCode::Internal),
+                    Err(_) => emit_modify_error(item.entry_id, LoreErrorCode::Internal),
                 }
             }
             applied
@@ -279,8 +282,8 @@ async fn apply_plan(
 
 /// Rewrite a batch of file nodes' content fields.
 ///
-/// Each entry emits `RevisionTreeModifyComplete` carrying its own `id` and the
-/// node it names, before the call's `Complete`; on failure the reported node is
+/// Each entry emits `RevisionTreeModifyComplete` carrying its own `entry_id` and
+/// the node it names, before the call's `Complete`; on failure the reported node is
 /// the invalid-node sentinel. `mode`, `size` and `address` take the values the
 /// entry supplies. Only a file is modifiable: a directory's size and address are
 /// derived at commit and a link's address is its target, so neither holds
@@ -290,18 +293,19 @@ async fn apply_plan(
 /// empty batch succeeds.
 ///
 /// The call as a whole reports on `RevisionTreeBatchComplete`, carrying the
-/// call's own `id` and firing exactly once — after any per-entry terminals and
-/// before `Complete`. A failure that belongs to the call rather than to one
-/// entry is reported only there: an unknown or closed handle, and an apply task
-/// that died without reporting the entries it still held.
+/// call's own `batch_id` and firing exactly once — after any per-entry
+/// terminals and before `Complete`. A failure that belongs to the call rather
+/// than to one entry is reported only there: an unknown or closed handle, and an
+/// apply task that died without reporting the entries it still held.
 ///
 /// Every entry is checked before any node is rewritten, and a single bad entry
-/// rejects the whole call with `INVALID_ARGUMENTS` on that entry's id, leaving
-/// every target untouched. The reason names the entry's batch index, since `id`
-/// may be `0` on several entries at once. Rejected are a node id that is
+/// rejects the whole call with `INVALID_ARGUMENTS` on that entry's `entry_id`,
+/// leaving every target untouched. The reason names the entry's batch index, since
+/// `entry_id` may be `0` on several entries at once. Rejected are a node id
+/// that is
 /// unknown, that addresses a slot holding no node, that has been deleted, or
 /// that names a directory or a link; a node id another entry in the same batch
-/// also names; and a non-zero caller `id` used by another entry — `0` means
+/// also names; and a non-zero `entry_id` used by another entry — `0` means
 /// "not correlating this entry" and may repeat. A deleted node and an
 /// unallocated slot both read back as an ordinary directory, so each is refused
 /// under its own reason rather than as the wrong kind.
@@ -359,10 +363,10 @@ async fn modify_impl(
         args,
         modify,
         |args: &LoreRevisionTreeModifyArgs| {
-            emit_batch_complete(args.id, LoreErrorCode::InvalidArguments);
+            emit_batch_complete(args.batch_id, LoreErrorCode::InvalidArguments);
         },
         async move |internal: Arc<RevisionTreeInternal>, args: LoreRevisionTreeModifyArgs| {
-            let call_id = args.id;
+            let call_id = args.batch_id;
             let result = modify_batch(internal, args).await;
             emit_batch_complete(call_id, batch_error_code(&result));
             result
@@ -424,13 +428,13 @@ mod tests {
                 }
                 LoreEvent::RevisionTreeLoaded(data) => Self::RevisionTreeLoaded(data.handle_id),
                 LoreEvent::RevisionTreeAddComplete(data) => {
-                    Self::AddComplete(data.id, data.node_id, data.error_code)
+                    Self::AddComplete(data.entry_id, data.node_id, data.error_code)
                 }
                 LoreEvent::RevisionTreeModifyComplete(data) => {
-                    Self::ModifyComplete(data.id, data.node_id, data.error_code)
+                    Self::ModifyComplete(data.entry_id, data.node_id, data.error_code)
                 }
                 LoreEvent::RevisionTreeBatchComplete(data) => {
-                    Self::BatchComplete(data.id, data.error_code)
+                    Self::BatchComplete(data.batch_id, data.error_code)
                 }
                 LoreEvent::RevisionTreeNodeInfo(data) => Self::NodeInfo(Box::new(data.clone())),
                 other => Self::Other(other.discriminant()),
@@ -506,9 +510,9 @@ mod tests {
         Context::from(uuid::Uuid::now_v7())
     }
 
-    fn entry(id: u64, node_id: NodeID) -> LoreRevisionTreeModifyEntry {
+    fn entry(entry_id: u64, node_id: NodeID) -> LoreRevisionTreeModifyEntry {
         LoreRevisionTreeModifyEntry {
-            id,
+            entry_id,
             node_id,
             mode: 0o600,
             size: 4096,
@@ -561,12 +565,12 @@ mod tests {
         let status = add(
             LoreGlobalArgs::default(),
             LoreRevisionTreeAddArgs {
-                id: 1,
+                batch_id: 1,
                 handle,
                 entries: LoreArray::from_vec(vec![LoreRevisionTreeAddEntry {
-                    id: 1,
+                    entry_id: 1,
                     parent_node_id: ROOT_NODE,
-                    parent_entry: 0,
+                    parent_entry_index: 0,
                     name: LoreString::from_str(name),
                     kind: kind as u32,
                     mode: 0o644,
@@ -596,7 +600,7 @@ mod tests {
         let status = modify(
             LoreGlobalArgs::default(),
             LoreRevisionTreeModifyArgs {
-                id: CALL_ID,
+                batch_id: CALL_ID,
                 handle,
                 entries: LoreArray::from_vec(entries),
             },
@@ -863,7 +867,7 @@ mod tests {
         release(handle, store_handle_id);
     }
 
-    /// A repeated non-zero caller id would make a reported id ambiguous, so it
+    /// A repeated non-zero `entry_id` would make a reported id ambiguous, so it
     /// rejects; a repeated zero is an explicit opt-out and does not.
     #[tokio::test]
     async fn modify_rejects_a_repeated_caller_id_but_accepts_repeated_zeros() {

@@ -92,12 +92,12 @@ async fn a_command_carrying_an_address_survives_both_serializations() {
         context: Context::from([0x73u8; 16]),
     };
     let args = LoreRevisionTreeAddArgs {
-        id: 900,
+        batch_id: 900,
         handle: LoreRevisionTree { handle_id: 5 },
         entries: LoreArray::from_vec(vec![LoreRevisionTreeAddEntry {
-            id: 1,
+            entry_id: 1,
             parent_node_id: 0,
-            parent_entry: 0,
+            parent_entry_index: 0,
             name: LoreString::from_str("payload.bin"),
             kind: 1,
             mode: 0o644,
@@ -142,7 +142,7 @@ async fn a_command_carrying_an_address_survives_both_serializations() {
 async fn revision_tree_modify_batch_survives_the_wire() {
     let entries = LoreArray::from_vec(vec![
         LoreRevisionTreeModifyEntry {
-            id: 7,
+            entry_id: 7,
             node_id: 42,
             mode: 0o600,
             size: 4096,
@@ -152,7 +152,7 @@ async fn revision_tree_modify_batch_survives_the_wire() {
             },
         },
         LoreRevisionTreeModifyEntry {
-            id: 0,
+            entry_id: 0,
             node_id: 43,
             mode: 0o644,
             size: 0,
@@ -160,7 +160,7 @@ async fn revision_tree_modify_batch_survives_the_wire() {
         },
     ]);
     let args = LoreRevisionTreeModifyArgs {
-        id: 900,
+        batch_id: 900,
         handle: LoreRevisionTree { handle_id: 5 },
         entries: entries.clone(),
     };
@@ -182,7 +182,7 @@ async fn revision_tree_modify_batch_survives_the_wire() {
 
         match processed.1.command {
             LoreCommand::RevisionTreeModify(read_back) => {
-                assert_eq!(read_back.id, args.id, "{label}");
+                assert_eq!(read_back.batch_id, args.batch_id, "{label}");
                 assert_eq!(read_back.handle.handle_id, args.handle.handle_id, "{label}");
                 assert_eq!(
                     read_back.entries.as_slice(),

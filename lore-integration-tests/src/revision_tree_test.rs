@@ -66,13 +66,13 @@ mod support {
                 LoreEvent::StorageOpened(data) => Captured::Opened(data.handle_id),
                 LoreEvent::RevisionTreeLoaded(data) => Captured::Loaded(data.handle_id),
                 LoreEvent::RevisionTreeAddComplete(data) => {
-                    Captured::AddComplete(data.id, data.node_id, data.error_code)
+                    Captured::AddComplete(data.entry_id, data.node_id, data.error_code)
                 }
                 LoreEvent::RevisionTreeModifyComplete(data) => {
-                    Captured::ModifyComplete(data.id, data.node_id, data.error_code)
+                    Captured::ModifyComplete(data.entry_id, data.node_id, data.error_code)
                 }
                 LoreEvent::RevisionTreeBatchComplete(data) => {
-                    Captured::BatchComplete(data.id, data.error_code)
+                    Captured::BatchComplete(data.batch_id, data.error_code)
                 }
                 LoreEvent::RevisionTreeNodeInfo(data) => Captured::NodeInfo(Box::new(data.clone())),
                 LoreEvent::RevisionTreeChild(data) => {
@@ -251,15 +251,15 @@ mod add_tests {
     use super::support::*;
 
     fn entry(
-        id: u64,
+        entry_id: u64,
         parent_node_id: NodeID,
         name: &str,
         kind: LoreNodeType,
     ) -> LoreRevisionTreeAddEntry {
         LoreRevisionTreeAddEntry {
-            id,
+            entry_id,
             parent_node_id,
-            parent_entry: 0,
+            parent_entry_index: 0,
             name: LoreString::from_str(name),
             kind: kind as u32,
             mode: 0o644,
@@ -270,13 +270,13 @@ mod add_tests {
 
     fn nested_entry(
         id: u64,
-        parent_entry: u32,
+        parent_entry_index: u32,
         name: &str,
         kind: LoreNodeType,
     ) -> LoreRevisionTreeAddEntry {
         LoreRevisionTreeAddEntry {
             parent_node_id: INVALID_NODE,
-            parent_entry,
+            parent_entry_index,
             ..entry(id, ROOT_NODE, name, kind)
         }
     }
@@ -289,7 +289,7 @@ mod add_tests {
         let status = add(
             LoreGlobalArgs::default(),
             LoreRevisionTreeAddArgs {
-                id: CALL_ID,
+                batch_id: CALL_ID,
                 handle,
                 entries: LoreArray::from_vec(entries),
             },
@@ -1042,9 +1042,9 @@ mod modify_tests {
         Context::from(uuid::Uuid::now_v7())
     }
 
-    fn modify_entry(id: u64, node_id: NodeID) -> LoreRevisionTreeModifyEntry {
+    fn modify_entry(entry_id: u64, node_id: NodeID) -> LoreRevisionTreeModifyEntry {
         LoreRevisionTreeModifyEntry {
-            id,
+            entry_id,
             node_id,
             mode: 0o600,
             size: 4096,
@@ -1064,12 +1064,12 @@ mod modify_tests {
         let status = add(
             LoreGlobalArgs::default(),
             LoreRevisionTreeAddArgs {
-                id: 1,
+                batch_id: 1,
                 handle,
                 entries: LoreArray::from_vec(vec![LoreRevisionTreeAddEntry {
-                    id: 1,
+                    entry_id: 1,
                     parent_node_id: parent,
-                    parent_entry: 0,
+                    parent_entry_index: 0,
                     name: LoreString::from_str(name),
                     kind: kind as u32,
                     mode: 0o644,
@@ -1099,7 +1099,7 @@ mod modify_tests {
         let status = modify(
             LoreGlobalArgs::default(),
             LoreRevisionTreeModifyArgs {
-                id: CALL_ID,
+                batch_id: CALL_ID,
                 handle,
                 entries: LoreArray::from_vec(entries),
             },
@@ -1226,9 +1226,9 @@ mod modify_tests {
         let count = BLOCK_NODE_COUNT * 3;
         let add_entries: Vec<LoreRevisionTreeAddEntry> = (0..count)
             .map(|index| LoreRevisionTreeAddEntry {
-                id: index as u64 + 1,
+                entry_id: index as u64 + 1,
                 parent_node_id: ROOT_NODE,
-                parent_entry: 0,
+                parent_entry_index: 0,
                 name: LoreString::from_str(&format!("f-{index:05}")),
                 kind: LoreNodeType::File as u32,
                 mode: 0o644,
@@ -1240,7 +1240,7 @@ mod modify_tests {
         let status = add(
             LoreGlobalArgs::default(),
             LoreRevisionTreeAddArgs {
-                id: 1,
+                batch_id: 1,
                 handle,
                 entries: LoreArray::from_vec(add_entries),
             },

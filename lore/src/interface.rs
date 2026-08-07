@@ -7452,7 +7452,7 @@ pub type LoreRevisionTreeAddArgs = crate::revision_tree::add::LoreRevisionTreeAd
 /// existing node or onto an earlier entry, so one call builds a subtree. Every
 /// entry is checked before any node is created, so one bad entry rejects the
 /// call and creates nothing; the reason names the offending entry's batch index,
-/// which a caller leaving `id` at zero has no other way to identify. A failure
+/// which a caller leaving `entry_id` at zero has no other way to identify. A failure
 /// after those checks pass is internal and may leave part of the batch created.
 ///
 /// A link entry's target revision is not resolved here, so a link naming a
@@ -7462,8 +7462,8 @@ pub type LoreRevisionTreeAddArgs = crate::revision_tree::add::LoreRevisionTreeAd
 ///
 /// | Terminal event                            | Payload                                          | Notes                                                    |
 /// |-------------------------------------------|--------------------------------------------------|----------------------------------------------------------|
-/// | `LORE_EVENT_REVISION_TREE_ADD_COMPLETE`   | `lore_revision_tree_add_complete_event_data_t`   | One per entry created or individually rejected           |
-/// | `LORE_EVENT_REVISION_TREE_BATCH_COMPLETE` | `lore_revision_tree_batch_complete_event_data_t` | Exactly one, carrying the call id and the call's outcome |
+/// | `LORE_EVENT_REVISION_TREE_ADD_COMPLETE`   | `lore_revision_tree_add_complete_event_data_t`   | One per entry, carrying its `entry_id`                    |
+/// | `LORE_EVENT_REVISION_TREE_BATCH_COMPLETE` | `lore_revision_tree_batch_complete_event_data_t` | Exactly one, carrying the `batch_id` and the call's outcome |
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_revision_tree_add(
     globals: &LoreGlobalArgs,
@@ -7488,7 +7488,7 @@ pub type LoreRevisionTreeModifyArgs = crate::revision_tree::modify::LoreRevision
 /// Rewrite a batch of file nodes' `mode`, `size` and `address` in a loaded
 /// revision tree. Every entry is checked before any node is rewritten, so one bad
 /// entry rejects the call and leaves every target untouched; the reason names the
-/// offending entry's batch index, which a caller leaving `id` at zero has no
+/// offending entry's batch index, which a caller leaving `entry_id` at zero has no
 /// other way to identify. A failure after those checks pass is internal and may
 /// leave part of the batch rewritten.
 ///
@@ -7501,8 +7501,8 @@ pub type LoreRevisionTreeModifyArgs = crate::revision_tree::modify::LoreRevision
 ///
 /// | Terminal event                              | Payload                                           | Notes                                                    |
 /// |---------------------------------------------|---------------------------------------------------|----------------------------------------------------------|
-/// | `LORE_EVENT_REVISION_TREE_MODIFY_COMPLETE`  | `lore_revision_tree_modify_complete_event_data_t` | One per entry rewritten or individually rejected         |
-/// | `LORE_EVENT_REVISION_TREE_BATCH_COMPLETE`   | `lore_revision_tree_batch_complete_event_data_t`  | Exactly one, carrying the call id and the call's outcome |
+/// | `LORE_EVENT_REVISION_TREE_MODIFY_COMPLETE`  | `lore_revision_tree_modify_complete_event_data_t` | One per entry, carrying its `entry_id`                    |
+/// | `LORE_EVENT_REVISION_TREE_BATCH_COMPLETE`   | `lore_revision_tree_batch_complete_event_data_t`  | Exactly one, carrying the `batch_id` and the call's outcome |
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_revision_tree_modify(
     globals: &LoreGlobalArgs,

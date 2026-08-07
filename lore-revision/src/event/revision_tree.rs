@@ -166,8 +166,8 @@ pub struct LoreRevisionTreeNodePathEventData {
     pub error_code: LoreErrorCode,
 }
 
-/// Terminal event for a batch write call as a whole, carrying the call's own id
-/// rather than any entry's.
+/// Terminal event for a batch write call as a whole, carrying the `batch_id` the
+/// call was submitted under rather than any entry's `entry_id`.
 ///
 /// Every batch write verb emits exactly one of these, after any per-entry
 /// terminals and before `Complete`. The error code is `NONE` when the call did
@@ -178,33 +178,36 @@ pub struct LoreRevisionTreeNodePathEventData {
 #[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionTreeBatchCompleteEventData {
-    /// Correlation id of the originating call
-    pub id: u64,
+    /// Correlation id the call was submitted under
+    pub batch_id: u64,
     /// The outcome of the call as a whole
     pub error_code: LoreErrorCode,
 }
 
 /// Terminal per-entry event for `add`. On success `node_id` is the
-/// newly-allocated child; on failure `node_id` is undefined.
+/// newly-allocated child; on failure it is the invalid-node sentinel, since
+/// nothing was created. The call as a whole reports separately on
+/// `RevisionTreeBatchComplete`.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionTreeAddCompleteEventData {
-    /// Correlation id of the originating call.
-    pub id: u64,
+    /// Correlation id of the entry this reports, not of the call.
+    pub entry_id: u64,
     /// The newly-added node.
     pub node_id: NodeID,
     /// The outcome of the call.
     pub error_code: LoreErrorCode,
 }
 
-/// Terminal per-call event for `delete`.
+/// Terminal per-entry event for `delete`. The call as a whole reports
+/// separately on `RevisionTreeBatchComplete`.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionTreeDeleteCompleteEventData {
-    /// Correlation id of the originating call.
-    pub id: u64,
+    /// Correlation id of the entry this reports, not of the call.
+    pub entry_id: u64,
     /// The outcome of the call.
     pub error_code: LoreErrorCode,
 }
@@ -217,40 +220,42 @@ pub struct LoreRevisionTreeDeleteCompleteEventData {
 #[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionTreeModifyCompleteEventData {
-    /// Correlation id of the originating call.
-    pub id: u64,
+    /// Correlation id of the entry this reports, not of the call.
+    pub entry_id: u64,
     /// The modified node.
     pub node_id: NodeID,
     /// The outcome of the call.
     pub error_code: LoreErrorCode,
 }
 
-/// Terminal per-call event for `move`. `node_id` echoes the moved node so
-/// the caller observes that `file_id` is preserved across the reparent.
+/// Terminal per-entry event for `move`. `node_id` echoes the moved node so
+/// the caller observes that `file_id` is preserved across the reparent. The
+/// call as a whole reports separately on `RevisionTreeBatchComplete`.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionTreeMoveCompleteEventData {
-    /// Correlation id of the originating call.
-    pub id: u64,
+    /// Correlation id of the entry this reports, not of the call.
+    pub entry_id: u64,
     /// The moved node.
     pub node_id: NodeID,
     /// The outcome of the call.
     pub error_code: LoreErrorCode,
 }
 
-/// Terminal per-call event for `metadata_set`.
+/// Terminal per-entry event for `metadata_set`. The call as a whole reports
+/// separately on `RevisionTreeBatchComplete`.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionTreeMetadataSetCompleteEventData {
-    /// Correlation id of the originating call.
-    pub id: u64,
+    /// Correlation id of the entry this reports, not of the call.
+    pub entry_id: u64,
     /// The outcome of the call.
     pub error_code: LoreErrorCode,
 }
 
-/// Per-call event carrying a metadata value from `metadata_get`. The
+/// Per-entry event carrying a metadata value from `metadata_get`. The
 /// missing-key case emits no value event and lets the trailing `Complete`
 /// fire on its own.
 ///
@@ -260,8 +265,8 @@ pub struct LoreRevisionTreeMetadataSetCompleteEventData {
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionTreeMetadataGetCompleteEventData {
-    /// Correlation id of the originating call.
-    pub id: u64,
+    /// Correlation id of the entry this reports, not of the call.
+    pub entry_id: u64,
     /// The metadata key.
     pub key: LoreString,
     /// The metadata value.
