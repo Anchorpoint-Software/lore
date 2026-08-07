@@ -2869,19 +2869,23 @@ async fn layer_branch_switch(
         // Check if branch already exists in layer repo
         let branch_exists = branch::exist_local(layer_repository.clone(), branch_id).await;
 
-        if !branch_exists {
-            // Create branch in layer repo - mirrors layer_branch_create pattern
+        let layer_current = if branch_exists {
+            None
+        } else {
             let current_revision =
                 state::State::deserialize(layer_repository.clone(), layer.current)
                     .await
                     .forward::<RepositoryError>("Failed to deserialize repository state")?;
             let current_branch = current_revision.branch(layer_repository.clone()).await;
+            Some((current_revision, current_branch))
+        };
 
-            if current_branch == branch_id {
-                // Already on this branch (by ID), skip
-                continue;
-            }
-
+        // Skip only the branch creation, not the layer: a layer already on this
+        // branch can still be behind the branch latest and needs resolving.
+        if let Some((current_revision, current_branch)) = layer_current
+            && current_branch != branch_id
+        {
+            // Create branch in layer repo - mirrors layer_branch_create pattern
             let parent_metadata = branch::metadata(layer_repository.clone(), current_branch)
                 .await
                 .forward::<RepositoryError>("Failed to load branch metadata")?;

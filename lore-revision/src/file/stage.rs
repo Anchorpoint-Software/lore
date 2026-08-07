@@ -432,6 +432,17 @@ pub async fn stage(
     for (layer, layer_state) in layer_staged {
         let state = layer_state.state_staged.clone();
 
+        // A staged state never hashes equal to the committed current, so
+        // pinning an unmutated layer pins a staged revision with nothing in it.
+        if !state.is_dirty() {
+            lore_debug!(
+                "Layer at {} has no staged modifications, leaving staged state {} untouched",
+                layer.target_path,
+                layer.staged
+            );
+            continue;
+        }
+
         state.set_revision_number(0);
 
         state.set_parent_self(layer_state.state_current.revision());
