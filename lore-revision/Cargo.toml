@@ -51,6 +51,7 @@ url = { workspace = true }
 lore-base = { workspace = true }
 lore-error-set = { workspace = true }
 lore-credential = { workspace = true }
+lore-io = { workspace = true }
 lore-storage = { workspace = true }
 lore-macro = { workspace = true }
 lore-proto = { workspace = true }

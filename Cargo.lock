@@ -2762,6 +2762,7 @@ dependencies = [
  "lore-base",
  "lore-credential",
  "lore-error-set",
+ "lore-io",
  "lore-macro",
  "lore-proto",
  "lore-storage",

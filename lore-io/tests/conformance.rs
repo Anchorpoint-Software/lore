@@ -361,6 +361,146 @@ async fn remove_dir_all_takes_the_tree_and_reports_a_missing_one() {
     }
 }
 
+/// A listing yields every child with the metadata the walk resolved for it, and ends. The
+/// entries arrive in whatever order the walk finds them, so the test compares them as a set.
+#[tokio::test]
+async fn read_dir_yields_every_child_with_metadata() {
+    for driver in drivers() {
+        let dir = TempDir::new("readdir");
+        let root = dir.file("tree");
+        driver.create_dir_all(root.join("child_dir")).await.unwrap();
+        driver
+            .write_file_bytes(root.join("child_file"), Bytes::from_static(b"four"), false)
+            .await
+            .unwrap();
+
+        let mut listing = driver.read_dir(&root).await.unwrap();
+        let mut found = Vec::new();
+        while let Some(entry) = listing.next().await {
+            let entry = entry.expect("an entry must be readable");
+            let metadata = entry.metadata.expect("an entry must resolve its metadata");
+            found.push((
+                entry.file_name.to_string_lossy().to_string(),
+                metadata.is_dir(),
+                metadata.len(),
+            ));
+        }
+        found.sort();
+
+        assert_eq!(found.len(), 2, "unexpected listing: {found:?}");
+        assert_eq!(found[0].0, "child_dir");
+        assert!(found[0].1, "the directory must report itself as one");
+        assert_eq!(found[1].0, "child_file");
+        assert!(
+            !found[1].1,
+            "the file must not report itself as a directory"
+        );
+        assert_eq!(found[1].2, 4);
+    }
+}
+
+/// Permissions round-trip through the driver: what `metadata` reports is what `set_permissions`
+/// accepts back, which is the whole shape callers use since none of them build a mode by hand.
+#[tokio::test]
+async fn set_permissions_marks_a_file_read_only() {
+    for driver in drivers() {
+        let dir = TempDir::new("permissions");
+        let path = dir.file("guarded");
+        driver
+            .write_file_bytes(&path, Bytes::from_static(b"contents"), false)
+            .await
+            .unwrap();
+
+        let mut permissions = driver.metadata(&path).await.unwrap().permissions();
+        permissions.set_readonly(true);
+        driver.set_permissions(&path, permissions).await.unwrap();
+        assert!(
+            driver
+                .metadata(&path)
+                .await
+                .unwrap()
+                .permissions()
+                .readonly()
+        );
+
+        let mut permissions = driver.metadata(&path).await.unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        driver.set_permissions(&path, permissions).await.unwrap();
+        assert!(
+            !driver
+                .metadata(&path)
+                .await
+                .unwrap()
+                .permissions()
+                .readonly(),
+            "the file must be writable again for the directory to clean up"
+        );
+    }
+}
+
+/// A directory wider than one chunk yields every child exactly once. The stream refills as the
+/// consumer drains it, so this is what says a name is neither dropped nor repeated at the seam
+/// between chunks — including the case where the walk ends exactly on one.
+#[tokio::test]
+async fn read_dir_spans_chunk_boundaries() {
+    for driver in drivers() {
+        // Straddles the chunk the listing resolves per dispatch: one short of it, exactly it,
+        // one past, and a count needing several refills with the last one partial.
+        for count in [1usize, 255, 256, 257, 600] {
+            let dir = TempDir::new("readdir-chunks");
+            let root = dir.file(&format!("wide{count}"));
+            driver.create_dir_all(&root).await.unwrap();
+            for index in 0..count {
+                driver
+                    .write_file_bytes(root.join(format!("child{index:04}")), Bytes::new(), false)
+                    .await
+                    .unwrap();
+            }
+
+            let mut listing = driver.read_dir(&root).await.unwrap();
+            let mut names = Vec::new();
+            while let Some(entry) = listing.next().await {
+                names.push(entry.unwrap().file_name.to_string_lossy().to_string());
+            }
+            names.sort();
+            names.dedup();
+
+            assert_eq!(names.len(), count, "{count} children yielded {names:?}");
+            assert_eq!(names[0], "child0000");
+        }
+    }
+}
+
+/// An empty directory ends immediately rather than hanging: the walk marks the stream finished
+/// even when it produced nothing, which a consumer parked on the first entry depends on.
+#[tokio::test]
+async fn read_dir_on_an_empty_directory_ends() {
+    for driver in drivers() {
+        let dir = TempDir::new("readdir-empty");
+        let root = dir.file("empty");
+        driver.create_dir_all(&root).await.unwrap();
+
+        let mut listing = driver.read_dir(&root).await.unwrap();
+        assert!(listing.next().await.is_none(), "an empty listing yielded");
+    }
+}
+
+/// A directory that cannot be read fails at the call rather than arriving as an empty listing,
+/// which is the distinction a caller deciding whether children exist depends on.
+#[tokio::test]
+async fn read_dir_reports_a_missing_directory() {
+    for driver in drivers() {
+        let dir = TempDir::new("readdir-missing");
+        let error = driver
+            .read_dir(dir.file("absent"))
+            .await
+            .err()
+            .expect("listing a missing directory must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    }
+}
+
 #[tokio::test]
 async fn concurrent_disjoint_writes_share_one_handle() {
     for driver in drivers() {

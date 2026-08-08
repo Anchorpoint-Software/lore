@@ -2057,7 +2057,10 @@ async fn commit_file(
                 .bytes_transferred
                 .fetch_add(size_content, Ordering::Relaxed);
 
-            let Ok(metadata) = tokio::fs::metadata(absolute_path.as_path()).await else {
+            let Ok(metadata) = lore_io::IoDriver::global()
+                .metadata(absolute_path.as_path())
+                .await
+            else {
                 return Err(CommitError::internal(format!(
                     "Failed to get metadata for file {}",
                     absolute_path.display()

@@ -28,6 +28,7 @@
 //!   the syscall pool.
 
 mod buffer;
+mod dir;
 mod driver;
 mod file;
 #[cfg(target_family = "windows")]
@@ -43,6 +44,8 @@ pub use buffer::StableBuf;
 pub use buffer::StableBufList;
 pub use buffer::StableBufListMut;
 pub use buffer::uninit_buffer;
+pub use dir::DirEntry;
+pub use dir::DirStream;
 pub use driver::BackendKind;
 pub use driver::IoDriver;
 pub use driver::WHOLE_FILE_LIMIT;

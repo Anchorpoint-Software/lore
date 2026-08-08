@@ -764,7 +764,8 @@ pub async fn stage_move(
 
     // Get target file/directory metadata
     let to_absolute_path = to_path.to_absolute_path(repository.require_path()?);
-    let to_metadata = tokio::fs::metadata(to_absolute_path)
+    let to_metadata = lore_io::IoDriver::global()
+        .metadata(to_absolute_path)
         .await
         .internal(&format!("Path {to_path} does not exist in repository "))?;
 

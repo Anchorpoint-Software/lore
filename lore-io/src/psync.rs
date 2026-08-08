@@ -351,9 +351,37 @@ impl PsyncDriver {
             .await
     }
 
+    pub(crate) async fn set_permissions(
+        &self,
+        path: PathBuf,
+        permissions: std::fs::Permissions,
+    ) -> std::io::Result<()> {
+        SyscallPool::global()
+            .submit(move || std::fs::set_permissions(path, permissions))
+            .await
+    }
+
+    pub(crate) async fn read_dir(&self, path: PathBuf) -> std::io::Result<crate::DirStream> {
+        SyscallPool::global()
+            .submit(move || Ok(crate::DirStream::start(std::fs::read_dir(path)?)))
+            .await
+    }
+
     pub(crate) async fn create_dir_all(&self, path: PathBuf) -> std::io::Result<()> {
         SyscallPool::global()
             .submit(move || std::fs::create_dir_all(path))
+            .await
+    }
+
+    pub(crate) async fn remove_dir(&self, path: PathBuf) -> std::io::Result<()> {
+        SyscallPool::global()
+            .submit(move || std::fs::remove_dir(path))
+            .await
+    }
+
+    pub(crate) async fn copy(&self, from: PathBuf, to: PathBuf) -> std::io::Result<u64> {
+        SyscallPool::global()
+            .submit(move || std::fs::copy(from, to))
             .await
     }
 

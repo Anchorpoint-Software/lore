@@ -22,7 +22,6 @@ use crate::defragment::read_defragment;
 use crate::error::StorageError;
 use crate::errors::SlowDown;
 use crate::fragment_flags::FragmentFlags;
-use crate::fs_util;
 use crate::hash;
 use crate::immutable_store::ImmutableStore;
 use crate::immutable_store::StoreError;
@@ -755,16 +754,12 @@ pub async fn read_into_file(
             drop(file);
 
             if !options.direct_write {
-                let path_owned = path.to_path_buf();
-                let file_path_clone = file_path.clone();
                 let rename_err_msg =
                     format!("rename {} -> {}", file_path.display(), path.display());
-                lore_base::lore_spawn_blocking!(move || {
-                    fs_util::rename_file(file_path_clone.as_path(), path_owned.as_path())
-                })
-                .await
-                .map_err(|e| StorageError::internal_with_context(e, "rename task join"))?
-                .map_err(|e| StorageError::internal_with_context(e, &rename_err_msg))?;
+                lore_io::IoDriver::global()
+                    .rename(file_path.as_path(), path)
+                    .await
+                    .map_err(|e| StorageError::internal_with_context(e, &rename_err_msg))?;
 
                 if let Some(temporary) = temporary.as_mut() {
                     temporary.renamed();

@@ -29,7 +29,6 @@ use crate::link;
 use crate::lore::BranchId;
 use crate::lore::Hash;
 use crate::lore_debug;
-use crate::lore_spawn_blocking;
 use crate::lore_trace;
 use crate::node;
 use crate::node::Node;
@@ -687,7 +686,7 @@ async fn wrap_path_error(
 ) -> Result<(), ResetError> {
     let absolute = relative_path.to_absolute_path(repository.require_path()?);
     let wrapped: Result<(), ResetError> = Err(err);
-    match tokio::fs::metadata(&absolute).await {
+    match lore_io::IoDriver::global().metadata(&absolute).await {
         Ok(_) => wrapped
             .forward::<ResetError>(&format!("Failed resetting an existing path: {user_path}")),
         _ => wrapped.forward::<ResetError>(&format!(
@@ -1361,14 +1360,19 @@ async fn reset_walk_directory(
     if child_node_iter.is_none() {
         if !directory_path.is_empty() {
             let absolute_path = directory_path.to_absolute_path(repository.require_path()?);
-            match tokio::fs::create_dir(absolute_path.as_path()).await {
+            match lore_io::IoDriver::global()
+                .create_dir_all(absolute_path.as_path())
+                .await
+            {
                 Ok(_) => {
                     lore_trace!("Created empty directory: {}", directory_path.as_str());
                 }
                 Err(err) => {
                     if err.kind() == std::io::ErrorKind::AlreadyExists {
                         lore_trace!("Directory already exists: {}", directory_path.as_str());
-                    } else if let Ok(metadata) = tokio::fs::metadata(absolute_path.as_path()).await
+                    } else if let Ok(metadata) = lore_io::IoDriver::global()
+                        .metadata(absolute_path.as_path())
+                        .await
                     {
                         if metadata.is_dir() {
                             lore_trace!("Directory already exists: {}", directory_path.as_str());
@@ -1494,17 +1498,27 @@ async fn reset_walk_directory(
     // its tracked children were filter-excluded — nothing to purge in that
     // case.
     let absolute_dir = directory_path.to_absolute_path(repository.require_path()?);
-    if tokio::fs::metadata(&absolute_dir).await.is_err() {
+    if lore_io::IoDriver::global()
+        .metadata(&absolute_dir)
+        .await
+        .is_err()
+    {
         return Ok(());
     }
-    let mut filesystem_children = util::fs::list_directory(absolute_dir).internal(&format!(
-        "Failed to list directory files in {}",
-        directory_path.as_str()
-    ))?;
+    let mut filesystem_children =
+        util::fs::list_directory(absolute_dir)
+            .await
+            .internal(&format!(
+                "Failed to list directory files in {}",
+                directory_path.as_str()
+            ))?;
 
     let force = execution_context().globals().force();
     let mut tasks = JoinSet::new();
-    while let Some(filesystem_child) = filesystem_children.recv().await {
+    while let Some(entry) = filesystem_children.next().await {
+        let Some(filesystem_child) = util::fs::file_list_item(entry) else {
+            continue;
+        };
         if filesystem_child.name == DOT_URC || filesystem_child.name == DOT_LORE {
             continue;
         }
@@ -1631,7 +1645,7 @@ async fn reset_file_realize(
     } = item;
 
     let node_path = relative_path.to_absolute_path(repository.require_path()?);
-    let metadata = tokio::fs::metadata(&node_path).await;
+    let metadata = lore_io::IoDriver::global().metadata(&node_path).await;
 
     let force = execution_context().globals().force();
 
@@ -1678,13 +1692,9 @@ async fn reset_file_realize(
                 .send();
 
                 let to_path = to_path.to_absolute_path(repository.require_path()?);
-                lore_spawn_blocking!(move || {
-                    util::fs::unify_name_case_rename(node_path.as_path(), to_path.as_path())
-                })
-                .await
-                .map_err(std::io::Error::other)
-                .flatten()
-                .internal("Failed renaming file")?;
+                util::fs::unify_name_case_rename(node_path.as_path(), to_path.as_path())
+                    .await
+                    .internal("Failed renaming file")?;
             } else {
                 lore_trace!("File {relative_path} is not modified, no reset");
             }

@@ -3,33 +3,6 @@
 use std::path::Path;
 
 #[cfg(not(target_family = "windows"))]
-pub fn rename_file<P: AsRef<Path>>(from: P, to: P) -> std::io::Result<()> {
-    std::fs::rename(from.as_ref(), to.as_ref())
-}
-
-#[cfg(target_family = "windows")]
-pub fn rename_file<P: AsRef<Path>>(from: P, to: P) -> std::io::Result<()> {
-    use windows_sys::Win32::Storage::FileSystem::*;
-
-    // `to_extended_wide` applies the \\?\ verbatim prefix only when the
-    // path would otherwise exceed MAX_PATH, so short paths skip the prefix
-    // overhead. MoveFileExW parses each parameter independently, so a
-    // short non-prefixed source and a long prefixed destination (or any
-    // mix) resolve correctly.
-    let from = lore_base::fs::win_path::to_extended_wide(from.as_ref());
-    let to = lore_base::fs::win_path::to_extended_wide(to.as_ref());
-
-    // Safety: Call Win32 APIs, buffers are valid and null-terminated
-    let ok = unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_REPLACE_EXISTING) };
-
-    if ok == 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(not(target_family = "windows"))]
 pub fn sync_dir<P: AsRef<Path>>(path: P) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::OpenOptionsExt;

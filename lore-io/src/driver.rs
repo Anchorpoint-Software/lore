@@ -6,8 +6,8 @@
 //! `read_at`, `read_exact_at`, `read_vectored_at`, `write_at`, `write_all_at`,
 //! `write_vectored_at`, `open_read_head`, `read_file_bytes`, `write_file_bytes`,
 //! `write_file_segments`, `write_file_segments_atomic`, `sync`, `metadata`, `file_metadata`,
-//! `set_len`, `rename`, `remove_file`, `create_dir_all` and `remove_dir_all`. A backend implements
-//! all twenty as inherent methods on its own type.
+//! `set_len`, `rename`, `copy`, `remove_file`, `create_dir_all`, `remove_dir` and
+//! `remove_dir_all`. A backend implements all twenty-two as inherent methods on its own type.
 //!
 //! Every operation dispatches, including the metadata ones a completion backend will keep on the
 //! syscall pool anyway — a ring-submitted `statx` is punted to a kernel worker making the same
@@ -395,6 +395,27 @@ impl IoDriver {
         }
     }
 
+    /// Lists `path`, resolving each entry's metadata, a chunk of entries per dispatch.
+    ///
+    /// The open is awaited, so a directory that cannot be read fails here rather than as an
+    /// empty listing, and the first chunk arrives with it. The stream holds one chunk, so a
+    /// directory of any width costs the same memory and a consumer that stops early stops the
+    /// walk.
+    ///
+    /// This is a driver operation rather than an inline `read_dir` because a listing is not one
+    /// syscall: it is `getdents` plus a stat per child, and a caller wanting the children's
+    /// metadata otherwise pays all of them on whatever thread polls it.
+    pub async fn read_dir(&self, path: impl AsRef<Path>) -> std::io::Result<crate::DirStream> {
+        let path = path.as_ref().to_path_buf();
+        match &*self.inner {
+            DriverInner::Psync(driver) => driver.read_dir(path).await,
+            #[cfg(target_os = "linux")]
+            DriverInner::Uring(driver) => driver.read_dir(path).await,
+            #[cfg(target_family = "windows")]
+            DriverInner::Iocp(driver) => driver.read_dir(path).await,
+        }
+    }
+
     pub async fn create_dir_all(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
         let path = path.as_ref().to_path_buf();
         match &*self.inner {
@@ -403,6 +424,48 @@ impl IoDriver {
             DriverInner::Uring(driver) => driver.create_dir_all(path).await,
             #[cfg(target_family = "windows")]
             DriverInner::Iocp(driver) => driver.create_dir_all(path).await,
+        }
+    }
+
+    /// Sets a path's permissions.
+    ///
+    /// Takes `std::fs::Permissions` rather than a mode, so what a permission is stays the
+    /// platform's business and a caller reads one off `metadata` and hands it back changed.
+    pub async fn set_permissions(
+        &self,
+        path: impl AsRef<Path>,
+        permissions: std::fs::Permissions,
+    ) -> std::io::Result<()> {
+        let path = path.as_ref().to_path_buf();
+        match &*self.inner {
+            DriverInner::Psync(driver) => driver.set_permissions(path, permissions).await,
+            #[cfg(target_os = "linux")]
+            DriverInner::Uring(driver) => driver.set_permissions(path, permissions).await,
+            #[cfg(target_family = "windows")]
+            DriverInner::Iocp(driver) => driver.set_permissions(path, permissions).await,
+        }
+    }
+
+    pub async fn remove_dir(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
+        let path = path.as_ref().to_path_buf();
+        match &*self.inner {
+            DriverInner::Psync(driver) => driver.remove_dir(path).await,
+            #[cfg(target_os = "linux")]
+            DriverInner::Uring(driver) => driver.remove_dir(path).await,
+            #[cfg(target_family = "windows")]
+            DriverInner::Iocp(driver) => driver.remove_dir(path).await,
+        }
+    }
+
+    pub async fn copy(&self, from: impl AsRef<Path>, to: impl AsRef<Path>) -> std::io::Result<u64> {
+        let from = from.as_ref().to_path_buf();
+        let to = to.as_ref().to_path_buf();
+        match &*self.inner {
+            DriverInner::Psync(driver) => driver.copy(from, to).await,
+            #[cfg(target_os = "linux")]
+            DriverInner::Uring(driver) => driver.copy(from, to).await,
+            #[cfg(target_family = "windows")]
+            DriverInner::Iocp(driver) => driver.copy(from, to).await,
         }
     }
 

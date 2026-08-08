@@ -172,6 +172,7 @@ pub(crate) async fn dirty_relative_paths_in(
             state_current.clone(),
             state_staged.clone(),
             relative_path,
+            DiskState::Unknown,
             stats.clone(),
         )
         .await?;
@@ -209,18 +210,35 @@ pub(crate) async fn dirty_relative_paths_in(
     Ok(signature)
 }
 
+/// What a caller already established about a path on disk, so that a scan asks once per path.
+enum DiskState {
+    /// Described by the listing that found it.
+    Present(std::fs::Metadata),
+    /// Established absent, which is why the path is being visited at all.
+    Absent,
+    /// Not looked at; [`dirty_path`] asks.
+    Unknown,
+}
+
 /// Process a single path and determine the dirty action.
 async fn dirty_path(
     repository: Arc<RepositoryContext>,
     state_current: Arc<State>,
     state_staged: Arc<State>,
     relative_path: &RelativePath,
+    disk_state: DiskState,
     stats: Arc<DirtyStats>,
 ) -> Result<(), DirtyError> {
     let absolute_path = relative_path.to_absolute_path(repository.require_path()?);
-    let metadata = tokio::fs::metadata(&absolute_path).await;
-    let exists_on_disk = metadata.is_ok();
-    let is_dir = metadata.as_ref().is_ok_and(|m| m.is_dir());
+    let (exists_on_disk, is_dir) = match disk_state {
+        DiskState::Present(metadata) => (true, metadata.is_dir()),
+        DiskState::Absent => (false, false),
+        DiskState::Unknown => {
+            let metadata = lore_io::IoDriver::global().metadata(&absolute_path).await;
+            let is_dir = metadata.as_ref().is_ok_and(|metadata| metadata.is_dir());
+            (metadata.is_ok(), is_dir)
+        }
+    };
 
     let staged_link = state_staged
         .find_node_link(repository.clone(), relative_path.as_str())
@@ -668,20 +686,21 @@ fn dirty_directory<'a>(
     stats: Arc<DirtyStats>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), DirtyError>> + Send + 'a>> {
     Box::pin(async move {
-        let mut entries = tokio::fs::read_dir(absolute_path).await.map_err(|e| {
-            DirtyError::internal_with_context(
-                e,
-                &format!("Failed to read directory {}", absolute_path.display()),
-            )
-        })?;
-
-        while let Some(entry) = entries
-            .next_entry()
+        let mut entries = lore_io::IoDriver::global()
+            .read_dir(absolute_path)
             .await
-            .map_err(|e| DirtyError::internal_with_context(e, "Failed to read directory entry"))?
-        {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
+            .map_err(|e| {
+                DirtyError::internal_with_context(
+                    e,
+                    &format!("Failed to read directory {}", absolute_path.display()),
+                )
+            })?;
+
+        while let Some(entry) = entries.next().await {
+            let entry = entry.map_err(|e| {
+                DirtyError::internal_with_context(e, "Failed to read directory entry")
+            })?;
+            let name_str = entry.file_name.to_string_lossy();
             let child_path = dir_path.push_into_buf(&name_str).freeze();
 
             let force = execution_context().globals().force();
@@ -698,6 +717,9 @@ fn dirty_directory<'a>(
                 state_current.clone(),
                 state_staged.clone(),
                 &child_path,
+                entry
+                    .metadata
+                    .map_or(DiskState::Unknown, DiskState::Present),
                 stats.clone(),
             )
             .await?;
@@ -723,13 +745,18 @@ fn dirty_directory<'a>(
                 let child_abs = absolute_path.join(&child_name);
 
                 // Only process children that are NOT on disk (deletes)
-                if tokio::fs::metadata(&child_abs).await.is_err() {
+                if lore_io::IoDriver::global()
+                    .metadata(&child_abs)
+                    .await
+                    .is_err()
+                {
                     let child_rel = child_path_buf.freeze();
                     dirty_path(
                         repository.clone(),
                         state_current.clone(),
                         state_staged.clone(),
                         &child_rel,
+                        DiskState::Absent,
                         stats.clone(),
                     )
                     .await?;

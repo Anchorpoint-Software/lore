@@ -5122,8 +5122,8 @@ async fn diff_filesystem_subtree_impl(
         .filesystem_path
         .to_absolute_path(ctx.from.repository.require_path()?);
 
-    match util::fs::list_path(absolute_path) {
-        util::fs::PathListingResult::Directory { receiver } => {
+    match util::fs::list_path(absolute_path).await {
+        util::fs::PathListingResult::Directory { listing } => {
             // A path-filtered scan can enter a directory present on disk but
             // absent from state_from (an untracked add). Create its dirty-add
             // node chain so adds discovered inside resolve their parent node.
@@ -5139,7 +5139,7 @@ async fn diff_filesystem_subtree_impl(
                 .await?;
                 ctx.from.root_node = entry_node;
             }
-            diff_filesystem_directory(ctx, receiver).await
+            diff_filesystem_directory(ctx, listing).await
         }
         util::fs::PathListingResult::File { item } => {
             // A path-filtered scan of a new file: ensure its parent directory
@@ -5675,11 +5675,11 @@ async fn handle_single_file_compare_result(
 }
 
 /// Handle diff for a directory path.
-/// All items from receiver are children of `node_path`.
+/// All items from the listing are children of `node_path`.
 #[allow(clippy::too_many_arguments)]
 async fn diff_filesystem_directory(
     ctx: DiffFilesystemContext,
-    file_receiver: tokio::sync::mpsc::UnboundedReceiver<util::fs::FileListItem>,
+    file_listing: lore_io::DirStream,
 ) -> Result<(Vec<NodeChange>, FilesystemDiffStats), StateError> {
     async fn collect_node_list(
         traversal: &FilesystemTraversal,
@@ -5742,7 +5742,7 @@ async fn diff_filesystem_directory(
     // tasks still running, leaking the Arc<RepositoryContext> clones.
     let work_result = diff_filesystem_directory_walk(
         &ctx,
-        file_receiver,
+        file_listing,
         &node_list,
         &current_node_list,
         &mut node_list_found,
@@ -5922,7 +5922,7 @@ async fn emit_filesystem_subtree_deletes(
 #[allow(clippy::too_many_arguments)]
 async fn diff_filesystem_directory_walk(
     ctx: &DiffFilesystemContext,
-    mut file_receiver: tokio::sync::mpsc::UnboundedReceiver<util::fs::FileListItem>,
+    mut file_listing: lore_io::DirStream,
     node_list: &StateChildrenNodes,
     current_node_list: &StateChildrenNodes,
     node_list_found: &mut [bool],
@@ -5932,7 +5932,10 @@ async fn diff_filesystem_directory_walk(
     pending_discards: &mut Vec<NodeID>,
 ) -> Result<(), StateError> {
     let mut new_file_list = vec![];
-    while let Some(item) = file_receiver.recv().await {
+    while let Some(entry) = file_listing.next().await {
+        let Some(item) = util::fs::file_list_item(entry) else {
+            continue;
+        };
         if item.name == DOT_URC || item.name == DOT_LORE {
             continue;
         }
@@ -6812,9 +6815,11 @@ pub async fn is_file_content_equal(
     if file_size <= CONTENT_COMPARE_STREAM_THRESHOLD {
         // Small file: load both into memory and compare
         let stored = immutable::read(repository, address, None, options).await;
-        let local = tokio::fs::read(absolute_path).await;
+        let local = lore_io::IoDriver::global()
+            .read_file_bytes(absolute_path)
+            .await;
         match (stored, local) {
-            (Ok(stored_bytes), Ok(local_bytes)) => stored_bytes.as_ref() == local_bytes.as_slice(),
+            (Ok(stored_bytes), Ok(local_bytes)) => stored_bytes == local_bytes,
             _ => false,
         }
     } else {
@@ -6826,35 +6831,47 @@ pub async fn is_file_content_equal(
             immutable::read_stream(repo_clone, address, options, sender).await
         });
 
-        let file = match tokio::fs::File::open(absolute_path).await {
+        let file = match lore_io::IoDriver::global()
+            .open(absolute_path, &lore_io::OpenOptions::new().read(true))
+            .await
+        {
             Ok(f) => f,
             Err(_) => return false,
         };
-        let mut reader = tokio::io::BufReader::new(file);
-        let mut equal = true;
-        let mut bytes_compared: u64 = 0;
 
-        while let Some(chunk) = receiver.recv().await {
-            use tokio::io::AsyncReadExt;
-            let mut local_buf = vec![0u8; chunk.len()];
-            if reader.read_exact(&mut local_buf).await.is_ok() {
-                if chunk.as_ref() != local_buf.as_slice() {
-                    equal = false;
-                    break;
-                }
-                bytes_compared += chunk.len() as u64;
-            } else {
-                equal = false;
-                break;
-            }
-        }
+        let matched = stream_matches_file(&mut receiver, &file, file_size).await;
 
         // Verify the stream completed successfully and we compared the
         // entire file. A failed or partial stream must not be treated as
         // content equality.
         let stream_ok = stream_handle.await.is_ok_and(|r| r.is_ok());
-        equal && stream_ok && bytes_compared == file_size
+        matched && stream_ok
     }
+}
+
+/// Whether every streamed chunk matched the file at the offset it belongs at, and whether they
+/// together covered it.
+///
+/// Each read is sized to the chunk that arrived rather than to a fixed window, since the stored
+/// chunking need not match anything about the file on disk — only the bytes have to agree. The
+/// byte count against `file_size` is what catches a local file *longer* than the stored content:
+/// every chunk matches and the loop still ends when the stream does, so the length is the only
+/// thing left that disagrees. A shorter local file fails earlier, on the read.
+async fn stream_matches_file(
+    receiver: &mut tokio::sync::mpsc::Receiver<Bytes>,
+    file: &lore_io::IoFile,
+    file_size: u64,
+) -> bool {
+    let mut bytes_compared: u64 = 0;
+    while let Some(chunk) = receiver.recv().await {
+        match file.read_exact_at(chunk.len(), bytes_compared).await {
+            Ok(local) if local == chunk => {
+                bytes_compared += chunk.len() as u64;
+            }
+            _ => return false,
+        }
+    }
+    bytes_compared == file_size
 }
 
 pub fn file_modified_time_key(salt: &[u8], instance: InstanceId, path: impl AsRef<str>) -> Hash {
@@ -8063,6 +8080,91 @@ pub async fn apply_tree_changes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A file holding `contents` plus a handle open on it, alive while the directory is.
+    #[allow(clippy::disallowed_methods)] // A test fixture in its own temporary directory.
+    async fn file_holding(contents: &[u8]) -> (tempfile::TempDir, lore_io::IoFile) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("local");
+        std::fs::write(&path, contents).expect("write local file");
+        let file = lore_io::IoDriver::global()
+            .open(&path, &lore_io::OpenOptions::new().read(true))
+            .await
+            .expect("open local file");
+        (dir, file)
+    }
+
+    /// Feeds `chunks` through a channel the way the stored-content stream does.
+    fn stream_of(chunks: &[&[u8]]) -> tokio::sync::mpsc::Receiver<Bytes> {
+        let (sender, receiver) = tokio::sync::mpsc::channel::<Bytes>(chunks.len().max(1));
+        for chunk in chunks {
+            sender
+                .try_send(Bytes::copy_from_slice(chunk))
+                .expect("channel sized for the chunks");
+        }
+        receiver
+    }
+
+    #[tokio::test]
+    async fn a_file_matching_every_chunk_is_equal() {
+        let (_dir, file) = file_holding(b"one-two-three").await;
+        let mut stream = stream_of(&[b"one-", b"two-", b"three"]);
+        assert!(stream_matches_file(&mut stream, &file, 13).await);
+    }
+
+    /// The chunking of the stored content says nothing about the file, so a single chunk and
+    /// many chunks over the same bytes must agree.
+    #[tokio::test]
+    async fn chunk_boundaries_do_not_affect_the_result() {
+        let (_dir, file) = file_holding(b"one-two-three").await;
+        let mut stream = stream_of(&[b"one-two-three"]);
+        assert!(stream_matches_file(&mut stream, &file, 13).await);
+    }
+
+    /// Every chunk matches and the stream still describes less than the file holds. Nothing in
+    /// the loop can see that, which is why the byte count is checked after it.
+    #[tokio::test]
+    async fn a_local_file_longer_than_the_stream_is_not_equal() {
+        let (_dir, file) = file_holding(b"one-two-three-and-more").await;
+        let mut stream = stream_of(&[b"one-", b"two-", b"three"]);
+        assert!(!stream_matches_file(&mut stream, &file, 22).await);
+    }
+
+    /// A short file fails on the read rather than on the count, since the last chunk asks for
+    /// bytes past the end.
+    #[tokio::test]
+    async fn a_local_file_shorter_than_the_stream_is_not_equal() {
+        let (_dir, file) = file_holding(b"one-two").await;
+        let mut stream = stream_of(&[b"one-", b"two-", b"three"]);
+        assert!(!stream_matches_file(&mut stream, &file, 7).await);
+    }
+
+    #[tokio::test]
+    async fn a_chunk_differing_mid_stream_is_not_equal() {
+        let (_dir, file) = file_holding(b"one-XXX-three").await;
+        let mut stream = stream_of(&[b"one-", b"two-", b"three"]);
+        assert!(!stream_matches_file(&mut stream, &file, 13).await);
+    }
+
+    /// The offsets are the running total of what came before, so a mismatch in the first chunk
+    /// is caught where a comparison anchored at zero would have missed it.
+    #[tokio::test]
+    async fn a_chunk_differing_at_the_start_is_not_equal() {
+        let (_dir, file) = file_holding(b"XXX-two-three").await;
+        let mut stream = stream_of(&[b"one-", b"two-", b"three"]);
+        assert!(!stream_matches_file(&mut stream, &file, 13).await);
+    }
+
+    #[tokio::test]
+    async fn an_empty_stream_matches_only_an_empty_file() {
+        let (_dir, file) = file_holding(b"").await;
+        let mut stream = stream_of(&[]);
+        assert!(stream_matches_file(&mut stream, &file, 0).await);
+
+        let (_dir, file) = file_holding(b"content").await;
+        let mut stream = stream_of(&[]);
+        assert!(!stream_matches_file(&mut stream, &file, 7).await);
+    }
 
     #[test]
     fn resolve_branch_returns_parent_when_branch_is_zero() {

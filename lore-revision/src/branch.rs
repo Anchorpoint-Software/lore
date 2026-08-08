@@ -2688,11 +2688,8 @@ async fn try_auto_resolve_conflict(
         }
     } else {
         lore_trace!("Change from theirs has no valid to node, empty theirs file");
-        let _ = tokio::fs::OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .create(true)
-            .open(&theirs_path)
+        let _ = lore_io::IoDriver::global()
+            .write_file_bytes(&theirs_path, bytes::Bytes::new(), false)
             .await;
     }
 
@@ -2736,11 +2733,8 @@ async fn try_auto_resolve_conflict(
         }
     } else {
         lore_trace!("Change from base has no valid to node, empty base file");
-        let _ = tokio::fs::OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .create(true)
-            .open(&base_path)
+        let _ = lore_io::IoDriver::global()
+            .write_file_bytes(&base_path, bytes::Bytes::new(), false)
             .await;
     }
 
@@ -2776,11 +2770,8 @@ async fn try_auto_resolve_conflict(
         }
     } else {
         lore_trace!("Change to mine has no valid to node, empty mine file");
-        let _ = tokio::fs::OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .create(true)
-            .open(&mine_path)
+        let _ = lore_io::IoDriver::global()
+            .write_file_bytes(&mine_path, bytes::Bytes::new(), false)
             .await;
     }
 

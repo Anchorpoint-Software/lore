@@ -320,7 +320,8 @@ pub async fn set(
                     relative_path.to_absolute_path(repo_path)
                 };
 
-                tokio::fs::read(input_path)
+                lore_io::IoDriver::global()
+                    .read_file_bytes(input_path)
                     .await
                     .internal("reading binary metadata file")?
             };

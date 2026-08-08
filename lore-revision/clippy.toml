@@ -24,6 +24,20 @@ disallowed-methods = [
     { path = "std::fs::remove_dir_all", reason = "Repository-level filesystem writes must go through a RepositoryWriteToken-gated helper. Add #[allow(clippy::disallowed_methods)] at module scope if this is an authorized writer." },
     { path = "tokio::fs::write", reason = "Repository-level filesystem writes must go through a RepositoryWriteToken-gated helper. Add #[allow(clippy::disallowed_methods)] at module scope if this is an authorized writer." },
     { path = "tokio::fs::rename", reason = "Repository-level filesystem writes must go through a RepositoryWriteToken-gated helper. Add #[allow(clippy::disallowed_methods)] at module scope if this is an authorized writer." },
+    { path = "tokio::fs::create_dir_all", reason = "Use lore_io::IoDriver::create_dir_all so the syscall runs on the I/O engine rather than the tokio blocking pool." },
+    { path = "tokio::fs::remove_dir", reason = "Use lore_io::IoDriver::remove_dir so the syscall runs on the I/O engine rather than the tokio blocking pool." },
+    { path = "tokio::fs::metadata", reason = "Use lore_io::IoDriver::metadata so the syscall runs on the I/O engine rather than the tokio blocking pool." },
+    { path = "tokio::fs::try_exists", reason = "Use lore_io::IoDriver::metadata and test the result, so the syscall runs on the I/O engine rather than the tokio blocking pool." },
+    { path = "tokio::fs::read", reason = "Use lore_io::IoDriver::read_file_bytes so the syscall runs on the I/O engine rather than the tokio blocking pool." },
+    { path = "tokio::fs::read_to_string", reason = "Use lore_io::IoDriver::read_file_bytes and decode the result, so the syscall runs on the I/O engine rather than the tokio blocking pool." },
+    { path = "tokio::fs::read_dir", reason = "Use lore_io::IoDriver::read_dir so the walk runs on the I/O engine rather than the tokio blocking pool." },
+    { path = "tokio::fs::copy", reason = "Use lore_io::IoDriver::copy so the syscall runs on the I/O engine rather than the tokio blocking pool." },
+    { path = "tokio::fs::remove_file", reason = "Use lore_io::IoDriver::remove_file so the syscall runs on the I/O engine rather than the tokio blocking pool." },
+    { path = "tokio::fs::remove_dir_all", reason = "Use lore_io::IoDriver::remove_dir_all so the syscall runs on the I/O engine rather than the tokio blocking pool." },
+    { path = "tokio::fs::create_dir", reason = "Use lore_io::IoDriver::create_dir_all so the syscall runs on the I/O engine rather than the tokio blocking pool." },
+    { path = "tokio::fs::set_permissions", reason = "Use lore_io::IoDriver::set_permissions so the syscall runs on the I/O engine rather than the tokio blocking pool." },
+    { path = "tokio::fs::File::open", reason = "Use lore_io::IoDriver::open so the handle is the engine's and its reads are positional." },
+    { path = "tokio::fs::File::create", reason = "Use lore_io::IoDriver::open with create and truncate set, so the handle is the engine's and its writes are positional." },
 ]
 
 future-size-threshold = 7_000

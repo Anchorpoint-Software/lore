@@ -42,8 +42,6 @@ use lore_transport::ProtocolError;
 use lore_transport::RepositoryData;
 use serde::Deserialize;
 use serde::Serialize;
-use tokio::fs::OpenOptions;
-use tokio::io::AsyncWriteExt;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use toml;
@@ -1259,22 +1257,10 @@ async fn save_config(
     config_path: impl AsRef<Path>,
     config: &RepositoryConfig,
 ) -> Result<(), RepositoryError> {
-    let mut config_file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(config_path)
-        .await
-        .internal("Failed to save config file")?;
-
     let config_string = toml::to_string_pretty(&config).internal("Failed to save config file")?;
 
-    config_file
-        .write_all(config_string.as_bytes())
-        .await
-        .internal("Failed to save config file")?;
-    config_file
-        .flush()
+    lore_io::IoDriver::global()
+        .write_file_bytes(config_path, bytes::Bytes::from(config_string), false)
         .await
         .internal("Failed to save config file")?;
     Ok(())
@@ -2132,13 +2118,19 @@ pub async fn load_and_connect_with_token(
         }
 
         if migrated_current {
-            if let Err(err) = tokio::fs::remove_file(&current_anchor_path).await {
+            if let Err(err) = lore_io::IoDriver::global()
+                .remove_file(&current_anchor_path)
+                .await
+            {
                 lore_warn!("Failed to remove old current anchor file: {err}");
             }
             lore_debug!("Migrated file-based current anchor to mutable store");
         }
         if migrated_staged {
-            if let Err(err) = tokio::fs::remove_file(&staged_anchor_path).await {
+            if let Err(err) = lore_io::IoDriver::global()
+                .remove_file(&staged_anchor_path)
+                .await
+            {
                 lore_warn!("Failed to remove old staged anchor file: {err}");
             }
             lore_debug!("Migrated file-based staged anchor to mutable store");
@@ -2181,15 +2173,20 @@ pub async fn create_local(
     let idpath = dotpath.join(ID);
 
     let dotpath_display = dotpath.display().to_string();
-    tokio::fs::create_dir_all(dotpath.as_path())
+    lore_io::IoDriver::global()
+        .create_dir_all(dotpath.as_path())
         .await
         .internal_with(|| {
             format!("Failed to create repository, unable to create directory {dotpath_display}")
         })?;
 
     let idpath_display = idpath.display().to_string();
-    #[allow(clippy::disallowed_methods)] // Authorized repository ID writer.
-    tokio::fs::write(idpath.as_path(), repository.data())
+    lore_io::IoDriver::global()
+        .write_file_bytes(
+            idpath.as_path(),
+            bytes::Bytes::copy_from_slice(repository.data()),
+            false,
+        )
         .await
         .internal_with(|| {
             format!(

@@ -513,6 +513,18 @@ impl UringDriver {
         PsyncDriver.read_file_bytes(path).await
     }
 
+    pub(crate) async fn read_dir(&self, path: PathBuf) -> std::io::Result<crate::DirStream> {
+        PsyncDriver.read_dir(path).await
+    }
+
+    pub(crate) async fn set_permissions(
+        &self,
+        path: PathBuf,
+        permissions: std::fs::Permissions,
+    ) -> std::io::Result<()> {
+        PsyncDriver.set_permissions(path, permissions).await
+    }
+
     pub(crate) async fn write_file_bytes(
         &self,
         path: PathBuf,
@@ -571,6 +583,14 @@ impl UringDriver {
 
     pub(crate) async fn create_dir_all(&self, path: PathBuf) -> std::io::Result<()> {
         PsyncDriver.create_dir_all(path).await
+    }
+
+    pub(crate) async fn remove_dir(&self, path: PathBuf) -> std::io::Result<()> {
+        PsyncDriver.remove_dir(path).await
+    }
+
+    pub(crate) async fn copy(&self, from: PathBuf, to: PathBuf) -> std::io::Result<u64> {
+        PsyncDriver.copy(from, to).await
     }
 
     pub(crate) async fn remove_dir_all(&self, path: PathBuf) -> std::io::Result<()> {

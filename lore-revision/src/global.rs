@@ -9,9 +9,6 @@ use lore_base::fs::lock::FSLock;
 use lore_error_set::prelude::*;
 use serde::Deserialize;
 use serde::Serialize;
-use tokio::fs::OpenOptions;
-use tokio::io::AsyncReadExt;
-use tokio::io::AsyncWriteExt;
 
 use crate::util;
 use crate::util::url::normalize_remote_url;
@@ -195,14 +192,18 @@ pub async fn load_config_with_lock<ConfigType: Default + Serialize + for<'a> Des
     Ok((config, lock))
 }
 
+/// Reads a TOML configuration, defaulting when the file is absent.
+///
+/// Absent is the only case that means defaults. A file that is present and unreadable as text or
+/// TOML is an error, since an empty string parses as empty TOML and would otherwise hand back a
+/// default configuration indistinguishable from a deliberate one.
 pub async fn load_config<ConfigType: Default + Serialize + for<'a> Deserialize<'a>>(
     path: impl AsRef<Path>,
 ) -> Result<ConfigType, LoadConfigError> {
-    if let Ok(mut config_file) = OpenOptions::new().create(false).read(true).open(path).await {
-        let mut config = String::default();
-        config_file.read_to_string(&mut config).await.ok();
-        toml::from_str(config.as_str())
-            .map_err(|_err| LoadConfigError::internal("failed to parse config"))
+    if let Ok(bytes) = lore_io::IoDriver::global().read_file_bytes(path).await {
+        let config = std::str::from_utf8(bytes.as_ref())
+            .map_err(|_err| LoadConfigError::internal("config file is not valid UTF-8"))?;
+        toml::from_str(config).map_err(|_err| LoadConfigError::internal("failed to parse config"))
     } else {
         Ok(ConfigType::default())
     }
@@ -215,18 +216,61 @@ pub async fn save_config<ConfigType: Serialize>(
     config: &ConfigType,
     path: impl AsRef<Path>,
 ) -> Result<(), SaveConfigError> {
-    let mut config_file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(path)
-        .await
-        .internal("opening config file for save")?;
     let config_string = toml::to_string_pretty(&config).internal("formatting config as TOML")?;
-    config_file
-        .write_all(config_string.as_bytes())
+    lore_io::IoDriver::global()
+        .write_file_bytes(path, bytes::Bytes::from(config_string), false)
         .await
         .internal("writing config file")?;
-    config_file.flush().await.internal("flushing config file")?;
     Ok(())
+}
+
+#[cfg(test)]
+// Fixtures write config files directly; what these test is how loading reads them.
+#[allow(clippy::disallowed_methods)]
+mod tests {
+    use super::*;
+
+    #[derive(Default, Serialize, Deserialize, PartialEq, Debug)]
+    struct Settings {
+        name: String,
+    }
+
+    #[tokio::test]
+    async fn an_absent_config_is_the_default() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config: Settings = load_config(dir.path().join("absent.toml"))
+            .await
+            .expect("an absent config defaults");
+        assert_eq!(config, Settings::default());
+    }
+
+    #[tokio::test]
+    async fn a_config_round_trips() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("settings.toml");
+        std::fs::write(&path, b"name = \"configured\"\n").expect("write config");
+
+        let config: Settings = load_config(&path).await.expect("a valid config loads");
+        assert_eq!(config.name, "configured");
+    }
+
+    /// A present file that is not text is an error rather than a default: an empty string parses
+    /// as empty TOML, so defaulting here would be indistinguishable from a deliberate default.
+    #[tokio::test]
+    async fn a_config_that_is_not_text_is_an_error() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("settings.toml");
+        std::fs::write(&path, [0xFF, 0xFE, 0x00, 0x80]).expect("write config");
+
+        assert!(load_config::<Settings>(&path).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_config_that_is_not_toml_is_an_error() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("settings.toml");
+        std::fs::write(&path, b"this is not toml = = =").expect("write config");
+
+        assert!(load_config::<Settings>(&path).await.is_err());
+    }
 }

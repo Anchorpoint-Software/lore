@@ -130,7 +130,10 @@ pub async fn set_revision(
                     }
                 };
 
-                tokio::fs::read(input_path).await.internal("Invalid path")?
+                lore_io::IoDriver::global()
+                    .read_file_bytes(input_path)
+                    .await
+                    .internal("Invalid path")?
             };
 
             // When storing binary data, put it in the immutable store
@@ -259,7 +262,10 @@ async fn set_file_task(
                         }
                     };
 
-                    tokio::fs::read(input_path).await.internal("Invalid path")?
+                    lore_io::IoDriver::global()
+                        .read_file_bytes(input_path)
+                        .await
+                        .internal("Invalid path")?
                 };
 
                 // When storing binary data, put it in the immutable store

@@ -15,7 +15,7 @@ Measurements quoted here are summaries. `lore-io/BENCHMARKS.md` holds the result
 | `iocp` | `BackendKind::Iocp` | Windows only. Positional read and write issued as overlapped operations against one I/O completion port; everything else forwards to `psync`. |
 | `auto` | `BackendKind::Auto` | Selects `psync` on every platform. |
 
-`auto` selects `psync` everywhere, and the completion backends are opt-in. The rule used to prefer whichever completion backend the platform could create, on the strength of the synthetic phases: on Linux the ring measures 1.60× the syscall pool for commit-shaped reads on ext4, and on Windows `iocp` reaches 1.76× and 4.80× on the synthetic read phases while running two threads against a saturated thirty-two. The smoke suite disagreed. Driving the real call sites end to end, it measured a regression under the completion backends and recovered under `psync`, and a whole-workload result outranks a per-operation one.
+`auto` selects `psync` everywhere, and the completion backends are opt-in. The two measurements disagree on that choice. Synthetic phases favour the completion backends: on Linux the ring measures 1.60× the syscall pool for commit-shaped reads on ext4, and on Windows `iocp` reaches 1.76× and 4.80× on the synthetic read phases while running two threads against a saturated thirty-two. The smoke suite, driving the real call sites end to end, measures a regression under them and recovers under `psync`. A whole-workload result outranks a per-operation one, so `psync` is the default.
 
 That leaves an open question rather than a closed one. The two measurements disagree, and where the end-to-end cost sits has not been profiled — the candidates include the submission path, the completion handoff, and the control-plane operations that forward to the pool on both completion backends. `BackendKind::Uring`, `BackendKind::Iocp` and `LORE_IO_BACKEND` select them explicitly, so that investigation needs no code change to run its A/B.
 
@@ -83,7 +83,9 @@ On `psync` the looping forms complete in a single backend dispatch, because the 
 
 There is no preallocating operation, which is a deliberate departure from the operation set the proposal lists. `posix_fallocate` reserves blocks only on some Linux filesystems — on ZFS it reserves nothing, and is indistinguishable from `set_len` — so an operation named for reservation would guarantee different things on different mounts and no test could pin it portably. Nothing in the workspace requires reservation: the one site that sizes a file up front, the defragment output in `lore-storage/src/defragment.rs`, does so to obtain a hole that reads as zeros. A caller that needs blocks committed should receive an operation named for that guarantee.
 
-Path-scoped operations live on the driver: `open`, `metadata`, `rename`, `remove_file`, `create_dir_all`. `OpenOptions` mirrors the `std::fs` builder for `read`, `write`, `create`, `create_new`, and `truncate`.
+Path-scoped operations live on the driver: `open`, `metadata`, `rename`, `copy`, `remove_file`, `create_dir_all`, `remove_dir`, `remove_dir_all`, `set_permissions`, and `read_dir`. `OpenOptions` mirrors the `std::fs` builder for `read`, `write`, `create`, `create_new`, and `truncate`.
+
+`read_dir` returns a `DirStream` rather than a list. A listing is one `getdents` plus a stat per child, and the stats are most of it; the stream resolves a chunk of entries per dispatch and holds one chunk, so a directory of any width costs the same memory and a consumer that stops early stops the walk. Entries carry the metadata of what a name refers to, following links, or `None` where that could not be resolved — a link with no target, or a name unlinked between the listing and the stat. An entry the walk could not read is yielded as an error rather than skipped, because skipping is indistinguishable from the name not being there, and a scan deciding what changed cannot afford that confusion where a listing can.
 
 Every operation dispatches through the backend, including the metadata ones. A completion backend keeps those on the syscall pool regardless, because a ring-submitted `statx` is punted to a kernel worker making the same blocking call. Routing them anyway allows a backend to override any operation, makes a driver instance self-contained rather than partly bypassed, and leaves the syscall pool reachable only from the backends.
 
@@ -142,11 +144,13 @@ The proposal's survey found 34 distinct file I/O sites across `lore-storage`, `l
 
 Most sites are mechanical: the pack store already uses positional I/O and maps one-to-one onto `read_at` and `write_at`. Three required a structural decision, and all three have landed:
 
-- **Defragment data path** — the mutex-plus-seek file sink became concurrent positional writes to disjoint offsets on one shared `IoFile`, and the parallel memory-mapped read and write variants were deleted rather than ported, which removed a dual-path sink and the page-fault stalls memory mapping hides from the scheduler. On Windows the sink used to require a synchronous handle, because `seek_write` is defined only for one, so the kernel serialized the writes it issued concurrently; the driver's handles are overlapped and carry their own `OVERLAPPED`, so those writes now overlap on that platform as they always did on Unix. The output is still sized up front with `set_len`, and the sink's byte-count check is what turns an uncovered range from a silent zero-filled hole into a failure.
+- **Defragment data path** — the file sink issues concurrent positional writes to disjoint offsets on one shared `IoFile`, with no memory-mapped variant, so there is one sink and no page-fault stalls hidden from the scheduler. On Windows its handle is overlapped and carries its own `OVERLAPPED`, so those writes overlap as they do on Unix; the synchronous handle `seek_write` requires would have the kernel serialize them. The output is sized up front with `set_len`, and the sink's byte-count check turns an uncovered range from a silent zero-filled hole into a failure.
 - **Bucket deserialization** — the position-dependent sequential reads became one `open_read_head` that returns the handle, the size and the head bytes together, with a vectored scatter straight into the bucket's `GrowVec` chunks for anything the head does not cover.
 - **Whole-file read-then-hash** — a whole-file mapping feeding a single hash call became `lore-storage/src/chunker.rs`, which streams windows and cuts content-defined boundaries identical to running `FastCDC` over the whole file. Its reads are `IoFile::read_exact_vectored_at` scatters into the window they fill, so the window travels into the operation and comes back with it rather than being read into by a blocking call.
 
-File locking changed mechanism rather than structure: blocking `flock` with thread-sleep retries became `LOCK_NB` with async retry, so no lock acquisition occupies a pool thread. Directory enumeration stays as inline syscalls, because `io_uring` has no `getdents` operation and page-cached directory walks are microsecond-scale; the driver does own `remove_dir_all`, which the recursive delete path uses.
+File locking changed mechanism rather than structure: blocking `flock` with thread-sleep retries became `LOCK_NB` with async retry, so no lock acquisition occupies a pool thread.
+
+Directory enumeration is a driver operation. A listing is not one syscall but `getdents` plus a stat per child, so running it inline puts a walk's worth of blocking calls on an async worker — the dirty scan does this per directory level across a whole working tree. `read_dir` forwards to the syscall pool on both completion backends, as the other control-plane operations do, `io_uring` having no `getdents`. The stat it resolves per entry is work its callers need, so the listing carries it rather than leaving each caller to ask again.
 
 Two constraints bound the replacement. Operations with no asynchronous form — OS keyring access, AWS SDK initialization, service IPC pipe reads — stay on a residual blocking pool of approximately four threads, core-count-independent because nothing that scales with load runs there. And `std::fs` remains correct in tests, build scripts, and CLI-process code outside the library thread model; the target is the library's own I/O paths.
 
@@ -154,15 +158,15 @@ Progress is observable as a shrinking match count. These are raw line counts ove
 
 | Crate | `tokio::fs` | `std::fs::` |
 | --- | --- | --- |
-| `lore-revision` | 114 | 41 |
-| `lore-storage` | — | 52 |
+| `lore-revision` | 7 | 26 |
+| `lore-storage` | — | 51 |
 | `lore-server` | 2 | 30 |
 | `lore` | 3 | — |
 | `lore-base` | 1 | 13 |
 
-`lore-storage` is where the migration has run, and the trend shows it: `tokio::fs` from 11 to none and `std::fs::` from 99 to 52, most of what is left being test modules. The library sites that remain are the directory walks that have no driver operation, the two `Drop` implementations that remove a temporary file where nothing can be awaited, the blocking `exists` and `metadata` probes the store open paths take before creating a directory, the bucket-version probe in `local/immutable_store.rs`, and the rename and permission helpers in `fs_util.rs`. The other crates are untouched so far, so their counts are the starting line rather than a measurement.
+`lore-storage` and `lore-revision` are migrated; most of what their counts still show is test modules. The library calls that remain in `lore-storage` are the directory walks, the two `Drop` implementations that remove a temporary file where nothing can be awaited, the `exists` probes the store open paths take before creating a directory, the bucket-version probe in `local/immutable_store.rs`, and the permission and directory-sync helpers in `fs_util.rs`. In `lore-revision` they are `Metadata` in type position, the ProjFS provider, and `sync_dir`; its `tokio::fs` count is entirely fixture setup in `repository/clone.rs`'s test module.
 
-When the migration completes, clippy `disallowed-methods` fences hold the line against direct `std::fs` and `tokio::fs` calls in library code, the same mechanism that excludes direct `tokio::spawn`.
+`lore-revision/clippy.toml` fences the `tokio::fs` methods the driver has an answer for, the same mechanism that excludes direct `tokio::spawn`. `canonicalize`, `hard_link`, `read_link` and `symlink_metadata` are not fenced, the driver offering nothing to use instead. `lore-storage` has no crate-level `clippy.toml` and so inherits the root one, which carries no filesystem entries.
 
 ## The `psync` backend
 
@@ -220,6 +224,7 @@ Cold, the two backends tie on the 64 KiB phase — both saturate a SATA SSD at 4
 - `lore-io/src/pool.rs::SyscallPool`, `::SyscallTask`, `::default_max_threads` — the bounded pool and its runtime-independent completion future.
 - `lore-io/src/buffer.rs::StableBuf`, `::uninit_buffer` — the write-side buffer contract, and the uninitialised allocation reads fill.
 - `lore-io/src/file.rs::IoFile`, `::OpenOptions` — the positional handle operations.
+- `lore-io/src/dir.rs::DirStream`, `::DirEntry` — the chunked listing and what an entry describes.
 - `lore-io/tests/conformance.rs` — the semantic reference every backend must satisfy; new backends join the `drivers` list.
 - `lore-io/examples/bench.rs` — the comparison against `spawn_blocking` and against `tokio::fs`, one engine per process. Results, protocol and experiments are in `lore-io/BENCHMARKS.md`, alongside `examples/pool-sweep.sh` for the cap sweep and `examples/build-ab.sh` for an A/B of two builds.
 - `lore-base/src/runtime.rs` — the core and net runtime accessors and the thread budget the engine is sized against.
