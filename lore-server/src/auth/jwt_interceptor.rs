@@ -26,6 +26,9 @@ fn add_auth_fields_to_current_span(auth: &AuthorizationToken) {
 fn authorize(verifier: &JwtVerifier, token: &str) -> Result<AuthorizationToken, tonic::Status> {
     match verifier.try_verify_token_cached(token) {
         Ok(Some(authorization)) => Ok(authorization),
+        // Reached only when the cache cannot answer, so the core handed off here is one the
+        // hot path never gives up.
+        #[allow(clippy::disallowed_methods)]
         Ok(None) => task::block_in_place(|| runtime().block_on(verifier.verify_token(token))),
         Err(e) => Err(e),
     }

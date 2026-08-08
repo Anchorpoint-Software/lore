@@ -10669,14 +10669,45 @@ int32_t lore_shutdown(void);
 
 // Limits the total number of threads Lore sizes its pools for.
 //
-// Lore internally decides how many worker and blocking threads to use based
-// on this ceiling and the host's processor count. Pass `0` for "no limit"
-// (the default — pools are sized from the processor count). The
-// `LORE_MAX_THREADS` environment variable overrides this count when set above
-// zero, and is the only environment control over thread counts: the retired
-// per-pool variables are ignored, since one that bypassed this ceiling could
-// raise the total above what the caller asked for. `LORE_BLOCKING_THREADS`
-// still sizes the blocking pool until that pool goes away.
+// Pass `0` for "no limit", which is the default and sizes every pool from the
+// host's processor count. The `LORE_MAX_THREADS` environment variable overrides
+// this count when set above zero.
+//
+// # The pools
+//
+// Four pools share the limit:
+//
+// - **worker** — the async runtime executing Lore's own work. Asks for one
+//   thread per processor.
+// - **blocking** — OS APIs with no async form (keyring, cloud SDK
+//   initialization, service IPC). Asks for 3 regardless of processor count,
+//   two for the async runtime and one for the network runtime, because file
+//   I/O does not run here.
+// - **net** — the network runtime carrying QUIC, TLS and HTTP/2, kept separate
+//   so protocol timers are not delayed by other work. Asks for 2 on a client,
+//   one per processor on a server.
+// - **io** — the syscall pool every file operation dispatches through. Asks for
+//   twice the processor count, capped at 16.
+//
+// # How a limit is divided
+//
+// Each pool states an ideal, as above. Where a pool takes a configuration or
+// environment control (`LORE_NET_THREADS`, `LORE_IO_POOL_THREADS`, the server's
+// thread settings), that control raises the pool's ideal — it never sets the
+// pool's final size, so no knob can lift the process above a limit set here.
+// Retired per-pool variables are ignored outright.
+//
+// With no limit, every pool gets its ideal. With one, the pools are scaled to
+// fit by the largest-remainder method: each is granted its proportional share
+// of the limit, and the threads left over by rounding go to the pools with the
+// largest remainders. A pool never drops below 2 threads, since a starved pool
+// can deadlock work another pool waits on. That floor outranks the limit, so a
+// limit below 8 yields 8.
+//
+// # What is not counted
+//
+// Threads the host application or a linked library creates. Lore accounts only
+// for its own.
 //
 // Must be called before the first Lore operation, while the runtime is still
 // unconstructed. Returns `0` if the limit was applied, `1` if it had already

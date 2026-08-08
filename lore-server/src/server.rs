@@ -1492,9 +1492,9 @@ async fn seed_local_store(settings: &LocalImmutableStoreSettings) -> Result<(), 
                 .map(|v| v.parse::<usize>().unwrap_or_default())
                 .unwrap_or_default();
 
-            let buffer = std::env::var("LORE_SEEDING_BUFFER")
-                .map(|v| v.parse::<usize>().unwrap_or(DEFAULT_BUFFER_SIZE))
-                .unwrap_or(DEFAULT_BUFFER_SIZE);
+            let buffer = std::env::var("LORE_SEEDING_BUFFER").map_or(DEFAULT_BUFFER_SIZE, |v| {
+                v.parse::<usize>().unwrap_or(DEFAULT_BUFFER_SIZE)
+            });
 
             let result = lore_revision::store::seeder::seed_local_store(
                 local_store,

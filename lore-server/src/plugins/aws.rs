@@ -245,6 +245,9 @@ impl ImmutableStorePluginFactory for AwsImmutableStorePluginFactory {
             "Creating AWS immutable store: {plugin_config:?}"
         );
 
+        // Plugin construction is a synchronous trait method. It runs once at startup, one plugin
+        // at a time, so at most one core is handed off at a time.
+        #[allow(clippy::disallowed_methods)]
         let (s3_client, dynamodb_client) = tokio::task::block_in_place(|| {
             runtime().block_on(Box::pin(async {
                 // Build S3 client
@@ -390,6 +393,9 @@ impl MutableStorePluginFactory for AwsMutableStorePluginFactory {
             "Creating AWS mutable store: {plugin_config:?}"
         );
 
+        // Plugin construction is a synchronous trait method. It runs once at startup, one plugin
+        // at a time, so at most one core is handed off at a time.
+        #[allow(clippy::disallowed_methods)]
         let dynamodb_client = tokio::task::block_in_place(|| {
             runtime().block_on(Box::pin(async {
                 let builder = Box::pin(
@@ -481,6 +487,9 @@ impl LockStorePluginFactory for AwsLockStorePluginFactory {
             "Creating DynamoDB lock store: {plugin_config:?}"
         );
 
+        // Plugin construction is a synchronous trait method. It runs once at startup, one plugin
+        // at a time, so at most one core is handed off at a time.
+        #[allow(clippy::disallowed_methods)]
         let dynamodb_client = tokio::task::block_in_place(|| {
             runtime().block_on(async {
                 let builder = Box::pin(

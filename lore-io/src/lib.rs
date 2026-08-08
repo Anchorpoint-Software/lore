@@ -54,6 +54,8 @@ pub use file::OpenOptions;
 #[cfg(target_family = "windows")]
 pub use iocp::IocpStats;
 pub use pool::PoolStats;
+pub use pool::requested_max_threads;
+pub use pool::set_max_threads;
 #[cfg(target_os = "linux")]
 pub use uring::UringStats;
 

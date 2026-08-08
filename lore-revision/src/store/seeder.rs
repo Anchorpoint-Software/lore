@@ -136,6 +136,9 @@ async fn do_seed_local_store(
         let tx = tx.clone();
         let in_flight = in_flight.clone();
 
+        // Payload generation is pure CPU ending in a `blocking_send`, with no context to carry:
+        // the store writes it feeds are what run under one.
+        #[allow(clippy::disallowed_methods)]
         tokio::task::spawn_blocking(move || {
             let mut rng = rand::rng();
             let mut buffer = BytesMut::with_capacity(FRAGMENT_SIZE_THRESHOLD);

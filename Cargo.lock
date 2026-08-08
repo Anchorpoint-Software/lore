@@ -2537,6 +2537,7 @@ dependencies = [
  "hex",
  "libc",
  "lore-error-set",
+ "lore-io",
  "parking_lot",
  "pin-project",
  "rand",

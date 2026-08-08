@@ -68,16 +68,16 @@ fn max_threads_from_value(value: &str) -> std::io::Result<usize> {
     Ok(count)
 }
 
-/// The cap the process-wide pool is built with: [`default_max_threads`] unless
+/// The pool size this crate asks for on its own: [`default_max_threads`] unless
 /// [`POOL_THREADS_VAR`] names a usable count.
 ///
 /// The variable is for measurement and rollback — sweeping the cap against a real workload is how
 /// the formula gets checked, and BENCHMARKS.md reports that no single value wins every phase — so
 /// an unusable one reports itself and yields to the formula rather than failing a host
-/// application's first file read. Sizing the engine for production stays with the `ThreadCounts`
-/// apportionment in `lore-base`, which is what keeps a process inside the budget an embedder asked
-/// for; this knob deliberately cannot exceed the pool it replaces.
-fn configured_max_threads() -> usize {
+/// application's first file read. It is a request rather than a final size: sizing the engine for
+/// production stays with the `ThreadCounts` apportionment in `lore-base`, which reads this and
+/// hands back the pool's share of the budget through [`set_max_threads`].
+pub fn requested_max_threads() -> usize {
     match std::env::var(POOL_THREADS_VAR) {
         Ok(value) => max_threads_from_value(&value).unwrap_or_else(|error| {
             eprintln!("lore-io: {error}; using the default pool size instead");
@@ -85,6 +85,28 @@ fn configured_max_threads() -> usize {
         }),
         Err(_) => default_max_threads(),
     }
+}
+
+/// The pool's share of the process thread budget, set before the pool is built.
+static BUDGETED_MAX_THREADS: OnceLock<usize> = OnceLock::new();
+
+/// Sets the pool's cap from the process thread budget, taking precedence over
+/// [`requested_max_threads`].
+///
+/// `lore-base` calls this as it sizes the runtime, so a total thread limit binds this pool as it
+/// binds the others rather than leaving the engine to grow outside it. Must run before the first
+/// file operation, which is what builds the pool; returns false if a cap was already set.
+pub fn set_max_threads(count: usize) -> bool {
+    BUDGETED_MAX_THREADS.set(count.max(1)).is_ok()
+}
+
+/// The cap the process-wide pool is built with: its budgeted share when one has been set, else
+/// what the crate asks for on its own.
+fn configured_max_threads() -> usize {
+    BUDGETED_MAX_THREADS
+        .get()
+        .copied()
+        .unwrap_or_else(requested_max_threads)
 }
 
 /// Submitted work and the slot its result is published into, in one allocation.
