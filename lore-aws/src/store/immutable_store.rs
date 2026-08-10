@@ -72,16 +72,18 @@ use crate::store::object_metadata::ObjectMetadataError;
 use crate::store::object_metadata::from_object_metadata;
 use crate::store::object_metadata::to_object_metadata;
 
+pub mod metadata_migrator;
+
 enum QueryResultSource {
     LegacyMetadata(Fragment),
     State,
 }
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
-struct FragmentsEntry {
-    hash: Hash,
+pub(crate) struct FragmentsEntry {
+    pub(crate) hash: Hash,
     #[serde(with = "serde_bytes")]
-    repository_context: [u8; size_of::<Context>() * 2],
+    pub(crate) repository_context: [u8; size_of::<Context>() * 2],
 }
 
 impl From<&FragmentsEntry> for Address {
@@ -103,7 +105,7 @@ impl Debug for FragmentsEntry {
 }
 
 impl FragmentsEntry {
-    fn new(repository: Context, address: Address) -> Self {
+    pub(crate) fn new(repository: Context, address: Address) -> Self {
         let mut repository_context = [0u8; size_of::<Context>() * 2];
         repository_context[..size_of::<Context>()].copy_from_slice(repository.data());
         repository_context[size_of::<Context>()..].copy_from_slice(address.context.data());
@@ -122,7 +124,7 @@ impl FragmentsEntry {
 /// cannot disagree. What `DynamoDB` adds is the ability to answer "does this hash exist, and may it
 /// be read" without an S3 request, which is the only reason the row exists at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FragmentState {
+pub(crate) enum FragmentState {
     /// The payload is stored and readable.
     Stored,
     /// An obliteration holds this hash. Transient: it is either cleared or advanced to
@@ -163,7 +165,7 @@ impl FragmentState {
 /// fragments were stored in `DynamoDB`: those carry flattened `flags`/`size_payload`/`size_content`
 /// instead. A migration can tell the two apart by shape alone.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-struct FragmentStateEntry {
+pub(crate) struct FragmentStateEntry {
     hash: Hash,
     #[serde(skip_serializing_if = "Option::is_none")]
     state: Option<u32>,
@@ -174,11 +176,11 @@ struct FragmentStateEntry {
 ///
 /// Deserialization only. Nothing writes this shape any more.
 #[derive(Clone, Debug, Deserialize)]
-struct FragmentMetadataEntry {
+pub(crate) struct FragmentMetadataEntry {
     #[allow(dead_code)]
-    hash: Hash,
+    pub(crate) hash: Hash,
     #[serde(flatten)]
-    fragment: Option<Fragment>,
+    pub(crate) fragment: Option<Fragment>,
 }
 
 impl FragmentStateEntry {
@@ -186,14 +188,14 @@ impl FragmentStateEntry {
         Self { hash, state: None }
     }
 
-    fn new(hash: Hash, state: FragmentState) -> Self {
+    pub(crate) fn new(hash: Hash, state: FragmentState) -> Self {
         Self {
             hash,
             state: Some(state.bits()),
         }
     }
 
-    fn state(&self) -> FragmentState {
+    pub(crate) fn state(&self) -> FragmentState {
         FragmentState::from_bits(self.state.unwrap_or_default())
     }
 }
@@ -311,7 +313,7 @@ pub const FRAGMENTS_DYNAMO_PARTITION_KEY_ATTRIBUTE: &str = "hash";
 pub const FRAGMENTS_DYNAMO_SORT_KEY_ATTRIBUTE: &str = "repository_context";
 
 #[derive(Debug, Clone, PartialEq)]
-enum FragmentsQuery {
+pub(crate) enum FragmentsQuery {
     Repository(Hash, Context),
     Hash(Hash),
     HashCount(Hash),
@@ -387,7 +389,7 @@ impl DynamoDbQuery for FragmentsQuery {
 /// Publishing a payload uses this so that a concurrent obliteration's mark cannot be erased by a
 /// racing writer: the writer's create loses, it re-reads the row, and it sees the mark.
 #[derive(Debug, PartialEq)]
-struct RowAbsent;
+pub(crate) struct RowAbsent;
 
 impl DynamoDbPutCondition for RowAbsent {
     fn into_parts(self) -> ConditionParts {
@@ -404,7 +406,7 @@ impl DynamoDbPutCondition for RowAbsent {
 /// Obliteration advances the row through its states with this, so two obliterations racing for the
 /// same hash cannot both believe they hold the mark.
 #[derive(Debug, PartialEq)]
-struct StateUnchanged(FragmentState);
+pub(crate) struct StateUnchanged(pub(crate) FragmentState);
 
 impl DynamoDbPutCondition for StateUnchanged {
     fn into_parts(self) -> ConditionParts {
@@ -1233,62 +1235,62 @@ impl AwsImmutableStore {
         Ok(())
     }
 
-    async fn write_payload(
+    pub(crate) async fn write_payload_and_state(
         &self,
-        repository: Context,
-        address: Address,
+        hash: Hash,
         fragment: Fragment,
         payload: Bytes,
     ) -> Result<(), StoreError> {
         if payload.len() != fragment.size_payload as usize {
             warn!(
-                "Failed to write fragment to immutable store for address: {address}, payload size invalid (expected {} bytes, but got {})",
-                fragment.size_payload,
-                payload.len()
+                exepected_size = fragment.size_payload,
+                received_size = payload.len(),
+                %hash,
+                "Failed to write fragment to immutable store for hash: payload size invalid"
             );
             return Err(StoreError::internal(format!(
-                "Failed to store in immutable store for put {}",
-                address.hash
+                "Failed to store in immutable store for put {hash}"
             )));
         }
 
-        let mut dst = [0u8; 64];
-        let hash = lore_revision::util::to_hex_str(address.hash.data(), &mut dst);
+        {
+            let mut dst = [0u8; 64];
+            let s3_key = lore_revision::util::to_hex_str(hash.data(), &mut dst);
 
-        self.s3
-            .put_object(
-                self.bucket.as_str(),
-                hash,
-                payload.to_vec(),
-                Some(to_object_metadata(&fragment)),
-            )
-            .await
-            .map(|_| ())
-            .map_err(|e| {
-                warn!("Failed to write payload for hash: {}: {e:?}", address.hash);
-                if matches!(&e, AwsError::AwsSdkError(_)) {
-                    StoreError::from(SlowDown)
-                } else {
-                    StoreError::internal_with_context(e, "S3 put object failed")
-                }
-            })?;
+            self.s3
+                .put_object(
+                    self.bucket.as_str(),
+                    s3_key,
+                    payload.to_vec(),
+                    Some(to_object_metadata(&fragment)),
+                )
+                .await
+                .map(|_| ())
+                .map_err(|error| {
+                    warn!(?error, %hash, %s3_key, "Failed to write payload for hash");
+                    if matches!(&error, AwsError::AwsSdkError(_)) {
+                        StoreError::from(SlowDown)
+                    } else {
+                        StoreError::internal_with_context(error, "S3 put object failed")
+                    }
+                })?;
+        }
 
-        match self.publish_state(address.hash).await? {
+        match self.publish_state(hash).await? {
             FragmentState::Stored => {}
             FragmentState::Obliterating => {
                 info!(
-                    "Payload for {address} was uploaded while an obliteration holds the hash; \
+                    %hash,
+                    "Payload was uploaded while an obliteration holds the hash; \
                      leaving it unassociated and asking the caller to retry"
                 );
                 return Err(StoreError::from(SlowDown));
             }
             FragmentState::Obliterated => {
-                info!("Payload for {address} revives a tombstoned hash");
-                self.revive_state(address.hash).await?;
+                info!(%hash, "Payload revives a tombstoned hash");
+                self.revive_state(hash).await?;
             }
         }
-
-        self.associate_fragment(repository, address).await?;
 
         Ok(())
     }
@@ -1405,7 +1407,7 @@ impl AwsImmutableStore {
     /// This is the cheap existence probe the whole design turns on: one strongly consistent
     /// `GetItem` answers "is this payload durable" for every partition at once, with no S3 request
     /// and no dependence on how many partitions reference it.
-    async fn load_state(&self, hash: Hash) -> Result<Option<FragmentState>, StoreError> {
+    pub(crate) async fn load_state(&self, hash: Hash) -> Result<Option<FragmentState>, StoreError> {
         let item = serde_dynamo::to_item(FragmentStateEntry::key(hash)).map_err(|e| {
             warn!("Failed to serialize fragment state entry for {hash}: {e:?}");
             StoreError::internal_with_context(
@@ -1581,7 +1583,7 @@ impl AwsImmutableStore {
     /// There is no `DynamoDB` read here at all. The fragment arrives as object metadata on the very
     /// response carrying the bytes, so it describes those bytes by construction — no second record
     /// to consult, and nothing that can be stale with respect to what was read.
-    async fn load(&self, hash: Hash) -> Result<(Fragment, Bytes), StoreError> {
+    pub(crate) async fn load(&self, hash: Hash) -> Result<(Fragment, Bytes), StoreError> {
         let s3_contents = self.get_s3_object_contents(hash).await?;
 
         let fragment = match s3_contents.fragment {
@@ -1901,8 +1903,10 @@ impl ImmutableStoreTrait for AwsImmutableStore {
 
                 _ => match payload {
                     Some(payload) => {
-                        self.write_payload(repository, address, fragment, payload)
-                            .await
+                        self.write_payload_and_state(address.hash, fragment, payload)
+                            .await?;
+                        self.associate_fragment(repository, address).await?;
+                        Ok(())
                     }
                     None => Err(StoreError::internal("Payload buffer required")),
                 },
@@ -2094,664 +2098,16 @@ impl InstrumentProvider for AwsImmutableStoreInstrumentProvider {
 
 #[cfg(test)]
 mod test {
-    use std::collections::HashMap;
-    use std::collections::HashSet;
-    use std::sync::Mutex;
     use std::sync::atomic::Ordering;
 
-    use aws_sdk_dynamodb::operation::delete_item::DeleteItemError;
-    use aws_sdk_dynamodb::operation::delete_item::DeleteItemOutput;
-    use aws_sdk_dynamodb::operation::get_item::GetItemError;
-    use aws_sdk_dynamodb::operation::get_item::GetItemOutput;
-    use aws_sdk_dynamodb::operation::put_item::PutItemOutput;
-    use aws_sdk_dynamodb::operation::query::QueryError;
-    use aws_sdk_dynamodb::operation::query::QueryOutput;
-    use aws_sdk_dynamodb::types::AttributeValue;
-    use aws_sdk_dynamodb::types::error::ConditionalCheckFailedException;
-    use aws_sdk_dynamodb::types::error::ProvisionedThroughputExceededException;
-    use aws_sdk_dynamodb::types::error::ResourceNotFoundException;
-    use aws_sdk_s3::error::ErrorMetadata;
-    use aws_sdk_s3::operation::delete_object::DeleteObjectError;
-    use aws_sdk_s3::operation::delete_object::DeleteObjectOutput;
-    use aws_sdk_s3::operation::get_object::GetObjectOutput;
-    use aws_sdk_s3::operation::head_object::HeadObjectOutput;
-    use aws_sdk_s3::operation::list_object_versions::ListObjectVersionsError;
-    use aws_sdk_s3::operation::list_object_versions::ListObjectVersionsOutput;
-    use aws_sdk_s3::operation::put_object::PutObjectOutput;
-    use aws_sdk_s3::primitives::SdkBody;
-    use aws_sdk_s3::types::error::NoSuchKey;
-    use aws_sdk_s3::types::error::NotFound;
-    use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
-    use aws_smithy_runtime_api::client::result::SdkError;
-    use aws_smithy_runtime_api::client::result::ServiceError;
-    use lore_base::runtime::LORE_CONTEXT;
     use lore_base::types::FragmentFlags;
     use lore_storage::ImmutableStore;
     use rand::random;
-    use tokio::sync::oneshot;
     use zerocopy::IntoBytes;
 
     use super::*;
-    use crate::dynamodb::MockDynamoDb;
-    use crate::s3::MockS3Impl;
     use crate::store::object_metadata::PAYLOAD_FLAGS;
-    use crate::store::setup_execution;
-
-    const BUCKET: &str = "test-bucket";
-    const FRAGMENTS_TABLE_NAME: &str = "fragments";
-    const FRAGMENT_STATE_TABLE_NAME: &str = "fragment-state";
-    /// A separate table name for legacy fragment metadata, distinct from the state table. Used
-    /// to test the `do_query` path that falls back to the metadata table when no state row exists.
-    const FRAGMENT_METADATA_TABLE_NAME: &str = "fragment-metadata";
-
-    fn aws_error<E>(error: E, status: u16) -> AwsError<SdkError<E, HttpResponse>> {
-        AwsError::AwsSdkError(SdkError::ServiceError(
-            ServiceError::builder()
-                .source(error)
-                .raw(HttpResponse::new(
-                    status.try_into().unwrap(),
-                    SdkBody::empty(),
-                ))
-                .build(),
-        ))
-    }
-
-    fn blob(item: &HashMap<String, AttributeValue>, key: &str) -> Vec<u8> {
-        item.get(key)
-            .and_then(|value| value.as_b().ok())
-            .map(|value| value.as_ref().to_vec())
-            .unwrap_or_default()
-    }
-
-    /// An in-memory stand-in for the bucket and the two tables.
-    ///
-    /// The tests are written against behaviour rather than a call sequence: they put and get
-    /// through the real store and assert on what ends up stored. That is what lets the concurrency
-    /// test exist at all — a mock programmed with an expected order of calls cannot express
-    /// "any interleaving, and the result must still be coherent".
-    /// A stored object: its body, and the object metadata written with it.
-    type StoredObject = (Vec<u8>, HashMap<String, String>);
-
-    /// An operation the fake can be told to fail, so error paths are reachable.
-    #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-    enum Fault {
-        StateRead,
-        StateReadTimeout,
-        StateReadBroken,
-        StateWrite,
-        StateDelete,
-        AssociationWrite,
-        AssociationDelete,
-        AssociationCount,
-        ObjectDelete,
-        ObjectList,
-    }
-
-    #[derive(Default)]
-    struct Storage {
-        faults: HashSet<Fault>,
-        race_state: Option<(Hash, FragmentState)>,
-        /// Fired when an obliteration deletes its association, so a task can land one of its own
-        /// in the window that follows.
-        association_deleted: Option<oneshot::Sender<()>>,
-        object_reads: usize,
-        objects: HashMap<Vec<u8>, StoredObject>,
-        associations: HashMap<(Vec<u8>, Vec<u8>), HashMap<String, AttributeValue>>,
-        state: HashMap<Vec<u8>, HashMap<String, AttributeValue>>,
-        /// Rows in the legacy fragment metadata table (separate from the state table). Only
-        /// populated by `set_legacy_metadata_row`, which is used by tests that need to exercise
-        /// the `do_query` path where no state row exists but a legacy metadata row does.
-        legacy_metadata: HashMap<Vec<u8>, HashMap<String, AttributeValue>>,
-    }
-
-    #[derive(Clone, Default)]
-    struct Fake(Arc<Mutex<Storage>>);
-
-    impl Fake {
-        fn lock(&self) -> std::sync::MutexGuard<'_, Storage> {
-            self.0.lock().unwrap()
-        }
-
-        /// Make `fault` fail from now on. Latched rather than one-shot, so a retrying caller sees a
-        /// persistent failure rather than one that heals underneath it.
-        fn fail(&self, fault: Fault) {
-            self.lock().faults.insert(fault);
-        }
-
-        /// Move `hash` into `state` at the moment its payload is uploaded, so a put reaches its
-        /// publish step having probed before an obliteration and uploaded after it. That window
-        /// cannot be hit by ordering calls from the outside.
-        fn obliterate_during_upload(&self, hash: Hash, state: FragmentState) {
-            self.lock().race_state = Some((hash, state));
-        }
-
-        fn failing(&self, fault: Fault) -> bool {
-            self.lock().faults.contains(&fault)
-        }
-
-        fn object_reads(&self) -> usize {
-            self.lock().object_reads
-        }
-
-        fn object(&self, hash: Hash) -> Option<StoredObject> {
-            self.lock()
-                .objects
-                .get(&hash.to_string().into_bytes())
-                .cloned()
-        }
-
-        fn stored_fragment(&self, hash: Hash) -> Option<Fragment> {
-            self.object(hash)
-                .map(|(_, metadata)| from_object_metadata(Some(&metadata)).unwrap())
-        }
-
-        fn state_of(&self, hash: Hash) -> Option<FragmentState> {
-            self.lock()
-                .state
-                .get(hash.data().as_slice())
-                .map(|item| serde_dynamo::from_item::<_, FragmentStateEntry>(item.clone()).unwrap())
-                .map(|entry| entry.state())
-        }
-
-        fn association_count(&self, hash: Hash) -> usize {
-            self.lock()
-                .associations
-                .keys()
-                .filter(|(stored, _)| stored == hash.data())
-                .count()
-        }
-
-        fn set_state(&self, hash: Hash, state: FragmentState) {
-            let item = serde_dynamo::to_item(FragmentStateEntry::new(hash, state)).unwrap();
-            self.lock().state.insert(hash.data().to_vec(), item);
-        }
-
-        /// Write a row in the shape used before fragments moved onto the object: no `state`, and a
-        /// whole flattened fragment whose `flags` also carry the obliteration bits.
-        fn set_fragment_metadata_row(&self, hash: Hash, fragment: Fragment) {
-            let item = HashMap::from([
-                (
-                    "hash".to_owned(),
-                    AttributeValue::B(Blob::new(hash.data().to_vec())),
-                ),
-                (
-                    "flags".to_owned(),
-                    AttributeValue::N(fragment.flags.to_string()),
-                ),
-                (
-                    "size_payload".to_owned(),
-                    AttributeValue::N(fragment.size_payload.to_string()),
-                ),
-                (
-                    "size_content".to_owned(),
-                    AttributeValue::N(fragment.size_content.to_string()),
-                ),
-            ]);
-
-            self.lock().state.insert(hash.data().to_vec(), item);
-        }
-
-        /// Write a legacy fragment metadata row into the *separate* metadata table (keyed by
-        /// `FRAGMENT_METADATA_TABLE_NAME`). Unlike `set_fragment_metadata_row`, this does NOT
-        /// touch `storage.state`, so `load_state` returns `None` for the same hash, letting tests
-        /// exercise the `do_query` branch that falls back to the metadata table when there is no
-        /// state row.
-        fn set_legacy_metadata_row(&self, hash: Hash, fragment: Fragment) {
-            let item = HashMap::from([
-                (
-                    "hash".to_owned(),
-                    AttributeValue::B(Blob::new(hash.data().to_vec())),
-                ),
-                (
-                    "flags".to_owned(),
-                    AttributeValue::N(fragment.flags.to_string()),
-                ),
-                (
-                    "size_payload".to_owned(),
-                    AttributeValue::N(fragment.size_payload.to_string()),
-                ),
-                (
-                    "size_content".to_owned(),
-                    AttributeValue::N(fragment.size_content.to_string()),
-                ),
-            ]);
-
-            self.lock()
-                .legacy_metadata
-                .insert(hash.data().to_vec(), item);
-        }
-
-        /// Delete an object while leaving every reference to it in place, as an obliteration
-        /// interrupted before its tombstone or an S3 durability event would.
-        fn lose_object(&self, hash: Hash) {
-            self.lock().objects.remove(&hash.to_string().into_bytes());
-        }
-
-        /// Store an object the way one was stored before the fragment moved onto it: bare bytes,
-        /// no fragment metadata.
-        fn put_object_without_metadata(&self, hash: Hash, body: &[u8]) {
-            self.lock().objects.insert(
-                hash.to_string().into_bytes(),
-                (body.to_vec(), HashMap::new()),
-            );
-        }
-
-        /// Store an object whose metadata is present but unreadable.
-        fn put_object_with_damaged_metadata(&self, hash: Hash, body: &[u8]) {
-            let mut metadata = HashMap::new();
-            metadata.insert("lore-fragment".to_owned(), "not:a:fragment".to_owned());
-
-            self.lock()
-                .objects
-                .insert(hash.to_string().into_bytes(), (body.to_vec(), metadata));
-        }
-
-        /// Signals when an obliteration deletes its association, so a caller can land its own
-        /// between that delete and the re-count — the window the drain exists to cover. Ordering
-        /// calls from the outside cannot hit it.
-        fn association_deleted(&self) -> oneshot::Receiver<()> {
-            let (sender, receiver) = oneshot::channel();
-            self.lock().association_deleted = Some(sender);
-            receiver
-        }
-
-        fn add_association(&self, repository: Context, address: Address) {
-            let entry = FragmentsEntry::new(repository, address);
-            let item: HashMap<String, AttributeValue> = serde_dynamo::to_item(&entry).unwrap();
-            self.lock().associations.insert(
-                (
-                    entry.hash.data().to_vec(),
-                    entry.repository_context.to_vec(),
-                ),
-                item,
-            );
-        }
-    }
-
-    /// Wire the fake into the generated mocks.
-    ///
-    /// Every expectation is unbounded and stateful, so a test asserts on the resulting storage
-    /// rather than on how many times something was called.
-    fn wire(fake: &Fake) -> (MockS3Impl, MockDynamoDb) {
-        let mut s3 = MockS3Impl::default();
-        let mut dynamodb = MockDynamoDb::default();
-
-        let f = fake.clone();
-        s3.expect_put_object::<Vec<u8>>()
-            .returning(move |_, key, body, metadata| {
-                let mut storage = f.lock();
-                storage.objects.insert(
-                    key.as_bytes().to_vec(),
-                    (body, metadata.unwrap_or_default()),
-                );
-
-                if let Some((hash, state)) = storage.race_state.take() {
-                    let item = serde_dynamo::to_item(FragmentStateEntry::new(hash, state)).unwrap();
-                    storage.state.insert(hash.data().to_vec(), item);
-                }
-
-                Ok(PutObjectOutput::builder().build())
-            });
-
-        let f = fake.clone();
-        s3.expect_get_object().returning(move |_, key, _| {
-            let mut storage = f.lock();
-            storage.object_reads += 1;
-            match storage.objects.get(key.as_bytes()) {
-                Some((body, metadata)) => Ok(GetObjectOutput::builder()
-                    .set_body(Some(body.clone().into()))
-                    .set_metadata(Some(metadata.clone()))
-                    .build()),
-                None => Err(aws_error(
-                    GetObjectError::NoSuchKey(NoSuchKey::builder().build()),
-                    404,
-                )),
-            }
-        });
-
-        let f = fake.clone();
-        s3.expect_head_object().returning(move |_, key| {
-            let mut storage = f.lock();
-            storage.object_reads += 1;
-            match storage.objects.get(key.as_bytes()) {
-                Some((_, metadata)) => Ok(HeadObjectOutput::builder()
-                    .set_metadata(Some(metadata.clone()))
-                    .build()),
-                None => Err(aws_error(
-                    HeadObjectError::NotFound(NotFound::builder().build()),
-                    404,
-                )),
-            }
-        });
-
-        let f = fake.clone();
-        s3.expect_delete_object().returning(move |_, key, _| {
-            if f.failing(Fault::ObjectDelete) {
-                return Err(aws_error(
-                    DeleteObjectError::generic(ErrorMetadata::builder().code("500").build()),
-                    500,
-                ));
-            }
-
-            f.lock().objects.remove(key.as_bytes());
-            Ok(DeleteObjectOutput::builder().build())
-        });
-
-        let f = fake.clone();
-        s3.expect_list_versions().returning(move |_, _| {
-            if f.failing(Fault::ObjectList) {
-                return Err(aws_error(
-                    ListObjectVersionsError::generic(ErrorMetadata::builder().code("500").build()),
-                    500,
-                ));
-            }
-
-            Ok(ListObjectVersionsOutput::builder().build())
-        });
-
-        let f = fake.clone();
-        dynamodb
-            .expect_get_item()
-            .returning(move |table, item, _| {
-                if &**table == FRAGMENT_STATE_TABLE_NAME {
-                    if f.failing(Fault::StateReadTimeout) {
-                        return Err(AwsError::AwsSdkError(SdkError::timeout_error(Box::new(
-                            std::io::Error::other("injected timeout"),
-                        ))));
-                    }
-                    if f.failing(Fault::StateReadBroken) {
-                        return Err(aws_error(
-                            GetItemError::ResourceNotFoundException(
-                                ResourceNotFoundException::builder().build(),
-                            ),
-                            400,
-                        ));
-                    }
-                    if f.failing(Fault::StateRead) {
-                        return Err(throughput_exceeded(
-                            GetItemError::ProvisionedThroughputExceededException(
-                                throttling_exception(),
-                            ),
-                        ));
-                    }
-                }
-
-                let storage = f.lock();
-                let found = if &**table == FRAGMENT_STATE_TABLE_NAME {
-                    storage.state.get(&blob(&item, "hash")).cloned()
-                } else if &**table == FRAGMENT_METADATA_TABLE_NAME {
-                    storage.legacy_metadata.get(&blob(&item, "hash")).cloned()
-                } else {
-                    storage
-                        .associations
-                        .get(&(blob(&item, "hash"), blob(&item, "repository_context")))
-                        .cloned()
-                };
-
-                Ok(GetItemOutput::builder().set_item(found).build())
-            });
-
-        let f = fake.clone();
-        dynamodb
-            .expect_batch_get_item()
-            .returning(move |_, keys, _| {
-                let storage = f.lock();
-
-                Ok(keys
-                    .iter()
-                    .filter_map(|key| {
-                        storage
-                            .associations
-                            .get(&(blob(key, "hash"), blob(key, "repository_context")))
-                            .cloned()
-                    })
-                    .collect())
-            });
-
-        let f = fake.clone();
-        dynamodb.expect_put_item().returning(move |table, item| {
-            if &**table == FRAGMENTS_TABLE_NAME && f.failing(Fault::AssociationWrite) {
-                return Err(throughput_exceeded(
-                    PutItemError::ProvisionedThroughputExceededException(throttling_exception()),
-                ));
-            }
-
-            let mut storage = f.lock();
-            if &**table == FRAGMENT_STATE_TABLE_NAME {
-                storage.state.insert(blob(&item, "hash"), item);
-            } else {
-                storage.associations.insert(
-                    (blob(&item, "hash"), blob(&item, "repository_context")),
-                    item,
-                );
-            }
-            Ok(PutItemOutput::builder().build())
-        });
-
-        let f = fake.clone();
-        dynamodb
-            .expect_put_item_conditional::<RowAbsent>()
-            .returning(move |_, item, _| {
-                let mut storage = f.lock();
-                let key = blob(&item, "hash");
-
-                if let Some(existing) = storage.state.get(&key) {
-                    return Err(conditional_check_failed(existing.clone()));
-                }
-
-                storage.state.insert(key, item);
-                Ok(PutItemOutput::builder().build())
-            });
-
-        let f = fake.clone();
-        dynamodb
-            .expect_put_item_conditional::<StateUnchanged>()
-            .returning(move |_, item, condition| {
-                if f.failing(Fault::StateWrite) {
-                    return Err(throughput_exceeded(
-                        PutItemError::ProvisionedThroughputExceededException(
-                            throttling_exception(),
-                        ),
-                    ));
-                }
-
-                let mut storage = f.lock();
-                let key = blob(&item, "hash");
-
-                let current = storage.state.get(&key).map(|existing| {
-                    serde_dynamo::from_item::<_, FragmentStateEntry>(existing.clone())
-                        .unwrap()
-                        .state()
-                });
-
-                if current == Some(condition.0) {
-                    storage.state.insert(key, item);
-                    Ok(PutItemOutput::builder().build())
-                } else {
-                    Err(conditional_check_failed(
-                        storage.state.get(&key).cloned().unwrap_or_default(),
-                    ))
-                }
-            });
-
-        let f = fake.clone();
-        dynamodb.expect_delete_item().returning(move |table, item| {
-            let fault = if &**table == FRAGMENT_STATE_TABLE_NAME {
-                Fault::StateDelete
-            } else {
-                Fault::AssociationDelete
-            };
-            if f.failing(fault) {
-                return Err(throughput_exceeded(
-                    DeleteItemError::ProvisionedThroughputExceededException(throttling_exception()),
-                ));
-            }
-
-            let mut storage = f.lock();
-            if &**table == FRAGMENT_STATE_TABLE_NAME {
-                storage.state.remove(&blob(&item, "hash"));
-            } else {
-                storage
-                    .associations
-                    .remove(&(blob(&item, "hash"), blob(&item, "repository_context")));
-                if let Some(deleted) = storage.association_deleted.take() {
-                    let _ = deleted.send(());
-                }
-            }
-            Ok(DeleteItemOutput::builder().build())
-        });
-
-        let f = fake.clone();
-        dynamodb.expect_query_single().returning(move |_, query| {
-            if f.failing(Fault::AssociationCount) {
-                return Err(throughput_exceeded(
-                    QueryError::ProvisionedThroughputExceededException(throttling_exception()),
-                ));
-            }
-
-            let storage = f.lock();
-            let count = match query {
-                FragmentsQuery::Hash(hash) | FragmentsQuery::HashCount(hash) => storage
-                    .associations
-                    .keys()
-                    .filter(|(stored, _)| stored == hash.data())
-                    .count(),
-                FragmentsQuery::Repository(hash, repository) => storage
-                    .associations
-                    .keys()
-                    .filter(|(stored, repository_context)| {
-                        stored == hash.data() && repository_context.starts_with(repository.data())
-                    })
-                    .count(),
-            };
-
-            Ok(QueryOutput::builder()
-                .count(i32::try_from(count).unwrap())
-                .build())
-        });
-
-        (s3, dynamodb)
-    }
-
-    /// A throttling exception carrying the error code a real response would, which is what the
-    /// classifier reads — a builder-constructed exception has no metadata at all.
-    fn throttling_exception() -> ProvisionedThroughputExceededException {
-        ProvisionedThroughputExceededException::builder()
-            .meta(
-                ErrorMetadata::builder()
-                    .code("ProvisionedThroughputExceededException")
-                    .build(),
-            )
-            .build()
-    }
-
-    fn throughput_exceeded<E>(error: E) -> AwsError<SdkError<E, HttpResponse>> {
-        aws_error(error, 400)
-    }
-
-    fn conditional_check_failed(
-        item: HashMap<String, AttributeValue>,
-    ) -> AwsError<SdkError<PutItemError, HttpResponse>> {
-        aws_error(
-            PutItemError::ConditionalCheckFailedException(
-                ConditionalCheckFailedException::builder()
-                    .set_item(Some(item))
-                    .build(),
-            ),
-            400,
-        )
-    }
-
-    async fn store_with(
-        fake: &Fake,
-        force_write: bool,
-        fragment_metadata: bool,
-    ) -> Arc<AwsImmutableStore> {
-        let (s3, dynamodb) = wire(fake);
-        let mut dynamodb_settings = DynamoDbImmutableStoreSettings::new(
-            FRAGMENTS_TABLE_NAME.to_string(),
-            FRAGMENT_STATE_TABLE_NAME.to_string(),
-        );
-        dynamodb_settings.timeout_millis = 1;
-
-        if fragment_metadata {
-            dynamodb_settings = dynamodb_settings
-                .with_fragment_metadata_table(FRAGMENT_STATE_TABLE_NAME.to_string());
-        }
-
-        let settings = AwsImmutableStoreSettings {
-            s3: S3StoreSettings::new(BUCKET.to_string()),
-            dynamodb: dynamodb_settings,
-            force_write,
-            batch_exist_submission_limit: 1000,
-        };
-
-        let execution = setup_execution("test".to_string());
-        LORE_CONTEXT
-            .scope(execution, async move {
-                Arc::new(AwsImmutableStore::new(s3, dynamodb, &settings))
-            })
-            .await
-    }
-
-    async fn store(fake: &Fake) -> Arc<AwsImmutableStore> {
-        store_with(fake, false, false).await
-    }
-
-    /// A store on a deployment that may still hold objects written before fragments moved onto
-    /// them, and so is configured to read the rows describing those.
-    async fn migrated_store(fake: &Fake) -> Arc<AwsImmutableStore> {
-        store_with(fake, false, true).await
-    }
-
-    /// A store whose state table and legacy-metadata table are two distinct ddb tables.
-    ///
-    /// `migrated_store` points both at `FRAGMENT_STATE_TABLE_NAME`, which means the same storage
-    /// map backs both. That collapses the scenario where no state row exists but a metadata row
-    /// does — `load_state` would find and interpret the metadata row as `Stored`. This helper uses
-    /// `FRAGMENT_METADATA_TABLE_NAME` for the metadata table so the two maps are independent,
-    /// enabling tests for the `do_query` path that falls back to the metadata table when there is
-    /// genuinely no state row.
-    async fn store_with_separate_metadata_table(fake: &Fake) -> Arc<AwsImmutableStore> {
-        let (s3, dynamodb) = wire(fake);
-        let mut dynamodb_settings = DynamoDbImmutableStoreSettings::new(
-            FRAGMENTS_TABLE_NAME.to_string(),
-            FRAGMENT_STATE_TABLE_NAME.to_string(),
-        );
-        dynamodb_settings.timeout_millis = 1;
-        dynamodb_settings = dynamodb_settings
-            .with_fragment_metadata_table(FRAGMENT_METADATA_TABLE_NAME.to_string());
-
-        let settings = AwsImmutableStoreSettings {
-            s3: S3StoreSettings::new(BUCKET.to_string()),
-            dynamodb: dynamodb_settings,
-            force_write: false,
-            batch_exist_submission_limit: 1000,
-        };
-
-        let execution = setup_execution("test".to_string());
-        LORE_CONTEXT
-            .scope(execution, async move {
-                Arc::new(AwsImmutableStore::new(s3, dynamodb, &settings))
-            })
-            .await
-    }
-
-    /// A payload and the fragment that correctly describes it.
-    fn representation(
-        codec: FragmentFlags,
-        size_payload: usize,
-        size_content: u64,
-    ) -> (Fragment, Bytes) {
-        let payload = Bytes::from(vec![codec.bits() as u8; size_payload]);
-        let fragment = Fragment {
-            flags: codec.bits(),
-            size_payload: u32::try_from(size_payload).unwrap(),
-            size_content,
-        };
-
-        (fragment, payload)
-    }
+    use crate::store::test_util::*;
 
     #[tokio::test]
     async fn put_stores_the_fragment_on_the_object() {

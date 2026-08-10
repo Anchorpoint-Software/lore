@@ -6,6 +6,9 @@ pub mod mutable_store;
 pub mod object_metadata;
 
 #[cfg(test)]
+pub mod test_util;
+
+#[cfg(test)]
 pub fn address_with_random_context(address: lore_storage::Address) -> lore_storage::Address {
     lore_storage::Address {
         context: rand::random::<lore_storage::Context>(),
