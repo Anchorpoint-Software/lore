@@ -149,6 +149,10 @@ impl Drop for RemoteFetchGuard {
 /// reset by a QUIC reconnect; the storage layer mapping turns this into
 /// `StorageError::NotConnected`, which we recover from by invalidating the
 /// cached session and retrying with a fresh `session_start`).
+///
+/// `Disconnected` is deliberately not retried here: on both transports it means the
+/// transport already exhausted its own reconnect-and-reissue and gave up, so the remote
+/// is down rather than the session being stale.
 async fn remote_get_retry(
     session: &StorageSession,
     address: Address,
