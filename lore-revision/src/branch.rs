@@ -1048,10 +1048,13 @@ async fn resolve_remote(
     branch: &str,
 ) -> Result<BranchStatus, BranchError> {
     let branch_input = branch;
-    let remote = repository.remote().await.map_err(|_err| {
-        BranchError::from(BranchNotFound {
-            branch: branch_input.to_string(),
-        })
+    let remote = repository.remote().await.map_err(|err| {
+        BranchError::BranchNotFound(
+            BranchNotFound {
+                branch: branch_input.to_string(),
+            }
+            .chain_err_from(err, "remote unavailable for branch lookup"),
+        )
     })?;
     let service = remote
         .revision(repository.id)
@@ -1098,10 +1101,13 @@ async fn resolve_default(
     } else if let Ok(branch) = branch::load_name_to_id(repository.clone(), branch).await {
         branch
     } else {
-        let remote = repository.remote().await.map_err(|_err| {
-            BranchError::from(BranchNotFound {
-                branch: branch_input.to_string(),
-            })
+        let remote = repository.remote().await.map_err(|err| {
+            BranchError::BranchNotFound(
+                BranchNotFound {
+                    branch: branch_input.to_string(),
+                }
+                .chain_err_from(err, "remote unavailable for branch lookup"),
+            )
         })?;
         match remote
             .revision(repository.id)

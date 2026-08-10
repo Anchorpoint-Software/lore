@@ -601,11 +601,23 @@ impl State {
         let options = read_options_from_repository(&repository);
         let mut data = match StateData::read_from_immutable(repository, address, options).await {
             Ok(data) => data,
-            Err(ref e) if e.is_address_not_found() || e.is_payload_not_found() => {
-                return Err(NotFound.into());
+            Err(ImmutableError::AddressNotFound(traced)) => {
+                return Err(StateError::NotFound(
+                    NotFound.chain_err(traced, "state data address not found"),
+                ));
+            }
+            Err(ImmutableError::PayloadNotFound(traced)) => {
+                return Err(StateError::NotFound(
+                    NotFound.chain_err(traced, "state data payload not found"),
+                ));
             }
             Err(ImmutableError::SlowDown(traced)) => return Err(StateError::SlowDown(traced)),
-            Err(_err) => return Err(StateError::internal("Failed to read state data")),
+            Err(err) => {
+                return Err(StateError::internal_with_context(
+                    err,
+                    "Failed to read state data",
+                ));
+            }
         };
 
         if data.magic != STATE_MAGIC {

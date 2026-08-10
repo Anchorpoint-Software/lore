@@ -296,10 +296,13 @@ pub async fn reset(
             execution_context().globals().search_location(),
         )
         .await
-        .map_err(|_err| {
-            ResetError::from(RevisionNotFound {
-                revision: revision_spec,
-            })
+        .map_err(|err| {
+            ResetError::RevisionNotFound(
+                RevisionNotFound {
+                    revision: revision_spec,
+                }
+                .chain_err_from(err, "target revision not found"),
+            )
         })?;
         state::State::deserialize(repository.clone(), resolved)
             .await
@@ -469,10 +472,13 @@ pub async fn reset_to_last_merged(
     let branch_name = branch.to_string();
     let branch = branch::resolve(repository.clone(), branch.as_str())
         .await
-        .map_err(|_err| {
-            ResetError::from(BranchNotFound {
-                branch: branch_name.clone(),
-            })
+        .map_err(|err| {
+            ResetError::BranchNotFound(
+                BranchNotFound {
+                    branch: branch_name.clone(),
+                }
+                .chain_err_from(err, "branch for last-merged reset not found"),
+            )
         })?;
 
     let branch_current = current_branch;
@@ -876,7 +882,7 @@ async fn find_merge_state(
         let node_link = state
             .find_node_link(repository.clone(), relative_path.as_str())
             .await
-            .map_err(|_err| ResetError::internal("Failed to find node"))?;
+            .map_err(|err| ResetError::internal_with_context(err, "Failed to find node"))?;
 
         let node_id = node_link.node;
 

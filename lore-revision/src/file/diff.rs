@@ -143,10 +143,13 @@ pub async fn diff(
             execution_context().globals().search_location(),
         )
         .await
-        .map_err(|_err| {
-            DiffError::from(RevisionNotFound {
-                revision: signature.clone(),
-            })
+        .map_err(|err| {
+            DiffError::RevisionNotFound(
+                RevisionNotFound {
+                    revision: signature.clone(),
+                }
+                .chain_err_from(err, "source revision not found"),
+            )
         })?
     } else {
         let (current_revision, _current_branch) = crate::instance::load_current_anchor(&repository)
@@ -165,10 +168,13 @@ pub async fn diff(
                 execution_context().globals().search_location(),
             )
             .await
-            .map_err(|_err| {
-                DiffError::from(RevisionNotFound {
-                    revision: signature.clone(),
-                })
+            .map_err(|err| {
+                DiffError::RevisionNotFound(
+                    RevisionNotFound {
+                        revision: signature.clone(),
+                    }
+                    .chain_err_from(err, "target revision not found"),
+                )
             })?,
         )
     } else {
