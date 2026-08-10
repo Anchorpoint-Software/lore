@@ -52,11 +52,13 @@ impl ::prost::Name for Address {
 /// a missing fragment is routine control flow, not a fault. A terminal `Status` is
 /// reserved for stream-fatal conditions, where no per-item attribution is possible
 /// (e.g. a corrupt request stream).
+/// A code other than `OK` decides the item on its own: the rest of the response carries no
+/// meaning in that case and a reader must not consult it. A response that omits the status
+/// entirely predates the field and is read as `OK`.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ItemStatus {
-    /// gRPC status code, as the numeric `google.rpc.Code` value. `OK` where the response
-    /// has no success variant of its own to carry the outcome (Put, Copy); never `OK` where
-    /// it does (Get), since there the success variant is the signal.
+    /// gRPC status code, as the numeric `google.rpc.Code` value. `OK` on a successful item,
+    /// so every streaming response reports its outcome the same way.
     #[prost(uint32, tag = "1")]
     pub code: u32,
     /// Human-readable detail, used for log lines and surfaced error text.

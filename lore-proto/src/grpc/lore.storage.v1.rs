@@ -3,24 +3,27 @@
 ///
 /// `address` is populated on success and failure alike — it is the key the client
 /// demultiplexes on, since the server answers out of order. A per-item failure
-/// arrives as `outcome = error` rather than as a stream `Status`, so a miss on one
-/// address leaves every other request on the stream intact.
+/// arrives as `status` rather than as a stream `Status`, so a miss on one address
+/// leaves every other request on the stream intact.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetResponse {
     #[prost(message, optional, tag = "1")]
     pub address: ::core::option::Option<crate::lore::model::v1::Address>,
-    #[prost(oneof = "get_response::Outcome", tags = "4, 5")]
-    pub outcome: ::core::option::Option<get_response::Outcome>,
-}
-/// Nested message and enum types in `GetResponse`.
-pub mod get_response {
-    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
-    pub enum Outcome {
-        #[prost(message, tag = "4")]
-        Found(super::GetFound),
-        #[prost(message, tag = "5")]
-        Error(crate::lore::model::v1::ItemStatus),
-    }
+    /// Meaningful only when `status` is `OK` or absent. `payload` is always empty for
+    /// GetMetadata, which carries Fragment only.
+    #[prost(message, optional, tag = "2")]
+    pub fragment: ::core::option::Option<crate::lore::model::v1::Fragment>,
+    #[prost(bytes = "bytes", tag = "3")]
+    pub payload: ::prost::bytes::Bytes,
+    /// `OK` for a served fragment, the failure otherwise.
+    ///
+    /// Absence means `OK`: the field postdates the original response, so a server without it
+    /// reports a per-item failure the only way it could, by ending the stream.
+    ///
+    /// Anything other than `OK` decides the item on its own. A reader must not consult
+    /// `fragment` or `payload` in that case, whatever they contain.
+    #[prost(message, optional, tag = "4")]
+    pub status: ::core::option::Option<crate::lore::model::v1::ItemStatus>,
 }
 impl ::prost::Name for GetResponse {
     const NAME: &'static str = "GetResponse";
@@ -30,26 +33,6 @@ impl ::prost::Name for GetResponse {
     }
     fn type_url() -> ::prost::alloc::string::String {
         "/lore.storage.v1.GetResponse".into()
-    }
-}
-/// Payload side of a successful Get. Nested rather than inline so the fragment is
-/// unreachable unless the item actually succeeded.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct GetFound {
-    #[prost(message, optional, tag = "1")]
-    pub fragment: ::core::option::Option<crate::lore::model::v1::Fragment>,
-    /// Always empty for GetMetadata, which carries Fragment only.
-    #[prost(bytes = "bytes", tag = "2")]
-    pub payload: ::prost::bytes::Bytes,
-}
-impl ::prost::Name for GetFound {
-    const NAME: &'static str = "GetFound";
-    const PACKAGE: &'static str = "lore.storage.v1";
-    fn full_name() -> ::prost::alloc::string::String {
-        "lore.storage.v1.GetFound".into()
-    }
-    fn type_url() -> ::prost::alloc::string::String {
-        "/lore.storage.v1.GetFound".into()
     }
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -71,15 +54,13 @@ impl ::prost::Name for PutRequest {
         "/lore.storage.v1.PutRequest".into()
     }
 }
-/// One item's outcome on the Put response stream. Unlike GetResponse there is no success
-/// payload to carry, so the status itself reports both outcomes.
+/// One item's outcome on the Put response stream, reported the same way as Get.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PutResponse {
     #[prost(message, optional, tag = "1")]
     pub address: ::core::option::Option<crate::lore::model::v1::Address>,
-    /// Always set — `OK` for a stored fragment, the failure otherwise. A response that
-    /// omits it is malformed rather than a success, so a put is never inferred from
-    /// silence: reading one as durable would discard the only other copy of the payload.
+    /// `OK` for a stored fragment, the failure otherwise. Absence means `OK`, and anything
+    /// other than `OK` decides the item on its own, both as on Get.
     #[prost(message, optional, tag = "2")]
     pub status: ::core::option::Option<crate::lore::model::v1::ItemStatus>,
 }
@@ -179,17 +160,16 @@ impl ::prost::Name for CopyRequest {
         "/lore.storage.v1.CopyRequest".into()
     }
 }
-/// One item's outcome on the Copy response stream. As with PutResponse the status reports
-/// both outcomes rather than being present only on failure.
+/// One item's outcome on the Copy response stream, reported the same way as Get.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CopyResponse {
     #[prost(bytes = "bytes", tag = "1")]
     pub source_repository_id: ::prost::bytes::Bytes,
     #[prost(message, optional, tag = "2")]
     pub source_address: ::core::option::Option<crate::lore::model::v1::Address>,
-    /// Always set — `OK`, or the failure. A missing source fragment is an expected outcome
-    /// that the caller's tier-2 fallback pattern-matches on, so it travels here rather
-    /// than ending the stream.
+    /// `OK`, or the failure — a missing source fragment is an expected outcome that the
+    /// caller's tier-2 fallback pattern-matches on. Absence means `OK`, and anything other
+    /// than `OK` decides the item on its own, both as on Get.
     #[prost(message, optional, tag = "3")]
     pub status: ::core::option::Option<crate::lore::model::v1::ItemStatus>,
 }
@@ -346,10 +326,17 @@ pub mod storage_service_client {
     ///
     /// These RPCs multiplex many independent item requests onto one long-lived stream,
     /// and the server answers out of order. A failure attributable to a single item is
-    /// therefore reported in-band, via that item's `error` field, and the stream stays
+    /// therefore reported in-band, via that item's `status` field, and the stream stays
     /// open. A terminal gRPC `Status` means the stream itself is unusable — the request
     /// stream failed to decode, or the RPC was rejected before any item was read — and
     /// every outstanding request on it must be retried on a fresh stream.
+    ///
+    /// The per-item fields keep the numbers they had before `status` existed, so a peer that
+    /// predates it still decodes what it understands. Such a peer reports a per-item failure
+    /// the only way it can, by ending the stream, which is why an absent status reads as `OK`.
+    ///
+    /// A status other than `OK` decides the item on its own: the reader must not consult the
+    /// other fields, whatever they contain.
     #[derive(Debug, Clone)]
     pub struct StorageServiceClient<T> {
         inner: tonic::client::Grpc<T>,
@@ -753,10 +740,17 @@ pub mod storage_service_server {
     ///
     /// These RPCs multiplex many independent item requests onto one long-lived stream,
     /// and the server answers out of order. A failure attributable to a single item is
-    /// therefore reported in-band, via that item's `error` field, and the stream stays
+    /// therefore reported in-band, via that item's `status` field, and the stream stays
     /// open. A terminal gRPC `Status` means the stream itself is unusable — the request
     /// stream failed to decode, or the RPC was rejected before any item was read — and
     /// every outstanding request on it must be retried on a fresh stream.
+    ///
+    /// The per-item fields keep the numbers they had before `status` existed, so a peer that
+    /// predates it still decodes what it understands. Such a peer reports a per-item failure
+    /// the only way it can, by ending the stream, which is why an absent status reads as `OK`.
+    ///
+    /// A status other than `OK` decides the item on its own: the reader must not consult the
+    /// other fields, whatever they contain.
     #[derive(Debug)]
     pub struct StorageServiceServer<T> {
         inner: Arc<T>,

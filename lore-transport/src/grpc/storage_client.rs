@@ -149,24 +149,27 @@ trait StreamResponse: Sized {
 
     /// Preserves the server's status code, which callers pattern-match on — a remote
     /// `NotFound` is a routine answer on the metadata path rather than a fault.
+    ///
+    /// An absent status is success: the field postdates the original response, so a peer
+    /// without it signals a per-item failure by ending the stream instead.
     fn into_result(self) -> Result<Self::Success, ProtocolError>;
 }
 
 impl StreamResponse for storage_v1::GetResponse {
-    type Success = storage_v1::GetFound;
+    type Success = (model_v1::Fragment, Bytes);
 
     fn key(&self) -> Option<Address> {
         self.address.as_ref().map(Address::from)
     }
 
     fn into_result(self) -> Result<Self::Success, ProtocolError> {
-        match self.outcome {
-            Some(storage_v1::get_response::Outcome::Found(found)) => Ok(found),
-            Some(storage_v1::get_response::Outcome::Error(error)) => {
-                Err(ProtocolError::from(tonic::Status::from(&error)))
-            }
-            None => Err(ProtocolError::internal("get: response carried no outcome")),
+        if let Some(status) = self.status.as_ref().filter(|status| !status.is_ok()) {
+            return Err(ProtocolError::from(tonic::Status::from(status)));
         }
+        let fragment = self
+            .fragment
+            .ok_or_else(|| ProtocolError::internal("get: successful response has no fragment"))?;
+        Ok((fragment, self.payload))
     }
 }
 
@@ -178,10 +181,9 @@ impl StreamResponse for storage_v1::PutResponse {
     }
 
     fn into_result(self) -> Result<Self::Success, ProtocolError> {
-        match self.status {
-            Some(status) if status.is_ok() => Ok(()),
-            Some(status) => Err(ProtocolError::from(tonic::Status::from(&status))),
-            None => Err(ProtocolError::internal("put: response carried no status")),
+        match self.status.as_ref().filter(|status| !status.is_ok()) {
+            Some(status) => Err(ProtocolError::from(tonic::Status::from(status))),
+            None => Ok(()),
         }
     }
 }
@@ -194,10 +196,9 @@ impl StreamResponse for storage_v1::CopyResponse {
     }
 
     fn into_result(self) -> Result<Self::Success, ProtocolError> {
-        match self.status {
-            Some(status) if status.is_ok() => Ok(()),
-            Some(status) => Err(ProtocolError::from(tonic::Status::from(&status))),
-            None => Err(ProtocolError::internal("copy: response carried no status")),
+        match self.status.as_ref().filter(|status| !status.is_ok()) {
+            Some(status) => Err(ProtocolError::from(tonic::Status::from(status))),
+            None => Ok(()),
         }
     }
 }
@@ -390,7 +391,7 @@ pub struct StorageService {
     connection: Arc<super::GRPCConnection>,
     /// Get and `GetMetadata` share a cache: same request and response shape, told apart by
     /// `Verb`.
-    get_streams: StreamCache<Address, storage_v1::GetFound>,
+    get_streams: StreamCache<Address, (model_v1::Fragment, Bytes)>,
     put_streams: StreamCache<storage_v1::PutRequest, ()>,
     copy_streams: StreamCache<storage_v1::CopyRequest, ()>,
     get_put_limiter: Semaphore,
@@ -452,17 +453,12 @@ impl StorageService {
             .await
             .internal("permit acquire")?;
 
-        let found = self
+        let (fragment, payload) = self
             .get_streams
             .request((session_id, Verb::Get), *address, || {
                 self.spawn_get_stream(ctx)
             })
             .await?;
-
-        let Some(fragment) = found.fragment.as_ref() else {
-            lore_error!("Invalid get response, missing fragment");
-            return Err(ProtocolError::internal("get: Missing fragment"));
-        };
 
         let fragment = Fragment {
             flags: fragment.flags,
@@ -476,16 +472,16 @@ impl StorageService {
                 "get: invalid fragment: {reason}"
             )));
         }
-        if found.payload.len() != fragment.size_payload as usize {
+        if payload.len() != fragment.size_payload as usize {
             lore_error!(
                 "Fragment payload is invalid in get response : {} bytes, expected {}",
-                found.payload.len(),
+                payload.len(),
                 fragment.size_payload
             );
             return Err(ProtocolError::internal("get: Invalid payload"));
         }
 
-        Ok((fragment, found.payload))
+        Ok((fragment, payload))
     }
 
     /// Fetch only the fragment metadata for an address. Same wire request as `get` (just an
@@ -510,17 +506,12 @@ impl StorageService {
             .await
             .internal("permit acquire")?;
 
-        let found = self
+        let (fragment, _payload) = self
             .get_streams
             .request((session_id, Verb::GetMetadata), *address, || {
                 self.spawn_get_metadata_stream(ctx)
             })
             .await?;
-
-        let Some(fragment) = found.fragment.as_ref() else {
-            lore_error!("Invalid get_metadata response, missing fragment");
-            return Err(ProtocolError::internal("get_metadata: Missing fragment"));
-        };
 
         let fragment = Fragment {
             flags: fragment.flags,
@@ -761,7 +752,7 @@ impl StorageService {
     fn spawn_get_stream(
         &self,
         ctx: &GrpcSessionContext,
-    ) -> StreamHandle<Address, storage_v1::GetFound> {
+    ) -> StreamHandle<Address, (model_v1::Fragment, Bytes)> {
         let mut client = StorageServiceClient::new(self.connection.channel());
         let (tx, mut rx) = mpsc::channel(STREAM_WRITE_BUFFER_SIZE);
         let handle = Arc::new(StreamState {
@@ -769,7 +760,7 @@ impl StorageService {
             opened: AtomicBool::new(false),
         });
         let state = handle.clone();
-        let inflight: Arc<Inflight<storage_v1::GetFound>> = Arc::new(DashMap::new());
+        let inflight: Arc<Inflight<(model_v1::Fragment, Bytes)>> = Arc::new(DashMap::new());
 
         let request_inflight = inflight.clone();
         let requests = async_stream::stream! {
@@ -806,7 +797,7 @@ impl StorageService {
     fn spawn_get_metadata_stream(
         &self,
         ctx: &GrpcSessionContext,
-    ) -> StreamHandle<Address, storage_v1::GetFound> {
+    ) -> StreamHandle<Address, (model_v1::Fragment, Bytes)> {
         let mut client = StorageServiceClient::new(self.connection.channel());
         let (tx, mut rx) = mpsc::channel(STREAM_WRITE_BUFFER_SIZE);
         let handle = Arc::new(StreamState {
@@ -814,7 +805,7 @@ impl StorageService {
             opened: AtomicBool::new(false),
         });
         let state = handle.clone();
-        let inflight: Arc<Inflight<storage_v1::GetFound>> = Arc::new(DashMap::new());
+        let inflight: Arc<Inflight<(model_v1::Fragment, Bytes)>> = Arc::new(DashMap::new());
 
         let request_inflight = inflight.clone();
         let requests = async_stream::stream! {
@@ -976,6 +967,8 @@ mod tests {
         RefuseOpen,
         /// Refuse the first open, then serve normally — a channel that was down and came back.
         RefuseFirstOpen,
+        /// Answer with a populated fragment and payload *and* a failure status.
+        ErrorBesidePayload,
     }
 
     /// Kills the first `Get` stream it accepts, then serves every later stream normally.
@@ -1015,18 +1008,23 @@ mod tests {
                 }
                 while let Some(Ok(address)) = requests.next().await {
                     requests_read.fetch_add(1, Ordering::SeqCst);
+                    let status = if matches!(kill_mode, KillMode::ErrorBesidePayload) {
+                        lore_proto::lore::model::v1::ItemStatus {
+                            code: i32::from(tonic::Code::NotFound) as u32,
+                            message: "gone".to_string(),
+                        }
+                    } else {
+                        lore_proto::lore::model::v1::ItemStatus::ok()
+                    };
                     yield Ok(storage_v1::GetResponse {
                         address: Some(address),
-                        outcome: Some(storage_v1::get_response::Outcome::Found(
-                            storage_v1::GetFound {
-                                fragment: Some(model_v1::Fragment {
-                                    flags: 0,
-                                    size_payload: TEST_PAYLOAD.len() as u32,
-                                    size_content: TEST_PAYLOAD.len() as u64,
-                                }),
-                                payload: Bytes::from_static(TEST_PAYLOAD),
-                            },
-                        )),
+                        fragment: Some(model_v1::Fragment {
+                            flags: 0,
+                            size_payload: TEST_PAYLOAD.len() as u32,
+                            size_content: TEST_PAYLOAD.len() as u64,
+                        }),
+                        payload: Bytes::from_static(TEST_PAYLOAD),
+                        status: Some(status),
                     });
                 }
             };
@@ -1315,6 +1313,28 @@ mod tests {
         );
     }
 
+    /// A failure status decides the item even when the payload fields are populated.
+    ///
+    /// The fields kept their original numbers so an older peer still decodes them, which means a
+    /// response can carry both a fragment and a failure. The status wins: consulting `fragment`
+    /// first would turn a reported miss into a served fragment.
+    #[tokio::test]
+    async fn a_failure_status_wins_over_a_populated_payload() {
+        let (service, _, _) = start_test_service(KillMode::ErrorBesidePayload).await;
+        let ctx = test_context();
+        let address = Address::zero_context_hash(Hash::from([0x77u8; 32]));
+
+        let err = service
+            .get(0, &ctx, &address)
+            .await
+            .expect_err("a failure status must not be overridden by the payload fields");
+
+        assert!(
+            err.is_not_found(),
+            "the server's code must survive, got {err:?}",
+        );
+    }
+
     /// A refused open must not poison the cache for later requests.
     ///
     /// Giving up leaves a handle whose stream never established. A later request that adopts it
@@ -1390,13 +1410,13 @@ mod tests {
         );
     }
 
-    /// A put response that reports neither success nor failure must not read as stored.
+    /// A put response without a status is read as success, for a peer that predates the field.
     ///
-    /// `write_content` drops the only local copy of the payload once a put reports success
-    /// (`lore-storage/src/write.rs:630`), so inferring one from a silent response would lose the
-    /// bytes outright — they would be on neither the server nor disk.
+    /// The status field is additive: a server that does not set it reports a per-item failure by
+    /// ending the stream, exactly as it did before the field existed. Treating silence as a
+    /// failure would break every put against such a server.
     #[tokio::test]
-    async fn put_rejects_a_response_carrying_no_status() {
+    async fn put_treats_a_missing_status_as_success() {
         let (service, _accepted, _) = start_test_service(KillMode::CleanEnd).await;
         let ctx = test_context();
         let address = Address::zero_context_hash(Hash::from([0x33u8; 32]));
@@ -1406,7 +1426,7 @@ mod tests {
             size_content: TEST_PAYLOAD.len() as u64,
         };
 
-        let err = service
+        service
             .put(
                 0,
                 &ctx,
@@ -1415,12 +1435,7 @@ mod tests {
                 Some(Bytes::from_static(TEST_PAYLOAD)),
             )
             .await
-            .expect_err("a status-less put response must not be taken as success");
-
-        assert!(
-            matches!(err, ProtocolError::Internal(_)),
-            "expected a malformed-response error, got {err:?}",
-        );
+            .expect("a status-less put response must be taken as success");
     }
 
     /// A stream that will not open hands straight off rather than reissuing.

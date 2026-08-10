@@ -72,10 +72,7 @@ async fn get_item(
     )
     .await
     {
-        Ok(LoreResponse::Get(response)) => Ok(storage_v1::GetFound {
-            fragment: Some(response.fragment.into()),
-            payload: response.payload,
-        }),
+        Ok(LoreResponse::Get(response)) => Ok(response),
         Ok(_) => Err(Status::internal(
             "Get handler returned the wrong response type",
         )),
@@ -91,12 +88,18 @@ async fn get_item(
         }),
     };
 
-    Ok(storage_v1::GetResponse {
-        address: Some(address.into()),
-        outcome: Some(match outcome {
-            Ok(found) => storage_v1::get_response::Outcome::Found(found),
-            Err(status) => storage_v1::get_response::Outcome::Error((&status).into()),
-        }),
+    Ok(match outcome {
+        Ok(response) => storage_v1::GetResponse {
+            address: Some(address.into()),
+            fragment: Some(response.fragment.into()),
+            payload: response.payload,
+            status: Some(lore_proto::lore::model::v1::ItemStatus::ok()),
+        },
+        Err(status) => storage_v1::GetResponse {
+            address: Some(address.into()),
+            status: Some((&status).into()),
+            ..Default::default()
+        },
     })
 }
 

@@ -47,12 +47,10 @@ pub(crate) trait ItemOutcome {
 
 impl ItemOutcome for lore_proto::lore::storage::v1::GetResponse {
     fn item_error(&self) -> Option<tonic::Status> {
-        match &self.outcome {
-            Some(lore_proto::lore::storage::v1::get_response::Outcome::Found(_)) | None => None,
-            Some(lore_proto::lore::storage::v1::get_response::Outcome::Error(error)) => {
-                Some(error.into())
-            }
-        }
+        self.status
+            .as_ref()
+            .filter(|status| !status.is_ok())
+            .map(Into::into)
     }
 }
 
