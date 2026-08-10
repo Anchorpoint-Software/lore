@@ -187,7 +187,7 @@ pub async fn set_revision(
             .internal("Failed to serialize staged revision anchor")?;
     }
 
-    let _ = event::metadata::send(&metadata);
+    event::metadata::send(&metadata);
 
     Ok(())
 }
@@ -326,7 +326,7 @@ async fn set_file_task(
     }
 
     if events {
-        let _ = event::metadata::send(&metadata);
+        event::metadata::send(&metadata);
     }
 
     Ok(())

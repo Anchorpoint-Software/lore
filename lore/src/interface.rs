@@ -7562,3 +7562,191 @@ pub extern "C" fn lore_revision_tree_modify_async(
         crate::revision_tree::modify::modify,
     );
 }
+
+pub type LoreRevisionTreeMetadataSetArgs =
+    crate::revision_tree::metadata_set::LoreRevisionTreeMetadataSetArgs;
+
+/// Record a batch of `(key, value)` pairs on a loaded revision tree's in-progress
+/// metadata.
+///
+/// `value` is a `lore_metadata_t`, which carries its own kind — set the union's
+/// `tag` and the matching member. There is no separate format field and nothing
+/// is parsed, so a value cannot be stored under a kind it is not, and a binary
+/// value can hold any bytes rather than only text. This differs from
+/// `lore_revision_metadata_set`, which takes text plus a parallel format array.
+/// `lore_revision_tree_metadata_get` returns the same union.
+///
+/// Every entry is checked before any pair is recorded, so one bad entry rejects
+/// the call and records nothing; the reason names the offending entry's batch
+/// index, which a caller leaving `entry_id` at zero has no other way to
+/// identify.
+///
+/// A repeated key is **not** rejected, unlike the duplicate-target rules on the
+/// node verbs: entries apply in index order, so the last entry naming a key wins
+/// — the same result as sending those pairs as separate calls.
+///
+/// Nothing reaches storage here. The pairs live on the handle until
+/// `lore_revision_tree_commit` serializes them, so only this handle's
+/// `lore_revision_tree_metadata_get` sees them. The whole batch applies under one
+/// write lock, which is what makes it atomic and why there is no concurrency to
+/// gain: the work is buffer writes, not I/O.
+///
+/// A revision's whole metadata is capped at 1 MiB. The cap counts the metadata
+/// itself — keys, values and per-entry overhead — and not what a value refers
+/// to: a value holding a content address costs the address, not the content
+/// behind it.
+///
+/// A single entry larger than the whole cap is rejected here, since no amount of
+/// removing other keys could make it fit. The running total is not checked here,
+/// because what a revision ends up carrying is only known once every set has
+/// run: a batch of individually legal entries that together push past the limit
+/// is reported as recorded and fails later, at `lore_revision_tree_commit`.
+///
+/// | Terminal event                                    | Payload                                                 | Notes                                                       |
+/// |---------------------------------------------------|---------------------------------------------------------|-------------------------------------------------------------|
+/// | `LORE_EVENT_REVISION_TREE_METADATA_SET_COMPLETE`  | `lore_revision_tree_metadata_set_complete_event_data_t` | One per entry, carrying its `entry_id`                      |
+/// | `LORE_EVENT_REVISION_TREE_BATCH_COMPLETE`         | `lore_revision_tree_batch_complete_event_data_t`        | Exactly one, carrying the `batch_id` and the call's outcome  |
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_tree_metadata_set(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionTreeMetadataSetArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(
+        globals,
+        args,
+        callback,
+        crate::revision_tree::metadata_set::metadata_set,
+    )
+}
+
+/// Record a batch of metadata pairs on a loaded revision tree (async variant).
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_tree_metadata_set_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionTreeMetadataSetArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(
+        globals,
+        args,
+        callback,
+        crate::revision_tree::metadata_set::metadata_set,
+    );
+}
+
+pub type LoreRevisionTreeMetadataGetArgs =
+    crate::revision_tree::metadata_get::LoreRevisionTreeMetadataGetArgs;
+
+/// Read a batch of metadata values from a loaded revision tree.
+///
+/// By default this reads only the **revision being built** — what
+/// `lore_revision_tree_metadata_set` recorded on this handle, which is exactly
+/// what `lore_revision_tree_commit` will write. Nothing is inherited from the
+/// revision the handle was loaded on. Set `include_revision` to `1` to also fall
+/// back to that revision for a key the handle has no entry for; a pending entry
+/// still wins, so the flag only adds answers.
+///
+/// A key present in neither emits **no event at all** and does not fail the call,
+/// matching `lore_revision_metadata_get`: detect an absent key by tracking
+/// whether a value event arrived for its `entry_id`. This verb is therefore **not
+/// all-or-nothing**, unlike the other batch verbs — it mutates nothing, so one
+/// unanswerable key costs the others nothing. Bad arguments still reject the
+/// whole call.
+///
+/// A value comes back as the same `lore_metadata_t` that
+/// `lore_revision_tree_metadata_set` takes, so it round-trips without either
+/// side encoding it as text. Every kind is returned, raw binary included.
+///
+/// A value whose stored bytes do not match the kind they are tagged with, or
+/// whose tag this build does not recognize, reports `LORE_ERROR_CODE_INTERNAL`
+/// on that entry rather than staying silent, so it is never mistaken for an
+/// absent key.
+///
+/// The revision's metadata is read once for the whole batch, which is what
+/// batching buys here.
+///
+/// | Terminal event                                    | Payload                                                 | Notes                                                       |
+/// |---------------------------------------------------|---------------------------------------------------------|-------------------------------------------------------------|
+/// | `LORE_EVENT_REVISION_TREE_METADATA_GET_COMPLETE`  | `lore_revision_tree_metadata_get_complete_event_data_t` | One per key that resolved, carrying its `entry_id`; none for an absent key |
+/// | `LORE_EVENT_REVISION_TREE_BATCH_COMPLETE`         | `lore_revision_tree_batch_complete_event_data_t`        | Exactly one, carrying the `batch_id` and the call's outcome  |
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_tree_metadata_get(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionTreeMetadataGetArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(
+        globals,
+        args,
+        callback,
+        crate::revision_tree::metadata_get::metadata_get,
+    )
+}
+
+/// Read a batch of metadata values from a loaded revision tree (async variant).
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_tree_metadata_get_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionTreeMetadataGetArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(
+        globals,
+        args,
+        callback,
+        crate::revision_tree::metadata_get::metadata_get,
+    );
+}
+
+pub type LoreRevisionTreeMetadataClearArgs =
+    crate::revision_tree::metadata_clear::LoreRevisionTreeMetadataClearArgs;
+
+/// Remove a batch of keys from a loaded revision tree's in-progress metadata.
+/// Every entry is checked before any key is removed, so one bad entry rejects the
+/// call and removes nothing; the reason names the offending entry's batch index,
+/// which a caller leaving `entry_id` at zero has no other way to identify.
+///
+/// **Clearing a key that is not set is a no-op success**, not a failure. The
+/// terminal's `removed` field says which happened: `1` when the key was there and
+/// is now gone, `0` when there was nothing to remove. A repeated key is likewise
+/// not rejected — the second entry naming it reports `removed = 0`.
+///
+/// This clears the **pending** metadata that `lore_revision_tree_metadata_set`
+/// records and `lore_revision_tree_metadata_get` reads first; a key frozen in the
+/// loaded revision is not reachable from here, since clearing edits the revision
+/// being built and the one it was loaded from is immutable. The whole batch
+/// applies under one write lock, which is what makes it atomic.
+///
+/// | Terminal event                                      | Payload                                                   | Notes                                                       |
+/// |-----------------------------------------------------|-----------------------------------------------------------|-------------------------------------------------------------|
+/// | `LORE_EVENT_REVISION_TREE_METADATA_CLEAR_COMPLETE`  | `lore_revision_tree_metadata_clear_complete_event_data_t` | One per entry, carrying its `entry_id` and `removed`        |
+/// | `LORE_EVENT_REVISION_TREE_BATCH_COMPLETE`           | `lore_revision_tree_batch_complete_event_data_t`          | Exactly one, carrying the `batch_id` and the call's outcome  |
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_tree_metadata_clear(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionTreeMetadataClearArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(
+        globals,
+        args,
+        callback,
+        crate::revision_tree::metadata_clear::metadata_clear,
+    )
+}
+
+/// Remove a batch of metadata keys from a loaded revision tree (async variant).
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_tree_metadata_clear_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionTreeMetadataClearArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(
+        globals,
+        args,
+        callback,
+        crate::revision_tree::metadata_clear::metadata_clear,
+    );
+}

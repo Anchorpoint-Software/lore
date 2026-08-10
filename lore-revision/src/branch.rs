@@ -1393,25 +1393,23 @@ pub async fn branch_metadata(
     let mut creator = String::default();
     let mut created = 0u64;
     let mut stack = vec![];
-    metadata
-        .walk(|key, value, _value_type| {
-            if key.eq(NAME.as_bytes()) {
-                name = String::from_utf8_lossy(value).to_string();
-            } else if key.eq(CATEGORY.as_bytes()) {
-                category = String::from_utf8_lossy(value).to_string();
-            } else if key.eq(PARENT_DEPRECATED.as_bytes()) {
-                parent = value.into();
-            } else if key.eq(BRANCH_POINT_DEPRECATED.as_bytes()) {
-                branch_point = value.into();
-            } else if key.eq(CREATOR.as_bytes()) {
-                creator = String::from_utf8_lossy(value).to_string();
-            } else if key.eq(CREATED.as_bytes()) {
-                created = u64::from_le_bytes(value.try_into().unwrap_or_default());
-            } else if key.eq(STACK.as_bytes()) {
-                stack = stack_from_bytes(value);
-            }
-        })
-        .forward::<BranchError>("Failed to walk branch metadata")?;
+    metadata.walk(|key, value, _value_type| {
+        if key.eq(NAME.as_bytes()) {
+            name = String::from_utf8_lossy(value).to_string();
+        } else if key.eq(CATEGORY.as_bytes()) {
+            category = String::from_utf8_lossy(value).to_string();
+        } else if key.eq(PARENT_DEPRECATED.as_bytes()) {
+            parent = value.into();
+        } else if key.eq(BRANCH_POINT_DEPRECATED.as_bytes()) {
+            branch_point = value.into();
+        } else if key.eq(CREATOR.as_bytes()) {
+            creator = String::from_utf8_lossy(value).to_string();
+        } else if key.eq(CREATED.as_bytes()) {
+            created = u64::from_le_bytes(value.try_into().unwrap_or_default());
+        } else if key.eq(STACK.as_bytes()) {
+            stack = stack_from_bytes(value);
+        }
+    });
 
     if stack.is_empty() && !parent.is_zero() {
         stack.push(BranchPoint {
@@ -2299,41 +2297,37 @@ impl From<&RevisionListItem> for lore_proto::Revision {
             parent_self_number: revision.parent_self_revision_number,
             parent_other_number: revision.parent_other_revision_number,
         };
-        revision
-            .metadata
-            .walk(|key, value, value_type| {
-                let key = std::str::from_utf8(key).unwrap_or("<binary>");
-                match key {
-                    metadata::MESSAGE => {
-                        proto_revision.commit_message =
-                            std::str::from_utf8(value).unwrap_or("<binary>").to_string();
-                    }
-                    metadata::TIMESTAMP => {
-                        if value.len() == std::mem::size_of::<u64>() {
-                            proto_revision.timestamp =
-                                u64::from_le_bytes(value.try_into().unwrap());
-                        }
-                    }
-                    metadata::CREATED_BY => {
-                        if let Ok(value) = std::str::from_utf8(value) {
-                            proto_revision.created_by = value.to_string();
-                        }
-                    }
-                    metadata::COMMITTED_BY => {
-                        if let Ok(value) = std::str::from_utf8(value) {
-                            proto_revision.committed_by = value.to_string();
-                        }
-                    }
-                    _ => {
-                        let metadata =
-                            as_lore_proto_metadata(String::from(key), value, value_type).ok();
-                        if let Some(metadata) = metadata {
-                            proto_revision.metadata.push(metadata);
-                        }
+        revision.metadata.walk(|key, value, value_type| {
+            let key = std::str::from_utf8(key).unwrap_or("<binary>");
+            match key {
+                metadata::MESSAGE => {
+                    proto_revision.commit_message =
+                        std::str::from_utf8(value).unwrap_or("<binary>").to_string();
+                }
+                metadata::TIMESTAMP => {
+                    if value.len() == std::mem::size_of::<u64>() {
+                        proto_revision.timestamp = u64::from_le_bytes(value.try_into().unwrap());
                     }
                 }
-            })
-            .unwrap_or_default();
+                metadata::CREATED_BY => {
+                    if let Ok(value) = std::str::from_utf8(value) {
+                        proto_revision.created_by = value.to_string();
+                    }
+                }
+                metadata::COMMITTED_BY => {
+                    if let Ok(value) = std::str::from_utf8(value) {
+                        proto_revision.committed_by = value.to_string();
+                    }
+                }
+                _ => {
+                    let metadata =
+                        as_lore_proto_metadata(String::from(key), value, value_type).ok();
+                    if let Some(metadata) = metadata {
+                        proto_revision.metadata.push(metadata);
+                    }
+                }
+            }
+        });
 
         proto_revision
     }

@@ -493,7 +493,7 @@ pub async fn commit_impl(
         )
         .await?;
 
-        let _ = event::metadata::send(&metadata);
+        event::metadata::send(&metadata);
     }
 
     if !dry_run && !dirty_paths.is_empty() {
@@ -995,15 +995,7 @@ async fn build_commit_metadata(
         .iter()
         .map(|v| String::from(v.as_str()))
         .collect();
-    let metadata_formats = formats
-        .as_slice()
-        .iter()
-        .map(|format| match format {
-            LoreMetadataType::Binary => MetadataType::Binary,
-            LoreMetadataType::Numeric => MetadataType::Numeric,
-            LoreMetadataType::String => MetadataType::String,
-        })
-        .collect();
+    let metadata_formats = formats.as_slice().to_vec();
 
     let metadata_hash = state_staged.metadata_hash();
     let original_metadata = if metadata_hash.is_zero() {

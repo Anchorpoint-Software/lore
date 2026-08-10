@@ -448,7 +448,7 @@ async fn metadata_set_impl(
 
     let mut encoded_values: Vec<Vec<u8>> = Vec::with_capacity(values.len());
     for (value, format) in values.iter().zip(formats.iter()) {
-        let metadata_type = (*format).into();
+        let metadata_type = *format;
         encoded_values.push(
             Metadata::decode_to_value(value.as_str(), &metadata_type).map_err(|e| {
                 lore_base::error::InvalidArguments {

@@ -7830,21 +7830,19 @@ async fn collect_new_node_metadata_fragments(
             .await
             .internal("Failed to deserialize metadata")?;
 
-        metadata
-            .walk(
-                |_key_slice: &[u8], value_slice: &[u8], value_type: MetadataType| {
-                    if value_type == MetadataType::Address {
-                        if let Ok(address) = Metadata::to_address(value_slice) {
-                            if address.hash.is_zero() {
-                                return;
-                            }
-                            metadata_refs.push(address);
+        metadata.walk(
+            |_key_slice: &[u8], value_slice: &[u8], value_type: MetadataType| {
+                if value_type == MetadataType::Address {
+                    if let Ok(address) = Metadata::to_address(value_slice) {
+                        if address.hash.is_zero() {
+                            return;
                         }
-                        addresses_expected += 1;
+                        metadata_refs.push(address);
                     }
-                },
-            )
-            .internal("Failed to deserialize metadata")?;
+                    addresses_expected += 1;
+                }
+            },
+        );
     }
 
     // Ensure metadata contained only valid addresses

@@ -352,7 +352,7 @@ async fn info_path(
                 .await
                 .forward::<InfoError>("Deserialize metadata failed")?;
 
-            event::metadata::send(&metadata).forward::<InfoError>("Deserialize metadata failed")?;
+            event::metadata::send(&metadata);
         }
     } else {
         let absolute_path = path.to_absolute_path(repository.require_path()?);

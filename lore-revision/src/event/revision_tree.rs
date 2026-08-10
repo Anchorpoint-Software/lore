@@ -255,14 +255,28 @@ pub struct LoreRevisionTreeMetadataSetCompleteEventData {
     pub error_code: LoreErrorCode,
 }
 
+/// Terminal per-entry event for `metadata_clear`. `removed` says whether the key
+/// was there to begin with: clearing an absent key is a no-op success, so the
+/// error code alone cannot tell the two apart. The call as a whole reports
+/// separately on `RevisionTreeBatchComplete`.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoreRevisionTreeMetadataClearCompleteEventData {
+    /// Correlation id of the entry this reports, not of the call.
+    pub entry_id: u64,
+    /// `1` when the key was present and has been removed, `0` when it was absent
+    /// and the entry was a no-op.
+    pub removed: u8,
+    /// The outcome of the call.
+    pub error_code: LoreErrorCode,
+}
+
 /// Per-entry event carrying a metadata value from `metadata_get`. The
 /// missing-key case emits no value event and lets the trailing `Complete`
 /// fire on its own.
-///
-/// No `Debug` derive: the embedded `LoreMetadata` enum does not implement
-/// `Debug`. Use `serde_json::to_string` to render this for diagnostics.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionTreeMetadataGetCompleteEventData {
     /// Correlation id of the entry this reports, not of the call.

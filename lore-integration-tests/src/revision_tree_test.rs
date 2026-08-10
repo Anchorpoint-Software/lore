@@ -34,6 +34,7 @@ mod support {
     use lore_revision::interface::LoreError;
     use lore_revision::interface::LoreEventCallback;
     use lore_revision::interface::LoreGlobalArgs;
+    use lore_revision::interface::LoreMetadata;
     use lore_revision::node::NodeID;
 
     /// Call-level id every test batch is submitted under, distinct from the
@@ -51,6 +52,9 @@ mod support {
         Loaded(u64),
         AddComplete(u64, NodeID, LoreErrorCode),
         ModifyComplete(u64, NodeID, LoreErrorCode),
+        MetadataSetComplete(u64, LoreErrorCode),
+        MetadataGetComplete(u64, String, LoreMetadata, LoreErrorCode),
+        MetadataClearComplete(u64, u8, LoreErrorCode),
         BatchComplete(u64, LoreErrorCode),
         NodeInfo(Box<LoreRevisionTreeNodeInfoEventData>),
         Child(NodeID, String),
@@ -70,6 +74,18 @@ mod support {
                 }
                 LoreEvent::RevisionTreeModifyComplete(data) => {
                     Captured::ModifyComplete(data.entry_id, data.node_id, data.error_code)
+                }
+                LoreEvent::RevisionTreeMetadataSetComplete(data) => {
+                    Captured::MetadataSetComplete(data.entry_id, data.error_code)
+                }
+                LoreEvent::RevisionTreeMetadataGetComplete(data) => Captured::MetadataGetComplete(
+                    data.entry_id,
+                    data.key.as_str().to_string(),
+                    data.value.clone(),
+                    data.error_code,
+                ),
+                LoreEvent::RevisionTreeMetadataClearComplete(data) => {
+                    Captured::MetadataClearComplete(data.entry_id, data.removed, data.error_code)
                 }
                 LoreEvent::RevisionTreeBatchComplete(data) => {
                     Captured::BatchComplete(data.batch_id, data.error_code)
@@ -1651,6 +1667,455 @@ mod modify_tests {
             parent_of(handle, node_id).await,
             ROOT_NODE,
             "the node must stay where add put it"
+        );
+    }
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use lore::revision_tree::handle::LoreRevisionTree;
+    use lore::revision_tree::metadata_get::LoreRevisionTreeMetadataGetArgs;
+    use lore::revision_tree::metadata_get::LoreRevisionTreeMetadataGetEntry;
+    use lore::revision_tree::metadata_get::metadata_get;
+    use lore::revision_tree::metadata_set::LoreRevisionTreeMetadataSetArgs;
+    use lore::revision_tree::metadata_set::LoreRevisionTreeMetadataSetEntry;
+    use lore::revision_tree::metadata_set::metadata_set;
+    use lore_base::lore_spawn;
+    use lore_base::types::Address;
+    use lore_base::types::Context;
+    use lore_base::types::Hash;
+    use lore_base::types::Partition;
+    use lore_revision::event::LoreErrorCode;
+    use lore_revision::interface::LoreArray;
+    use lore_revision::interface::LoreBinary;
+    use lore_revision::interface::LoreGlobalArgs;
+    use lore_revision::interface::LoreMetadata;
+    use lore_revision::interface::LoreString;
+    use tokio::task::JoinSet;
+
+    use super::support::*;
+
+    fn set_entry(entry_id: u64, key: &str, value: &str) -> LoreRevisionTreeMetadataSetEntry {
+        LoreRevisionTreeMetadataSetEntry {
+            entry_id,
+            key: LoreString::from_str(key),
+            value: LoreMetadata::String(LoreString::from_str(value)),
+        }
+    }
+
+    fn get_entry(entry_id: u64, key: &str) -> LoreRevisionTreeMetadataGetEntry {
+        LoreRevisionTreeMetadataGetEntry {
+            entry_id,
+            key: LoreString::from_str(key),
+        }
+    }
+
+    async fn run_set(
+        handle: LoreRevisionTree,
+        entries: Vec<LoreRevisionTreeMetadataSetEntry>,
+    ) -> (i32, Vec<Captured>) {
+        let (sink, callback) = make_sink();
+        let status = metadata_set(
+            LoreGlobalArgs::default(),
+            LoreRevisionTreeMetadataSetArgs {
+                batch_id: CALL_ID,
+                handle,
+                entries: LoreArray::from_vec(entries),
+            },
+            callback,
+        )
+        .await;
+        let events = sink.lock().unwrap().clone();
+        (status, events)
+    }
+
+    async fn run_get(
+        handle: LoreRevisionTree,
+        entries: Vec<LoreRevisionTreeMetadataGetEntry>,
+    ) -> (i32, Vec<Captured>) {
+        let (sink, callback) = make_sink();
+        let status = metadata_get(
+            LoreGlobalArgs::default(),
+            LoreRevisionTreeMetadataGetArgs {
+                batch_id: CALL_ID,
+                handle,
+                include_revision: 0,
+                entries: LoreArray::from_vec(entries),
+            },
+            callback,
+        )
+        .await;
+        let events = sink.lock().unwrap().clone();
+        (status, events)
+    }
+
+    fn set_completes(events: &[Captured]) -> Vec<(u64, LoreErrorCode)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Captured::MetadataSetComplete(id, code) => Some((*id, *code)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn get_completes(events: &[Captured]) -> Vec<(u64, String, LoreMetadata, LoreErrorCode)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Captured::MetadataGetComplete(id, key, value, code) => {
+                    Some((*id, key.clone(), value.clone(), *code))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A value of each kind, chosen so no two entries in the batch share one.
+    fn value_for(index: u64) -> LoreMetadata {
+        match index % 7 {
+            0 => LoreMetadata::String(LoreString::from_str(&format!("value-{index}"))),
+            1 => LoreMetadata::Numeric(index),
+            2 => LoreMetadata::Boolean(u8::from(index.is_multiple_of(2))),
+            3 => LoreMetadata::Binary(LoreBinary::from_bytes(&index.to_le_bytes())),
+            4 => LoreMetadata::Hash(Hash::from_u64(index)),
+            5 => LoreMetadata::Context(Context::from([index as u8; 16])),
+            _ => LoreMetadata::Address(Address {
+                hash: Hash::from_u64(index),
+                context: Context::from([index as u8; 16]),
+            }),
+        }
+    }
+
+    /// A batch larger than a handful, over a real store, asserting every key
+    /// lands and reads back under its own entry id — carrying the kind it was
+    /// written with, since a typed value is what these verbs exchange.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_large_metadata_batch_lands_every_key() {
+        let handle = load_handle(Partition::from([0xD1u8; 16])).await;
+
+        const KEYS: u64 = 256;
+        let entries: Vec<_> = (0..KEYS)
+            .map(|index| LoreRevisionTreeMetadataSetEntry {
+                entry_id: index + 1,
+                key: LoreString::from_str(&format!("key-{index:04}")),
+                value: value_for(index),
+            })
+            .collect();
+        let (status, events) = run_set(handle, entries).await;
+        assert_eq!(status, 0, "got {:?}", batch_outcomes(&events));
+        assert_eq!(
+            set_completes(&events).len() as u64,
+            KEYS,
+            "every entry must report"
+        );
+
+        let reads: Vec<_> = (0..KEYS)
+            .map(|index| get_entry(index + 1, &format!("key-{index:04}")))
+            .collect();
+        let (status, events) = run_get(handle, reads).await;
+        assert_eq!(status, 0, "got {:?}", batch_outcomes(&events));
+        let mut reported = get_completes(&events);
+        reported.sort_by_key(|(id, _, _, _)| *id);
+        let expected: Vec<_> = (0..KEYS)
+            .map(|index| {
+                (
+                    index + 1,
+                    format!("key-{index:04}"),
+                    value_for(index),
+                    LoreErrorCode::None,
+                )
+            })
+            .collect();
+        assert_eq!(
+            reported, expected,
+            "every key must read back in order, under the kind it was set with"
+        );
+    }
+
+    /// Separate calls on one handle each take the pending-metadata write lock, so
+    /// every batch must land whole — no batch may lose keys to another.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_set_batches_each_land_whole() {
+        let handle = load_handle(Partition::from([0xD2u8; 16])).await;
+
+        const BATCHES: u64 = 4;
+        const PER_BATCH: u64 = 16;
+        let mut tasks: JoinSet<i32> = JoinSet::new();
+        for batch in 0..BATCHES {
+            lore_spawn!(tasks, async move {
+                let entries: Vec<_> = (0..PER_BATCH)
+                    .map(|index| {
+                        let global = batch * PER_BATCH + index;
+                        set_entry(global + 1, &format!("b{batch}-k{index}"), "value")
+                    })
+                    .collect();
+                run_set(handle, entries).await.0
+            });
+        }
+        while let Some(result) = tasks.join_next().await {
+            assert_eq!(
+                result.expect("batch task must not panic"),
+                0,
+                "every concurrent batch must succeed"
+            );
+        }
+
+        let reads: Vec<_> = (0..BATCHES)
+            .flat_map(|batch| {
+                (0..PER_BATCH).map(move |index| {
+                    let global = batch * PER_BATCH + index;
+                    get_entry(global + 1, &format!("b{batch}-k{index}"))
+                })
+            })
+            .collect();
+        let (status, events) = run_get(handle, reads).await;
+        assert_eq!(status, 0, "got {:?}", batch_outcomes(&events));
+        assert_eq!(
+            get_completes(&events).len() as u64,
+            BATCHES * PER_BATCH,
+            "no key may be lost to a concurrent batch"
+        );
+    }
+
+    /// A closed handle is the call's failure, not any entry's, for both verbs:
+    /// it reports on the batch terminal and leaves every entry silent.
+    #[tokio::test]
+    async fn metadata_verbs_on_a_closed_handle_report_only_the_batch_terminal() {
+        let handle = load_handle(Partition::from([0xD3u8; 16])).await;
+        close_handle(handle).await;
+
+        let (status, events) = run_set(handle, vec![set_entry(7, "a", "1")]).await;
+        assert_ne!(status, 0, "a closed handle must fail the set");
+        assert!(set_completes(&events).is_empty(), "got {events:?}");
+        assert_eq!(
+            batch_outcomes(&events),
+            vec![(CALL_ID, LoreErrorCode::InvalidArguments)]
+        );
+
+        let (status, events) = run_get(handle, vec![get_entry(8, "a")]).await;
+        assert_ne!(status, 0, "a closed handle must fail the get");
+        assert!(get_completes(&events).is_empty(), "got {events:?}");
+        assert_eq!(
+            batch_outcomes(&events),
+            vec![(CALL_ID, LoreErrorCode::InvalidArguments)]
+        );
+    }
+
+    /// A read mixing present and absent keys reports only the present ones and
+    /// still succeeds — the one batch verb that tolerates a key it cannot answer.
+    #[tokio::test]
+    async fn a_read_mixing_present_and_absent_keys_succeeds() {
+        let handle = load_handle(Partition::from([0xD4u8; 16])).await;
+        run_set(handle, vec![set_entry(1, "here", "yes")]).await;
+
+        let (status, events) = run_get(
+            handle,
+            vec![
+                get_entry(10, "missing-one"),
+                get_entry(11, "here"),
+                get_entry(12, "missing-two"),
+            ],
+        )
+        .await;
+        assert_eq!(status, 0, "absent keys must not fail the call");
+        assert_eq!(
+            get_completes(&events),
+            vec![(
+                11,
+                "here".to_string(),
+                LoreMetadata::String(LoreString::from_str("yes")),
+                LoreErrorCode::None
+            )],
+            "only the present key reports"
+        );
+        assert_eq!(
+            batch_outcomes(&events),
+            vec![(CALL_ID, LoreErrorCode::None)]
+        );
+    }
+}
+
+#[cfg(test)]
+mod metadata_clear_tests {
+    use lore::revision_tree::handle::LoreRevisionTree;
+    use lore::revision_tree::metadata_clear::LoreRevisionTreeMetadataClearArgs;
+    use lore::revision_tree::metadata_clear::LoreRevisionTreeMetadataClearEntry;
+    use lore::revision_tree::metadata_clear::metadata_clear;
+    use lore::revision_tree::metadata_get::LoreRevisionTreeMetadataGetArgs;
+    use lore::revision_tree::metadata_get::LoreRevisionTreeMetadataGetEntry;
+    use lore::revision_tree::metadata_get::metadata_get;
+    use lore::revision_tree::metadata_set::LoreRevisionTreeMetadataSetArgs;
+    use lore::revision_tree::metadata_set::LoreRevisionTreeMetadataSetEntry;
+    use lore::revision_tree::metadata_set::metadata_set;
+    use lore_base::types::Partition;
+    use lore_revision::event::LoreErrorCode;
+    use lore_revision::interface::LoreArray;
+    use lore_revision::interface::LoreGlobalArgs;
+    use lore_revision::interface::LoreMetadata;
+    use lore_revision::interface::LoreString;
+
+    use super::support::*;
+
+    async fn seed(handle: LoreRevisionTree, keys: &[&str]) {
+        let (_, callback) = make_sink();
+        let entries: Vec<_> = keys
+            .iter()
+            .enumerate()
+            .map(|(index, key)| LoreRevisionTreeMetadataSetEntry {
+                entry_id: index as u64 + 1,
+                key: LoreString::from_str(key),
+                value: LoreMetadata::String(LoreString::from_str("value")),
+            })
+            .collect();
+        let status = metadata_set(
+            LoreGlobalArgs::default(),
+            LoreRevisionTreeMetadataSetArgs {
+                batch_id: 1,
+                handle,
+                entries: LoreArray::from_vec(entries),
+            },
+            callback,
+        )
+        .await;
+        assert_eq!(status, 0, "seeding metadata must succeed");
+    }
+
+    async fn run_clear(handle: LoreRevisionTree, keys: &[&str]) -> (i32, Vec<Captured>) {
+        let (sink, callback) = make_sink();
+        let entries: Vec<_> = keys
+            .iter()
+            .enumerate()
+            .map(|(index, key)| LoreRevisionTreeMetadataClearEntry {
+                entry_id: index as u64 + 1,
+                key: LoreString::from_str(key),
+            })
+            .collect();
+        let status = metadata_clear(
+            LoreGlobalArgs::default(),
+            LoreRevisionTreeMetadataClearArgs {
+                batch_id: CALL_ID,
+                handle,
+                entries: LoreArray::from_vec(entries),
+            },
+            callback,
+        )
+        .await;
+        let events = sink.lock().unwrap().clone();
+        (status, events)
+    }
+
+    async fn keys_present(handle: LoreRevisionTree, keys: &[&str]) -> Vec<String> {
+        let (sink, callback) = make_sink();
+        let entries: Vec<_> = keys
+            .iter()
+            .enumerate()
+            .map(|(index, key)| LoreRevisionTreeMetadataGetEntry {
+                entry_id: index as u64 + 1,
+                key: LoreString::from_str(key),
+            })
+            .collect();
+        metadata_get(
+            LoreGlobalArgs::default(),
+            LoreRevisionTreeMetadataGetArgs {
+                batch_id: 2,
+                handle,
+                include_revision: 0,
+                entries: LoreArray::from_vec(entries),
+            },
+            callback,
+        )
+        .await;
+        sink.lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                Captured::MetadataGetComplete(_, key, _, _) => Some(key.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn clear_completes(events: &[Captured]) -> Vec<(u64, u8, LoreErrorCode)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Captured::MetadataClearComplete(id, removed, code) => Some((*id, *removed, *code)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The full cycle over a real store: set, clear a subset, and read back to
+    /// confirm exactly the cleared keys are gone.
+    #[tokio::test]
+    async fn set_then_clear_leaves_only_the_untouched_keys() {
+        let handle = load_handle(Partition::from([0xE1u8; 16])).await;
+        seed(handle, &["alpha", "beta", "gamma"]).await;
+
+        let (status, events) = run_clear(handle, &["alpha", "gamma"]).await;
+        assert_eq!(status, 0, "got {:?}", batch_outcomes(&events));
+        assert_eq!(
+            clear_completes(&events),
+            vec![(1, 1, LoreErrorCode::None), (2, 1, LoreErrorCode::None)],
+            "both keys were present and are reported removed"
+        );
+        assert_eq!(
+            keys_present(handle, &["alpha", "beta", "gamma"]).await,
+            vec!["beta".to_string()],
+            "only the untouched key still reads back"
+        );
+    }
+
+    /// A larger batch mixing present and absent keys, asserting the no-op is a
+    /// success carrying `removed = 0`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_large_clear_batch_reports_each_key_it_did_and_did_not_remove() {
+        let handle = load_handle(Partition::from([0xE2u8; 16])).await;
+        let present: Vec<String> = (0..64).map(|index| format!("key-{index:04}")).collect();
+        let present_refs: Vec<&str> = present.iter().map(String::as_str).collect();
+        seed(handle, &present_refs).await;
+
+        let absent: Vec<String> = (0..64).map(|index| format!("gone-{index:04}")).collect();
+        let mut all: Vec<&str> = present_refs.clone();
+        all.extend(absent.iter().map(String::as_str));
+
+        let (status, events) = run_clear(handle, &all).await;
+        assert_eq!(status, 0, "got {:?}", batch_outcomes(&events));
+        let outcomes = clear_completes(&events);
+        assert_eq!(outcomes.len(), 128, "every entry must report");
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|(_, removed, _)| *removed == 1)
+                .count(),
+            64,
+            "exactly the seeded keys report a removal"
+        );
+        assert!(
+            outcomes
+                .iter()
+                .all(|(_, _, code)| *code == LoreErrorCode::None),
+            "an absent key is a no-op success, not a failure"
+        );
+        assert!(
+            keys_present(handle, &present_refs).await.is_empty(),
+            "every seeded key must be gone"
+        );
+    }
+
+    /// A closed handle is the call's failure, not any entry's.
+    #[tokio::test]
+    async fn clear_on_a_closed_handle_reports_only_the_batch_terminal() {
+        let handle = load_handle(Partition::from([0xE3u8; 16])).await;
+        close_handle(handle).await;
+
+        let (status, events) = run_clear(handle, &["a"]).await;
+        assert_ne!(status, 0, "a closed handle must fail the call");
+        assert!(clear_completes(&events).is_empty(), "got {events:?}");
+        assert_eq!(
+            batch_outcomes(&events),
+            vec![(CALL_ID, LoreErrorCode::InvalidArguments)]
         );
     }
 }

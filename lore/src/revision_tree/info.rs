@@ -125,7 +125,7 @@ async fn info_impl(
                 .map(LoreString::from)
                 .unwrap_or_default();
             let mut metadata_key_count = 0u32;
-            let _ = metadata.walk(|_, _, _| metadata_key_count += 1);
+            metadata.walk(|_, _, _| metadata_key_count += 1);
 
             LoreEvent::RevisionTreeInfo(LoreRevisionTreeInfoEventData {
                 id,

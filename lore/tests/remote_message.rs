@@ -194,3 +194,96 @@ async fn revision_tree_modify_batch_survives_the_wire() {
         }
     }
 }
+
+/// A metadata read delivers its value to the caller as an event, and an
+/// out-of-process caller only ever sees the serialized form. Binary values are
+/// the ones with no textual representation to fall back on, so they are the
+/// case worth pinning.
+///
+/// Only JSON is exercised: `LoreEvent` is adjacently tagged, which bitcode
+/// cannot deserialize, so no event of any kind survives a `Bincode`
+/// connection today. That gap is independent of the payload type.
+#[tokio::test]
+async fn a_metadata_event_carries_a_binary_value_to_a_client() {
+    use lore::remote::message::MessageToClient;
+    use lore_revision::event::LoreEvent;
+    use lore_revision::event::LoreMetadataEventData;
+    use lore_revision::interface::LoreBinary;
+    use lore_revision::interface::LoreMetadata;
+
+    let value = LoreMetadata::Binary(LoreBinary::from_bytes(b"raw\x00bytes"));
+    let event = LoreEvent::Metadata(LoreMetadataEventData {
+        key: LoreString::from_str("thumbnail"),
+        value: value.clone(),
+    });
+
+    let bytes = write_v1_message(MessageToClient::Event(event), SerializationType::Json).unwrap();
+    let read: Result<Option<(V1Header, MessageToClient)>, MessageError> =
+        blocking_read_v1_message(&mut bytes.as_slice());
+    let read = read
+        .unwrap_or_else(|error| panic!("a metadata event must read back: {error:?}"))
+        .expect("a whole message must be present");
+
+    match read.1 {
+        MessageToClient::Event(LoreEvent::Metadata(data)) => {
+            assert_eq!(data.key.as_str(), "thumbnail");
+            assert_eq!(
+                data.value, value,
+                "the binary payload must survive the wire"
+            );
+        }
+        _ => panic!("expected a metadata event"),
+    }
+}
+
+/// The set verb carries a typed value rather than text, so the value union has
+/// to cross the wire in both serializations — a command that only survives one
+/// of them is unusable on the other transport.
+#[tokio::test]
+async fn revision_tree_metadata_set_batch_survives_the_wire() {
+    use lore::revision_tree::metadata_set::LoreRevisionTreeMetadataSetArgs;
+    use lore::revision_tree::metadata_set::LoreRevisionTreeMetadataSetEntry;
+    use lore_revision::interface::LoreBinary;
+    use lore_revision::interface::LoreMetadata;
+
+    let entries = LoreArray::from_vec(vec![
+        LoreRevisionTreeMetadataSetEntry {
+            entry_id: 1,
+            key: LoreString::from_str("blob"),
+            value: LoreMetadata::Binary(LoreBinary::from_bytes(&[0x00, 0xff, 0x01])),
+        },
+        LoreRevisionTreeMetadataSetEntry {
+            entry_id: 2,
+            key: LoreString::from_str("count"),
+            value: LoreMetadata::Numeric(4207),
+        },
+    ]);
+    let args = LoreRevisionTreeMetadataSetArgs {
+        batch_id: 900,
+        handle: LoreRevisionTree { handle_id: 5 },
+        entries: entries.clone(),
+    };
+
+    for (serialization, label) in [
+        (SerializationType::Json, "json"),
+        (SerializationType::Bincode, "bincode"),
+    ] {
+        let message = MessageToServer {
+            globals: LoreGlobalArgs::default(),
+            command: LoreCommand::RevisionTreeMetadataSet(args.clone()),
+        };
+        let message_bytes = write_v1_message(message, serialization).unwrap();
+        let processed: Result<Option<(V1Header, MessageToServer)>, MessageError> =
+            blocking_read_v1_message(&mut message_bytes.as_slice());
+        let processed = processed
+            .unwrap_or_else(|error| panic!("{label} must read back: {error:?}"))
+            .expect("a whole message must be present");
+
+        match processed.1.command {
+            LoreCommand::RevisionTreeMetadataSet(read_back) => {
+                assert_eq!(read_back.entries.as_slice(), entries.as_slice(), "{label}");
+            }
+            _ => panic!("Unexpected command"),
+        }
+    }
+}
