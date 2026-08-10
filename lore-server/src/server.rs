@@ -96,6 +96,7 @@ use crate::quic::stream_handler::StreamHandler;
 use crate::server_config::ServerConfig;
 use crate::settings::CompositeStoreSettings;
 use crate::settings::CompositeSubStoreSettings;
+use crate::settings::GrpcSettings;
 use crate::settings::LocalImmutableStoreSettings;
 use crate::settings::LocalMutableStoreSettings;
 use crate::settings::NotificationSettings;
@@ -637,22 +638,27 @@ async fn launch_http_server(
     .await
 }
 
+/// Start a minimal gRPC server in maintenance mode on the address described by
+/// `grpc_settings`.
+///
+/// The server registers only the environment service, which returns
+/// `UNAVAILABLE` to signal that the node is intentionally in a reduced state.
+/// No storage, replication, or admin services are exposed.
+///
+/// Infrastructure health checks (load-balancers, service meshes, deployment controllers) may
+/// probe the internal port to determine whether the node is ready to receive
+/// peer traffic.  Binding the maintenance server on every exposed port ensures those
+/// checks can reach it and observe `UNAVAILABLE`, rather than hitting a refused
+/// connection that a probe might misinterpret as a hard failure.
 async fn launch_maintenance_grpc_server(
-    settings: Settings,
+    grpc_settings: GrpcSettings,
+    environment: EnvironmentConfig,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
-    let grpc_settings = settings
-        .server
-        .grpc
-        .clone()
-        .ok_or(anyhow!("Missing gRPC settings"))?;
-
     let addr =
         SocketAddr::from_str(format!("{}:{}", grpc_settings.host, grpc_settings.port).as_str())?;
 
     info!("Starting Lore maintenance gRPC Server: {}", &addr);
-
-    let environment = settings.environment.clone().unwrap_or_default();
 
     let (cert_path, key_path, cert_chain_path) =
         if let Some(cert_settings) = grpc_settings.certificate {
@@ -1892,11 +1898,27 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
             });
         }
     } else {
+        let grpc_settings = settings
+            .server
+            .grpc
+            .clone()
+            .ok_or(anyhow!("Missing gRPC settings"))?;
+        let environment = settings.environment.clone().unwrap_or_default();
+
         lore_spawn!(endpoints, {
-            let settings = settings.clone();
             let shutdown_rx = _shutdown_rx.clone();
-            launch_maintenance_grpc_server(settings, shutdown_rx)
+            launch_maintenance_grpc_server(grpc_settings, environment.clone(), shutdown_rx)
         });
+
+        if let Some(grpc_internal) = &settings.server.grpc_internal
+            && grpc_internal.enabled
+        {
+            lore_spawn!(endpoints, {
+                let grpc_settings = grpc_internal.clone();
+                let shutdown_rx = _shutdown_rx.clone();
+                launch_maintenance_grpc_server(grpc_settings, environment, shutdown_rx)
+            });
+        }
     }
 
     // the public facing QUIC server. Authentication is via JWT, so the
@@ -1961,7 +1983,8 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     // blanket storage access with no JWT layer — so the startup-time
     // validator demands mTLS unless verify_client_certs is explicitly
     // disabled.
-    if let Some(quic_internal_settings) = settings.server.quic_internal.as_ref()
+    if !is_maintenance
+        && let Some(quic_internal_settings) = settings.server.quic_internal.as_ref()
         && quic_internal_settings.enabled
     {
         let security = validate_endpoint_security(
