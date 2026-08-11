@@ -23,6 +23,7 @@ use lore_revision::event::revision_tree::LoreRevisionTreeModifyCompleteEventData
 use lore_revision::interface::LoreArray;
 use lore_revision::interface::LoreError;
 use lore_revision::node::INVALID_NODE;
+use lore_revision::node::NodeFlags;
 use lore_revision::node::NodeID;
 use lore_revision::node::ROOT_NODE;
 use lore_revision::repository::RepositoryContext;
@@ -145,6 +146,10 @@ struct Planned {
     mode: u16,
     size: u64,
     address: Address,
+    /// The staged and dirty change the rewrite records, decided while the plan
+    /// phase had the node in hand.
+    staged: NodeFlags,
+    dirty: NodeFlags,
 }
 
 /// Check every entry against the tree and against the rest of the batch,
@@ -181,6 +186,9 @@ async fn plan_entries(
         if node.is_discarded() {
             return Err(reject(entry_id, index, "node has been deleted"));
         }
+        if node.is_staged_delete() {
+            return Err(reject(entry_id, index, "node is staged for deletion"));
+        }
         // A slot the allocator never handed out reads back zeroed, which is a
         // perfectly ordinary directory. Every allocated node has a name, so a
         // zero length is what separates the two.
@@ -199,12 +207,15 @@ async fn plan_entries(
             ));
         }
 
+        let (staged, dirty) = State::staged_edit_flags(&node);
         planned.push(Planned {
             entry_id,
             node_id: entry.node_id,
             mode: entry.mode,
             size: entry.size,
             address: entry.address,
+            staged,
+            dirty,
         });
     }
 
@@ -241,7 +252,7 @@ async fn apply_plan(
         lore_spawn!(tasks, async move {
             let mut applied = 0;
             for item in &planned[start..end] {
-                match state
+                let rewritten = state
                     .node_modify(
                         context.clone(),
                         item.node_id,
@@ -249,8 +260,21 @@ async fn apply_plan(
                         item.size,
                         item.address,
                     )
-                    .await
-                {
+                    .await;
+                let outcome = match rewritten {
+                    Ok(()) => {
+                        state
+                            .node_mark_staged(
+                                context.clone(),
+                                item.node_id,
+                                item.staged,
+                                item.dirty,
+                            )
+                            .await
+                    }
+                    Err(error) => Err(error),
+                };
+                match outcome {
                     Ok(()) => {
                         emit_modify_complete(item.entry_id, item.node_id, LoreErrorCode::None);
                         applied += 1;

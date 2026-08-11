@@ -2172,6 +2172,167 @@ impl State {
         Ok(())
     }
 
+    /// Record a staged change on a node and the matching dirty change, marking
+    /// its ancestors on the way to the root.
+    ///
+    /// The pairing is the one the working-tree staging path applies: the staged
+    /// action on the node, `Staged` on every ancestor, then the dirty action on
+    /// the node and `Dirty` on every ancestor. A staged change recorded without
+    /// its dirty counterpart leaves the two views of the tree disagreeing, so
+    /// they are set together here rather than at each call site.
+    pub async fn node_mark_staged(
+        &self,
+        repository: Arc<RepositoryContext>,
+        node_id: NodeID,
+        staged: NodeFlags,
+        dirty: NodeFlags,
+    ) -> Result<(), StateError> {
+        self.node_mark(repository.clone(), node_id, staged, true)
+            .await?;
+        self.node_mark_dirty(repository, node_id, dirty, true).await
+    }
+
+    /// The staged and dirty flags an edit to `node` should record.
+    ///
+    /// A node staged for addition stays staged for addition however it is edited
+    /// afterwards: it is in no revision yet, so there is nothing for a commit to
+    /// record a modification against.
+    pub fn staged_edit_flags(node: &Node) -> (NodeFlags, NodeFlags) {
+        if node.is_staged_add() {
+            (NodeFlags::StagedAdd, NodeFlags::DirtyAdd)
+        } else {
+            (NodeFlags::StagedModify, NodeFlags::DirtyModify)
+        }
+    }
+
+    /// Stage a single node for deletion, leaving it in the tree.
+    ///
+    /// Returns whether the node took the tag; `false` means it already carried
+    /// it and nothing was written. The node keeps its name, its parent and its
+    /// place in the sibling chain — only flags change — so the revision still
+    /// reads it and the commit that freezes the tree is what discards it. This
+    /// is the tagging half of a deletion; a node staged for addition has nothing
+    /// to delete in the revision it was loaded from and is discarded outright
+    /// through [`node_discard_patch`] instead.
+    ///
+    /// Recursion is the caller's: this stages the one node it is given, not the
+    /// subtree under it.
+    ///
+    /// # Concurrency
+    ///
+    /// Safe for distinct nodes to run concurrently. Each tag takes the target's
+    /// block write lock, and no parent or sibling pointer is written, so the
+    /// chain the CAS-prepend in [`Self::node_add`] does not protect is never
+    /// touched. The walk to the root that marks ancestors staged takes one block
+    /// write lock at a time and stops at the first ancestor already marked.
+    pub async fn node_delete(
+        &self,
+        repository: Arc<RepositoryContext>,
+        node_id: NodeID,
+    ) -> Result<bool, StateError> {
+        if !node_id.is_valid_or_root_node_id() {
+            return Err(StateError::from(InvalidArguments {
+                reason: "node id does not name a deletable node".into(),
+            }));
+        }
+        let block_index = NodeBlock::index(node_id);
+        let block = self.block(repository.clone(), block_index).await?;
+        {
+            let node = block.node(Node::index(node_id));
+            if node.is_discarded() {
+                return Err(StateError::from(InvalidArguments {
+                    reason: "cannot delete a discarded node".into(),
+                }));
+            }
+            if node.is_staged_delete() {
+                return Ok(false);
+            }
+        }
+
+        self.node_mark_staged(
+            repository,
+            node_id,
+            NodeFlags::StagedDelete,
+            NodeFlags::DirtyDelete,
+        )
+        .await?;
+        Ok(true)
+    }
+
+    /// Take a node staged for deletion back into the revision, rewriting the
+    /// content fields its kind carries.
+    ///
+    /// The node returns as a **modification**, not an addition: it exists in the
+    /// revision the handle was loaded from, so what is staged is a change to it.
+    /// A zero `address.context` preserves the existing file id, as
+    /// [`Self::node_modify`] does, since the node keeps the identity it already
+    /// had. Fields a kind does not carry are dropped rather than refused — a
+    /// directory stores no size and no address, a link no size.
+    ///
+    /// Only the node named is restored. Its children stay staged for deletion
+    /// until each is restored in turn.
+    pub async fn node_undelete(
+        &self,
+        repository: Arc<RepositoryContext>,
+        node_id: NodeID,
+        mode: u16,
+        size: u64,
+        address: Address,
+    ) -> Result<(), StateError> {
+        if !node_id.is_valid_node_id() {
+            return Err(StateError::from(InvalidArguments {
+                reason: "node id does not name a restorable node".into(),
+            }));
+        }
+        let block_index = NodeBlock::index(node_id);
+        let block = self.block(repository.clone(), block_index).await?;
+        let dirtied = {
+            let mut block_writer = block.write();
+            let node = block_writer.node(Node::index(node_id));
+            if node.is_discarded() {
+                return Err(StateError::from(InvalidArguments {
+                    reason: "cannot restore a discarded node".into(),
+                }));
+            }
+            if !node.is_staged_delete() {
+                return Err(StateError::from(InvalidArguments {
+                    reason: "node is not staged for deletion".into(),
+                }));
+            }
+            let file_id = node.address.context;
+            let is_file = node.is_file();
+            let is_link = node.is_link();
+            node.clear_staged_flags();
+            node.mode = mode;
+            if is_file {
+                node.size = size;
+                node.address = address;
+                if node.address.context.is_zero() {
+                    node.address.context = file_id;
+                }
+            } else if is_link {
+                node.size = 0;
+                node.address = address;
+            } else {
+                node.size = 0;
+                node.address = Address::default();
+            }
+            block_writer.mark_dirty()
+        };
+        if dirtied {
+            self.block_modified(block, block_index);
+            self.mark_dirty();
+        }
+
+        self.node_mark_staged(
+            repository,
+            node_id,
+            NodeFlags::StagedModify,
+            NodeFlags::DirtyModify,
+        )
+        .await
+    }
+
     pub async fn node_children(
         &self,
         repository: Arc<RepositoryContext>,

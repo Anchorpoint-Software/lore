@@ -15,7 +15,6 @@ use lore_base::types::Address;
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
 use lore_macro::ValidateText;
-use lore_revision::errors::StateErrors;
 use lore_revision::event::EventError;
 use lore_revision::event::LoreErrorCode;
 use lore_revision::event::LoreEvent;
@@ -144,12 +143,11 @@ fn batch_error_code(result: &Result<(), AddError>) -> LoreErrorCode {
     }
 }
 
-/// Zero the fields a kind does not carry, and assign a file id where one is due.
+/// Zero the fields a kind does not carry.
 ///
 /// A directory's size and address are derived when the revision is committed and
 /// a link has no content of its own, so a value supplied for either is dropped
-/// rather than stored. A file arriving without a file id is given a generated one
-/// so it has a stable identity before commit.
+/// rather than stored.
 fn fields_for_kind(flags: NodeFlags, size: u64, address: Address) -> (u64, Address) {
     if flags.is_directory() {
         return (0, Address::default());
@@ -157,11 +155,23 @@ fn fields_for_kind(flags: NodeFlags, size: u64, address: Address) -> (u64, Addre
     if flags.contains(NodeFlags::Link) {
         return (0, address);
     }
-    let mut address = address;
-    if address.context.is_zero() {
-        address.context = uuid::Uuid::now_v7().into();
-    }
     (size, address)
+}
+
+/// Give a file arriving without a file id a generated one, so it has a stable
+/// identity before commit.
+///
+/// Only for a node being created. A node being restored already has an identity,
+/// and generating one here would leave the restore unable to keep it — the zero
+/// context that means "preserve" would never reach [`State::node_undelete`].
+fn with_generated_file_id(flags: NodeFlags, address: Address) -> Address {
+    if flags.is_directory() || flags.contains(NodeFlags::Link) || !address.context.is_zero() {
+        return address;
+    }
+    Address {
+        context: uuid::Uuid::now_v7().into(),
+        ..address
+    }
 }
 
 /// Map a `LoreNodeType` `kind` to its node flags; `None` if unsupported.
@@ -193,6 +203,10 @@ struct Planned {
     entry_id: u64,
     entry_index: usize,
     parent: ParentRef,
+    /// An existing node staged for deletion that this entry takes back into the
+    /// revision instead of creating one. Set only when the name is held by a
+    /// deleted child of the same kind.
+    restore: Option<NodeID>,
     node: Node,
 }
 
@@ -230,28 +244,138 @@ fn reject_internal(
     AddError::internal_with_context(error, &format!("entry {entry_index}: {context}"))
 }
 
-/// Name hashes of every existing child of `parent`, collected in one walk of the
-/// sibling chain and sorted for lookup.
-///
-/// A sorted `Vec` rather than a set: the values are already hashes, so a hash set
-/// would run each of them through the hasher a second time, and would carry
-/// bucket overhead on a collection whose size is the parent's child count rather
-/// than anything the batch chose.
-async fn child_name_hashes(
+/// A child staged for deletion, which a matching name may restore rather than
+/// collide with.
+#[derive(Clone, Copy)]
+struct DeletedChild {
+    name_hash: u64,
+    node_id: NodeID,
+    /// The node's own type flags, so a restore only happens for the same kind.
+    kind: NodeFlags,
+}
+
+/// The existing children of one parent, split by whether they still belong to
+/// the revision.
+struct ChildNames {
+    /// Name hashes of the children a name would collide with, sorted for lookup.
+    ///
+    /// A sorted `Vec` rather than a set: the values are already hashes, so a hash
+    /// set would run each of them through the hasher a second time, and would
+    /// carry bucket overhead on a collection whose size is the parent's child
+    /// count rather than anything the batch chose.
+    live: Vec<u64>,
+    /// The children staged for deletion. A name matching one of these restores it
+    /// instead of creating a node, so this keeps the node id and the kind the
+    /// direct lookup would otherwise have to fetch again. Scanned rather than
+    /// searched: it is empty unless something in this parent has been deleted.
+    deleted: Vec<DeletedChild>,
+}
+
+/// What an existing parent already holds under a name.
+enum NameLookup {
+    /// Nothing holds the name.
+    Vacant,
+    /// A child that belongs to the revision holds it.
+    Live,
+    /// Only a child staged for deletion holds it, and it can be restored.
+    Deleted(DeletedChild),
+}
+
+impl ChildNames {
+    /// What this parent holds under `name_hash`, for a node of `kind`.
+    ///
+    /// A live child wins over a deleted one: the name is genuinely taken, and a
+    /// deleted namesake alongside it is the remains of an earlier replacement. A
+    /// deleted child of a different kind does not answer the name either — the
+    /// caller is replacing the node rather than restoring it.
+    fn lookup(&self, name_hash: u64, kind: NodeFlags) -> NameLookup {
+        if self.live.binary_search(&name_hash).is_ok() {
+            return NameLookup::Live;
+        }
+        match self
+            .deleted
+            .iter()
+            .find(|child| child.name_hash == name_hash && child.kind == kind)
+        {
+            Some(child) => NameLookup::Deleted(*child),
+            None => NameLookup::Vacant,
+        }
+    }
+}
+
+/// Every existing child of `parent`, collected in one walk of the sibling chain.
+async fn child_names(
     state: &Arc<State>,
     context: &Arc<RepositoryContext>,
     parent: NodeID,
     parent_node: &Node,
-) -> Result<Vec<u64>, StateError> {
+) -> Result<ChildNames, StateError> {
     let mut children =
         StateNodeChildrenIterator::from_parent(state.clone(), context.clone(), parent, parent_node)
             .await?;
-    let mut hashes = Vec::new();
-    while let Some((_, node)) = children.next().await? {
-        hashes.push(node.name_hash);
+    let mut live = Vec::new();
+    let mut deleted = Vec::new();
+    while let Some((node_id, node)) = children.next().await? {
+        if node.is_staged_delete() {
+            deleted.push(DeletedChild {
+                name_hash: node.name_hash,
+                node_id,
+                kind: node_kind_flags(&node),
+            });
+        } else {
+            live.push(node.name_hash);
+        }
     }
-    hashes.sort_unstable();
-    Ok(hashes)
+    live.sort_unstable();
+    Ok(ChildNames { live, deleted })
+}
+
+/// The type flags of an existing node, with everything else masked off, so two
+/// nodes' kinds compare without their staging state getting in the way.
+fn node_kind_flags(node: &Node) -> NodeFlags {
+    if node.is_file() {
+        NodeFlags::File
+    } else if node.is_link() {
+        NodeFlags::Link
+    } else {
+        NodeFlags::NoFlags
+    }
+}
+
+/// Walk one parent's chain looking for a single name, for the first entry to land
+/// under that parent — the case where snapshotting every child to check one name
+/// would be a loss.
+async fn find_name_in_parent(
+    state: &Arc<State>,
+    context: &Arc<RepositoryContext>,
+    parent: NodeID,
+    parent_node: &Node,
+    name_hash: u64,
+    kind: NodeFlags,
+) -> Result<NameLookup, StateError> {
+    let mut children =
+        StateNodeChildrenIterator::from_parent(state.clone(), context.clone(), parent, parent_node)
+            .await?;
+    let mut restorable = None;
+    while let Some((node_id, node)) = children.next().await? {
+        if node.name_hash != name_hash {
+            continue;
+        }
+        if !node.is_staged_delete() {
+            return Ok(NameLookup::Live);
+        }
+        if restorable.is_none() && node_kind_flags(&node) == kind {
+            restorable = Some(DeletedChild {
+                name_hash,
+                node_id,
+                kind,
+            });
+        }
+    }
+    Ok(match restorable {
+        Some(child) => NameLookup::Deleted(child),
+        None => NameLookup::Vacant,
+    })
 }
 
 /// How far a batch has got with the checks it runs once per existing parent.
@@ -271,8 +395,8 @@ struct ParentState {
     /// The parent as it read when it was checked, so neither a name lookup nor
     /// the snapshot walk has to fetch it again.
     node: Node,
-    /// Its child name hashes, sorted, collected once a second entry named it.
-    names: Option<Vec<u64>>,
+    /// Its children, collected once a second entry named it.
+    names: Option<ChildNames>,
 }
 
 /// Check that an existing node can take children, attributing any failure to
@@ -299,6 +423,13 @@ async fn check_existing_parent(
             entry_id,
             entry_index,
             "parent node has been deleted",
+        ));
+    }
+    if parent_node.is_staged_delete() {
+        return Err(reject(
+            entry_id,
+            entry_index,
+            "parent node is staged for deletion, so a child added under it would go with it",
         ));
     }
     if parent_node.is_link() {
@@ -398,13 +529,13 @@ async fn plan_entries(
                 }
                 ParentProgress::Checked => {
                     let node = existing[&parent_node_id].node;
-                    match child_name_hashes(state, context, parent_node_id, &node).await {
-                        Ok(hashes) => {
+                    match child_names(state, context, parent_node_id, &node).await {
+                        Ok(names) => {
                             existing.insert(
                                 parent_node_id,
                                 ParentState {
                                     node,
-                                    names: Some(hashes),
+                                    names: Some(names),
                                 },
                             );
                         }
@@ -431,46 +562,62 @@ async fn plan_entries(
                 "two entries add the same name under one parent",
             ));
         }
+        let mut restore = None;
         if let ParentRef::Existing(parent_node_id) = parent {
             let snapshot_hit = existing
                 .get(&parent_node_id)
                 .and_then(|parent| parent.names.as_ref())
-                .map(|hashes| hashes.binary_search(&name_hash).is_ok());
-            let occupied = if let Some(occupied) = snapshot_hit {
-                occupied
+                .map(|names| names.lookup(name_hash, flags));
+            let held = if let Some(held) = snapshot_hit {
+                held
             } else {
                 let parent_node = existing[&parent_node_id].node;
-                match state
-                    .find_subnode_of(context.clone(), parent_node_id, &parent_node, name_hash)
-                    .await
+                match find_name_in_parent(
+                    state,
+                    context,
+                    parent_node_id,
+                    &parent_node,
+                    name_hash,
+                    flags,
+                )
+                .await
                 {
-                    Ok(_) => true,
-                    Err(StateErrors::NodeNotFound(_)) => false,
+                    Ok(held) => held,
                     Err(error) => {
                         return Err(reject_internal(
                             entry_id,
                             index,
                             error,
-                            "State::find_subnode",
+                            "search a parent's children for the name",
                         ));
                     }
                 }
             };
-            if occupied {
-                return Err(reject(
-                    entry_id,
-                    index,
-                    "a child with this name already exists",
-                ));
+            match held {
+                NameLookup::Live => {
+                    return Err(reject(
+                        entry_id,
+                        index,
+                        "a child with this name already exists",
+                    ));
+                }
+                NameLookup::Deleted(child) => restore = Some(child.node_id),
+                NameLookup::Vacant => {}
             }
         }
 
         let (size, address) = fields_for_kind(flags, entry.size, entry.address);
+        let address = if restore.is_some() {
+            address
+        } else {
+            with_generated_file_id(flags, address)
+        };
 
         planned.push(Planned {
             entry_id,
             entry_index: index,
             parent,
+            restore,
             node: Node {
                 flags: flags.bits(),
                 mode: entry.mode,
@@ -573,10 +720,34 @@ async fn apply_wave(
                 for index in group {
                     let item = planned[index];
                     let name = entry_name(&args, item.entry_index);
-                    match state
-                        .node_add(context.clone(), parent, item.node, name)
-                        .await
-                    {
+                    let outcome = match item.restore {
+                        Some(node_id) => state
+                            .node_undelete(
+                                context.clone(),
+                                node_id,
+                                item.node.mode,
+                                item.node.size,
+                                item.node.address,
+                            )
+                            .await
+                            .map(|()| node_id),
+                        None => match state
+                            .node_add(context.clone(), parent, item.node, name)
+                            .await
+                        {
+                            Ok(node_id) => state
+                                .node_mark_staged(
+                                    context.clone(),
+                                    node_id,
+                                    NodeFlags::StagedAdd,
+                                    NodeFlags::DirtyAdd,
+                                )
+                                .await
+                                .map(|()| node_id),
+                            Err(error) => Err(error),
+                        },
+                    };
+                    match outcome {
                         Ok(node_id) => {
                             emit_add_complete(item.entry_id, node_id, LoreErrorCode::None);
                             landed.push((index, node_id));

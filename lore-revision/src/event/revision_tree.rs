@@ -68,6 +68,9 @@ pub struct LoreRevisionTreeChildEventData {
     pub parent_id: NodeID,
     /// The kind of node.
     pub kind: u32,
+    /// The change staged on the node, as a `LoreNodeStagedAction`. A child
+    /// staged for deletion is still listed, carrying the deletion here.
+    pub staged_action: u32,
     /// The file mode bits.
     pub mode: u16,
     /// The size of the node's content in bytes.
@@ -133,6 +136,9 @@ pub struct LoreRevisionTreeNodeInfoEventData {
     pub parent_id: NodeID,
     /// The kind of node.
     pub kind: u32,
+    /// The change staged on the node, as a `LoreNodeStagedAction`. A node
+    /// staged for deletion still reports, carrying the deletion here.
+    pub staged_action: u32,
     /// The file mode bits.
     pub mode: u16,
     /// The size of the node's content in bytes.
@@ -208,6 +214,9 @@ pub struct LoreRevisionTreeAddCompleteEventData {
 pub struct LoreRevisionTreeDeleteCompleteEventData {
     /// Correlation id of the entry this reports, not of the call.
     pub entry_id: u64,
+    /// How many nodes the entry's subtree removed, staged and discarded
+    /// together. Zero on failure, since nothing was removed.
+    pub node_count: u64,
     /// The outcome of the call.
     pub error_code: LoreErrorCode,
 }

@@ -1337,6 +1337,30 @@ pub enum LoreNodeType {
 /// cbindgen:prefix-with-name
 /// cbindgen:rename-all=ScreamingSnakeCase
 #[repr(C)]
+/// The change staged on a node for the next revision. `None` is a node the
+/// current revision holds unchanged; every other value is an edit that has not
+/// been committed yet.
+#[derive(Clone, Copy, PartialEq, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LoreNodeStagedAction {
+    /// No staged change.
+    #[default]
+    None = 0,
+    /// Staged for addition; the node is not in the revision it was loaded from.
+    Add = 1,
+    /// Staged with rewritten content fields.
+    Modify = 2,
+    /// Staged for removal; the node is dropped when the revision is committed.
+    Delete = 3,
+    /// Staged at a new path or under a new name.
+    Move = 4,
+    /// Staged as a copy of another node.
+    Copy = 5,
+}
+
+/// cbindgen:prefix-with-name
+/// cbindgen:rename-all=ScreamingSnakeCase
+#[repr(C)]
 /// The change applied to a file.
 #[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

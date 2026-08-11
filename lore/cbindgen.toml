@@ -66,9 +66,13 @@ exclude = []
 # args struct definitions land in the header before their extern "C" entry
 # points reference them. `LoreBytes` and `LoreErrorCode` are reachable via
 # the `lore_*_event_data_t` variants and do not need to be listed.
+# `LoreNodeStagedAction` names the values of the `staged_action` field on the
+# child and node-info records; the field is a `uint32_t` there, as `kind` is, so
+# nothing declares the enum type and cbindgen cannot reach it on its own.
 include = [
     "LoreStore",
     "LoreRevisionTree",
+    "LoreNodeStagedAction",
     "LoreRevisionTreeLoadArgs",
     "LoreRevisionTreeCloseArgs",
     "LoreRevisionTreeResolvePathArgs",
@@ -505,6 +509,8 @@ include = [
 "LoreRevisionTreeDeleteArgs" = "lore_revision_tree_delete_args_t"
 "LoreRevisionTreeModifyArgs" = "lore_revision_tree_modify_args_t"
 "LoreRevisionTreeModifyEntry" = "lore_revision_tree_modify_entry_t"
+"LoreArray_lore_revision_tree_delete_entry" = "lore_revision_tree_delete_entry_array_t"
+"LoreRevisionTreeDeleteEntry" = "lore_revision_tree_delete_entry_t"
 "LoreArray_lore_revision_tree_modify_entry" = "lore_revision_tree_modify_entry_array_t"
 "LoreRevisionTreeMoveArgs" = "lore_revision_tree_move_args_t"
 "LoreRevisionTreeMetadataSetArgs" = "lore_revision_tree_metadata_set_args_t"
@@ -527,6 +533,7 @@ include = [
 "LoreArray_lore_metadata_type" = "lore_metadata_type_array_t"
 "LoreArray_lore_string" = "lore_string_array_t"
 "LoreArray_lore_trace_location" = "lore_trace_location_array_t"
+"LoreNodeStagedAction" = "lore_node_staged_action_t"
 "LoreNodeType" = "lore_node_type_t"
 "LoreNotificationBranchCreatedEventData" = "lore_notification_branch_created_event_data_t"
 "LoreNotificationBranchDeletedEventData" = "lore_notification_branch_deleted_event_data_t"

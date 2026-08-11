@@ -169,6 +169,24 @@ typedef enum lore_key_type_t {
   LORE_KEY_TYPE_INSTANCE = 6,
 } lore_key_type_t;
 
+// The change staged on a node for the next revision. `None` is a node the
+// current revision holds unchanged; every other value is an edit that has not
+// been committed yet.
+typedef enum lore_node_staged_action_t {
+  // No staged change.
+  LORE_NODE_STAGED_ACTION_NONE = 0,
+  // Staged for addition; the node is not in the revision it was loaded from.
+  LORE_NODE_STAGED_ACTION_ADD = 1,
+  // Staged with rewritten content fields.
+  LORE_NODE_STAGED_ACTION_MODIFY = 2,
+  // Staged for removal; the node is dropped when the revision is committed.
+  LORE_NODE_STAGED_ACTION_DELETE = 3,
+  // Staged at a new path or under a new name.
+  LORE_NODE_STAGED_ACTION_MOVE = 4,
+  // Staged as a copy of another node.
+  LORE_NODE_STAGED_ACTION_COPY = 5,
+} lore_node_staged_action_t;
+
 // Data for a generic progress event.
 typedef struct lore_progress_event_data_t {
   // Placeholder field; carries no meaningful value.
@@ -2566,6 +2584,9 @@ typedef struct lore_revision_tree_child_event_data_t {
   lore_node_id_t parent_id;
   // The kind of node.
   uint32_t kind;
+  // The change staged on the node, as a `LoreNodeStagedAction`. A child
+  // staged for deletion is still listed, carrying the deletion here.
+  uint32_t staged_action;
   // The file mode bits.
   uint16_t mode;
   // The size of the node's content in bytes.
@@ -2599,6 +2620,9 @@ typedef struct lore_revision_tree_node_info_event_data_t {
   lore_node_id_t parent_id;
   // The kind of node.
   uint32_t kind;
+  // The change staged on the node, as a `LoreNodeStagedAction`. A node
+  // staged for deletion still reports, carrying the deletion here.
+  uint32_t staged_action;
   // The file mode bits.
   uint16_t mode;
   // The size of the node's content in bytes.
@@ -2647,6 +2671,9 @@ typedef struct lore_revision_tree_add_complete_event_data_t {
 typedef struct lore_revision_tree_delete_complete_event_data_t {
   // Correlation id of the entry this reports, not of the call.
   uint64_t entry_id;
+  // How many nodes the entry's subtree removed, staged and discarded
+  // together. Zero on failure, since nothing was removed.
+  uint64_t node_count;
   // The outcome of the call.
   enum lore_error_code_t error_code;
 } lore_revision_tree_delete_complete_event_data_t;
@@ -5199,6 +5226,33 @@ typedef struct lore_revision_tree_add_args_t {
   struct lore_revision_tree_add_entry_array_t entries;
 } lore_revision_tree_add_args_t;
 
+// One subtree to remove. The node must already exist and must not be the root.
+typedef struct lore_revision_tree_delete_entry_t {
+  // Caller-chosen id echoed back as `entry_id` on this entry's `DELETE_COMPLETE`
+  uint64_t entry_id;
+  // Root of the subtree to remove, including its transitive children
+  lore_node_id_t node_id;
+} lore_revision_tree_delete_entry_t;
+
+// A contiguous array of elements described by a pointer and a count.
+// Holds zero or more values of the element type laid out one after another.
+typedef struct lore_revision_tree_delete_entry_array_t {
+  // Pointer to the first element.
+  const struct lore_revision_tree_delete_entry_t *ptr;
+  // Number of elements in the array.
+  uintptr_t count;
+} lore_revision_tree_delete_entry_array_t;
+
+// Arguments for `lore_revision_tree_delete`.
+typedef struct lore_revision_tree_delete_args_t {
+  // Caller-chosen id echoed back as `batch_id` on `BATCH_COMPLETE`
+  uint64_t batch_id;
+  // Loaded revision-tree handle to mutate
+  struct lore_revision_tree_t handle;
+  // Subtrees to remove; each emits its own `DELETE_COMPLETE`
+  struct lore_revision_tree_delete_entry_array_t entries;
+} lore_revision_tree_delete_args_t;
+
 // One node to rewrite. The node must already exist and be a file.
 typedef struct lore_revision_tree_modify_entry_t {
   // Caller-chosen id echoed back as `entry_id` on this entry's `MODIFY_COMPLETE`
@@ -5318,16 +5372,6 @@ typedef struct lore_revision_tree_metadata_clear_args_t {
   // Keys to remove; each emits its own `METADATA_CLEAR_COMPLETE`
   struct lore_revision_tree_metadata_clear_entry_array_t entries;
 } lore_revision_tree_metadata_clear_args_t;
-
-// Arguments for `lore_revision_tree_delete`.
-typedef struct lore_revision_tree_delete_args_t {
-  // Per-call correlation id echoed back in events
-  uint64_t id;
-  // Loaded revision-tree handle to mutate
-  struct lore_revision_tree_t handle;
-  // Subtree root to mark deleted, including its transitive children
-  lore_node_id_t node_id;
-} lore_revision_tree_delete_args_t;
 
 // Arguments for `lore_revision_tree_move`.
 typedef struct lore_revision_tree_move_args_t {
@@ -11021,6 +11065,51 @@ int32_t lore_revision_tree_add(const struct lore_global_args_t *globals,
 void lore_revision_tree_add_async(const struct lore_global_args_t *globals,
                                   const struct lore_revision_tree_add_args_t *args,
                                   struct lore_event_callback_config_t callback);
+
+// Remove a batch of subtrees from a loaded revision tree. Each entry names a
+// subtree root and removes it whole, transitive children included. Every entry
+// is checked before any node is touched, so one bad entry rejects the call and
+// leaves every subtree in place; the reason names the offending entry's batch
+// index, which a caller leaving `entry_id` at zero has no other way to
+// identify. A failure after those checks pass is internal and may leave part of
+// the batch removed.
+//
+// A node the loaded revision holds is **staged** for deletion and stays in the
+// tree: it keeps its name and its place among its siblings, still lists through
+// `lore_revision_tree_list_children`, and reports
+// `LORE_NODE_STAGED_ACTION_DELETE` in its `staged_action`. The commit that
+// freezes the tree is what drops it. A node added through this handle is in no
+// revision yet, so it is discarded outright instead, freeing its name and its
+// node id. A link is removed as one node — its subtree belongs to the linked
+// repository's tree.
+//
+// A staged deletion is reversible: `lore_revision_tree_add` of the same name
+// under the same parent with the same kind restores the node. A zero
+// `address.context` on that add preserves the node's `file_id`; supplying one
+// replaces it, as on `lore_revision_tree_modify`. Only the named node comes back
+// — restoring a directory leaves its children staged for deletion, so each has to
+// be added back in turn. A discarded node is not restorable, since its id is
+// gone.
+//
+// Staging fans out one depth level at a time; discarding an added node rewrites
+// sibling pointers and so runs serially, deepest first. Memory while the call
+// runs is proportional to the widest level of the subtrees being removed rather
+// than to the entry count, since a level is collected before it is staged. The
+// root cannot be deleted, and an entry whose ancestor another entry deletes is
+// rejected rather than removed twice.
+//
+// | Terminal event                              | Payload                                           | Notes                                                    |
+// |---------------------------------------------|---------------------------------------------------|----------------------------------------------------------|
+// | `LORE_EVENT_REVISION_TREE_DELETE_COMPLETE`  | `lore_revision_tree_delete_complete_event_data_t` | One per entry, carrying its `entry_id` and `node_count`   |
+// | `LORE_EVENT_REVISION_TREE_BATCH_COMPLETE`   | `lore_revision_tree_batch_complete_event_data_t`  | Exactly one, carrying the `batch_id` and the call's outcome |
+int32_t lore_revision_tree_delete(const struct lore_global_args_t *globals,
+                                  const struct lore_revision_tree_delete_args_t *args,
+                                  struct lore_event_callback_config_t callback);
+
+// Remove a batch of subtrees from a loaded revision tree (async variant).
+void lore_revision_tree_delete_async(const struct lore_global_args_t *globals,
+                                     const struct lore_revision_tree_delete_args_t *args,
+                                     struct lore_event_callback_config_t callback);
 
 // Rewrite a batch of file nodes' `mode`, `size` and `address` in a loaded
 // revision tree. Every entry is checked before any node is rewritten, so one bad

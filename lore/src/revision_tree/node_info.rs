@@ -179,6 +179,7 @@ async fn node_info_impl(
                 name: LoreString::from(name.as_str()),
                 parent_id: node.parent,
                 kind,
+                staged_action: node.staged_action() as u32,
                 mode: node.mode,
                 size: node.size,
                 address: node.address,

@@ -7514,6 +7514,73 @@ pub extern "C" fn lore_revision_tree_add_async(
     run_asynchronously(globals, args, callback, crate::revision_tree::add::add);
 }
 
+pub type LoreRevisionTreeDeleteArgs = crate::revision_tree::delete::LoreRevisionTreeDeleteArgs;
+
+/// Remove a batch of subtrees from a loaded revision tree. Each entry names a
+/// subtree root and removes it whole, transitive children included. Every entry
+/// is checked before any node is touched, so one bad entry rejects the call and
+/// leaves every subtree in place; the reason names the offending entry's batch
+/// index, which a caller leaving `entry_id` at zero has no other way to
+/// identify. A failure after those checks pass is internal and may leave part of
+/// the batch removed.
+///
+/// A node the loaded revision holds is **staged** for deletion and stays in the
+/// tree: it keeps its name and its place among its siblings, still lists through
+/// `lore_revision_tree_list_children`, and reports
+/// `LORE_NODE_STAGED_ACTION_DELETE` in its `staged_action`. The commit that
+/// freezes the tree is what drops it. A node added through this handle is in no
+/// revision yet, so it is discarded outright instead, freeing its name and its
+/// node id. A link is removed as one node — its subtree belongs to the linked
+/// repository's tree.
+///
+/// A staged deletion is reversible: `lore_revision_tree_add` of the same name
+/// under the same parent with the same kind restores the node. A zero
+/// `address.context` on that add preserves the node's `file_id`; supplying one
+/// replaces it, as on `lore_revision_tree_modify`. Only the named node comes back
+/// — restoring a directory leaves its children staged for deletion, so each has to
+/// be added back in turn. A discarded node is not restorable, since its id is
+/// gone.
+///
+/// Staging fans out one depth level at a time; discarding an added node rewrites
+/// sibling pointers and so runs serially, deepest first. Memory while the call
+/// runs is proportional to the widest level of the subtrees being removed rather
+/// than to the entry count, since a level is collected before it is staged. The
+/// root cannot be deleted, and an entry whose ancestor another entry deletes is
+/// rejected rather than removed twice.
+///
+/// | Terminal event                              | Payload                                           | Notes                                                    |
+/// |---------------------------------------------|---------------------------------------------------|----------------------------------------------------------|
+/// | `LORE_EVENT_REVISION_TREE_DELETE_COMPLETE`  | `lore_revision_tree_delete_complete_event_data_t` | One per entry, carrying its `entry_id` and `node_count`   |
+/// | `LORE_EVENT_REVISION_TREE_BATCH_COMPLETE`   | `lore_revision_tree_batch_complete_event_data_t`  | Exactly one, carrying the `batch_id` and the call's outcome |
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_tree_delete(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionTreeDeleteArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(
+        globals,
+        args,
+        callback,
+        crate::revision_tree::delete::delete,
+    )
+}
+
+/// Remove a batch of subtrees from a loaded revision tree (async variant).
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_tree_delete_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionTreeDeleteArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(
+        globals,
+        args,
+        callback,
+        crate::revision_tree::delete::delete,
+    );
+}
+
 pub type LoreRevisionTreeModifyArgs = crate::revision_tree::modify::LoreRevisionTreeModifyArgs;
 
 /// Rewrite a batch of file nodes' `mode`, `size` and `address` in a loaded

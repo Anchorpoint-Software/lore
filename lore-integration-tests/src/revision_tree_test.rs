@@ -51,6 +51,7 @@ mod support {
         Opened(u64),
         Loaded(u64),
         AddComplete(u64, NodeID, LoreErrorCode),
+        DeleteComplete(u64, u64, LoreErrorCode),
         ModifyComplete(u64, NodeID, LoreErrorCode),
         MetadataSetComplete(u64, LoreErrorCode),
         MetadataGetComplete(u64, String, LoreMetadata, LoreErrorCode),
@@ -71,6 +72,9 @@ mod support {
                 LoreEvent::RevisionTreeLoaded(data) => Captured::Loaded(data.handle_id),
                 LoreEvent::RevisionTreeAddComplete(data) => {
                     Captured::AddComplete(data.entry_id, data.node_id, data.error_code)
+                }
+                LoreEvent::RevisionTreeDeleteComplete(data) => {
+                    Captured::DeleteComplete(data.entry_id, data.node_count, data.error_code)
                 }
                 LoreEvent::RevisionTreeModifyComplete(data) => {
                     Captured::ModifyComplete(data.entry_id, data.node_id, data.error_code)
@@ -2117,5 +2121,375 @@ mod metadata_clear_tests {
             batch_outcomes(&events),
             vec![(CALL_ID, LoreErrorCode::InvalidArguments)]
         );
+    }
+}
+
+#[cfg(test)]
+mod delete_tests {
+    use lore::revision_tree::add::LoreRevisionTreeAddArgs;
+    use lore::revision_tree::add::LoreRevisionTreeAddEntry;
+    use lore::revision_tree::add::add;
+    use lore::revision_tree::delete::LoreRevisionTreeDeleteArgs;
+    use lore::revision_tree::delete::LoreRevisionTreeDeleteEntry;
+    use lore::revision_tree::delete::delete;
+    use lore::revision_tree::handle::LoreRevisionTree;
+    use lore_base::types::Address;
+    use lore_base::types::Partition;
+    use lore_revision::event::LoreErrorCode;
+    use lore_revision::interface::LoreArray;
+    use lore_revision::interface::LoreGlobalArgs;
+    use lore_revision::interface::LoreNodeType;
+    use lore_revision::interface::LoreString;
+    use lore_revision::node::BLOCK_NODE_COUNT;
+    use lore_revision::node::INVALID_NODE;
+    use lore_revision::node::NodeID;
+    use lore_revision::node::ROOT_NODE;
+
+    use super::support::*;
+
+    /// A handle can only reach nodes it added itself until `commit` exists, and
+    /// clearing the staging flags to fake a settled node needs
+    /// `RevisionTreeInternal`, which is `pub(crate)`. So these tests exercise the
+    /// discard half of the verb — the phase that rewrites sibling pointers over a
+    /// real store — and the staged half is covered by the unit tests in
+    /// `lore/src/revision_tree/delete.rs`.
+    fn add_entry(
+        entry_id: u64,
+        parent_node_id: NodeID,
+        name: &str,
+        kind: LoreNodeType,
+    ) -> LoreRevisionTreeAddEntry {
+        LoreRevisionTreeAddEntry {
+            entry_id,
+            parent_node_id,
+            parent_entry_index: 0,
+            name: LoreString::from_str(name),
+            kind: kind as u32,
+            mode: 0o644,
+            size: 0,
+            address: Address::default(),
+        }
+    }
+
+    fn nested_add_entry(
+        entry_id: u64,
+        parent_entry_index: u32,
+        name: &str,
+        kind: LoreNodeType,
+    ) -> LoreRevisionTreeAddEntry {
+        LoreRevisionTreeAddEntry {
+            parent_node_id: INVALID_NODE,
+            parent_entry_index,
+            ..add_entry(entry_id, ROOT_NODE, name, kind)
+        }
+    }
+
+    fn entry(entry_id: u64, node_id: NodeID) -> LoreRevisionTreeDeleteEntry {
+        LoreRevisionTreeDeleteEntry { entry_id, node_id }
+    }
+
+    async fn run_add(
+        handle: LoreRevisionTree,
+        entries: Vec<LoreRevisionTreeAddEntry>,
+    ) -> Vec<Captured> {
+        let (sink, callback) = make_sink();
+        let status = add(
+            LoreGlobalArgs::default(),
+            LoreRevisionTreeAddArgs {
+                batch_id: 1,
+                handle,
+                entries: LoreArray::from_vec(entries),
+            },
+            callback,
+        )
+        .await;
+        assert_eq!(status, 0, "seeding the tree must succeed");
+        sink.lock().unwrap().clone()
+    }
+
+    async fn run_delete(
+        handle: LoreRevisionTree,
+        entries: Vec<LoreRevisionTreeDeleteEntry>,
+    ) -> (i32, Vec<Captured>) {
+        let (sink, callback) = make_sink();
+        let status = delete(
+            LoreGlobalArgs::default(),
+            LoreRevisionTreeDeleteArgs {
+                batch_id: CALL_ID,
+                handle,
+                entries: LoreArray::from_vec(entries),
+            },
+            callback,
+        )
+        .await;
+        let events = sink.lock().unwrap().clone();
+        (status, events)
+    }
+
+    fn added_node(events: &[Captured], id: u64) -> NodeID {
+        events
+            .iter()
+            .find_map(|event| match event {
+                Captured::AddComplete(event_id, node_id, code) if *event_id == id => {
+                    assert_eq!(*code, LoreErrorCode::None, "entry {id} must succeed");
+                    Some(*node_id)
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("entry {id} must emit AddComplete, got {events:?}"))
+    }
+
+    /// Every per-entry terminal in emission order, so a test can pin which
+    /// entries reported and which stayed silent.
+    fn delete_completes(events: &[Captured]) -> Vec<(u64, u64, LoreErrorCode)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Captured::DeleteComplete(id, count, code) => Some((*id, *count, *code)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A subtree this handle added leaves the tree outright, and the nodes it held
+    /// stop being reachable through the listing.
+    #[tokio::test]
+    async fn delete_removes_an_added_subtree_over_a_real_store() {
+        let handle = load_handle(Partition::from([0x71u8; 16])).await;
+
+        let seeded = run_add(
+            handle,
+            vec![
+                add_entry(1, ROOT_NODE, "dir", LoreNodeType::Directory),
+                nested_add_entry(2, 0, "a.bin", LoreNodeType::File),
+                nested_add_entry(3, 0, "b.bin", LoreNodeType::File),
+                add_entry(4, ROOT_NODE, "kept.bin", LoreNodeType::File),
+            ],
+        )
+        .await;
+        let directory = added_node(&seeded, 1);
+        assert_eq!(
+            child_names(handle, ROOT_NODE).await,
+            vec!["dir".to_string(), "kept.bin".to_string()],
+            "the fixture must be in place before the deletion"
+        );
+
+        let (status, events) = run_delete(handle, vec![entry(10, directory)]).await;
+        assert_eq!(status, 0, "deleting an added subtree must succeed");
+        assert_eq!(
+            delete_completes(&events),
+            vec![(10, 3, LoreErrorCode::None)],
+            "the directory and both children must be counted"
+        );
+        assert_eq!(
+            batch_outcomes(&events),
+            vec![(CALL_ID, LoreErrorCode::None)],
+            "the batch terminal must fire exactly once"
+        );
+        assert_eq!(
+            child_names(handle, ROOT_NODE).await,
+            vec!["kept.bin".to_string()],
+            "only the untouched sibling may remain"
+        );
+        close_handle(handle).await;
+    }
+
+    /// Two disjoint subtrees in one call, each reporting its own count. The
+    /// discard phase rewrites sibling pointers serially, so this is where a
+    /// mis-ordered unlink would strand a node.
+    #[tokio::test]
+    async fn delete_removes_two_disjoint_subtrees_in_one_call() {
+        let handle = load_handle(Partition::from([0x72u8; 16])).await;
+
+        let seeded = run_add(
+            handle,
+            vec![
+                add_entry(1, ROOT_NODE, "left", LoreNodeType::Directory),
+                nested_add_entry(2, 0, "a.bin", LoreNodeType::File),
+                add_entry(3, ROOT_NODE, "right", LoreNodeType::Directory),
+                nested_add_entry(4, 2, "b.bin", LoreNodeType::File),
+                nested_add_entry(5, 2, "c.bin", LoreNodeType::File),
+                add_entry(6, ROOT_NODE, "kept.bin", LoreNodeType::File),
+            ],
+        )
+        .await;
+        let left = added_node(&seeded, 1);
+        let right = added_node(&seeded, 3);
+
+        let (status, events) = run_delete(handle, vec![entry(10, left), entry(11, right)]).await;
+        assert_eq!(status, 0, "deleting two subtrees must succeed");
+        let mut reported = delete_completes(&events);
+        reported.sort_by_key(|(id, _, _)| *id);
+        assert_eq!(
+            reported,
+            vec![(10, 2, LoreErrorCode::None), (11, 3, LoreErrorCode::None),],
+            "each entry must report the size of its own subtree"
+        );
+        assert_eq!(
+            child_names(handle, ROOT_NODE).await,
+            vec!["kept.bin".to_string()],
+            "both subtrees must be gone and the sibling untouched"
+        );
+        close_handle(handle).await;
+    }
+
+    /// Deleting frees the name, so the same path can be rebuilt in the same
+    /// handle — the case a caller replacing a directory hits.
+    #[tokio::test]
+    async fn a_name_freed_by_delete_can_be_added_again() {
+        let handle = load_handle(Partition::from([0x73u8; 16])).await;
+
+        let seeded = run_add(
+            handle,
+            vec![add_entry(1, ROOT_NODE, "thing", LoreNodeType::Directory)],
+        )
+        .await;
+        let first = added_node(&seeded, 1);
+
+        let (status, _) = run_delete(handle, vec![entry(10, first)]).await;
+        assert_eq!(status, 0, "deleting must succeed");
+
+        let seeded = run_add(
+            handle,
+            vec![add_entry(2, ROOT_NODE, "thing", LoreNodeType::File)],
+        )
+        .await;
+        let second = added_node(&seeded, 2);
+        assert_eq!(
+            child_names(handle, ROOT_NODE).await,
+            vec!["thing".to_string()],
+            "the rebuilt node must be the only child"
+        );
+        assert_eq!(
+            node_info_of(handle, second).await.kind,
+            LoreNodeType::File as u32,
+            "the rebuilt node must carry its own kind, not the deleted node's"
+        );
+        close_handle(handle).await;
+    }
+
+    /// Validation covers the whole batch before anything is touched, and the
+    /// handle stays usable afterwards.
+    #[tokio::test]
+    async fn delete_rejects_the_batch_and_leaves_the_tree_intact() {
+        let handle = load_handle(Partition::from([0x74u8; 16])).await;
+
+        let seeded = run_add(
+            handle,
+            vec![
+                add_entry(1, ROOT_NODE, "dir", LoreNodeType::Directory),
+                nested_add_entry(2, 0, "a.bin", LoreNodeType::File),
+            ],
+        )
+        .await;
+        let directory = added_node(&seeded, 1);
+        let leaf = added_node(&seeded, 2);
+
+        for (entries, reason) in [
+            (vec![entry(10, ROOT_NODE)], "the root"),
+            (vec![entry(10, INVALID_NODE)], "an unknown node"),
+            (
+                vec![entry(10, directory), entry(11, directory)],
+                "a repeated node",
+            ),
+            (
+                vec![entry(10, directory), entry(11, leaf)],
+                "an entry under another entry",
+            ),
+        ] {
+            let (status, events) = run_delete(handle, entries).await;
+            assert_eq!(
+                status, REJECTED_STATUS,
+                "{reason} must reject the batch during validation"
+            );
+            assert_eq!(
+                batch_outcomes(&events),
+                vec![(CALL_ID, LoreErrorCode::InvalidArguments)],
+                "{reason} must report once on the batch terminal"
+            );
+            assert_eq!(
+                child_names(handle, ROOT_NODE).await,
+                vec!["dir".to_string()],
+                "{reason} must leave the tree as it was"
+            );
+        }
+
+        let (status, _) = run_delete(handle, vec![entry(12, directory)]).await;
+        assert_eq!(
+            status, 0,
+            "the handle must stay usable after a rejected batch"
+        );
+        close_handle(handle).await;
+    }
+
+    /// A block holds `BLOCK_NODE_COUNT` nodes and ids are handed out in sequence,
+    /// so a subtree has to exceed that count before the walk crosses a block
+    /// boundary and a level spreads over every task.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn delete_removes_more_nodes_than_one_block_holds() {
+        let handle = load_handle(Partition::from([0x75u8; 16])).await;
+
+        let children = 3 * BLOCK_NODE_COUNT;
+        let mut entries = vec![add_entry(1, ROOT_NODE, "dir", LoreNodeType::Directory)];
+        for index in 0..children {
+            entries.push(nested_add_entry(
+                index as u64 + 2,
+                0,
+                &format!("f{index}.bin"),
+                LoreNodeType::File,
+            ));
+        }
+        let seeded = run_add(handle, entries).await;
+        let directory = added_node(&seeded, 1);
+
+        let (status, events) = run_delete(handle, vec![entry(10, directory)]).await;
+        assert_eq!(status, 0, "deleting a multi-block subtree must succeed");
+        assert_eq!(
+            delete_completes(&events),
+            vec![(10, children as u64 + 1, LoreErrorCode::None)],
+            "every node across every block must be counted"
+        );
+        assert!(
+            child_names(handle, ROOT_NODE).await.is_empty(),
+            "the whole subtree must be gone"
+        );
+        close_handle(handle).await;
+    }
+
+    /// A caller must be able to treat the batch terminal as the end of the call,
+    /// which only holds if it fires after every entry and before `Complete`.
+    #[tokio::test]
+    async fn delete_reports_entries_then_the_batch_terminal_then_complete() {
+        let handle = load_handle(Partition::from([0x76u8; 16])).await;
+
+        let seeded = run_add(
+            handle,
+            vec![
+                add_entry(1, ROOT_NODE, "a.bin", LoreNodeType::File),
+                add_entry(2, ROOT_NODE, "b.bin", LoreNodeType::File),
+            ],
+        )
+        .await;
+        let first = added_node(&seeded, 1);
+        let second = added_node(&seeded, 2);
+
+        let (_, events) = run_delete(handle, vec![entry(10, first), entry(11, second)]).await;
+        let last_entry_at = events
+            .iter()
+            .rposition(|event| matches!(event, Captured::DeleteComplete(..)))
+            .expect("both entries must report");
+        let batch_at = events
+            .iter()
+            .position(|event| matches!(event, Captured::BatchComplete(..)))
+            .expect("the batch terminal must fire");
+        let complete_at = events
+            .iter()
+            .position(|event| matches!(event, Captured::Complete(..)))
+            .expect("Complete must fire");
+        assert!(
+            last_entry_at < batch_at && batch_at < complete_at,
+            "order must be entries, then the batch terminal, then Complete: {events:?}"
+        );
+        close_handle(handle).await;
     }
 }
