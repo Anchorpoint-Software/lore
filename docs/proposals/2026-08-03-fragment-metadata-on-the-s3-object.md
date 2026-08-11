@@ -461,7 +461,7 @@ re-put that sees `MatchFull` and does nothing.
    `error!` turn a silent miss into an alarmable one. *Implemented, on both reads that can observe
    it: `get` and `get_metadata`. Doing it on only one would have made detection depend on which call
    a client happened to make, and `get_metadata` is the cheaper one. The counter is
-   `store.immutable.missing_payload`.*
+   `urc.store.immutable.aws.missing_payload`.*
 
    This is also why a failed `DynamoDB` read must never be reported as not-found. Repair acts on
    that signal, so mapping a throttle to a miss would let overload be recorded as data loss and

@@ -33,9 +33,11 @@ use aws_smithy_runtime_api::client::result::SdkError;
 use aws_smithy_runtime_api::client::result::ServiceError;
 use bytes::Bytes;
 use lore_base::runtime::LORE_CONTEXT;
+use lore_base::types::Address;
 use lore_base::types::Fragment;
 use lore_base::types::FragmentFlags;
 use lore_base::types::Hash;
+use lore_base::types::Partition;
 use tokio::sync::oneshot;
 
 use crate::aws_error::AwsError;
@@ -44,6 +46,7 @@ use crate::s3::MockS3Impl;
 use crate::store::immutable_store::AwsImmutableStore;
 use crate::store::immutable_store::AwsImmutableStoreSettings;
 use crate::store::immutable_store::DynamoDbImmutableStoreSettings;
+use crate::store::immutable_store::FRAGMENTS_DYNAMO_SORT_KEY_ATTRIBUTE;
 use crate::store::immutable_store::FragmentState;
 use crate::store::immutable_store::FragmentStateEntry;
 use crate::store::immutable_store::FragmentsEntry;
@@ -255,18 +258,18 @@ impl Fake {
         receiver
     }
 
-    pub(crate) fn add_association(
-        &self,
-        repository: lore_base::types::Context,
-        address: lore_base::types::Address,
-    ) {
-        let entry = FragmentsEntry::new(repository, address);
+    pub(crate) fn has_association(&self, partition: Partition, address: Address) -> bool {
+        let entry = FragmentsEntry::new(partition, address);
+        self.lock()
+            .associations
+            .contains_key(&(entry.hash.data().to_vec(), entry.partition_context.to_vec()))
+    }
+
+    pub(crate) fn add_association(&self, partition: Partition, address: Address) {
+        let entry = FragmentsEntry::new(partition, address);
         let item: HashMap<String, AttributeValue> = serde_dynamo::to_item(&entry).unwrap();
         self.lock().associations.insert(
-            (
-                entry.hash.data().to_vec(),
-                entry.repository_context.to_vec(),
-            ),
+            (entry.hash.data().to_vec(), entry.partition_context.to_vec()),
             item,
         );
     }
@@ -284,12 +287,12 @@ pub(crate) fn wire(fake: &Fake) -> (MockS3Impl, MockDynamoDb) {
     let mut dynamodb = MockDynamoDb::default();
 
     let f = fake.clone();
-    s3.expect_put_object::<Vec<u8>>()
+    s3.expect_put_object()
         .returning(move |_, key, body, metadata| {
             let mut storage = f.lock();
             storage.objects.insert(
                 key.as_bytes().to_vec(),
-                (body, metadata.unwrap_or_default()),
+                (body.to_vec(), metadata.unwrap_or_default()),
             );
 
             if let Some((hash, state)) = storage.race_state.take() {
@@ -387,7 +390,10 @@ pub(crate) fn wire(fake: &Fake) -> (MockS3Impl, MockDynamoDb) {
         } else {
             storage
                 .associations
-                .get(&(blob(&item, "hash"), blob(&item, "repository_context")))
+                .get(&(
+                    blob(&item, "hash"),
+                    blob(&item, FRAGMENTS_DYNAMO_SORT_KEY_ATTRIBUTE),
+                ))
                 .cloned()
         };
 
@@ -397,16 +403,28 @@ pub(crate) fn wire(fake: &Fake) -> (MockS3Impl, MockDynamoDb) {
     let f = fake.clone();
     dynamodb
         .expect_batch_get_item()
-        .returning(move |_, keys, _| {
+        .returning(move |table, keys, _| {
             let storage = f.lock();
 
+            // Routed by table, like the single-item read above. Reading the state table - and
+            // the legacy metadata table behind it - in one request each is what lets resolution
+            // consult lifecycle state once per batch rather than once per address.
             Ok(keys
                 .iter()
                 .filter_map(|key| {
-                    storage
-                        .associations
-                        .get(&(blob(key, "hash"), blob(key, "repository_context")))
-                        .cloned()
+                    if &**table == FRAGMENT_STATE_TABLE_NAME {
+                        storage.state.get(&blob(key, "hash")).cloned()
+                    } else if &**table == FRAGMENT_METADATA_TABLE_NAME {
+                        storage.legacy_metadata.get(&blob(key, "hash")).cloned()
+                    } else {
+                        storage
+                            .associations
+                            .get(&(
+                                blob(key, "hash"),
+                                blob(key, FRAGMENTS_DYNAMO_SORT_KEY_ATTRIBUTE),
+                            ))
+                            .cloned()
+                    }
                 })
                 .collect())
         });
@@ -424,7 +442,10 @@ pub(crate) fn wire(fake: &Fake) -> (MockS3Impl, MockDynamoDb) {
             storage.state.insert(blob(&item, "hash"), item);
         } else {
             storage.associations.insert(
-                (blob(&item, "hash"), blob(&item, "repository_context")),
+                (
+                    blob(&item, "hash"),
+                    blob(&item, FRAGMENTS_DYNAMO_SORT_KEY_ATTRIBUTE),
+                ),
                 item,
             );
         }
@@ -492,9 +513,10 @@ pub(crate) fn wire(fake: &Fake) -> (MockS3Impl, MockDynamoDb) {
         if &**table == FRAGMENT_STATE_TABLE_NAME {
             storage.state.remove(&blob(&item, "hash"));
         } else {
-            storage
-                .associations
-                .remove(&(blob(&item, "hash"), blob(&item, "repository_context")));
+            storage.associations.remove(&(
+                blob(&item, "hash"),
+                blob(&item, FRAGMENTS_DYNAMO_SORT_KEY_ATTRIBUTE),
+            ));
             if let Some(deleted) = storage.association_deleted.take() {
                 let _ = deleted.send(());
             }
@@ -511,24 +533,16 @@ pub(crate) fn wire(fake: &Fake) -> (MockS3Impl, MockDynamoDb) {
         }
 
         let storage = f.lock();
-        let count = match query {
-            FragmentsQuery::Hash(hash) | FragmentsQuery::HashCount(hash) => storage
-                .associations
-                .keys()
-                .filter(|(stored, _)| stored == hash.data())
-                .count(),
-            FragmentsQuery::Repository(hash, repository) => storage
-                .associations
-                .keys()
-                .filter(|(stored, repository_context)| {
-                    stored == hash.data() && repository_context.starts_with(repository.data())
-                })
-                .count(),
-        };
+        let FragmentsQuery(hash) = query;
+        let matched = storage
+            .associations
+            .keys()
+            .any(|(stored, _)| stored == hash.data());
 
-        Ok(QueryOutput::builder()
-            .count(i32::try_from(count).unwrap())
-            .build())
+        // The query limits itself to one row, so the service could never report more than one no
+        // matter how many partitions hold the hash. Reporting the true total here would let a
+        // caller that needs an actual count pass against this fake and under-report against S3.
+        Ok(QueryOutput::builder().count(i32::from(matched)).build())
     });
 
     (s3, dynamodb)
@@ -555,7 +569,6 @@ pub(crate) async fn store_with(
         s3: S3StoreSettings::new(BUCKET.to_string()),
         dynamodb: dynamodb_settings,
         force_write,
-        batch_exist_submission_limit: 1000,
     };
 
     let execution = super::setup_execution("test".to_string());
@@ -598,7 +611,6 @@ pub(crate) async fn store_with_separate_metadata_table(fake: &Fake) -> Arc<AwsIm
         s3: S3StoreSettings::new(BUCKET.to_string()),
         dynamodb: dynamodb_settings,
         force_write: false,
-        batch_exist_submission_limit: 1000,
     };
 
     let execution = super::setup_execution("test".to_string());

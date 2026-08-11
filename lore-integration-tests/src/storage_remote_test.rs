@@ -87,9 +87,10 @@ mod storage_remote_tests {
         let backend_for_test = backend_immutable.clone();
         let backend_mutable_for_test: Arc<dyn lore_storage::MutableStore> = backend_mutable.clone();
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        // Bound here and handed over, so nothing can take the port between choosing it and
+        // serving on it.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr: SocketAddr = listener.local_addr().unwrap();
-        drop(listener);
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let signal = async {
@@ -100,10 +101,11 @@ mod storage_remote_tests {
             Arc::new(lore_server::notification::local::NotificationSender::default());
         let hook_dispatcher = Arc::new(HookDispatcher::empty());
 
+        let (stopped_tx, mut stopped_rx) = tokio::sync::oneshot::channel::<String>();
         // Background server task in a test; LORE_CONTEXT propagation is unnecessary here.
         #[allow(clippy::disallowed_methods)]
         tokio::spawn(async move {
-            GrpcServerBuilder::new()
+            let outcome = GrpcServerBuilder::new()
                 .with_environment(EnvironmentConfig::default())
                 .with_feature(FeatureSettings::default())
                 .with_immutable_store(backend_immutable.clone(), backend_immutable)
@@ -124,17 +126,28 @@ mod storage_remote_tests {
                 )
                 .with_jwt_verifier(None)
                 .unwrap()
-                .serve(addr, signal)
-                .await
-                .unwrap();
+                .serve_with_listener(listener, signal)
+                .await;
+            let _ = stopped_tx.send(match outcome {
+                Ok(()) => "stopped before the test finished".to_string(),
+                Err(error) => format!("failed: {error}"),
+            });
         });
 
+        // A server that never starts must say so, rather than leaving a client to wait on a socket
+        // nothing is answering.
+        let mut ready = false;
         for _ in 0..50 {
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            if let Ok(reason) = stopped_rx.try_recv() {
+                panic!("test server on {addr} {reason}");
+            }
             if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                ready = true;
                 break;
             }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        assert!(ready, "test server on {addr} never accepted a connection");
 
         TestServer {
             url: format!("grpc://127.0.0.1:{}", addr.port()),
@@ -256,6 +269,7 @@ mod storage_remote_tests {
         use lore_revision::event::LoreBytes;
         use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
+        use lore_storage::immutable_store::query_one;
         use lore_storage::store_types::StoreMatch;
 
         let execution = setup_execution("storage-remote-put".to_string());
@@ -310,14 +324,11 @@ mod storage_remote_tests {
                 assert_eq!(code, LoreErrorCode::None);
                 assert_ne!(address.hash, lore_base::types::Hash::default());
 
-                let server_match = server
-                    .backend_immutable
-                    .clone()
-                    .exist(partition, address, StoreMatch::MatchFull)
+                let server_match = query_one(&server.backend_immutable.clone(), partition, address)
                     .await
                     .expect("backend exist call");
                 assert_eq!(
-                    server_match,
+                    server_match.match_made,
                     StoreMatch::MatchFull,
                     "remote backend must hold the address after remote_write=1 put",
                 );
@@ -339,6 +350,7 @@ mod storage_remote_tests {
         use lore_revision::event::LoreBytes;
         use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
+        use lore_storage::immutable_store::query_one;
         use lore_storage::store_types::StoreMatch;
 
         let execution = setup_execution("storage-remote-put-localonly".to_string());
@@ -390,14 +402,11 @@ mod storage_remote_tests {
                 let (_, address, code) = events[0];
                 assert_eq!(code, LoreErrorCode::None);
 
-                let server_match = server
-                    .backend_immutable
-                    .clone()
-                    .exist(partition, address, StoreMatch::MatchFull)
+                let server_match = query_one(&server.backend_immutable.clone(), partition, address)
                     .await
                     .expect("backend exist call");
                 assert_eq!(
-                    server_match,
+                    server_match.match_made,
                     StoreMatch::MatchNone,
                     "remote backend must NOT hold the address when remote_write=0",
                 );
@@ -511,17 +520,12 @@ mod storage_remote_tests {
                         handle_id,
                     })
                     .expect("handle still registered");
-                let local_match = local
-                    .clone()
-                    .exist(
-                        partition,
-                        address,
-                        lore_storage::store_types::StoreMatch::MatchFull,
-                    )
-                    .await
-                    .expect("local exist call");
+                let local_match =
+                    lore_storage::immutable_store::query_one(&local.clone(), partition, address)
+                        .await
+                        .expect("local exist call");
                 assert_eq!(
-                    local_match,
+                    local_match.match_made,
                     lore_storage::store_types::StoreMatch::MatchNone,
                     "unflagged remote-fetched payload must NOT be cached locally",
                 );
@@ -549,6 +553,7 @@ mod storage_remote_tests {
         use lore_base::types::fragment_flags::FragmentFlags;
         use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
+        use lore_storage::immutable_store::query_one;
         use lore_storage::store_types::StoreMatch;
 
         let execution = setup_execution("storage-remote-cache-priority".to_string());
@@ -615,13 +620,11 @@ mod storage_remote_tests {
                         handle_id,
                     })
                     .expect("handle still registered");
-                let local_match = local
-                    .clone()
-                    .exist(partition, address, StoreMatch::MatchFull)
+                let local_match = query_one(&local.clone(), partition, address)
                     .await
                     .expect("local exist call");
                 assert_eq!(
-                    local_match,
+                    local_match.match_made,
                     StoreMatch::MatchFull,
                     "priority-flagged remote-fetched payload must be cached locally",
                 );
@@ -648,6 +651,7 @@ mod storage_remote_tests {
         use lore_base::types::Partition;
         use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
+        use lore_storage::immutable_store::query_one;
         use lore_storage::store_types::StoreMatch;
 
         let execution = setup_execution("storage-remote-get-localcache".to_string());
@@ -704,13 +708,11 @@ mod storage_remote_tests {
                         handle_id,
                     })
                     .expect("handle still registered");
-                let local_match = local
-                    .clone()
-                    .exist(partition, address, StoreMatch::MatchFull)
+                let local_match = query_one(&local.clone(), partition, address)
                     .await
                     .expect("local exist");
                 assert_eq!(
-                    local_match,
+                    local_match.match_made,
                     StoreMatch::MatchFull,
                     "local_cache=1 must populate the local store after remote fetch",
                 );
@@ -736,7 +738,6 @@ mod storage_remote_tests {
         use lore_revision::event::LoreBytes;
         use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
-        use lore_storage::store_types::StoreMatch;
 
         let execution = setup_execution("storage-remote-put-localcache".to_string());
         LORE_CONTEXT
@@ -794,8 +795,9 @@ mod storage_remote_tests {
                     .expect("handle still registered");
                 let (fragment, _bytes) = local
                     .clone()
-                    .get(partition, address, StoreMatch::MatchFull)
+                    .get(partition, address)
                     .await
+                    .and_then(lore_storage::StoreGetData::into_payload)
                     .expect("local fragment fetch");
                 assert!(
                     fragment.flags
@@ -970,6 +972,7 @@ mod storage_remote_tests {
     async fn copy_tier1_server_side_when_source_on_both() -> TestResult {
         use lore_base::types::Partition;
         use lore_revision::event::LoreErrorCode;
+        use lore_storage::immutable_store::query_one;
         use lore_storage::store_types::StoreMatch;
 
         let execution = setup_execution("storage-remote-copy-tier1".to_string());
@@ -999,14 +1002,12 @@ mod storage_remote_tests {
                 assert_eq!(events[0].2, LoreErrorCode::None);
                 assert_eq!(events[0].1, address);
 
-                let on_server = server
-                    .backend_immutable
-                    .clone()
-                    .exist(target_partition, address, StoreMatch::MatchFull)
-                    .await
-                    .unwrap();
+                let on_server =
+                    query_one(&server.backend_immutable.clone(), target_partition, address)
+                        .await
+                        .unwrap();
                 assert_eq!(
-                    on_server,
+                    on_server.match_made,
                     StoreMatch::MatchFull,
                     "server must hold target entry after server-side copy",
                 );
@@ -1021,6 +1022,7 @@ mod storage_remote_tests {
     async fn copy_tier2_upload_fallback_when_local_source_only() -> TestResult {
         use lore_base::types::Partition;
         use lore_revision::event::LoreErrorCode;
+        use lore_storage::immutable_store::query_one;
         use lore_storage::store_types::StoreMatch;
 
         let execution = setup_execution("storage-remote-copy-tier2".to_string());
@@ -1039,14 +1041,12 @@ mod storage_remote_tests {
                     put_local_via_handle(handle_id, source_partition, payload_bytes.as_slice())
                         .await;
 
-                let server_pre = server
-                    .backend_immutable
-                    .clone()
-                    .exist(source_partition, address, StoreMatch::MatchFull)
-                    .await
-                    .unwrap();
+                let server_pre =
+                    query_one(&server.backend_immutable.clone(), source_partition, address)
+                        .await
+                        .unwrap();
                 assert_eq!(
-                    server_pre,
+                    server_pre.match_made,
                     StoreMatch::MatchNone,
                     "precondition: server must NOT have source",
                 );
@@ -1059,14 +1059,12 @@ mod storage_remote_tests {
 
                 // After tier-2 fallback the server now holds the target tuple (uploaded into
                 // the destination's partition).
-                let on_server = server
-                    .backend_immutable
-                    .clone()
-                    .exist(target_partition, address, StoreMatch::MatchFull)
-                    .await
-                    .unwrap();
+                let on_server =
+                    query_one(&server.backend_immutable.clone(), target_partition, address)
+                        .await
+                        .unwrap();
                 assert_eq!(
-                    on_server,
+                    on_server.match_made,
                     StoreMatch::MatchFull,
                     "server must hold target after upload fallback",
                 );
@@ -1371,6 +1369,7 @@ mod storage_remote_tests {
     async fn upload_local_only_payload_pushes_to_remote_and_marks_durable() -> TestResult {
         use lore_base::types::Partition;
         use lore_revision::event::LoreErrorCode;
+        use lore_storage::immutable_store::query_one;
         use lore_storage::store_types::StoreMatch;
 
         let execution = setup_execution("storage-remote-upload".to_string());
@@ -1394,14 +1393,11 @@ mod storage_remote_tests {
                 assert_eq!(error_code, LoreErrorCode::None);
                 assert_eq!(already_durable, 0, "first upload was not yet durable");
 
-                let on_server = server
-                    .backend_immutable
-                    .clone()
-                    .exist(partition, address, StoreMatch::MatchFull)
+                let on_server = query_one(&server.backend_immutable.clone(), partition, address)
                     .await
                     .unwrap();
                 assert_eq!(
-                    on_server,
+                    on_server.match_made,
                     StoreMatch::MatchFull,
                     "server must hold the address after a successful upload",
                 );
@@ -1556,6 +1552,7 @@ mod storage_remote_tests {
     async fn copy_idempotent_when_target_already_present() -> TestResult {
         use lore_base::types::Partition;
         use lore_revision::event::LoreErrorCode;
+        use lore_storage::immutable_store::query_one;
         use lore_storage::store_types::StoreMatch;
 
         let execution = setup_execution("storage-remote-copy-idempotent".to_string());
@@ -1578,13 +1575,11 @@ mod storage_remote_tests {
                     copy_one_item(handle_id, source_partition, address, target_partition).await;
                 assert_eq!(status1, 0);
                 assert_eq!(events1[0].2, LoreErrorCode::None);
-                let target_after_first = server
-                    .backend_immutable
-                    .clone()
-                    .exist(target_partition, address, StoreMatch::MatchFull)
-                    .await
-                    .unwrap();
-                assert_eq!(target_after_first, StoreMatch::MatchFull);
+                let target_after_first =
+                    query_one(&server.backend_immutable.clone(), target_partition, address)
+                        .await
+                        .unwrap();
+                assert_eq!(target_after_first.match_made, StoreMatch::MatchFull);
 
                 // Second invocation with identical arguments: must return None and leave the
                 // target tuple in the same state.
@@ -1593,12 +1588,10 @@ mod storage_remote_tests {
                 assert_eq!(status2, 0);
                 assert_eq!(events2[0].2, LoreErrorCode::None);
                 assert_eq!(events2[0].1, address);
-                let target_after_second = server
-                    .backend_immutable
-                    .clone()
-                    .exist(target_partition, address, StoreMatch::MatchFull)
-                    .await
-                    .unwrap();
+                let target_after_second =
+                    query_one(&server.backend_immutable.clone(), target_partition, address)
+                        .await
+                        .unwrap();
                 assert_eq!(
                     target_after_second, target_after_first,
                     "second copy must produce no observable change",
@@ -1660,6 +1653,7 @@ mod storage_remote_tests {
         use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
         use lore_revision::interface::LoreString;
+        use lore_storage::immutable_store::query_one;
         use lore_storage::store_types::StoreMatch;
 
         let execution = setup_execution("storage-remote-put-file".to_string());
@@ -1717,14 +1711,11 @@ mod storage_remote_tests {
                 assert_eq!(code, LoreErrorCode::None);
                 assert_ne!(address.hash, lore_base::types::Hash::default());
 
-                let server_match = server
-                    .backend_immutable
-                    .clone()
-                    .exist(partition, address, StoreMatch::MatchFull)
+                let server_match = query_one(&server.backend_immutable.clone(), partition, address)
                     .await
                     .expect("backend exist call");
                 assert_eq!(
-                    server_match,
+                    server_match.match_made,
                     StoreMatch::MatchFull,
                     "remote backend must hold the address after put_file with remote_write=1",
                 );
@@ -1876,6 +1867,7 @@ mod storage_remote_tests {
         use lore_revision::event::LoreBytes;
         use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
+        use lore_storage::immutable_store::query_one;
         use lore_storage::store_types::StoreMatch;
 
         let execution = setup_execution("storage-remote-bound-offline".to_string());
@@ -1934,14 +1926,11 @@ mod storage_remote_tests {
                 let (_, address, code) = events[0];
                 assert_eq!(code, LoreErrorCode::None);
 
-                let server_match = server
-                    .backend_immutable
-                    .clone()
-                    .exist(partition, address, StoreMatch::MatchFull)
+                let server_match = query_one(&server.backend_immutable.clone(), partition, address)
                     .await
                     .expect("backend exist call");
                 assert_eq!(
-                    server_match,
+                    server_match.match_made,
                     StoreMatch::MatchNone,
                     "bound-offline handle must NOT push to the remote even with remote_write=1",
                 );
@@ -2380,6 +2369,7 @@ mod storage_remote_tests {
         use lore_base::types::Partition;
         use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
+        use lore_storage::immutable_store::query_one;
         use lore_storage::store_types::StoreMatch;
 
         let execution = setup_execution("storage-remote-bound-offline-copy".to_string());
@@ -2438,21 +2428,18 @@ mod storage_remote_tests {
 
                 // Server backend must NOT have received the copied address — proves remote
                 // server-side copy was suppressed.
-                let server_match = server
-                    .backend_immutable
-                    .clone()
-                    .exist(
-                        target_partition,
-                        lore_base::types::Address {
-                            hash: source_address.hash,
-                            context: target_context,
-                        },
-                        StoreMatch::MatchFull,
-                    )
-                    .await
-                    .expect("backend exist");
+                let server_match = query_one(
+                    &server.backend_immutable.clone(),
+                    target_partition,
+                    lore_base::types::Address {
+                        hash: source_address.hash,
+                        context: target_context,
+                    },
+                )
+                .await
+                .expect("backend exist");
                 assert_eq!(
-                    server_match,
+                    server_match.match_made,
                     StoreMatch::MatchNone,
                     "bound-offline copy must not reach the remote",
                 );
@@ -3286,12 +3273,30 @@ mod storage_remote_tests {
 
     #[async_trait::async_trait]
     impl lore_storage::ImmutableStore for SlowDownOnce {
+        // Answered from the wrapped store rather than the trait defaults: these describe how widely
+        // the store behind this one reads and reports, and the `query` contract is written against
+        // them. A decorator that let them default would misdescribe whatever it wraps.
+        fn is_local(&self) -> bool {
+            self.inner.is_local()
+        }
+
+        fn isolates_partitions(&self) -> bool {
+            self.inner.isolates_partitions()
+        }
+
+        fn read_scope(&self) -> lore_storage::StoreMatch {
+            self.inner.read_scope()
+        }
+
+        fn query_scope(&self) -> lore_storage::StoreMatch {
+            self.inner.query_scope()
+        }
+
         async fn get(
             self: Arc<Self>,
             partition: lore_base::types::Partition,
             address: lore_base::types::Address,
-            match_required: lore_storage::StoreMatch,
-        ) -> Result<(lore_base::types::Fragment, bytes::Bytes), lore_storage::StoreError> {
+        ) -> Result<lore_storage::StoreGetData, lore_storage::StoreError> {
             if address == self.target
                 && self
                     .remaining
@@ -3304,53 +3309,28 @@ mod storage_remote_tests {
             {
                 return Err(lore_storage::StoreError::from(lore_base::error::SlowDown));
             }
-            self.inner
-                .clone()
-                .get(partition, address, match_required)
-                .await
-        }
-
-        async fn exist(
-            self: Arc<Self>,
-            partition: lore_base::types::Partition,
-            address: lore_base::types::Address,
-            match_requested: lore_storage::StoreMatch,
-        ) -> Result<lore_storage::StoreMatch, lore_storage::StoreError> {
-            self.inner
-                .clone()
-                .exist(partition, address, match_requested)
-                .await
-        }
-
-        async fn exist_batch(
-            self: Arc<Self>,
-            partition: lore_base::types::Partition,
-            addresses: &[lore_base::types::Address],
-            match_requested: lore_storage::StoreMatch,
-        ) -> Result<Vec<lore_storage::StoreMatch>, lore_storage::StoreError> {
-            self.inner
-                .clone()
-                .exist_batch(partition, addresses, match_requested)
-                .await
+            self.inner.clone().get(partition, address).await
         }
 
         async fn query(
             self: Arc<Self>,
             partition: lore_base::types::Partition,
-            address: lore_base::types::Address,
-            match_requested: lore_storage::StoreMatch,
-        ) -> Result<lore_storage::StoreQueryResult, lore_storage::StoreError> {
+            addresses: &[lore_base::types::Address],
+            results: &mut [lore_storage::StoreMatchResult],
+        ) -> Result<(), lore_storage::StoreError> {
             self.inner
                 .clone()
-                .query(partition, address, match_requested)
+                .query(partition, addresses, results)
                 .await
         }
 
+        // Forwarded explicitly, as the trait requires: delegating `query` alone would leave the
+        // inner store's own override unused.
         async fn get_metadata(
             self: Arc<Self>,
             partition: lore_base::types::Partition,
             address: lore_base::types::Address,
-        ) -> Result<lore_storage::StoreQueryResult, lore_storage::StoreError> {
+        ) -> Result<lore_storage::StoreGetData, lore_storage::StoreError> {
             self.inner.clone().get_metadata(partition, address).await
         }
 
