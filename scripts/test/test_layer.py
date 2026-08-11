@@ -18,6 +18,10 @@ from lore_parsers import (
 
 logger = logging.getLogger(__name__)
 
+MAIN_FILE = "main_file.txt"
+LAYER_FILE = os.path.join("lay", "layer_file.txt")
+LAYER_STAGED_FILE = os.path.join("lay", "staged_new.txt")
+
 
 def _setup_repo_with_layer(new_lore_repo):
     """Create a main repo with a layer repo and initial content in both.
@@ -28,10 +32,10 @@ def _setup_repo_with_layer(new_lore_repo):
     repo: Lore = new_lore_repo()
     layer_repo: Lore = new_lore_repo(repo.name + "_layer")
 
-    repo.write_commit_push(None, {"main_file.txt": b"main content"})
+    repo.write_commit_push(None, {MAIN_FILE: b"main content"})
 
     layer_repo.make_dirs("lay")
-    layer_repo.write_commit_push(None, {"lay/layer_file.txt": b"layer content v1"})
+    layer_repo.write_commit_push(None, {LAYER_FILE: b"layer content v1"})
 
     repo.layer_add("lay", layer_repo, "lay/")
     return repo, layer_repo
@@ -1364,6 +1368,146 @@ def test_layer_remove_two_layers_non_overlapping(new_lore_repo):
     # The sec layer is untouched
     assert os.path.isfile(
         os.path.join(repo.path, "sec", "second", "second_repo.txt")
+    )
+
+
+def _setup_layer_behind(new_lore_repo, advance_layer: bool):
+    """Set up a repo whose working copy is behind the parent's branch latest, so
+    a plain `lore sync` moves it forward.
+
+    A layer-only commit creates no parent revision, so a second working copy
+    pushes one. The layer has no metadata link, meaning it always targets the
+    layer repository's branch latest, so `advance_layer` decides whether the
+    sync moves the layer's pinned revision.
+
+    Returns (repo, layer_repo).
+    """
+    repo, layer_repo = _setup_repo_with_layer(new_lore_repo)
+
+    other = repo.clone(name=repo.name + "_other")
+    other.write_commit_push(None, {MAIN_FILE: b"main content v2"})
+
+    if advance_layer:
+        layer_repo.write_commit_push(None, {LAYER_FILE: b"layer content v2"})
+
+    with repo.open_file(LAYER_FILE, "rb") as f:
+        content = f.read()
+    assert content == b"layer content v1", (
+        f"setup: expected layer still at v1, got: {content}"
+    )
+
+    return repo, layer_repo
+
+
+def _stage_layer_change(repo: Lore) -> None:
+    """Stage a new file inside the layer.
+
+    Deliberately a different file from the one the incoming sync carries: a
+    staged edit to that file is stopped by the local-modifications check during
+    realize, which masks whether the staged-layer gate fired at all.
+    """
+    repo.write_files({LAYER_STAGED_FILE: b"layer staged addition"})
+    repo.stage(LAYER_STAGED_FILE)
+
+    status_entries = parse_status_json(repo.status(json=True))
+    paths = [e.get("path") for e in status_entries if e.get("flagStaged")]
+    assert paths == ["lay/staged_new.txt"], (
+        f"setup: expected the new layer file staged, got {paths}: {status_entries}"
+    )
+
+
+@pytest.mark.smoke
+def test_layer_sync_refused_with_staged_layer_content(new_lore_repo):
+    """A sync that would advance a layer holding staged content is refused,
+    naming the offending layer.
+    """
+    from error_types import LoreException
+
+    repo, _ = _setup_layer_behind(new_lore_repo, advance_layer=True)
+    pinned_before = _layer_pinned_revision(repo, "lay")
+
+    _stage_layer_change(repo)
+
+    with pytest.raises(LoreException) as excinfo:
+        repo.sync()
+    assert "Unable to sync when layer lay has a staged state" in str(excinfo.value), (
+        f"sync should refuse and name the layer, got:\n{excinfo.value}"
+    )
+
+    assert _layer_pinned_revision(repo, "lay") == pinned_before, (
+        "refused sync must not advance the layer's pinned revision"
+    )
+    status_entries = parse_status_json(repo.status(json=True))
+    paths = [e.get("path") for e in status_entries if e.get("flagStaged")]
+    assert paths == ["lay/staged_new.txt"], (
+        f"staged layer content should survive the refused sync, got {paths}"
+    )
+    with repo.open_file(LAYER_FILE, "rb") as f:
+        content = f.read()
+    assert content == b"layer content v1", (
+        f"refused sync must not realize the layer change, got: {content}"
+    )
+
+
+@pytest.mark.smoke
+def test_layer_sync_leaves_unmoved_layer_staged_state(new_lore_repo):
+    """A sync that does not move a layer's pinned revision keeps that layer's
+    staged content, rather than refusing the sync or clearing the pin.
+    """
+    repo, _ = _setup_layer_behind(new_lore_repo, advance_layer=False)
+    pinned_before = _layer_pinned_revision(repo, "lay")
+
+    _stage_layer_change(repo)
+
+    repo.sync()
+
+    with repo.open_file(MAIN_FILE, "rb") as f:
+        content = f.read()
+    assert content == b"main content v2", (
+        f"expected the parent to have synced forward, got: {content}"
+    )
+    assert _layer_pinned_revision(repo, "lay") == pinned_before, (
+        "layer with no matching change should keep its pinned revision"
+    )
+
+    status_entries = parse_status_json(repo.status(json=True))
+    paths = [e.get("path") for e in status_entries if e.get("flagStaged")]
+    assert paths == ["lay/staged_new.txt"], (
+        f"staged layer content should survive an unrelated sync, got {paths}"
+    )
+
+    repo.commit("Commit the layer edit after an unrelated sync")
+    assert _layer_pinned_revision(repo, "lay") != pinned_before, (
+        "committing the staged layer content should advance the layer pin"
+    )
+
+
+@pytest.mark.smoke
+def test_layer_sync_force_clears_stale_staged_pin(new_lore_repo):
+    """`--force` sync discards the layer's staged state instead of leaving a pin
+    parented on the pre-sync revision.
+    """
+    repo, _ = _setup_layer_behind(new_lore_repo, advance_layer=True)
+    pinned_before = _layer_pinned_revision(repo, "lay")
+
+    _stage_layer_change(repo)
+
+    repo.sync(force=True)
+
+    pinned_after = _layer_pinned_revision(repo, "lay")
+    assert pinned_after != pinned_before, (
+        "forced sync should advance the layer's pinned revision"
+    )
+    with repo.open_file(LAYER_FILE, "rb") as f:
+        content = f.read()
+    assert content == b"layer content v2", (
+        f"forced sync should realize the synced layer content, got: {content}"
+    )
+
+    status_entries = parse_status_json(repo.status(json=True))
+    paths = [e.get("path") for e in status_entries if e.get("flagStaged")]
+    assert paths == [], (
+        f"forced sync should leave no staged layer content, got {paths}: {status_entries}"
     )
 
 
