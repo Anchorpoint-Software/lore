@@ -1136,26 +1136,33 @@ async fn reset_walk_path(ctx: ResetContext, relative_path: RelativePath) -> Resu
             }
 
             if delete_path {
-                lore_trace!("Reset removing path {}", relative_path.as_str());
-                stats.file_delete_count.fetch_add(1, Ordering::Relaxed);
-                event::LoreEvent::FileResetFile(LoreFileResetFileEventData {
-                    path: LoreString::from(&relative_path),
-                    action: LoreFileAction::Delete,
-                    from_path: LoreString::default(),
-                })
-                .send();
-
-                util::fs::unlink_recursive(
-                    relative_path.to_absolute_path(repository.require_path()?),
-                )
-                .await
-                .internal("Failed to remove path")?;
+                reset_delete_path(&repository, &stats, relative_path).await?;
             }
 
             Ok(())
         }
         Err(err) => Err(err).forward::<ResetError>("Failed to find node"),
     }
+}
+
+async fn reset_delete_path(
+    repository: &Arc<RepositoryContext>,
+    stats: &Arc<ResetStats>,
+    relative_path: RelativePath,
+) -> Result<(), ResetError> {
+    lore_trace!("Reset removing path {}", relative_path.as_str());
+    stats.file_delete_count.fetch_add(1, Ordering::Relaxed);
+    event::LoreEvent::FileResetFile(LoreFileResetFileEventData {
+        path: LoreString::from(&relative_path),
+        action: LoreFileAction::Delete,
+        from_path: LoreString::default(),
+    })
+    .send();
+
+    util::fs::unlink_recursive(relative_path.to_absolute_path(repository.require_path()?))
+        .await
+        .internal("Failed to remove path")?;
+    Ok(())
 }
 
 /// Apply view/ignore filter, staged check, and dispatch a single child node
@@ -1658,8 +1665,8 @@ async fn reset_file_realize(
     let block_index = NodeBlock::index(node_id);
     let node_index = Node::index(node_id);
 
-    if !force && let Ok(file_metadata) = metadata {
-        let (mtime, size) = crate::util::fs::file_mtime_and_size(&file_metadata);
+    if !force && let Ok(file_metadata) = metadata.as_ref() {
+        let (mtime, size) = crate::util::fs::file_mtime_and_size(file_metadata);
         let (file_modified, _) = state::is_file_modified(
             repository.clone(),
             &node,
@@ -1712,6 +1719,14 @@ async fn reset_file_realize(
         "Recovering node {name} with path {}",
         relative_path.as_str()
     );
+
+    // If being reset from a directory to a file the directory must be deleted before the file is
+    // created.
+    if let Ok(metadata) = metadata
+        && metadata.is_dir()
+    {
+        reset_delete_path(&repository, &stats, relative_path.clone()).await?;
+    }
 
     stats.file_reset_count.fetch_add(1, Ordering::Relaxed);
     event::LoreEvent::FileResetFile(LoreFileResetFileEventData {
