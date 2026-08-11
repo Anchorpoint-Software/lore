@@ -328,6 +328,14 @@ mod tests {
         assert_eq!(response.status_code(), StatusCode::NOT_FOUND);
     }
 
+    /// The S3 default type passes the allowlist, so it reaches the existence
+    /// check and returns 404 rather than 400.
+    #[tokio::test]
+    async fn accepts_s3_binary_octet_stream() {
+        let response = mint(json!({"content_type": "binary/octet-stream"})).await;
+        assert_eq!(response.status_code(), StatusCode::NOT_FOUND);
+    }
+
     #[tokio::test]
     async fn returns_400_for_disallowed_content_type() {
         let response = mint(json!({"content_type": "text/html"})).await;

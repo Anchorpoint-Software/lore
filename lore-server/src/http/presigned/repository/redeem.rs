@@ -467,6 +467,26 @@ mod tests {
         assert_eq!(response.headers().get(CONTENT_TYPE).unwrap(), "image/png");
     }
 
+    /// The S3 default type must round-trip verbatim, so a caller that mints
+    /// with forwarded S3 metadata reads back the same value it sent.
+    #[tokio::test]
+    async fn redeem_serves_s3_binary_octet_stream_verbatim() {
+        let response = redeem_with_content_type(Some("binary/octet-stream")).await;
+        assert_eq!(response.status_code(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE).unwrap(),
+            "binary/octet-stream"
+        );
+        assert_eq!(
+            response.headers().get("x-content-type-options").unwrap(),
+            "nosniff"
+        );
+        assert_eq!(
+            response.headers().get("content-security-policy").unwrap(),
+            "default-src 'none'; sandbox"
+        );
+    }
+
     #[tokio::test]
     async fn redeem_coerces_disallowed_content_type_to_octet_stream() {
         let response = redeem_with_content_type(Some("text/html")).await;
