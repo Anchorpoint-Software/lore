@@ -1281,7 +1281,6 @@ async fn clone_materialize(
 
         #[cfg(all(target_family = "windows", feature = "vfs"))]
         {
-            //crate::swfs::serve::serve(_path, repository.clone(), state);
             crate::projfs::serve::serve(
                 _path,
                 repository.clone(),
