@@ -358,10 +358,10 @@ mod tests {
     use zerocopy::IntoBytes;
 
     use super::*;
+    use crate::protocol::replication_store::get;
     use crate::protocol::replication_store::get::Get;
-    use crate::protocol::replication_store::get::GetResponse;
+    use crate::protocol::replication_store::get_metadata;
     use crate::protocol::replication_store::get_metadata::GetMetadata;
-    use crate::protocol::replication_store::get_metadata::GetMetadataResponse;
     use crate::protocol::replication_store::header::ReplicationHeader;
     use crate::protocol::replication_store::obliterate::Obliterate;
     use crate::protocol::replication_store::put::Put;
@@ -601,10 +601,10 @@ mod tests {
             .run_request_handler(AttributeMap::default().into(), parse_output)
             .await
             .expect("handler failed");
-        let response_parsed =
-            GetResponse::parse(collapse_bytes(&handle_output)).expect("response parse should work");
+        let response_parsed = get::parse_response(collapse_bytes(&handle_output))
+            .expect("response parse should work");
         assert_eq!(response_parsed.fragment, fragment);
-        assert_eq!(response_parsed.payload, payload);
+        assert_eq!(response_parsed.payload, Some(payload));
     }
 
     #[tokio::test]
@@ -731,7 +731,7 @@ mod tests {
             .await
             .expect("handler failed");
         let parsed_response =
-            GetMetadataResponse::parse(collapse_bytes(&service_output)).expect("Failed to parse");
+            get_metadata::parse_response(collapse_bytes(&service_output)).expect("Failed to parse");
 
         let store_direct_output = LORE_CONTEXT
             .scope(execution.clone(), async move {
@@ -745,6 +745,7 @@ mod tests {
 
         assert_eq!(parsed_response.fragment, store_direct_output.fragment);
         assert_eq!(parsed_response.match_made, store_direct_output.match_made);
+        assert_eq!(parsed_response.partition, store_direct_output.partition);
     }
 
     #[tokio::test]
@@ -794,7 +795,7 @@ mod tests {
             .await
             .expect("handler failed");
         let parsed_response =
-            GetMetadataResponse::parse(collapse_bytes(&service_output)).expect("Failed to parse");
+            get_metadata::parse_response(collapse_bytes(&service_output)).expect("Failed to parse");
 
         let store_direct_output = LORE_CONTEXT
             .scope(execution.clone(), async move {
@@ -808,6 +809,7 @@ mod tests {
 
         assert_eq!(parsed_response.fragment, store_direct_output.fragment);
         assert_eq!(parsed_response.match_made, store_direct_output.match_made);
+        assert_eq!(parsed_response.partition, store_direct_output.partition);
     }
 
     #[tokio::test]
@@ -857,7 +859,7 @@ mod tests {
             .await
             .expect("handler failed");
         let parsed_response =
-            GetMetadataResponse::parse(collapse_bytes(&service_output)).expect("Failed to parse");
+            get_metadata::parse_response(collapse_bytes(&service_output)).expect("Failed to parse");
         assert_eq!(parsed_response.match_made, StoreMatch::MatchFull);
 
         // Regular ImmutableGetMetadata should NOT find it (main store is empty)
@@ -873,7 +875,7 @@ mod tests {
             .await
             .expect("handler should succeed even for a miss");
         let parsed_response =
-            GetMetadataResponse::parse(collapse_bytes(&service_output)).expect("Failed to parse");
+            get_metadata::parse_response(collapse_bytes(&service_output)).expect("Failed to parse");
         assert_eq!(parsed_response.match_made, StoreMatch::MatchNone);
     }
 
@@ -1006,10 +1008,10 @@ mod tests {
             .run_request_handler(AttributeMap::default().into(), parse_output)
             .await
             .expect("handler failed");
-        let response_parsed =
-            GetResponse::parse(collapse_bytes(&handle_output)).expect("response parse should work");
+        let response_parsed = get::parse_response(collapse_bytes(&handle_output))
+            .expect("response parse should work");
         assert_eq!(response_parsed.fragment, fragment);
-        assert_eq!(response_parsed.payload, payload);
+        assert_eq!(response_parsed.payload, Some(payload));
 
         // Regular ImmutableGet should NOT find it (main store is empty)
         let parse_output = service

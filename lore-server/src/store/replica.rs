@@ -14,7 +14,6 @@ use lore_revision::runtime::execution_context;
 use lore_storage::ImmutableStore;
 use lore_storage::StoreError;
 use lore_storage::StoreGetData;
-use lore_storage::StoreMatch;
 use lore_storage::StoreMatchResult;
 use lore_storage::StoreObliterateStats;
 use lore_telemetry::InstrumentProvider;
@@ -298,12 +297,7 @@ where
         .await
         .output;
 
-        let query_response = handle_service_response(service_result, self, meta)?;
-        Ok(StoreGetData::metadata(
-            query_response.fragment,
-            query_response.match_made,
-            repository,
-        ))
+        handle_service_response(service_result, self, meta)
     }
 
     #[lore_macro::lore_instrument]
@@ -348,14 +342,7 @@ where
         .await
         .output;
 
-        let response = handle_service_response(service_result, self, meta)?;
-        // The peer answers exact addresses, so anything it served matched fully.
-        Ok(StoreGetData {
-            fragment: response.fragment,
-            match_made: StoreMatch::MatchFull,
-            partition: repository,
-            payload: Some(response.payload),
-        })
+        handle_service_response(service_result, self, meta)
     }
 
     #[lore_macro::lore_instrument]
@@ -499,6 +486,7 @@ mod tests {
     use lore_base::types::Context;
     use lore_revision::fragment;
     use lore_revision::util::time::RetryPolicy;
+    use lore_storage::StoreMatch;
     use lore_transport::quic::client::ConnectionStats;
     use mockall::predicate::eq;
     use rand::random;
@@ -508,9 +496,7 @@ mod tests {
     use tokio::sync::mpsc::Receiver;
 
     use super::*;
-    use crate::protocol::replication_store::get::GetResponse;
     use crate::protocol::replication_store::get_metadata::GetMetadata;
-    use crate::protocol::replication_store::get_metadata::GetMetadataResponse;
     use crate::protocol::replication_store::obliterate::Obliterate;
     use crate::protocol::replication_store::obliterate::ObliterateResponse;
     use crate::protocol::replication_store::put::Put;
@@ -532,24 +518,21 @@ mod tests {
                 request: Obliterate,
             ) -> Result<ObliterateResponse, ReplicationStoreClientError>;
 
-            async fn get(
-                &self,
-                request: Get,
-            ) -> Result<GetResponse, ReplicationStoreClientError>;
+            async fn get(&self, request: Get) -> Result<StoreGetData, ReplicationStoreClientError>;
 
             async fn get_metadata(
                 &self,
-                    request: GetMetadata,
-                ) -> Result<GetMetadataResponse, ReplicationStoreClientError>;
+                request: GetMetadata,
+            ) -> Result<StoreGetData, ReplicationStoreClientError>;
 
             async fn local_put(&self, request: Put) -> Result<(), ReplicationStoreClientError>;
 
-            async fn local_get(&self, request: Get) -> Result<GetResponse, ReplicationStoreClientError>;
+            async fn local_get(&self, request: Get) -> Result<StoreGetData, ReplicationStoreClientError>;
 
             async fn local_get_metadata(
                 &self,
                 request: GetMetadata,
-            ) -> Result<GetMetadataResponse, ReplicationStoreClientError>;
+            ) -> Result<StoreGetData, ReplicationStoreClientError>;
 
             async fn query(
                 &self,
@@ -636,12 +619,9 @@ mod tests {
                         results: vec![StoreMatchResult::default(); request.addresses.len()],
                     })
                 });
-                client.expect_local_get_metadata().returning(|_| {
-                    Ok(GetMetadataResponse {
-                        fragment: Fragment::default(),
-                        match_made: StoreMatch::MatchNone,
-                    })
-                });
+                client
+                    .expect_local_get_metadata()
+                    .returning(|_| Ok(StoreGetData::default()));
                 client.expect_local_get().returning(|_| {
                     Err(ReplicationStoreClientError::ServiceError(
                         ReplicationServiceErrorCode::AddressNotFound,
@@ -1328,9 +1308,11 @@ mod tests {
                                 address,
                             }))
                             .returning(move |_| {
-                                Ok(GetResponse {
+                                Ok(StoreGetData {
                                     fragment,
-                                    payload: payload.clone(),
+                                    match_made: lore_storage::StoreMatch::MatchFull,
+                                    partition: repository.into(),
+                                    payload: Some(payload.clone()),
                                 })
                             });
                     }
@@ -1471,9 +1453,11 @@ mod tests {
                             address,
                         }))
                         .returning(move |_| {
-                            Ok(GetMetadataResponse {
+                            Ok(StoreGetData {
                                 fragment,
-                                match_made: StoreMatch::MatchFull,
+                                match_made: lore_storage::StoreMatch::MatchFull,
+                                partition: repository.into(),
+                                payload: None,
                             })
                         });
 
@@ -1525,9 +1509,11 @@ mod tests {
                             address,
                         }))
                         .returning(move |_| {
-                            Ok(GetMetadataResponse {
+                            Ok(StoreGetData {
                                 fragment,
-                                match_made: StoreMatch::MatchPartition,
+                                match_made: lore_storage::StoreMatch::MatchPartition,
+                                partition: repository.into(),
+                                payload: None,
                             })
                         });
 

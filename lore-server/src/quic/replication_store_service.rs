@@ -70,17 +70,20 @@ pub enum Command {
     // 0 and 5 were `ExistsBatch` / `LocalExistsBatch`, superseded by `Query` (11) and
     // `LocalQuery` (12). Left unused rather than reassigned, so a peer that still sends one is
     // rejected instead of misread.
-    ImmutableGet = 1,
     ImmutablePut = 2,
     ImmutableObliterate = 3,
     // 4 and 7 were the single-address `Query`, whose operation no longer exists. Left unused rather
     // than reassigned, so a peer that still sends one is rejected instead of misread.
-    ImmutableLocalGet = 6,
     ImmutableLocalPut = 8,
-    ImmutableGetMetadata = 9,
-    ImmutableLocalGetMetadata = 10,
     ImmutableQuery = 11,
     ImmutableLocalQuery = 12,
+    // 1, 6, 9, 10 were `Get`, `LocalGet`, `GetMetadata`, `LocalGetMetadata` under the old response
+    // shape. Left unused rather than reassigned, so a peer that still sends one is rejected instead
+    // of misread.
+    ImmutableGet = 13,
+    ImmutableLocalGet = 14,
+    ImmutableGetMetadata = 15,
+    ImmutableLocalGetMetadata = 16,
 }
 
 impl From<Command> for QuicOpCode {

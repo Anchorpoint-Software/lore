@@ -7,8 +7,10 @@ use bytes::Bytes;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Address;
 use lore_base::types::Fragment;
+use lore_base::types::Partition;
 use lore_storage::ImmutableStore;
 use lore_storage::StoreError;
+use lore_storage::StoreGetData;
 use lore_storage::StoreMatch;
 use lore_telemetry::tracing::fields::ADDRESS;
 use lore_telemetry::tracing::fields::CORRELATION_ID;
@@ -16,6 +18,7 @@ use lore_telemetry::tracing::fields::REPOSITORY_ID;
 use tracing::Span;
 use tracing::debug;
 use tracing::info_span;
+use tracing::warn;
 use zerocopy::IntoBytes;
 
 use crate::protocol::replication_store::REPLICATION_SERVICE_USER_ID;
@@ -26,14 +29,7 @@ use crate::quic::replication_store_service::server::ParsedReplicationStoreReques
 use crate::quic::replication_store_service::server::RequestHandler;
 use crate::util::setup_execution;
 
-pub const BASE_REQUEST_SIZE: usize = size_of::<ReplicationHeader>() +
-        size_of::<Address>() +
-        // reserved byte
-        1;
-
-/// The byte that used to carry the required match level. Written as the level every caller last
-/// sent and ignored on the way in; kept so the request layout does not change.
-const RESERVED_MATCH_BYTE: u8 = StoreMatch::MatchFull as u8;
+pub const BASE_REQUEST_SIZE: usize = size_of::<ReplicationHeader>() + size_of::<Address>();
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Get {
@@ -42,12 +38,11 @@ pub struct Get {
 }
 
 impl Get {
-    pub fn to_quic_chunks(self) -> [Bytes; 4] {
+    pub fn to_quic_chunks(self) -> [Bytes; 3] {
         [
             Bytes::default(), // command header
             Bytes::from_owner(self.header),
             Bytes::from_owner(self.address),
-            Bytes::copy_from_slice(&[RESERVED_MATCH_BYTE]),
         ]
     }
 
@@ -58,34 +53,38 @@ impl Get {
 
         let header: ReplicationHeader = bytes.split_to(size_of::<ReplicationHeader>()).into();
         let address: Address = bytes.split_to(size_of::<Address>()).into();
-        bytes.advance(1); // reserved, see RESERVED_MATCH_BYTE
 
         Ok(Get { header, address })
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct GetResponse {
-    pub fragment: Fragment,
-    pub payload: Bytes,
+fn serialize_response(data: StoreGetData) -> Vec<Bytes> {
+    let match_made: u8 = data.match_made.into();
+    let mut response = vec![
+        Bytes::copy_from_slice(data.fragment.as_bytes()),
+        Bytes::copy_from_slice(&[match_made]),
+        Bytes::copy_from_slice(data.partition.as_bytes()),
+    ];
+    if let Some(payload) = data.payload {
+        response.push(payload);
+    }
+    response
 }
 
-impl GetResponse {
-    fn data(self) -> Vec<Bytes> {
-        vec![
-            Bytes::copy_from_slice(self.fragment.as_bytes()),
-            self.payload.clone(),
-        ]
-    }
-
-    pub fn parse(mut bytes: Bytes) -> Result<Self, ReplicationStoreClientError> {
-        let fragment: Fragment = bytes.split_to(size_of::<Fragment>()).into();
-
-        Ok(GetResponse {
-            fragment,
-            payload: bytes,
-        })
-    }
+pub fn parse_response(mut bytes: Bytes) -> Result<StoreGetData, ReplicationStoreClientError> {
+    let fragment: Fragment = bytes.split_to(size_of::<Fragment>()).into();
+    let match_made: StoreMatch = bytes[0].try_into().map_err(|error| {
+        warn!(?error, "failed to parse match_made");
+        ReplicationStoreClientError::ResponseError("failed to parse match_made from get response")
+    })?;
+    bytes.advance(1);
+    let partition: Partition = bytes.split_to(size_of::<Partition>()).into();
+    Ok(StoreGetData {
+        fragment,
+        match_made,
+        partition,
+        payload: Some(bytes),
+    })
 }
 
 pub fn create_handler(
@@ -131,20 +130,15 @@ impl RequestHandler for GetHandler {
             REPLICATION_SERVICE_USER_ID.to_string(),
         );
 
-        let (fragment, bytes) = LORE_CONTEXT
+        let result = LORE_CONTEXT
             .scope(execution, async move {
                 self.immutable_store
                     .get(self.request.header.repository.into(), self.request.address)
                     .await
-                    .and_then(lore_storage::StoreGetData::into_payload)
             })
             .await?;
 
-        let response = GetResponse {
-            fragment,
-            payload: bytes,
-        };
-        Ok(response.data())
+        Ok(serialize_response(result))
     }
 }
 
@@ -156,6 +150,7 @@ pub mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use crate::quic::tests::collapse_bytes;
     use crate::quic::tests::collapse_bytes_without_header;
 
     mod request {
@@ -200,17 +195,34 @@ pub mod tests {
 
     mod response {
         use super::*;
-        use crate::quic::tests::collapse_bytes;
 
         #[test]
-        fn response_to_bytes_works() {
+        fn serialize_response_has_four_chunks() {
             let (fragment, _, payload) = fragment::generate_random();
-            let original = GetResponse { fragment, payload };
-            let bytes = original.clone().data();
+            let data = StoreGetData {
+                fragment,
+                match_made: StoreMatch::MatchFull,
+                partition: random::<lore_base::types::Partition>(),
+                payload: Some(payload),
+            };
+            assert_eq!(serialize_response(data).len(), 4);
+        }
 
-            let reparsed_response =
-                GetResponse::parse(collapse_bytes(&bytes)).expect("parse should work");
-            assert_eq!(reparsed_response, original);
+        #[test]
+        fn response_roundtrips() {
+            let (fragment, _, payload) = fragment::generate_random();
+            let original = StoreGetData {
+                fragment,
+                match_made: StoreMatch::MatchFull,
+                partition: random::<lore_base::types::Partition>(),
+                payload: Some(payload),
+            };
+            let bytes = serialize_response(original.clone());
+            let reparsed = parse_response(collapse_bytes(&bytes)).expect("parse should work");
+            assert_eq!(reparsed.fragment, original.fragment);
+            assert_eq!(reparsed.match_made, original.match_made);
+            assert_eq!(reparsed.partition, original.partition);
+            assert_eq!(reparsed.payload, original.payload);
         }
     }
 }

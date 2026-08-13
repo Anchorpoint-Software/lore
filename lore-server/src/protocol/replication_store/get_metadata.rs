@@ -7,8 +7,10 @@ use bytes::Bytes;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Address;
 use lore_base::types::Fragment;
+use lore_base::types::Partition;
 use lore_storage::ImmutableStore;
 use lore_storage::StoreError;
+use lore_storage::StoreGetData;
 use lore_storage::StoreMatch;
 use lore_telemetry::tracing::fields::ADDRESS;
 use lore_telemetry::tracing::fields::CORRELATION_ID;
@@ -27,23 +29,8 @@ use crate::quic::replication_store_service::server::ParsedReplicationStoreReques
 use crate::quic::replication_store_service::server::RequestHandler;
 use crate::util::setup_execution;
 
-pub const BASE_REQUEST_SIZE: usize = size_of::<ReplicationHeader>() +
-        // reserved byte
-        1 +
-        size_of::<Address>();
+pub const BASE_REQUEST_SIZE: usize = size_of::<ReplicationHeader>() + size_of::<Address>();
 
-/// The byte that used to carry the requested match level, back when this request was an existence
-/// check. Written as the level every caller last sent and ignored on the way in; kept so the
-/// request layout does not change.
-const RESERVED_MATCH_BYTE: u8 = StoreMatch::MatchFull as u8;
-
-/// Ask a peer what the payload at an address *is* - its compression and its sizes.
-///
-/// This used to be the existence request under another name, wrapping [`ExistsBatch`] and
-/// rejecting anything but a single address, so the peer answered it out of its own existence
-/// check and the caller received a well-formed fragment with no sizes in it. It carries one
-/// address because it describes one representation, in the same bytes the old request put it -
-/// header, the reserved level byte, then the address - so the wire is unchanged.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GetMetadata {
     pub header: ReplicationHeader,
@@ -51,11 +38,10 @@ pub struct GetMetadata {
 }
 
 impl GetMetadata {
-    pub fn to_quic_chunks(self) -> [Bytes; 4] {
+    pub fn to_quic_chunks(self) -> [Bytes; 3] {
         [
             Bytes::default(), // command header
             Bytes::from_owner(self.header),
-            Bytes::copy_from_slice(&[RESERVED_MATCH_BYTE]),
             Bytes::from_owner(self.address),
         ]
     }
@@ -66,44 +52,37 @@ impl GetMetadata {
         };
 
         let header: ReplicationHeader = bytes.split_to(size_of::<ReplicationHeader>()).into();
-        bytes.advance(1); // reserved, see RESERVED_MATCH_BYTE
         let address: Address = bytes.split_to(size_of::<Address>()).into();
 
         Ok(GetMetadata { header, address })
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct GetMetadataResponse {
-    pub fragment: Fragment,
-    pub match_made: StoreMatch,
+fn serialize_response(data: StoreGetData) -> Vec<Bytes> {
+    let match_made: u8 = data.match_made.into();
+    vec![
+        Bytes::copy_from_slice(data.fragment.as_bytes()),
+        Bytes::copy_from_slice(&[match_made]),
+        Bytes::copy_from_slice(data.partition.as_bytes()),
+    ]
 }
 
-impl GetMetadataResponse {
-    fn data(self) -> Vec<Bytes> {
-        let match_made: u8 = self.match_made.into();
-        vec![
-            Bytes::copy_from_slice(self.fragment.as_bytes()),
-            Bytes::copy_from_slice(&[match_made]),
-        ]
-    }
-
-    pub fn parse(mut bytes: Bytes) -> Result<Self, ReplicationStoreClientError> {
-        let fragment: Fragment = bytes.split_to(size_of::<Fragment>()).into();
-        let match_made: StoreMatch = {
-            let raw_value = bytes[0];
-            bytes.advance(1);
-            raw_value.try_into().map_err(|error| {
-                warn!(?error, "failed to parse match_made");
-                ReplicationStoreClientError::ResponseError("Invalid match_made")
-            })?
-        };
-
-        Ok(GetMetadataResponse {
-            fragment,
-            match_made,
-        })
-    }
+pub fn parse_response(mut bytes: Bytes) -> Result<StoreGetData, ReplicationStoreClientError> {
+    let fragment: Fragment = bytes.split_to(size_of::<Fragment>()).into();
+    let match_made: StoreMatch = bytes[0].try_into().map_err(|error| {
+        warn!(?error, "failed to parse match_made");
+        ReplicationStoreClientError::ResponseError(
+            "failed to parse match_made from get_metadata response",
+        )
+    })?;
+    bytes.advance(1);
+    let partition: Partition = bytes.split_to(size_of::<Partition>()).into();
+    Ok(StoreGetData {
+        fragment,
+        match_made,
+        partition,
+        payload: None,
+    })
 }
 
 pub fn create_handler(
@@ -158,11 +137,7 @@ impl RequestHandler for GetMetadataHandler {
             })
             .await?;
 
-        let response = GetMetadataResponse {
-            fragment: result.fragment,
-            match_made: result.match_made,
-        };
-        Ok(response.data())
+        Ok(serialize_response(result))
     }
 }
 
@@ -174,6 +149,7 @@ pub mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use crate::quic::tests::collapse_bytes;
     use crate::quic::tests::collapse_bytes_without_header;
 
     mod request {
@@ -221,21 +197,37 @@ pub mod tests {
 
     mod response {
         use super::*;
-        use crate::quic::tests::collapse_bytes;
 
         #[test]
-        fn to_bytes_works() {
+        fn serialize_response_has_three_chunks() {
             let (fragment, _, _) = fragment::generate_random();
-
-            let original = GetMetadataResponse {
+            let data = StoreGetData {
                 fragment,
                 match_made: StoreMatch::MatchFull,
+                partition: random::<lore_base::types::Partition>(),
+                payload: None,
             };
-            let bytes = original.clone().data();
+            // if this assertion fails, then new servers sending
+            // this response to old clients will be silently wrong
+            // and could end up parsing incorrect payloads.
+            assert_eq!(serialize_response(data).len(), 3);
+        }
 
-            let reparsed_response =
-                GetMetadataResponse::parse(collapse_bytes(&bytes)).expect("parse should work");
-            assert_eq!(reparsed_response, original);
+        #[test]
+        fn response_roundtrips() {
+            let (fragment, _, _) = fragment::generate_random();
+            let original = StoreGetData {
+                fragment,
+                match_made: StoreMatch::MatchFull,
+                partition: random::<lore_base::types::Partition>(),
+                payload: None,
+            };
+            let bytes = serialize_response(original.clone());
+            let reparsed = parse_response(collapse_bytes(&bytes)).expect("parse should work");
+            assert_eq!(reparsed.fragment, original.fragment);
+            assert_eq!(reparsed.match_made, original.match_made);
+            assert_eq!(reparsed.partition, original.partition);
+            assert_eq!(reparsed.payload, None);
         }
     }
 }
