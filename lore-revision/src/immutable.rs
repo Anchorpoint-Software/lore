@@ -219,17 +219,23 @@ pub async fn load_raw(
 // Read path -- delegates to lore-storage with session
 // ---------------------------------------------------------------------------
 
+/// Stream the given data range to `sender`, returning the number of bytes that will arrive.
+///
+/// `None` streams the whole content, so the count is `size_content` as it always was. A range
+/// is clamped to the content and only the fragments it touches are fetched.
 pub async fn read_stream(
     repository: Arc<RepositoryContext>,
     address: Address,
+    range: Option<Range<usize>>,
     options: ReadOptions,
     sender: Sender<Bytes>,
 ) -> Result<u64, ImmutableError> {
     let store = repository.immutable_store();
     let partition = repository.id;
     let session = Some(resolve_session(&repository));
-    lore_storage::read_stream(store, partition, address, options, sender, session)
+    lore_storage::read_stream(store, partition, address, range, options, sender, session)
         .await
+        .map(|(_fragment, streamed)| streamed.end - streamed.start)
         .forward("reading immutable data")
 }
 
@@ -247,6 +253,7 @@ pub async fn read(
     let session = Some(resolve_session(&repository));
     lore_storage::read(store, partition, address, range, options, session)
         .await
+        .map(|(_fragment, bytes)| bytes)
         .forward("reading immutable data")
 }
 
@@ -265,19 +272,24 @@ pub async fn read_into(
         .forward("reading immutable data")
 }
 
+/// Write the given data range to `path`. The file holds exactly that range starting at its
+/// first byte; `None` writes the whole content.
 pub async fn read_into_file(
     repository: Arc<RepositoryContext>,
     address: Address,
     path: &Path,
+    range: Option<Range<usize>>,
     options: ReadOptions,
 ) -> Result<(Fragment, Option<std::fs::Metadata>), ImmutableError> {
     let store = repository.immutable_store();
     let partition = repository.id;
     let temp_ext = crate::repository::TEMP_FILE_EXTENSION;
     let session = Some(resolve_session(&repository));
-    lore_storage::read_into_file(store, partition, address, path, temp_ext, options, session)
-        .await
-        .forward("reading immutable data")
+    lore_storage::read_into_file(
+        store, partition, address, path, temp_ext, range, options, session,
+    )
+    .await
+    .forward("reading immutable data")
 }
 
 // ---------------------------------------------------------------------------

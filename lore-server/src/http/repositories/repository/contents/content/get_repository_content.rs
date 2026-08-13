@@ -153,9 +153,10 @@ pub async fn handler(
 
             let (tx, rx) = channel(CHUNKED_RESPONSE_BUFFER_SIZE);
 
-            let content_length = immutable::read_stream(repository, parsed_address, options, tx)
-                .await
-                .map_err(GetContentError::ReadStream)?;
+            let content_length =
+                immutable::read_stream(repository, parsed_address, None, options, tx)
+                    .await
+                    .map_err(GetContentError::ReadStream)?;
 
             let stream = ReceiverStream::new(rx).map(Ok::<Bytes, GetContentError>);
 

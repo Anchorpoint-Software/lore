@@ -4822,7 +4822,7 @@ mod tests {
         .unwrap();
         assert_eq!(new_address, address);
 
-        let bytes = read(
+        let (_fragment, bytes) = read(
             store.clone(),
             partition,
             new_address,
@@ -5042,7 +5042,7 @@ mod tests {
         // must have adopted source's pack pointer AND encoding flag together — if encoding
         // and bytes were ever desynchronized, decompression in `read` would fail or return
         // garbage.
-        let bytes = read(
+        let (_fragment, bytes) = read(
             store.clone(),
             target_partition,
             target_address,
@@ -5110,7 +5110,7 @@ mod tests {
             context: target_context,
         };
 
-        let bytes = read(
+        let (_fragment, bytes) = read(
             store.clone(),
             partition,
             destination_address,
@@ -5124,7 +5124,7 @@ mod tests {
 
         // Source tuple must remain readable independently — copy creates a new entry, it does
         // not consume or repoint the source.
-        let bytes = read(
+        let (_fragment, bytes) = read(
             store.clone(),
             partition,
             source_address,

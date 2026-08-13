@@ -1109,6 +1109,7 @@ mod tests {
                     repository.clone(),
                     address,
                     output_path.as_path(),
+                    None,
                     options,
                 )
                 .await
@@ -1174,7 +1175,7 @@ mod tests {
                 let (tx, mut rx) = tokio::sync::mpsc::channel::<Bytes>(64);
                 let options = immutable::read_options_from_repository(&repository);
                 let content_length =
-                    immutable::read_stream(repository.clone(), address, options, tx)
+                    immutable::read_stream(repository.clone(), address, None, options, tx)
                         .await
                         .expect("read_stream failed");
 
@@ -1240,6 +1241,7 @@ mod tests {
                     repository.clone(),
                     address,
                     output_path.as_path(),
+                    None,
                     options,
                 )
                 .await

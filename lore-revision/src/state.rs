@@ -7000,7 +7000,7 @@ pub async fn is_file_content_equal(
         let (sender, mut receiver) = tokio::sync::mpsc::channel::<Bytes>(4);
         let repo_clone = repository.clone();
         let stream_handle = lore_spawn!(async move {
-            immutable::read_stream(repo_clone, address, options, sender).await
+            immutable::read_stream(repo_clone, address, None, options, sender).await
         });
 
         let file = match lore_io::IoDriver::global()

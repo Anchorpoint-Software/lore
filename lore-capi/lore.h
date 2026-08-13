@@ -4668,7 +4668,7 @@ typedef struct lore_storage_put_args_t {
   struct lore_storage_put_item_array_t items;
 } lore_storage_put_args_t;
 
-// One get item — the `(partition, address)` to read.
+// One get item — the `(partition, address)` to read, and the range of it to read.
 typedef struct lore_storage_get_item_t {
   // Caller-chosen id echoed back in every event for this item
   uint64_t id;
@@ -4676,6 +4676,12 @@ typedef struct lore_storage_get_item_t {
   struct lore_partition_t partition;
   // Content address to read; `hash == Hash::default()` short-circuits to an empty buffer
   struct lore_address_t address;
+  // First content byte to read, counted from the start of the decompressed content.
+  // Past the end of the content rejects with `INVALID_ARGUMENTS`
+  uint64_t offset;
+  // Content bytes to read from `offset`; `0` reads to the end. A range reaching past the
+  // end is clamped to it, so `GET_DATA` may carry fewer bytes than asked for
+  uint64_t length;
   // Stream one `GET_DATA` per leaf fragment instead of a single reassembled buffer
   uint8_t streaming;
   // Cache fetched bytes back to the local store even without the producer's
@@ -4969,6 +4975,12 @@ typedef struct lore_storage_get_file_item_t {
   // Destination path; empty rejects with `INVALID_ARGUMENTS`. Multi-fragment writes
   // stage via `<path>.loretmp` then atomically rename
   struct lore_string_t path;
+  // First content byte to write, counted from the start of the decompressed content.
+  // Past the end of the content rejects with `INVALID_ARGUMENTS`
+  uint64_t offset;
+  // Content bytes to write from `offset`; `0` writes to the end. The file holds exactly the
+  // requested range starting at its own first byte, and is sized to it
+  uint64_t length;
   // Cache fetched fragments back to the local store, not just write them to `path`
   uint8_t local_cache;
 } lore_storage_get_file_item_t;

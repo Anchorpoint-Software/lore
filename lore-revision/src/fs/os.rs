@@ -304,6 +304,7 @@ impl InstanceOperation for OsOperation {
                 repository,
                 node.address,
                 self.absolute_path(path).as_path(),
+                None,
                 options,
             )
             .await

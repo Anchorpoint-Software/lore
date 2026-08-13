@@ -158,9 +158,10 @@ pub async fn handler(
 
             let (tx, rx) = channel(CHUNKED_RESPONSE_BUFFER_SIZE);
 
-            let content_length = immutable::read_stream(repository, parsed_address, options, tx)
-                .await
-                .map_err(RedeemError::ReadStream)?;
+            let content_length =
+                immutable::read_stream(repository, parsed_address, None, options, tx)
+                    .await
+                    .map_err(RedeemError::ReadStream)?;
 
             let mut response_headers = HeaderMap::new();
             response_headers.insert(CONTENT_TYPE, content_type);

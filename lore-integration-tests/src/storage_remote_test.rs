@@ -493,6 +493,7 @@ mod storage_remote_tests {
                     address,
                     streaming: 0,
                     local_cache: 0,
+                    ..Default::default()
                 };
                 let status = get::get(
                     LoreGlobalArgs::default(),
@@ -607,6 +608,7 @@ mod storage_remote_tests {
                             address,
                             streaming: 0,
                             local_cache: 0,
+                            ..Default::default()
                         }]),
                     },
                     callback,
@@ -695,6 +697,7 @@ mod storage_remote_tests {
                             address,
                             streaming: 0,
                             local_cache: 1,
+                            ..Default::default()
                         }]),
                     },
                     callback,
@@ -922,6 +925,17 @@ mod storage_remote_tests {
         partition: lore_base::types::Partition,
         bytes: &[u8],
     ) -> lore_base::types::Address {
+        put_local_and_remote_chunked(handle_id, partition, bytes, 0).await
+    }
+
+    /// As above, but cutting the content at `chunk` so it is stored — and uploaded — as a
+    /// fragment tree rather than one fragment.
+    async fn put_local_and_remote_chunked(
+        handle_id: u64,
+        partition: lore_base::types::Partition,
+        bytes: &[u8],
+        chunk: u64,
+    ) -> lore_base::types::Address {
         use lore::storage::put;
         use lore::storage::put::LoreStoragePutArgs;
         use lore::storage::put::LoreStoragePutItem;
@@ -951,7 +965,7 @@ mod storage_remote_tests {
             },
             remote_write: 1,
             local_cache: 0,
-            fixed_size_chunk: 0,
+            fixed_size_chunk: chunk,
         };
         let status = put::put(
             LoreGlobalArgs::default(),
@@ -1802,6 +1816,7 @@ mod storage_remote_tests {
                     address,
                     path: LoreString::from(target_path.as_str()),
                     local_cache: 0,
+                    ..Default::default()
                 };
                 let status = get_file::get_file(
                     LoreGlobalArgs::default(),
@@ -2007,6 +2022,7 @@ mod storage_remote_tests {
                     address,
                     streaming: 0,
                     local_cache: 0,
+                    ..Default::default()
                 };
                 // bound-local + non-streaming get of an address only present on the remote.
                 // The handle must reject the miss locally rather than reaching out.
@@ -2172,6 +2188,7 @@ mod storage_remote_tests {
                             address,
                             streaming: 0,
                             local_cache: 0,
+                            ..Default::default()
                         }]),
                     },
                     callback,
@@ -2530,6 +2547,7 @@ mod storage_remote_tests {
                             address,
                             streaming: 0,
                             local_cache: 0,
+                            ..Default::default()
                         }]),
                     },
                     callback,
@@ -3044,6 +3062,11 @@ mod storage_remote_tests {
     struct GetBatchResults {
         codes: HashMap<u64, lore_revision::event::LoreErrorCode>,
         bytes: HashMap<u64, Vec<u8>>,
+        /// `GET_HEADER`'s `size_content` per item — the whole content's size, which a ranged
+        /// read cannot infer from the bytes it got back.
+        headers: HashMap<u64, u64>,
+        /// The content offset each item's first `GET_DATA` carried.
+        first_offsets: HashMap<u64, u64>,
     }
 
     async fn run_get_batch(
@@ -3053,14 +3076,29 @@ mod storage_remote_tests {
         let codes: Arc<Mutex<HashMap<u64, lore_revision::event::LoreErrorCode>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let bytes: Arc<Mutex<HashMap<u64, Vec<u8>>>> = Arc::new(Mutex::new(HashMap::new()));
+        let headers: Arc<Mutex<HashMap<u64, u64>>> = Arc::new(Mutex::new(HashMap::new()));
+        let first_offsets: Arc<Mutex<HashMap<u64, u64>>> = Arc::new(Mutex::new(HashMap::new()));
         let codes_for_cb = codes.clone();
         let bytes_for_cb = bytes.clone();
+        let headers_for_cb = headers.clone();
+        let offsets_for_cb = first_offsets.clone();
 
         let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| match event {
+            LoreEvent::StorageGetHeader(data) => {
+                headers_for_cb
+                    .lock()
+                    .unwrap()
+                    .insert(data.id, data.size_content);
+            }
             LoreEvent::StorageGetData(data) => {
                 let slice = unsafe {
                     std::slice::from_raw_parts(data.bytes.ptr.cast::<u8>(), data.bytes.len)
                 };
+                offsets_for_cb
+                    .lock()
+                    .unwrap()
+                    .entry(data.id)
+                    .or_insert(data.offset);
                 bytes_for_cb
                     .lock()
                     .unwrap()
@@ -3089,7 +3127,34 @@ mod storage_remote_tests {
 
         let codes = codes.lock().unwrap().clone();
         let bytes = bytes.lock().unwrap().clone();
-        GetBatchResults { codes, bytes }
+        let headers = headers.lock().unwrap().clone();
+        let first_offsets = first_offsets.lock().unwrap().clone();
+        GetBatchResults {
+            codes,
+            bytes,
+            headers,
+            first_offsets,
+        }
+    }
+
+    /// A get item asking for `offset..offset + length` of the content.
+    fn ranged_get_item(
+        id: u64,
+        partition: lore_base::types::Partition,
+        address: lore_base::types::Address,
+        offset: u64,
+        length: u64,
+        streaming: u8,
+    ) -> lore::storage::get::LoreStorageGetItem {
+        lore::storage::get::LoreStorageGetItem {
+            id,
+            partition,
+            address,
+            offset,
+            length,
+            streaming,
+            ..Default::default()
+        }
     }
 
     fn get_item(
@@ -3103,6 +3168,7 @@ mod storage_remote_tests {
             address,
             streaming: 0,
             local_cache: 0,
+            ..Default::default()
         }
     }
 
@@ -3162,6 +3228,160 @@ mod storage_remote_tests {
                         "item {id} must return its full payload",
                     );
                 }
+
+                close_handle(handle_id).await;
+                Ok(())
+            })
+            .await
+    }
+
+    /// A range on content the handle does not hold locally: the fragment crosses the wire whole
+    /// — no protocol carries a range — and the range is applied to what came back. The header
+    /// still describes the whole content, which is the only way a caller can tell a short read
+    /// from a complete one.
+    #[tokio::test]
+    async fn get_with_a_range_falls_back_to_remote_and_returns_only_the_range() -> TestResult {
+        use bytes::Bytes;
+        use lore_base::types::Partition;
+        use lore_revision::event::LoreErrorCode;
+
+        let execution = setup_execution("storage-remote-get-range".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let server = start_test_server().await;
+                let partition = Partition::from([0xd1u8; 16]);
+
+                let payload = Bytes::from((0..200u32).map(|b| b as u8).collect::<Vec<u8>>());
+                let address = seed_server(&server, partition, &payload).await;
+
+                let handle_id = open_remote_handle(&server).await;
+                let results = run_get_batch(
+                    handle_id,
+                    vec![ranged_get_item(1, partition, address, 40, 60, 0)],
+                )
+                .await;
+
+                assert_eq!(results.codes.get(&1), Some(&LoreErrorCode::None));
+                assert_eq!(results.headers.get(&1), Some(&(payload.len() as u64)));
+                assert_eq!(results.first_offsets.get(&1), Some(&40));
+                assert_eq!(
+                    results.bytes.get(&1).map(Vec::as_slice),
+                    Some(&payload[40..100]),
+                );
+
+                close_handle(handle_id).await;
+                Ok(())
+            })
+            .await
+    }
+
+    /// The same over a fragment tree, which is where a range earns its keep remotely: the
+    /// content is uploaded chunked, then read back through a handle whose local store is empty,
+    /// so every fragment the range needs is a round trip and every fragment it does not need is
+    /// one that never happens.
+    ///
+    /// Buffered and streaming are driven against the same uploaded content, because they prune
+    /// through different code — `read_defragment` and the tree walker — and a range has to mean
+    /// the same thing through both.
+    #[tokio::test]
+    async fn get_with_a_range_over_a_remote_fragment_tree_returns_only_the_range() -> TestResult {
+        use lore_base::types::FRAGMENT_SIZE_THRESHOLD;
+        use lore_base::types::Partition;
+        use lore_revision::event::LoreErrorCode;
+
+        let execution = setup_execution("storage-remote-get-range-tree".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let server = start_test_server().await;
+                let partition = Partition::from([0xd2u8; 16]);
+
+                let content: Vec<u8> = (0..4 * FRAGMENT_SIZE_THRESHOLD)
+                    .map(|byte| (byte as u8).wrapping_mul(31))
+                    .collect();
+
+                let upload_handle = open_remote_handle(&server).await;
+                let address =
+                    put_local_and_remote_chunked(upload_handle, partition, &content, 64 * 1024)
+                        .await;
+                close_handle(upload_handle).await;
+
+                // Starts and ends inside a chunk, so both ends are clipped.
+                let start = 100_000u64;
+                let length = 300_000u64;
+                let expected = &content[start as usize..(start + length) as usize];
+
+                let handle_id = open_remote_handle(&server).await;
+                let results = run_get_batch(
+                    handle_id,
+                    vec![
+                        ranged_get_item(1, partition, address, start, length, 0),
+                        ranged_get_item(2, partition, address, start, length, 1),
+                    ],
+                )
+                .await;
+
+                for id in [1u64, 2u64] {
+                    assert_eq!(
+                        results.codes.get(&id),
+                        Some(&LoreErrorCode::None),
+                        "item {id}"
+                    );
+                    assert_eq!(
+                        results.headers.get(&id),
+                        Some(&(content.len() as u64)),
+                        "item {id} header must describe the whole content",
+                    );
+                    assert_eq!(
+                        results.first_offsets.get(&id),
+                        Some(&start),
+                        "item {id} must place its first chunk at the range start",
+                    );
+                    assert_eq!(
+                        results.bytes.get(&id).map(Vec::as_slice),
+                        Some(expected),
+                        "item {id} must return exactly the range",
+                    );
+                }
+
+                close_handle(handle_id).await;
+                Ok(())
+            })
+            .await
+    }
+
+    /// The range is validated against the content the remote actually holds, so a start past
+    /// the end is rejected on the same terms it would be locally.
+    #[tokio::test]
+    async fn get_with_an_offset_past_the_end_rejects_over_remote() -> TestResult {
+        use bytes::Bytes;
+        use lore_base::types::Partition;
+        use lore_revision::event::LoreErrorCode;
+
+        let execution = setup_execution("storage-remote-get-range-past-end".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let server = start_test_server().await;
+                let partition = Partition::from([0xd3u8; 16]);
+
+                let payload = Bytes::from_static(b"a short remote payload");
+                let address = seed_server(&server, partition, &payload).await;
+
+                let handle_id = open_remote_handle(&server).await;
+                let past_end = payload.len() as u64 + 1;
+                let results = run_get_batch(
+                    handle_id,
+                    vec![ranged_get_item(1, partition, address, past_end, 10, 0)],
+                )
+                .await;
+
+                assert_eq!(
+                    results.codes.get(&1),
+                    Some(&LoreErrorCode::InvalidArguments),
+                );
+                assert!(
+                    !results.bytes.contains_key(&1),
+                    "a rejected range must emit no data",
+                );
 
                 close_handle(handle_id).await;
                 Ok(())

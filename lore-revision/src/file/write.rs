@@ -244,6 +244,7 @@ pub async fn write_file(
             repository.clone(),
             node.address,
             destination.as_path(),
+            None,
             immutable::read_options_from_repository(&repository),
         )
         .await
@@ -342,6 +343,7 @@ pub async fn write_address(
         repository.clone(),
         address_value,
         destination.as_path(),
+        None,
         immutable::read_options_from_repository(&repository),
     )
     .await

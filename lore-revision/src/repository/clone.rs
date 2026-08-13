@@ -1963,6 +1963,7 @@ async fn clone_file(
                 repository.clone(),
                 node.address,
                 absolute_path.as_path(),
+                None,
                 read_options_from_repository(&repository),
             )
             .await
