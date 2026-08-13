@@ -31,8 +31,8 @@ pub const BASE_REQUEST_SIZE: usize = size_of::<ReplicationHeader>() +
         // reserved byte
         1;
 
-/// The byte that used to carry the required match level. See
-/// [`crate::protocol::replication_store::exists_batch`] for why it stays.
+/// The byte that used to carry the required match level. Written as the level every caller last
+/// sent and ignored on the way in; kept so the request layout does not change.
 const RESERVED_MATCH_BYTE: u8 = StoreMatch::MatchFull as u8;
 
 #[derive(Clone, Debug, PartialEq)]

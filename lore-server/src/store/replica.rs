@@ -32,12 +32,12 @@ use tracing::Instrument;
 use tracing::instrument;
 use tracing::warn;
 
-use crate::protocol::replication_store::exists_batch::ExistsBatch;
-use crate::protocol::replication_store::exists_batch::ExistsBatchResponse;
-use crate::protocol::replication_store::exists_batch::MAX_ADDRESSES;
 use crate::protocol::replication_store::get::Get;
 use crate::protocol::replication_store::get_metadata::GetMetadata;
 use crate::protocol::replication_store::header::ReplicationHeader;
+use crate::protocol::replication_store::query;
+use crate::protocol::replication_store::query::Query;
+use crate::protocol::replication_store::query::QueryResponse;
 use crate::quic::client_monitor::ClientMetrics;
 use crate::quic::replication_store_service::client::ReplicationStoreClientError;
 use crate::quic::replication_store_service::client::ServiceRequestMeta;
@@ -161,12 +161,11 @@ where
             .output
     }
 
-    async fn do_exists_batch(
+    async fn do_query(
         self: Arc<Self>,
-        metric_label: &'static str,
         repository: Partition,
         addresses: Vec<Address>,
-    ) -> Result<ExistsBatchResponse, StoreError> {
+    ) -> Result<QueryResponse, StoreError> {
         let meta = ServiceRequestMeta {
             client_epoch: self.client_container.epoch(),
             address: None,
@@ -174,7 +173,7 @@ where
 
         let service_result = async {
             let context = execution_context();
-            let request = ExistsBatch {
+            let request = Query {
                 header: ReplicationHeader {
                     correlation_id: uuid::Uuid::try_parse(
                         context.globals().correlation_id.as_str(),
@@ -185,14 +184,13 @@ where
                 addresses,
             };
             let client = self.client_container.client().read().await;
-            let response = client.local_exists_batch(request).await?;
-            Ok(response)
+            client.local_query(request).await
         }
         .observe(
             self.instruments.operation_latency.clone(),
             self.instruments
                 .provider
-                .get_labels_for_operation_context(metric_label),
+                .get_labels_for_operation_context("query"),
             observe_client_interaction(),
         )
         .await
@@ -213,9 +211,6 @@ where
         true
     }
 
-    /// A replica is a peer inside the deployment rather than across a trust boundary, so the level
-    /// it establishes is carried through intact. It makes no claim about where the payload is kept:
-    /// the replication request has no room to say, and a replica is not durable storage.
     #[lore_macro::lore_instrument]
     #[instrument(name = "QuicReplica::Query", skip_all)]
     async fn query(
@@ -230,39 +225,27 @@ where
             return Err(StoreError::internal("client is unhealthy"));
         }
 
-        let batch_futures = addresses.chunks(MAX_ADDRESSES).map(|chunk| {
-            self.clone()
-                .do_exists_batch("query", repository, chunk.to_vec())
-        });
+        let batch_futures = addresses
+            .chunks(query::MAX_ADDRESSES)
+            .map(|chunk| self.clone().do_query(repository, chunk.to_vec()));
 
         let responses = join_all(batch_futures).await;
 
         let mut offset = 0;
-        for (chunk, response) in addresses.chunks(MAX_ADDRESSES).zip(responses) {
+        for (chunk, response) in addresses.chunks(query::MAX_ADDRESSES).zip(responses) {
             let response = response?;
-            if response.matches.len() != chunk.len() {
+            if response.results.len() != chunk.len() {
                 return Err(StoreError::internal(
                     "read replica resolve response mismatch",
                 ));
             }
 
-            for (match_made, result) in response
-                .matches
+            for (result_from_peer, result) in response
+                .results
                 .into_iter()
                 .zip(results[offset..].iter_mut())
             {
-                *result = if match_made == StoreMatch::MatchNone {
-                    StoreMatchResult::default()
-                } else {
-                    StoreMatchResult {
-                        match_made,
-                        // A peer resolves inside the partition it was asked about; a match
-                        // anywhere else never leaves it.
-                        partition: repository,
-                        stored_local: false,
-                        stored_durable: false,
-                    }
-                };
+                *result = result_from_peer;
             }
             offset += chunk.len();
         }
@@ -525,14 +508,14 @@ mod tests {
     use tokio::sync::mpsc::Receiver;
 
     use super::*;
-    use crate::protocol::replication_store::exists_batch::ExistsBatch;
-    use crate::protocol::replication_store::exists_batch::ExistsBatchResponse;
     use crate::protocol::replication_store::get::GetResponse;
     use crate::protocol::replication_store::get_metadata::GetMetadata;
     use crate::protocol::replication_store::get_metadata::GetMetadataResponse;
     use crate::protocol::replication_store::obliterate::Obliterate;
     use crate::protocol::replication_store::obliterate::ObliterateResponse;
     use crate::protocol::replication_store::put::Put;
+    use crate::protocol::replication_store::query::Query;
+    use crate::protocol::replication_store::query::QueryResponse;
     use crate::quic::replication_store_service::ReplicationServiceErrorCode;
 
     mockall::mock! {
@@ -543,11 +526,6 @@ mod tests {
             async fn connection_stats(&self) -> Option<ConnectionStats>;
 
             async fn put(&self, request: Put) -> Result<(), ReplicationStoreClientError>;
-
-            async fn exists_batch(
-                &self,
-                request: ExistsBatch,
-            ) -> Result<ExistsBatchResponse, ReplicationStoreClientError>;
 
             async fn obliterate(
                 &self,
@@ -566,17 +544,22 @@ mod tests {
 
             async fn local_put(&self, request: Put) -> Result<(), ReplicationStoreClientError>;
 
-            async fn local_exists_batch(
-                &self,
-                request: ExistsBatch,
-            ) -> Result<ExistsBatchResponse, ReplicationStoreClientError>;
-
             async fn local_get(&self, request: Get) -> Result<GetResponse, ReplicationStoreClientError>;
 
             async fn local_get_metadata(
                 &self,
                 request: GetMetadata,
             ) -> Result<GetMetadataResponse, ReplicationStoreClientError>;
+
+            async fn query(
+                &self,
+                request: Query,
+            ) -> Result<QueryResponse, ReplicationStoreClientError>;
+
+            async fn local_query(
+                &self,
+                request: Query,
+            ) -> Result<QueryResponse, ReplicationStoreClientError>;
         }
     }
 
@@ -648,9 +631,9 @@ mod tests {
                 let factory = ChannelFactory { rx: rx.into() };
 
                 let mut client = make_mock_client();
-                client.expect_local_exists_batch().returning(|request| {
-                    Ok(ExistsBatchResponse {
-                        matches: vec![StoreMatch::MatchNone; request.addresses.len()],
+                client.expect_local_query().returning(|request| {
+                    Ok(QueryResponse {
+                        results: vec![StoreMatchResult::default(); request.addresses.len()],
                     })
                 });
                 client.expect_local_get_metadata().returning(|_| {
@@ -1056,11 +1039,16 @@ mod tests {
         }
     }
 
-    mod exists {
+    mod query {
+        use std::collections::HashMap;
+
+        use parking_lot::Mutex;
+
         use super::*;
+        use crate::protocol::replication_store::query::MAX_ADDRESSES;
 
         #[tokio::test]
-        async fn successful_exist_transform_works() {
+        async fn successful_query_one_works() {
             let correlation_id = uuid::Uuid::new_v4();
             let execution = crate::util::setup_execution(
                 "test",
@@ -1075,19 +1063,25 @@ mod tests {
                     let (tx, rx) = mpsc::channel(1);
                     let factory = ChannelFactory { rx: rx.into() };
 
+                    let repository_partition: Partition = repository.into();
                     let mut client = make_mock_client();
                     client
-                        .expect_local_exists_batch()
-                        .with(eq(ExistsBatch {
+                        .expect_local_query()
+                        .with(eq(Query {
                             header: ReplicationHeader {
                                 correlation_id,
                                 repository,
                             },
                             addresses: vec![address],
                         }))
-                        .returning(|_| {
-                            Ok(ExistsBatchResponse {
-                                matches: vec![StoreMatch::MatchPartition],
+                        .returning(move |_| {
+                            Ok(QueryResponse {
+                                results: vec![StoreMatchResult {
+                                    match_made: lore_storage::StoreMatch::MatchPartition,
+                                    partition: repository_partition,
+                                    stored_local: false,
+                                    stored_durable: false,
+                                }],
                             })
                         });
 
@@ -1114,105 +1108,9 @@ mod tests {
                 .await;
         }
 
-        #[tokio::test]
-        async fn service_error_transformation_works() {
-            let execution =
-                crate::util::setup_execution("test", String::default(), String::default());
-            LORE_CONTEXT
-                .scope(execution, async move {
-                    let repository: Context = random();
-                    let (_, address, _) = fragment::generate_random();
-
-                    let (tx, rx) = mpsc::channel(1);
-                    let factory = ChannelFactory { rx: rx.into() };
-
-                    let mut client = make_mock_client();
-                    client.expect_local_exists_batch().returning(|_| {
-                        Err(ReplicationStoreClientError::ServiceError(
-                            ReplicationServiceErrorCode::SlowDown,
-                        ))
-                    });
-
-                    tx.send(Ok(client)).await.unwrap();
-                    let replica = Replica::new(
-                        Arc::new(factory),
-                        make_client_container_config(),
-                        LabelArray::default(),
-                    )
-                    .await
-                    .expect("Creation should work");
-                    let replica = Arc::new(replica);
-
-                    let exist_error = lore_storage::immutable_store::query_one(
-                        &(replica as Arc<dyn ImmutableStore>),
-                        repository.into(),
-                        address,
-                    )
-                    .await
-                    .expect_err("resolve should fail");
-
-                    assert!(matches!(exist_error, StoreError::SlowDown(_)));
-                })
-                .await;
-        }
-
-        #[tokio::test]
-        async fn exist_returns_error_when_unhealthy() {
-            let execution =
-                crate::util::setup_execution("test", String::default(), String::default());
-            LORE_CONTEXT
-                .scope(execution, async move {
-                    let (tx, rx) = mpsc::channel(1);
-                    let factory = ChannelFactory { rx: rx.into() };
-
-                    tx.send(Ok(make_mock_client())).await.unwrap();
-                    let replica = Replica::new(
-                        Arc::new(factory),
-                        make_client_container_config(),
-                        LabelArray::default(),
-                    )
-                    .await
-                    .expect("Creation should work");
-                    let replica = Arc::new(replica);
-
-                    // drive the regenerate forward enough to mark unhealthy, then drop
-                    {
-                        let regen = replica.client_container.regenerate_client(
-                            replica.client_container.epoch(),
-                            GenerateClientReason::ConnectionFailed,
-                        );
-                        tokio::pin!(regen);
-                        tokio::select! {
-                            _ = &mut regen => { panic!("regen should not finish"); },
-                            _ = tokio::time::sleep(Duration::from_millis(100)) => {},
-                        }
-                    }
-                    assert!(!replica.client_container.is_healthy());
-
-                    let repository: Context = random();
-                    let (_, address, _) = fragment::generate_random();
-
-                    let error = lore_storage::immutable_store::query_one(
-                        &(replica as Arc<dyn ImmutableStore>),
-                        repository.into(),
-                        address,
-                    )
-                    .await
-                    .expect_err("resolve should fail when unhealthy");
-                    assert!(matches!(error, StoreError::Internal(_)));
-                })
-                .await;
-        }
-    }
-
-    mod exists_batch {
-        use std::collections::HashMap;
-
-        use parking_lot::Mutex;
-
-        use super::*;
-        use crate::protocol::replication_store::exists_batch::MAX_ADDRESSES;
-
+        // Creates a large number of addresses, each with a pre-assigned random StoreMatchResult.
+        // The mocks return the pre-assigned result per address, and the test verifies the full
+        // result (match level, partition, and storage flags) is forwarded in the original order.
         #[tokio::test]
         async fn successful_transformation_with_order_preserved() {
             let correlation_id = uuid::Uuid::new_v4();
@@ -1224,19 +1122,25 @@ mod tests {
             LORE_CONTEXT
                 .scope(execution, async move {
                     let repository: Context = random();
+                    let partition: Partition = repository.into();
 
+                    // create random addresses and decide randomly what store match result they will be
+                    // for the duration of the test
                     let mut addresses = Vec::new();
-                    let address_matches: Arc<Mutex<HashMap<Address, StoreMatch>>> =
+                    let address_results: Arc<Mutex<HashMap<Address, StoreMatchResult>>> =
                         Arc::new(HashMap::new().into());
                     for _ in 0..MAX_ADDRESSES * 4 {
                         let (_, address, _) = fragment::generate_random();
                         addresses.push(address);
 
                         let random_match: u8 = random::<u8>() % 4;
-                        let store_match: StoreMatch =
-                            random_match.try_into().expect("invalid store match");
-
-                        address_matches.lock().insert(address, store_match);
+                        let result = StoreMatchResult {
+                            match_made: random_match.try_into().expect("invalid store match"),
+                            partition,
+                            stored_local: random(),
+                            stored_durable: random(),
+                        };
+                        address_results.lock().insert(address, result);
                     }
 
                     let (tx, rx) = mpsc::channel(1);
@@ -1244,10 +1148,10 @@ mod tests {
 
                     let mut client = make_mock_client();
                     for addresses in addresses.chunks(MAX_ADDRESSES) {
-                        let address_matches = address_matches.clone();
+                        let address_results = address_results.clone();
                         client
-                            .expect_local_exists_batch()
-                            .with(eq(ExistsBatch {
+                            .expect_local_query()
+                            .with(eq(Query {
                                 header: ReplicationHeader {
                                     correlation_id,
                                     repository,
@@ -1255,12 +1159,9 @@ mod tests {
                                 addresses: addresses.to_vec(),
                             }))
                             .returning(move |request| {
-                                let map = address_matches.lock();
-                                let mut output = Vec::new();
-                                for address in request.addresses {
-                                    output.push(map[&address]);
-                                }
-                                Ok(ExistsBatchResponse { matches: output })
+                                let map = address_results.lock();
+                                let results = request.addresses.iter().map(|a| map[a]).collect();
+                                Ok(QueryResponse { results })
                             });
                     }
 
@@ -1280,11 +1181,11 @@ mod tests {
                         .await
                         .expect("resolve should work");
 
-                    let map = address_matches.lock();
-                    for (index, store_match) in store_matches.iter().enumerate() {
+                    // sanity check the addresses are what we expect
+                    let map = address_results.lock();
+                    for (index, got) in store_matches.iter().enumerate() {
                         let address = addresses[index];
-                        let expected_match = map[&address];
-                        assert_eq!(store_match.match_made, expected_match);
+                        assert_eq!(*got, map[&address]);
                     }
                 })
                 .await;
@@ -1313,17 +1214,17 @@ mod tests {
 
                     let mut client = make_mock_client();
                     // 1 of the batched calls is ok, the other isn't
-                    client.expect_local_exists_batch().returning(|_| {
+                    client.expect_local_query().returning(|_| {
                         Err(ReplicationStoreClientError::ServiceError(
                             ReplicationServiceErrorCode::SlowDown,
                         ))
                     });
-                    client.expect_local_exists_batch().returning(|request| {
-                        Ok(ExistsBatchResponse {
-                            matches: request
+                    client.expect_local_query().returning(|request| {
+                        Ok(QueryResponse {
+                            results: request
                                 .addresses
-                                .into_iter()
-                                .map(|_| StoreMatch::MatchHash)
+                                .iter()
+                                .map(|_| StoreMatchResult::default())
                                 .collect(),
                         })
                     });
@@ -1544,7 +1445,7 @@ mod tests {
         use super::*;
 
         #[tokio::test]
-        async fn successful_transform_works() {
+        async fn full_match_transform_works() {
             let correlation_id = uuid::Uuid::new_v4();
             let execution = crate::util::setup_execution(
                 "test",
@@ -1592,6 +1493,60 @@ mod tests {
                         .expect("get_metadata should work");
 
                     assert_eq!(output.match_made, StoreMatch::MatchFull);
+                    assert_eq!(output.fragment, fragment);
+                })
+                .await;
+        }
+
+        #[tokio::test]
+        async fn partial_match_transform_works() {
+            let correlation_id = uuid::Uuid::new_v4();
+            let execution = crate::util::setup_execution(
+                "test",
+                correlation_id.as_hyphenated().to_string(),
+                String::default(),
+            );
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let repository: Context = random();
+                    let (fragment, address, _) = fragment::generate_random();
+
+                    let (tx, rx) = mpsc::channel(1);
+                    let factory = ChannelFactory { rx: rx.into() };
+
+                    let mut client = make_mock_client();
+                    client
+                        .expect_local_get_metadata()
+                        .with(eq(GetMetadata {
+                            header: ReplicationHeader {
+                                correlation_id,
+                                repository,
+                            },
+                            address,
+                        }))
+                        .returning(move |_| {
+                            Ok(GetMetadataResponse {
+                                fragment,
+                                match_made: StoreMatch::MatchPartition,
+                            })
+                        });
+
+                    tx.send(Ok(client)).await.unwrap();
+                    let replica = Replica::new(
+                        Arc::new(factory),
+                        make_client_container_config(),
+                        LabelArray::default(),
+                    )
+                    .await
+                    .expect("Creation should work");
+                    let replica = Arc::new(replica);
+
+                    let output = replica
+                        .get_metadata(repository.into(), address)
+                        .await
+                        .expect("get_metadata should work");
+
+                    assert_eq!(output.match_made, StoreMatch::MatchPartition);
                     assert_eq!(output.fragment, fragment);
                 })
                 .await;
@@ -1655,148 +1610,6 @@ mod tests {
                     .expect("Creation should work");
                     let replica = Arc::new(replica);
 
-                    {
-                        let regen = replica.client_container.regenerate_client(
-                            replica.client_container.epoch(),
-                            GenerateClientReason::ConnectionFailed,
-                        );
-                        tokio::pin!(regen);
-                        tokio::select! {
-                            _ = &mut regen => { panic!("regen should not finish"); },
-                            _ = tokio::time::sleep(Duration::from_millis(100)) => {},
-                        }
-                    }
-                    assert!(!replica.client_container.is_healthy());
-
-                    let repository: Context = random();
-                    let (_, address, _) = fragment::generate_random();
-
-                    let error = replica
-                        .get_metadata(repository.into(), address)
-                        .await
-                        .expect_err("get_metadata should fail when unhealthy");
-                    assert!(matches!(error, StoreError::Internal(_)));
-                })
-                .await;
-        }
-    }
-
-    mod query {
-        use super::*;
-
-        #[tokio::test]
-        async fn successful_transform_works() {
-            let correlation_id = uuid::Uuid::new_v4();
-            let execution = crate::util::setup_execution(
-                "test",
-                correlation_id.as_hyphenated().to_string(),
-                String::default(),
-            );
-            LORE_CONTEXT
-                .scope(execution, async move {
-                    let repository: Context = random();
-                    let (fragment, address, _) = fragment::generate_random();
-
-                    let (tx, rx) = mpsc::channel(1);
-                    let factory = ChannelFactory { rx: rx.into() };
-
-                    let mut client = make_mock_client();
-                    client
-                        .expect_local_get_metadata()
-                        .with(eq(GetMetadata {
-                            header: ReplicationHeader {
-                                correlation_id,
-                                repository,
-                            },
-                            address,
-                        }))
-                        .returning(move |_| {
-                            Ok(GetMetadataResponse {
-                                fragment,
-                                match_made: StoreMatch::MatchPartition,
-                            })
-                        });
-
-                    tx.send(Ok(client)).await.unwrap();
-                    let replica = Replica::new(
-                        Arc::new(factory),
-                        make_client_container_config(),
-                        LabelArray::default(),
-                    )
-                    .await
-                    .expect("Creation should work");
-                    let replica = Arc::new(replica);
-
-                    let query_output = replica
-                        .get_metadata(repository.into(), address)
-                        .await
-                        .expect("get_metadata should work");
-
-                    assert_eq!(query_output.match_made, StoreMatch::MatchPartition);
-                    assert_eq!(query_output.fragment, fragment);
-                })
-                .await;
-        }
-
-        #[tokio::test]
-        async fn service_error_transformation_works() {
-            let execution =
-                crate::util::setup_execution("test", String::default(), String::default());
-            LORE_CONTEXT
-                .scope(execution, async move {
-                    let repository: Context = random();
-                    let (_, address, _) = fragment::generate_random();
-
-                    let (tx, rx) = mpsc::channel(1);
-                    let factory = ChannelFactory { rx: rx.into() };
-
-                    let mut client = make_mock_client();
-                    client.expect_local_get_metadata().returning(|_| {
-                        Err(ReplicationStoreClientError::ServiceError(
-                            ReplicationServiceErrorCode::SlowDown,
-                        ))
-                    });
-
-                    tx.send(Ok(client)).await.unwrap();
-                    let replica = Replica::new(
-                        Arc::new(factory),
-                        make_client_container_config(),
-                        LabelArray::default(),
-                    )
-                    .await
-                    .expect("Creation should work");
-                    let replica = Arc::new(replica);
-
-                    let error = replica
-                        .get_metadata(repository.into(), address)
-                        .await
-                        .expect_err("get_metadata should fail");
-
-                    assert!(matches!(error, StoreError::SlowDown(_)));
-                })
-                .await;
-        }
-
-        #[tokio::test]
-        async fn query_returns_error_when_unhealthy() {
-            let execution =
-                crate::util::setup_execution("test", String::default(), String::default());
-            LORE_CONTEXT
-                .scope(execution, async move {
-                    let (tx, rx) = mpsc::channel(1);
-                    let factory = ChannelFactory { rx: rx.into() };
-
-                    tx.send(Ok(make_mock_client())).await.unwrap();
-                    let replica = Replica::new(
-                        Arc::new(factory),
-                        make_client_container_config(),
-                        LabelArray::default(),
-                    )
-                    .await
-                    .expect("Creation should work");
-                    let replica = Arc::new(replica);
-
-                    // drive the regenerate forward enough to mark unhealthy, then drop
                     {
                         let regen = replica.client_container.regenerate_client(
                             replica.client_container.epoch(),

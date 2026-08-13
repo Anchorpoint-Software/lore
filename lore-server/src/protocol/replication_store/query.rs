@@ -6,6 +6,7 @@ use bytes::Buf;
 use bytes::Bytes;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Address;
+use lore_base::types::Partition;
 use lore_base::types::TypedBytes;
 use lore_base::types::VecBytes;
 use lore_storage::ImmutableStore;
@@ -18,6 +19,7 @@ use tracing::Span;
 use tracing::debug;
 use tracing::info_span;
 use tracing::warn;
+use zerocopy::IntoBytes;
 
 use crate::protocol::replication_store::REPLICATION_SERVICE_USER_ID;
 use crate::protocol::replication_store::header::ReplicationHeader;
@@ -29,76 +31,97 @@ use crate::util::setup_execution;
 
 pub const MAX_ADDRESSES: usize = 100;
 
-pub const BASE_REQUEST_SIZE: usize = size_of::<ReplicationHeader>() +
-        // reserved byte
-        1 +
-        // at least 1 address
-        size_of::<Address>();
+/// The `ReplicationHeader` and at least 1 `Address`
+pub const BASE_REQUEST_SIZE: usize = size_of::<ReplicationHeader>() + size_of::<Address>();
 
-/// The byte that used to carry the requested match level. Callers no longer choose one - the store
-/// decides its own scope - but the byte stays so the request layout does not change. It is written
-/// as the level every caller last sent and ignored on the way in.
-const RESERVED_MATCH_BYTE: u8 = StoreMatch::MatchFull as u8;
+/// Wire size of one serialised [`StoreMatchResult`]:
+///   1 byte  — `match_made`
+///  16 bytes — partition
+///   1 byte  — flags: bit 0 = `stored_local`, bit 1 = `stored_durable`
+const RESULT_WIRE_SIZE: usize = 1 + size_of::<Partition>() + 1;
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct ExistsBatch {
+pub struct Query {
     pub header: ReplicationHeader,
     pub addresses: Vec<Address>,
 }
 
-impl ExistsBatch {
-    pub fn to_quic_chunks(self) -> [Bytes; 4] {
+impl Query {
+    pub fn to_quic_chunks(self) -> [Bytes; 3] {
         [
             Bytes::default(), // command header
             Bytes::from_owner(self.header),
-            Bytes::copy_from_slice(&[RESERVED_MATCH_BYTE]),
             Bytes::from_owner(VecBytes(self.addresses)),
         ]
     }
 
-    pub fn parse(mut bytes: Bytes) -> Result<ExistsBatch, MessageParseError> {
+    pub fn parse(mut bytes: Bytes) -> Result<Query, MessageParseError> {
         if bytes.len() < BASE_REQUEST_SIZE {
             return Err(MessageParseError::InvalidFieldLength);
         };
 
         let header: ReplicationHeader = bytes.split_to(size_of::<ReplicationHeader>()).into();
-        bytes.advance(1); // reserved, see RESERVED_MATCH_BYTE
         let addresses = bytes.as_type_slice::<Address>().to_vec();
 
         if addresses.len() > MAX_ADDRESSES {
             return Err(MessageParseError::InvalidFieldLength);
         }
 
-        Ok(ExistsBatch { header, addresses })
+        Ok(Query { header, addresses })
     }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct ExistsBatchResponse {
-    pub matches: Vec<StoreMatch>,
+pub struct QueryResponse {
+    pub results: Vec<StoreMatchResult>,
 }
 
-impl ExistsBatchResponse {
+impl QueryResponse {
     fn data(self) -> Vec<Bytes> {
-        let matches_bytes: Vec<u8> = self.matches.into_iter().map(u8::from).collect();
-        vec![Bytes::from(matches_bytes)]
+        let mut buf = Vec::with_capacity(self.results.len() * RESULT_WIRE_SIZE);
+        for r in self.results {
+            buf.push(r.match_made.into());
+            buf.extend_from_slice(r.partition.as_bytes());
+            buf.push((r.stored_local as u8) | ((r.stored_durable as u8) << 1));
+        }
+        vec![Bytes::from(buf)]
     }
 
-    pub fn parse(bytes: Bytes) -> Result<Self, ReplicationStoreClientError> {
-        let matches_data: Vec<u8> = bytes.into();
-        let matches: Vec<StoreMatch> = matches_data
-            .into_iter()
-            .map(|b| {
-                StoreMatch::try_from(b).map_err(|error| {
-                    warn!(?error, "failed to parse store match");
-                    ReplicationStoreClientError::ResponseError(
-                        "Failed to parse store match from ExistsBatchResponse",
-                    )
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+    pub fn parse(mut bytes: Bytes) -> Result<Self, ReplicationStoreClientError> {
+        if !bytes.len().is_multiple_of(RESULT_WIRE_SIZE) {
+            return Err(ReplicationStoreClientError::ResponseError(
+                "QueryResponse length is not a multiple of entry size",
+            ));
+        }
 
-        Ok(ExistsBatchResponse { matches })
+        let count = bytes.len() / RESULT_WIRE_SIZE;
+        let mut results = Vec::with_capacity(count);
+
+        for _ in 0..count {
+            let match_made: StoreMatch = bytes[0].try_into().map_err(|error| {
+                warn!(?error, "failed to parse store match");
+                ReplicationStoreClientError::ResponseError(
+                    "Failed to parse store match from QueryResponse",
+                )
+            })?;
+            bytes.advance(1);
+
+            let partition: Partition = bytes.split_to(size_of::<Partition>()).into();
+
+            let flags = bytes[0];
+            bytes.advance(1);
+            let stored_local = flags & 0b01 != 0;
+            let stored_durable = flags & 0b10 != 0;
+
+            results.push(StoreMatchResult {
+                match_made,
+                partition,
+                stored_local,
+                stored_durable,
+            });
+        }
+
+        Ok(QueryResponse { results })
     }
 }
 
@@ -107,37 +130,34 @@ pub fn create_handler(
     immutable_store: Arc<dyn ImmutableStore>,
     message_context: &'static str,
 ) -> Result<ParsedReplicationStoreRequest, MessageParseError> {
-    let request = ExistsBatch::parse(bytes)?;
-    let handler = ExistsBatchHandler {
+    let request = Query::parse(bytes)?;
+    let handler = QueryHandler {
         immutable_store,
         request,
         message_context,
     };
 
-    Ok(ParsedReplicationStoreRequest::ExistsBatch(handler))
+    Ok(ParsedReplicationStoreRequest::Query(handler))
 }
 
 #[derive(Debug)]
-pub struct ExistsBatchHandler {
+pub struct QueryHandler {
     immutable_store: Arc<dyn ImmutableStore>,
-    pub request: ExistsBatch,
+    pub request: Query,
     message_context: &'static str,
 }
 
 #[async_trait::async_trait]
-impl RequestHandler for ExistsBatchHandler {
+impl RequestHandler for QueryHandler {
     fn span(&self) -> Span {
-        info_span!("exists_batch",
+        info_span!("query",
             {CORRELATION_ID} = %self.request.header.correlation_id.as_hyphenated(),
             {REPOSITORY_ID} = %self.request.header.repository,
             message_context = self.message_context)
     }
 
     async fn run(self) -> Result<Vec<Bytes>, StoreError> {
-        debug!(
-            num_items = self.request.addresses.len(),
-            "exists_batch request"
-        );
+        debug!(num_items = self.request.addresses.len(), "query request");
 
         let execution = setup_execution(
             module_path!(),
@@ -145,10 +165,7 @@ impl RequestHandler for ExistsBatchHandler {
             REPLICATION_SERVICE_USER_ID.to_string(),
         );
 
-        // One address and many used to take different paths, because the AWS store answered
-        // `exist` and `exist_batch` differently and the two client kinds must not observe that.
-        // There is one operation now, so there is one path.
-        let matches = LORE_CONTEXT
+        let results = LORE_CONTEXT
             .scope(execution, async move {
                 let mut resolved = vec![StoreMatchResult::default(); self.request.addresses.len()];
                 self.immutable_store
@@ -158,16 +175,11 @@ impl RequestHandler for ExistsBatchHandler {
                         &mut resolved,
                     )
                     .await
-                    .map(|()| {
-                        resolved
-                            .iter()
-                            .map(|resolved| resolved.match_made)
-                            .collect::<Vec<_>>()
-                    })
+                    .map(|()| resolved)
             })
             .await?;
 
-        let response = ExistsBatchResponse { matches };
+        let response = QueryResponse { results };
         Ok(response.data())
     }
 }
@@ -175,6 +187,7 @@ impl RequestHandler for ExistsBatchHandler {
 #[cfg(test)]
 pub mod tests {
     use lore_base::types::Context;
+    use lore_base::types::Partition;
     use lore_revision::fragment;
     use lore_transport::quic::command_header::CommandHeader;
     use rand::random;
@@ -182,25 +195,28 @@ pub mod tests {
 
     use super::*;
     use crate::quic::replication_store_service::MAX_CHUNK_SIZE;
+    use crate::quic::tests::collapse_bytes;
     use crate::quic::tests::collapse_bytes_without_header;
 
     #[test]
     fn is_under_max_chunk_size() {
         // 1 address is included in base request size, so pad with max addresses-1
         let max_request_size = BASE_REQUEST_SIZE + (size_of::<Address>() * (MAX_ADDRESSES - 1));
-        // the request is bigger than the response, so if it is under then all good
+        let max_response_size = RESULT_WIRE_SIZE * MAX_ADDRESSES;
+        // ensure both directions fit within the chunk size limit
         assert!(max_request_size + size_of::<CommandHeader>() < MAX_CHUNK_SIZE);
+        assert!(max_response_size + size_of::<CommandHeader>() < MAX_CHUNK_SIZE);
     }
 
     mod request {
         use super::*;
 
         #[test]
-        fn parsing_single_exists_works() {
+        fn parsing_single_works() {
             let repository = random::<Context>();
             let (_, address, _) = fragment::generate_random();
 
-            let input = ExistsBatch {
+            let input = Query {
                 header: ReplicationHeader {
                     correlation_id: Uuid::new_v4(),
                     repository,
@@ -208,7 +224,7 @@ pub mod tests {
                 addresses: vec![address],
             };
             let input_bytes = collapse_bytes_without_header(&input.clone().to_quic_chunks());
-            let output = ExistsBatch::parse(input_bytes).expect("parse should work");
+            let output = Query::parse(input_bytes).expect("parse should work");
 
             assert_eq!(input, output);
         }
@@ -223,7 +239,7 @@ pub mod tests {
                 })
                 .collect();
 
-            let input = ExistsBatch {
+            let input = Query {
                 header: ReplicationHeader {
                     correlation_id: Uuid::new_v4(),
                     repository,
@@ -231,7 +247,7 @@ pub mod tests {
                 addresses,
             };
             let input_bytes = collapse_bytes_without_header(&input.clone().to_quic_chunks());
-            let output = ExistsBatch::parse(input_bytes).expect("parse should work");
+            let output = Query::parse(input_bytes).expect("parse should work");
 
             assert_eq!(input, output);
         }
@@ -246,7 +262,7 @@ pub mod tests {
                 })
                 .collect();
 
-            let input = ExistsBatch {
+            let input = Query {
                 header: ReplicationHeader {
                     correlation_id: Uuid::new_v4(),
                     repository,
@@ -254,7 +270,7 @@ pub mod tests {
                 addresses,
             };
             let input_bytes = collapse_bytes_without_header(&input.clone().to_quic_chunks());
-            let output = ExistsBatch::parse(input_bytes).expect_err("parse should fail");
+            let output = Query::parse(input_bytes).expect_err("parse should fail");
 
             assert_eq!(output, MessageParseError::InvalidFieldLength);
         }
@@ -263,16 +279,15 @@ pub mod tests {
         fn parsing_fails_if_too_small() {
             let repository = random::<Context>();
 
-            let input = ExistsBatch {
+            let input = Query {
                 header: ReplicationHeader {
                     correlation_id: Uuid::new_v4(),
                     repository,
                 },
-                // no address is invalid
                 addresses: vec![],
             };
             let input_bytes = collapse_bytes_without_header(&input.to_quic_chunks());
-            let output = ExistsBatch::parse(input_bytes).expect_err("parse should fail");
+            let output = Query::parse(input_bytes).expect_err("parse should fail");
 
             assert_eq!(output, MessageParseError::InvalidFieldLength);
         }
@@ -280,39 +295,61 @@ pub mod tests {
 
     mod response {
         use super::*;
-        use crate::quic::tests::collapse_bytes;
 
         #[test]
-        fn response_to_bytes_works() {
-            let original = ExistsBatchResponse {
-                matches: vec![
-                    StoreMatch::MatchNone,
-                    StoreMatch::MatchHash,
-                    StoreMatch::MatchFull,
-                    StoreMatch::MatchPartition,
-                    StoreMatch::MatchNone,
+        fn response_roundtrips() {
+            let original = QueryResponse {
+                results: vec![
+                    StoreMatchResult {
+                        match_made: StoreMatch::MatchNone,
+                        partition: random::<Partition>(),
+                        stored_local: false,
+                        stored_durable: false,
+                    },
+                    StoreMatchResult {
+                        match_made: StoreMatch::MatchHash,
+                        partition: random::<Partition>(),
+                        stored_local: true,
+                        stored_durable: false,
+                    },
+                    StoreMatchResult {
+                        match_made: StoreMatch::MatchFull,
+                        partition: random::<Partition>(),
+                        stored_local: true,
+                        stored_durable: true,
+                    },
                 ],
             };
 
             let bytes = original.clone().data();
-            assert_eq!(bytes, vec![Bytes::from(vec![0, 1, 3, 2, 0])]);
+            let reparsed = QueryResponse::parse(collapse_bytes(&bytes)).expect("parse should work");
+            assert_eq!(reparsed, original);
+        }
 
-            let reparsed_response =
-                ExistsBatchResponse::parse(collapse_bytes(&bytes)).expect("parse should work");
-            assert_eq!(reparsed_response, original);
+        #[test]
+        fn parsing_fails_for_wrong_length() {
+            let bytes = vec![Bytes::from(vec![0u8; RESULT_WIRE_SIZE - 1])];
+            let error =
+                QueryResponse::parse(collapse_bytes(&bytes)).expect_err("parse should fail");
+            assert!(matches!(
+                error,
+                ReplicationStoreClientError::ResponseError(
+                    "QueryResponse length is not a multiple of entry size"
+                )
+            ));
         }
 
         #[test]
         fn parsing_fails_for_unknown_store_match() {
-            // 255 is not a known StoreMatch at time of writing
-            let bytes = vec![Bytes::from(vec![255])];
-
+            let mut entry = vec![0u8; RESULT_WIRE_SIZE];
+            entry[0] = 255; // invalid StoreMatch
+            let bytes = vec![Bytes::from(entry)];
             let error =
-                ExistsBatchResponse::parse(collapse_bytes(&bytes)).expect_err("parse should fail");
+                QueryResponse::parse(collapse_bytes(&bytes)).expect_err("parse should fail");
             assert!(matches!(
                 error,
                 ReplicationStoreClientError::ResponseError(
-                    "Failed to parse store match from ExistsBatchResponse"
+                    "Failed to parse store match from QueryResponse"
                 )
             ));
         }

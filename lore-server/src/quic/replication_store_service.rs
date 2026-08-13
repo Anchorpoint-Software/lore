@@ -67,17 +67,20 @@ impl From<&StoreError> for ReplicationServiceErrorCode {
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq)]
 pub enum Command {
-    ImmutableExistBatch = 0,
+    // 0 and 5 were `ExistsBatch` / `LocalExistsBatch`, superseded by `Query` (11) and
+    // `LocalQuery` (12). Left unused rather than reassigned, so a peer that still sends one is
+    // rejected instead of misread.
     ImmutableGet = 1,
     ImmutablePut = 2,
     ImmutableObliterate = 3,
     // 4 and 7 were the single-address `Query`, whose operation no longer exists. Left unused rather
     // than reassigned, so a peer that still sends one is rejected instead of misread.
-    ImmutableLocalExistBatch = 5,
     ImmutableLocalGet = 6,
     ImmutableLocalPut = 8,
     ImmutableGetMetadata = 9,
     ImmutableLocalGetMetadata = 10,
+    ImmutableQuery = 11,
+    ImmutableLocalQuery = 12,
 }
 
 impl From<Command> for QuicOpCode {
@@ -89,19 +92,17 @@ impl TryFrom<QuicOpCode> for Command {
     type Error = UnknownCommand;
     fn try_from(value: QuicOpCode) -> Result<Self, Self::Error> {
         match value {
-            v if v == Command::ImmutableExistBatch as u8 => Ok(Command::ImmutableExistBatch),
             v if v == Command::ImmutableGet as u8 => Ok(Command::ImmutableGet),
             v if v == Command::ImmutablePut as u8 => Ok(Command::ImmutablePut),
             v if v == Command::ImmutableObliterate as u8 => Ok(Command::ImmutableObliterate),
             v if v == Command::ImmutableGetMetadata as u8 => Ok(Command::ImmutableGetMetadata),
-            v if v == Command::ImmutableLocalExistBatch as u8 => {
-                Ok(Command::ImmutableLocalExistBatch)
-            }
             v if v == Command::ImmutableLocalGet as u8 => Ok(Command::ImmutableLocalGet),
             v if v == Command::ImmutableLocalGetMetadata as u8 => {
                 Ok(Command::ImmutableLocalGetMetadata)
             }
             v if v == Command::ImmutableLocalPut as u8 => Ok(Command::ImmutableLocalPut),
+            v if v == Command::ImmutableQuery as u8 => Ok(Command::ImmutableQuery),
+            v if v == Command::ImmutableLocalQuery as u8 => Ok(Command::ImmutableLocalQuery),
             _ => Err(UnknownCommand(value)),
         }
     }

@@ -23,8 +23,6 @@ use tracing::info_span;
 
 use crate::protocol::attribute_map::AttributeMap;
 use crate::protocol::attribute_map::ConnectionId;
-use crate::protocol::replication_store::exists_batch;
-use crate::protocol::replication_store::exists_batch::ExistsBatchHandler;
 use crate::protocol::replication_store::get;
 use crate::protocol::replication_store::get::GetHandler;
 use crate::protocol::replication_store::get_metadata;
@@ -33,6 +31,8 @@ use crate::protocol::replication_store::obliterate;
 use crate::protocol::replication_store::obliterate::ObliterateHandler;
 use crate::protocol::replication_store::put;
 use crate::protocol::replication_store::put::PutHandler;
+use crate::protocol::replication_store::query;
+use crate::protocol::replication_store::query::QueryHandler;
 use crate::protocol::storage::messages::MessageParseError;
 use crate::quic::NO_CONNECTION_ID;
 use crate::quic::ProtocolErrorInfo;
@@ -61,23 +61,23 @@ pub trait RequestHandler {
 #[enum_dispatch(RequestHandler)]
 pub enum ParsedReplicationStoreRequest {
     Put(PutHandler),
-    ExistsBatch(ExistsBatchHandler),
     Get(GetHandler),
     Obliterate(ObliterateHandler),
     GetMetadata(GetMetadataHandler),
+    Query(QueryHandler),
 }
 
 pub fn command_name(command: &Command) -> &'static str {
     match command {
-        Command::ImmutableExistBatch => "immutable_exist_batch",
         Command::ImmutableGet => "immutable_get",
         Command::ImmutablePut => "immutable_put",
         Command::ImmutableObliterate => "immutable_obliterate",
         Command::ImmutableGetMetadata => "immutable_get_metadata",
-        Command::ImmutableLocalExistBatch => "immutable_local_exist_batch",
         Command::ImmutableLocalGet => "immutable_local_get",
         Command::ImmutableLocalPut => "immutable_local_put",
         Command::ImmutableLocalGetMetadata => "immutable_local_get_metadata",
+        Command::ImmutableQuery => "immutable_query",
+        Command::ImmutableLocalQuery => "immutable_local_query",
     }
 }
 
@@ -122,9 +122,6 @@ impl QuicService for ReplicationStoreService {
             .map_err(|_e| MessageParseError::UnknownOpcode(header.cmd))?;
 
         let handler = match command {
-            Command::ImmutableExistBatch => {
-                exists_batch::create_handler(bytes, self.immutable_store.clone(), "exists_batch")?
-            }
             Command::ImmutableGet => {
                 get::create_handler(bytes, self.immutable_store.clone(), "get")?
             }
@@ -137,9 +134,6 @@ impl QuicService for ReplicationStoreService {
             Command::ImmutableGetMetadata => {
                 get_metadata::create_handler(bytes, self.immutable_store.clone(), "get_metadata")?
             }
-            Command::ImmutableLocalExistBatch => {
-                exists_batch::create_handler(bytes, self.local_store.clone(), "local_exists_batch")?
-            }
             Command::ImmutableLocalGet => {
                 get::create_handler(bytes, self.local_store.clone(), "local_get")?
             }
@@ -148,6 +142,12 @@ impl QuicService for ReplicationStoreService {
             }
             Command::ImmutableLocalGetMetadata => {
                 get_metadata::create_handler(bytes, self.local_store.clone(), "local_get_metadata")?
+            }
+            Command::ImmutableQuery => {
+                query::create_handler(bytes, self.immutable_store.clone(), "query")?
+            }
+            Command::ImmutableLocalQuery => {
+                query::create_handler(bytes, self.local_store.clone(), "local_query")?
             }
         };
 
@@ -205,9 +205,9 @@ impl QuicService for ReplicationStoreService {
         let replication_header = match message {
             ParsedReplicationStoreRequest::Get(h) => &h.request.header,
             ParsedReplicationStoreRequest::Put(h) => &h.request.header,
-            ParsedReplicationStoreRequest::ExistsBatch(h) => &h.request.header,
             ParsedReplicationStoreRequest::Obliterate(h) => &h.request.header,
             ParsedReplicationStoreRequest::GetMetadata(h) => &h.request.header,
+            ParsedReplicationStoreRequest::Query(h) => &h.request.header,
         };
         let repository_id = replication_header.repository.to_string();
         let correlation_id = replication_header
@@ -225,17 +225,6 @@ impl QuicService for ReplicationStoreService {
             .map_or("", |command| command_name(command));
 
         match command_parse {
-            Ok(Command::ImmutableExistBatch) => info_span!(
-                parent: None,
-                "ReplicationExistBatchTask",
-                { SAMPLING_TIER_LOW } = true,
-                { TRANSPORT } = %Transport::Quic,
-                { PROTOCOL } = %StorageProtocol::Replication,
-                { QUIC_OPCODE } = opcode_label,
-                { CONNECTION_ID } = connection_id,
-                { REPOSITORY_ID } = repository_id,
-                { CORRELATION_ID } = correlation_id,
-            ),
             Ok(Command::ImmutableGet) => info_span!(
                 parent: None,
                 "ReplicationGetTask",
@@ -278,17 +267,6 @@ impl QuicService for ReplicationStoreService {
                 { REPOSITORY_ID } = repository_id,
                 { CORRELATION_ID } = correlation_id,
             ),
-            Ok(Command::ImmutableLocalExistBatch) => info_span!(
-                parent: None,
-                "ReplicationLocalExistBatchTask",
-                { SAMPLING_TIER_LOW } = true,
-                { TRANSPORT } = %Transport::Quic,
-                { PROTOCOL } = %StorageProtocol::Replication,
-                { QUIC_OPCODE } = opcode_label,
-                { CONNECTION_ID } = connection_id,
-                { REPOSITORY_ID } = repository_id,
-                { CORRELATION_ID } = correlation_id,
-            ),
             Ok(Command::ImmutableLocalGet) => info_span!(
                 parent: None,
                 "ReplicationLocalGetTask",
@@ -314,6 +292,28 @@ impl QuicService for ReplicationStoreService {
             Ok(Command::ImmutableLocalGetMetadata) => info_span!(
                 parent: None,
                 "ReplicationLocalGetMetadataTask",
+                { TRANSPORT } = %Transport::Quic,
+                { PROTOCOL } = %StorageProtocol::Replication,
+                { QUIC_OPCODE } = opcode_label,
+                { CONNECTION_ID } = connection_id,
+                { REPOSITORY_ID } = repository_id,
+                { CORRELATION_ID } = correlation_id,
+            ),
+            Ok(Command::ImmutableQuery) => info_span!(
+                parent: None,
+                "ReplicationQueryTask",
+                { SAMPLING_TIER_LOW } = true,
+                { TRANSPORT } = %Transport::Quic,
+                { PROTOCOL } = %StorageProtocol::Replication,
+                { QUIC_OPCODE } = opcode_label,
+                { CONNECTION_ID } = connection_id,
+                { REPOSITORY_ID } = repository_id,
+                { CORRELATION_ID } = correlation_id,
+            ),
+            Ok(Command::ImmutableLocalQuery) => info_span!(
+                parent: None,
+                "ReplicationLocalQueryTask",
+                { SAMPLING_TIER_LOW } = true,
                 { TRANSPORT } = %Transport::Quic,
                 { PROTOCOL } = %StorageProtocol::Replication,
                 { QUIC_OPCODE } = opcode_label,
@@ -358,7 +358,6 @@ mod tests {
     use zerocopy::IntoBytes;
 
     use super::*;
-    use crate::protocol::replication_store::exists_batch::ExistsBatch;
     use crate::protocol::replication_store::get::Get;
     use crate::protocol::replication_store::get::GetResponse;
     use crate::protocol::replication_store::get_metadata::GetMetadata;
@@ -366,6 +365,8 @@ mod tests {
     use crate::protocol::replication_store::header::ReplicationHeader;
     use crate::protocol::replication_store::obliterate::Obliterate;
     use crate::protocol::replication_store::put::Put;
+    use crate::protocol::replication_store::query::Query;
+    use crate::protocol::replication_store::query::QueryResponse;
     use crate::quic::QuicService;
     use crate::quic::replication_store_service::*;
     use crate::quic::tests::collapse_bytes;
@@ -440,9 +441,8 @@ mod tests {
             .await;
     }
 
-    // batch version
     #[tokio::test]
-    async fn immutable_exists_batch_works_end_to_end() {
+    async fn immutable_query_works_end_to_end() {
         let (immutable_store, _, execution) =
             test_store_create().await.expect("Failed to create stores");
 
@@ -450,30 +450,25 @@ mod tests {
 
         let address_match_full = {
             let (fragment, address, payload) = fragment::generate_random();
-
             let immutable_store = immutable_store.clone();
             LORE_CONTEXT
                 .scope(execution.clone(), async move {
                     immutable_store
-                        .clone()
                         .put(repository.into(), address, fragment, Some(payload), false)
                         .await
                         .expect("put should work");
                 })
                 .await;
-
             address
         };
 
         let address_other_repository = {
             let other_repository = random::<Context>();
             let (fragment, address, payload) = fragment::generate_random();
-
             let immutable_store = immutable_store.clone();
             LORE_CONTEXT
                 .scope(execution.clone(), async move {
                     immutable_store
-                        .clone()
                         .put(
                             other_repository.into(),
                             address,
@@ -485,28 +480,23 @@ mod tests {
                         .expect("put should work");
                 })
                 .await;
-
             address
         };
 
         let address_different_context = {
             let (fragment, address, payload) = fragment::generate_random();
-
             let immutable_store = immutable_store.clone();
             LORE_CONTEXT
                 .scope(execution.clone(), async move {
                     immutable_store
-                        .clone()
                         .put(repository.into(), address, fragment, Some(payload), false)
                         .await
                         .expect("put should work");
                 })
                 .await;
-
-            let different_context = random::<Context>();
             Address {
                 hash: address.hash,
-                context: different_context,
+                context: random::<Context>(),
             }
         };
 
@@ -519,7 +509,7 @@ mod tests {
             address_no_match,
         ];
 
-        let request = ExistsBatch {
+        let request = Query {
             header: ReplicationHeader {
                 correlation_id: Uuid::new_v4(),
                 repository,
@@ -532,126 +522,35 @@ mod tests {
 
         let parse_output = service
             .parse_request_bytes(
-                &CommandHeader::new(Command::ImmutableExistBatch as QuicOpCode, 0, 0),
+                &CommandHeader::new(Command::ImmutableQuery as QuicOpCode, 0, 0),
                 collapse_bytes_without_header(&request.to_quic_chunks()),
             )
             .expect("Failed to parse");
         assert!(matches!(
             parse_output,
-            ParsedReplicationStoreRequest::ExistsBatch(_)
+            ParsedReplicationStoreRequest::Query(_)
         ));
 
         let handle_output = service
             .run_request_handler(AttributeMap::default().into(), parse_output)
             .await
             .expect("handler failed");
-        assert_eq!(handle_output, vec![Bytes::from(vec![3, 1, 2, 0])]);
 
-        // and the output matches as if we went to the store directly
+        // the response matches what the store returns directly
         let direct_store_output = LORE_CONTEXT
             .scope(execution.clone(), async move {
                 let mut resolved = vec![StoreMatchResult::default(); addresses.len()];
                 immutable_store
-                    .clone()
                     .query(repository.into(), &addresses, &mut resolved)
                     .await
                     .expect("direct should work");
                 resolved
-                    .into_iter()
-                    .map(|resolved| resolved.match_made)
-                    .collect::<Vec<_>>()
             })
             .await;
-        assert_eq!(
-            handle_output,
-            vec![Bytes::from(
-                direct_store_output
-                    .into_iter()
-                    .map(u8::from)
-                    .collect::<Vec<_>>()
-            )]
-        );
-    }
 
-    // single address version
-    #[tokio::test]
-    async fn immutable_exists_works_end_to_end() {
-        let (immutable_store, _, execution) =
-            test_store_create().await.expect("Failed to create stores");
-
-        let repository = random::<Context>();
-
-        let address_match_full = {
-            let (fragment, address, payload) = fragment::generate_random();
-
-            let immutable_store = immutable_store.clone();
-            LORE_CONTEXT
-                .scope(execution.clone(), async move {
-                    immutable_store
-                        .clone()
-                        .put(repository.into(), address, fragment, Some(payload), false)
-                        .await
-                        .expect("put should work");
-                })
-                .await;
-
-            address
-        };
-
-        let addresses = vec![address_match_full];
-
-        let request = ExistsBatch {
-            header: ReplicationHeader {
-                correlation_id: Uuid::new_v4(),
-                repository,
-            },
-            addresses: addresses.clone(),
-        };
-
-        let service =
-            ReplicationStoreService::new(immutable_store.clone(), immutable_store.clone());
-
-        let parse_output = service
-            .parse_request_bytes(
-                &CommandHeader::new(Command::ImmutableExistBatch as QuicOpCode, 0, 0),
-                collapse_bytes_without_header(&request.to_quic_chunks()),
-            )
-            .expect("Failed to parse");
-        assert!(matches!(
-            parse_output,
-            ParsedReplicationStoreRequest::ExistsBatch(_)
-        ));
-
-        let handle_output = service
-            .run_request_handler(AttributeMap::default().into(), parse_output)
-            .await
-            .expect("handler failed");
-        assert_eq!(handle_output, vec![Bytes::from(vec![3])]);
-
-        // and the output matches as if we went to the store directly
-        let direct_store_output = LORE_CONTEXT
-            .scope(execution.clone(), async move {
-                let mut resolved = vec![StoreMatchResult::default(); addresses.len()];
-                immutable_store
-                    .clone()
-                    .query(repository.into(), &addresses, &mut resolved)
-                    .await
-                    .expect("direct should work");
-                resolved
-                    .into_iter()
-                    .map(|resolved| resolved.match_made)
-                    .collect::<Vec<_>>()
-            })
-            .await;
-        assert_eq!(
-            handle_output,
-            vec![Bytes::from(
-                direct_store_output
-                    .into_iter()
-                    .map(u8::from)
-                    .collect::<Vec<_>>()
-            )]
-        );
+        let response = QueryResponse::parse(collapse_bytes(&handle_output))
+            .expect("response parse should work");
+        assert_eq!(response.results, direct_store_output);
     }
 
     #[tokio::test]
@@ -994,7 +893,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn immutable_local_exists_batch_routes_to_local_store() {
+    async fn immutable_local_query_routes_to_local_store() {
         let (main_store, local_store, execution) = create_two_stores().await;
 
         let repository = random::<Context>();
@@ -1013,7 +912,7 @@ mod tests {
                 .await;
         }
 
-        let request = ExistsBatch {
+        let request = Query {
             header: ReplicationHeader {
                 correlation_id: Uuid::new_v4(),
                 repository,
@@ -1023,28 +922,30 @@ mod tests {
 
         let service = ReplicationStoreService::new(main_store.clone(), local_store.clone());
 
-        // ImmutableLocalExistBatch should find the data via the local store
+        // ImmutableLocalQuery should find the data via the local store
         let parse_output = service
             .parse_request_bytes(
-                &CommandHeader::new(Command::ImmutableLocalExistBatch as QuicOpCode, 0, 0),
+                &CommandHeader::new(Command::ImmutableLocalQuery as QuicOpCode, 0, 0),
                 collapse_bytes_without_header(&request.clone().to_quic_chunks()),
             )
             .expect("Failed to parse");
         assert!(matches!(
             parse_output,
-            ParsedReplicationStoreRequest::ExistsBatch(_)
+            ParsedReplicationStoreRequest::Query(_)
         ));
 
         let handle_output = service
             .run_request_handler(AttributeMap::default().into(), parse_output)
             .await
             .expect("handler failed");
-        assert_eq!(handle_output, vec![Bytes::from(vec![3])]);
+        let response = QueryResponse::parse(collapse_bytes(&handle_output))
+            .expect("response parse should work");
+        assert_eq!(response.results[0].match_made, StoreMatch::MatchFull);
 
-        // Regular ImmutableExistBatch should NOT find it (main store is empty)
+        // ImmutableQuery should NOT find it (main store is empty)
         let parse_output = service
             .parse_request_bytes(
-                &CommandHeader::new(Command::ImmutableExistBatch as QuicOpCode, 0, 0),
+                &CommandHeader::new(Command::ImmutableQuery as QuicOpCode, 0, 0),
                 collapse_bytes_without_header(&request.to_quic_chunks()),
             )
             .expect("Failed to parse");
@@ -1053,7 +954,9 @@ mod tests {
             .run_request_handler(AttributeMap::default().into(), parse_output)
             .await
             .expect("handler failed");
-        assert_eq!(handle_output, vec![Bytes::from(vec![0])]);
+        let response = QueryResponse::parse(collapse_bytes(&handle_output))
+            .expect("response parse should work");
+        assert_eq!(response.results[0].match_made, StoreMatch::MatchNone);
     }
 
     #[tokio::test]

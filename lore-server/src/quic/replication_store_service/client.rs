@@ -40,8 +40,6 @@ use tokio::sync::SemaphorePermit;
 use tracing::trace;
 use tracing::warn;
 
-use crate::protocol::replication_store::exists_batch::ExistsBatch;
-use crate::protocol::replication_store::exists_batch::ExistsBatchResponse;
 use crate::protocol::replication_store::get::Get;
 use crate::protocol::replication_store::get::GetResponse;
 use crate::protocol::replication_store::get_metadata::GetMetadata;
@@ -51,6 +49,8 @@ use crate::protocol::replication_store::obliterate::Obliterate;
 use crate::protocol::replication_store::obliterate::ObliterateResponse;
 use crate::protocol::replication_store::put::Put;
 use crate::protocol::replication_store::put::PutFlags;
+use crate::protocol::replication_store::query::Query;
+use crate::protocol::replication_store::query::QueryResponse;
 use crate::quic::replication_store_service::Command;
 use crate::quic::replication_store_service::MAX_CHUNK_SIZE;
 use crate::quic::replication_store_service::ReplicationServiceErrorCode;
@@ -115,12 +115,6 @@ pub trait StoreClient: Send + Sync + Sized + 'static {
     /// Request an Immutable `Put` on the server
     async fn put(&self, request: Put) -> Result<(), ReplicationStoreClientError>;
 
-    /// Request an Immutable `ExistsBatch` on the server
-    async fn exists_batch(
-        &self,
-        request: ExistsBatch,
-    ) -> Result<ExistsBatchResponse, ReplicationStoreClientError>;
-
     /// Request an Immutable `Obliterate` on the server
     async fn obliterate(
         &self,
@@ -139,12 +133,6 @@ pub trait StoreClient: Send + Sync + Sized + 'static {
     /// Request an Immutable `Put` on the server's local store
     async fn local_put(&self, request: Put) -> Result<(), ReplicationStoreClientError>;
 
-    /// Request an Immutable `ExistsBatch` on the server's local store
-    async fn local_exists_batch(
-        &self,
-        request: ExistsBatch,
-    ) -> Result<ExistsBatchResponse, ReplicationStoreClientError>;
-
     /// Request an Immutable `Get` on the server's local store
     async fn local_get(&self, request: Get) -> Result<GetResponse, ReplicationStoreClientError>;
 
@@ -153,6 +141,15 @@ pub trait StoreClient: Send + Sync + Sized + 'static {
         &self,
         request: GetMetadata,
     ) -> Result<GetMetadataResponse, ReplicationStoreClientError>;
+
+    /// Request an Immutable `Query` on the server
+    async fn query(&self, request: Query) -> Result<QueryResponse, ReplicationStoreClientError>;
+
+    /// Request an Immutable `Query` on the server's local store
+    async fn local_query(
+        &self,
+        request: Query,
+    ) -> Result<QueryResponse, ReplicationStoreClientError>;
 }
 
 #[derive(Clone)]
@@ -254,24 +251,6 @@ impl ReplicationStoreClient {
         Ok(())
     }
 
-    async fn send_exists_batch(
-        &self,
-        request: ExistsBatch,
-        command: Command,
-    ) -> Result<ExistsBatchResponse, ReplicationStoreClientError> {
-        let num_input_addresses = request.addresses.len();
-        let quic_chunks = request.to_quic_chunks();
-        let response_bytes =
-            send_normal_with_reconnect(self, command, 0, || quic_chunks.clone()).await?;
-        let response = ExistsBatchResponse::parse(response_bytes)?;
-        if num_input_addresses != response.matches.len() {
-            return Err(ReplicationStoreClientError::ResponseError(
-                "response length mismatch",
-            ));
-        }
-        Ok(response)
-    }
-
     async fn send_get(
         &self,
         request: Get,
@@ -293,6 +272,24 @@ impl ReplicationStoreClient {
             send_normal_with_reconnect(self, command, 0, || quic_chunks.clone()).await?;
         GetMetadataResponse::parse(response_chunks)
     }
+
+    async fn send_query(
+        &self,
+        request: Query,
+        command: Command,
+    ) -> Result<QueryResponse, ReplicationStoreClientError> {
+        let num_input_addresses = request.addresses.len();
+        let quic_chunks = request.to_quic_chunks();
+        let response_bytes =
+            send_normal_with_reconnect(self, command, 0, || quic_chunks.clone()).await?;
+        let response = QueryResponse::parse(response_bytes)?;
+        if num_input_addresses != response.results.len() {
+            return Err(ReplicationStoreClientError::ResponseError(
+                "response length mismatch",
+            ));
+        }
+        Ok(response)
+    }
 }
 
 #[async_trait]
@@ -303,14 +300,6 @@ impl StoreClient for ReplicationStoreClient {
 
     async fn put(&self, request: Put) -> Result<(), ReplicationStoreClientError> {
         self.send_put(request, Command::ImmutablePut).await
-    }
-
-    async fn exists_batch(
-        &self,
-        request: ExistsBatch,
-    ) -> Result<ExistsBatchResponse, ReplicationStoreClientError> {
-        self.send_exists_batch(request, Command::ImmutableExistBatch)
-            .await
     }
 
     async fn obliterate(
@@ -342,14 +331,6 @@ impl StoreClient for ReplicationStoreClient {
         self.send_put(request, Command::ImmutableLocalPut).await
     }
 
-    async fn local_exists_batch(
-        &self,
-        request: ExistsBatch,
-    ) -> Result<ExistsBatchResponse, ReplicationStoreClientError> {
-        self.send_exists_batch(request, Command::ImmutableLocalExistBatch)
-            .await
-    }
-
     async fn local_get(&self, request: Get) -> Result<GetResponse, ReplicationStoreClientError> {
         self.send_get(request, Command::ImmutableLocalGet).await
     }
@@ -360,6 +341,17 @@ impl StoreClient for ReplicationStoreClient {
     ) -> Result<GetMetadataResponse, ReplicationStoreClientError> {
         self.send_metadata(request, Command::ImmutableLocalGetMetadata)
             .await
+    }
+
+    async fn query(&self, request: Query) -> Result<QueryResponse, ReplicationStoreClientError> {
+        self.send_query(request, Command::ImmutableQuery).await
+    }
+
+    async fn local_query(
+        &self,
+        request: Query,
+    ) -> Result<QueryResponse, ReplicationStoreClientError> {
+        self.send_query(request, Command::ImmutableLocalQuery).await
     }
 }
 

@@ -33,7 +33,8 @@ pub const BASE_REQUEST_SIZE: usize = size_of::<ReplicationHeader>() +
         size_of::<Address>();
 
 /// The byte that used to carry the requested match level, back when this request was an existence
-/// check. See [`crate::protocol::replication_store::exists_batch`] for why it stays.
+/// check. Written as the level every caller last sent and ignored on the way in; kept so the
+/// request layout does not change.
 const RESERVED_MATCH_BYTE: u8 = StoreMatch::MatchFull as u8;
 
 /// Ask a peer what the payload at an address *is* - its compression and its sizes.
