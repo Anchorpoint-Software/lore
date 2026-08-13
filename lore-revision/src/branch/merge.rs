@@ -788,6 +788,7 @@ async fn merge_start_link(
         link_node,
         link_context,
         link_reference,
+        ..
     } = link::resolve_link_at_path(&state, repository.clone(), &link_path)
         .await
         .forward_with::<MergeError, _>(|| format!("link not found: {link_path}"))?;
@@ -2382,6 +2383,7 @@ async fn resolve_abort_entries(
             link_node,
             link_context,
             link_reference,
+            ..
         } = link::resolve_link_at_path(state_staged, repository.clone(), &link_path)
             .await
             .forward_with::<MergeError, _>(|| format!("link not found: {link_path}"))?;
@@ -2553,6 +2555,7 @@ async fn merge_abort_link(
         link_node,
         link_context,
         link_reference,
+        ..
     } = link::resolve_link_at_path(&state_staged, repository.clone(), &link_path)
         .await
         .forward_with::<MergeError, _>(|| format!("link not found: {link_path}"))?;

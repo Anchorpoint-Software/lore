@@ -291,60 +291,9 @@ pub(crate) async fn process_link_updates(
     state: Arc<State>,
     link_tracker: Arc<link::LinkTracker>,
 ) -> Result<(), StageError> {
-    if !link_tracker.has_modifications() {
-        return Ok(());
-    }
-
-    let links_needing_rehash = link_tracker.get_links_needing_rehash();
-
-    for link_context in links_needing_rehash {
-        // Get the current branch from existing link metadata
-        let link_reference = state
-            .link_find(
-                repository.clone(),
-                link_context.link_repository_id,
-                link_context.link_node_id,
-            )
-            .await
-            .forward::<StageError>("Link not found for update")?;
-
-        let current_link_reference = state_current
-            .link_find(
-                repository.clone(),
-                link_context.link_repository_id,
-                link_context.link_node_id,
-            )
-            .await
-            .forward::<StageError>("Link not found for update")?;
-
-        lore_debug!(
-            "Setting link parent to {}",
-            current_link_reference.signature
-        );
-
-        link::reserialize_tracked_link(
-            &state,
-            repository.clone(),
-            token,
-            &link_context,
-            current_link_reference.signature,
-            link_reference.branch,
-        )
+    link::drain_link_tracker(repository, token, state_current, state, &link_tracker, true)
         .await
-        .forward::<StageError>("Failed to update link")?;
-
-        // Mark the link node as staged
-        state
-            .node_mark(
-                repository.clone(),
-                link_context.link_node_id,
-                NodeFlags::Staged,
-                true,
-            )
-            .await
-            .forward::<StageError>("Failed to mark node as staged")?;
-    }
-    Ok(())
+        .forward::<StageError>("Failed to update link")
 }
 
 /// Stage changes from filesystem into the given state
@@ -581,27 +530,22 @@ pub(crate) async fn stage_filesystem_path(
         if let Some(ref tracker) = link_tracker
             && node_link.repository != repository.id
         {
-            let link_path = relative_path.clone().into_buf();
+            // Record a tracker context for every link crossed to reach the
+            // deleted path, so a delete nested two or more levels deep folds
+            // its pin up through all intermediate links (not just one level).
+            let chain = crate::link::resolve_link_chain(
+                repository.clone(),
+                state.clone(),
+                state.clone(),
+                relative_path.clone(),
+                BranchId::default(),
+            )
+            .await
+            .forward::<StageError>("Failed to resolve link chain")?;
 
-            // Find the parent repository's link node
-            let parent_link_node_id = state
-                .find_link_parent_node(
-                    repository.clone(),
-                    relative_path.as_str(),
-                    node_link.repository,
-                )
-                .await
-                .forward::<StageError>("Failed to find subnode")?;
-
-            let link_context = crate::link::LinkContext {
-                link_repository_id: node_link.repository,
-                link_node_id: parent_link_node_id,
-                parent_repository_id: repository.id,
-                link_path,
-                link_state: node_state.clone(),
-            };
-
-            tracker.add_link(link_context);
+            chain
+                .record_tracker_contexts(tracker, &node_state, relative_path.as_str())
+                .await;
         }
 
         let node_path = node_state

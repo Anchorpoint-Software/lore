@@ -29,9 +29,16 @@ pub(crate) async fn reset_staged_add_link(
     let absolute_path = link_path.to_absolute_path(repository.require_path()?);
 
     // If the link replaced a committed directory, `link::add` staged that
-    // directory node for delete. Capture it so we can restore it.
+    // directory node for delete. Capture it so we can restore it. Resolve
+    // against the link node's path WITHIN its owning repository (not the full
+    // top-level `link_path`), so this works for a nested link whose owning
+    // state is a linked repo rather than the top-level one.
+    let owner_relative_path = state_staged
+        .node_path(repository.clone(), link_node_id)
+        .await
+        .unwrap_or_else(|_| link_path.as_str().to_string());
     let committed_directory_node = state_current
-        .find_node_link(repository.clone(), link_path.as_str())
+        .find_node_link(repository.clone(), &owner_relative_path)
         .await
         .ok()
         .filter(|node_link| node_link.is_valid())

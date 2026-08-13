@@ -897,7 +897,7 @@ async fn commit_link_only(
         link_repository.clone(),
         &link_state_staged,
         link_branch,
-        message,
+        message.clone(),
         keys,
         values,
         formats,
@@ -943,11 +943,38 @@ async fn commit_link_only(
     )
     .await?;
 
-    // Update parent link pin to point at the committed revision and stage the parent
-    let link_local_node = resolved_staged.link_reference.local_node;
-    link::update_link_pin_by_node(
-        &state_parent_staged,
+    // Update the link pin in the OWNING repository's registry (the innermost
+    // containing repo for a nested link, the top-level repo otherwise), then
+    // fold any intermediate linked revisions up into the top-level staged
+    // state. `resolve_link_chain` gives one shared mutable state per level so
+    // the pin write and the propagation see the same objects.
+    let chain = link::resolve_link_chain(
         repository.clone(),
+        state_parent_staged.clone(),
+        state_parent_current.clone(),
+        RelativePath::from_str(&link_path).unwrap_or_default(),
+        current_branch,
+    )
+    .await
+    .forward::<CommitError>("Failed to resolve link chain")?;
+
+    let owner_repository = chain.innermost_repository.clone();
+    let owner_state = chain.innermost_state.clone();
+
+    // Locate the link node within the owning repo's staged state.
+    let link_local_node = owner_state
+        .find_relative_node_link(
+            owner_repository.clone(),
+            chain.innermost_base_node,
+            chain.remainder_path.as_str(),
+        )
+        .await
+        .forward::<CommitError>("Failed to resolve link node in owning repository")?
+        .node;
+
+    link::update_link_pin_by_node(
+        &owner_state,
+        owner_repository.clone(),
         resolved_staged.link_context.id,
         resolved_staged.link_reference.branch,
         link_signature,
@@ -956,10 +983,86 @@ async fn commit_link_only(
     .await
     .forward::<CommitError>("Failed to update link pin")?;
 
-    state_parent_staged
-        .node_mark(repository.clone(), link_local_node, NodeFlags::Staged, true)
+    owner_state
+        .node_mark(
+            owner_repository.clone(),
+            link_local_node,
+            NodeFlags::Staged,
+            true,
+        )
         .await
         .forward::<CommitError>("Failed to mark link node as staged")?;
+
+    // For a nested link, each intermediate link between the committed target
+    // and the top-level repo must itself be COMMITTED (not just reserialized),
+    // so the top-level pin references a real revision on each intermediate
+    // branch. Walk the chain inner -> outer: commit each level's child state
+    // (which now carries the updated pin), then repin its parent.
+    for i in (0..chain.levels.len()).rev() {
+        let level = &chain.levels[i];
+        let (child_state, child_repository) = chain.child_at(i);
+
+        let child_current = State::deserialize(child_repository.clone(), level.old_signature)
+            .await
+            .forward::<CommitError>("Failed to deserialize intermediate link current state")?;
+        child_state.set_parent_self(level.old_signature);
+
+        let child_metadata = build_commit_metadata(
+            child_repository.clone(),
+            &child_state,
+            level.branch,
+            message.clone(),
+            LoreArray::default(),
+            LoreArray::default(),
+            LoreArray::default(),
+        )
+        .await?;
+
+        let child_signature = commit_staged_revision(
+            child_repository.clone(),
+            token.share(),
+            child_current.clone(),
+            child_state.clone(),
+            child_metadata,
+            None,
+            Arc::new(HashMap::new()),
+            level.branch,
+            stats,
+        )
+        .await?;
+
+        finalize_commit(
+            child_repository.clone(),
+            &child_current,
+            &child_state,
+            child_signature,
+            level.branch,
+            &token,
+        )
+        .await?;
+
+        link::update_link_pin_by_node(
+            &level.state,
+            level.repository.clone(),
+            level.child_repository_id,
+            level.branch,
+            child_signature,
+            level.link_node_id,
+        )
+        .await
+        .forward::<CommitError>("Failed to update intermediate link pin")?;
+
+        level
+            .state
+            .node_mark(
+                level.repository.clone(),
+                level.link_node_id,
+                NodeFlags::Staged,
+                true,
+            )
+            .await
+            .forward::<CommitError>("Failed to mark intermediate link node staged")?;
+    }
 
     if !execution_context().globals().dry_run() {
         let parent_signature = state_parent_staged
@@ -2214,6 +2317,7 @@ async fn commit_link_node(
         branch_id,
         signature,
         link_metadata,
+        link_messages,
         stats,
         parent_tracker,
     )
@@ -2282,6 +2386,7 @@ async fn commit_link(
     branch: BranchId,
     current_revision: Hash,
     metadata: Arc<Metadata>,
+    link_messages: Arc<HashMap<String, String>>,
     stats: Arc<CommitStats>,
     parent_tracker: Arc<lore_storage::write_tracker::WriteTracker>,
 ) -> Result<(Hash, NodeID), CommitError> {
@@ -2316,6 +2421,7 @@ async fn commit_link(
         let repository = repository.clone();
         let state = state.clone();
         let metadata = metadata.clone();
+        let link_messages = link_messages.clone();
         let stats = stats.clone();
         async move {
             let delta = Arc::new(parking_lot::RwLock::new(BytesMut::new()));
@@ -2336,6 +2442,7 @@ async fn commit_link(
                 let discard = discard.clone();
                 let subnodes_to_discard = subnodes_to_discard.clone();
                 let metadata = metadata.clone();
+                let link_messages = link_messages.clone();
                 let stats = stats.clone();
                 let tracker = work_tracker.clone();
                 // Own budget per linked sub-repo, isolated from the parent's.
@@ -2353,9 +2460,11 @@ async fn commit_link(
                         subnodes_to_discard,
                         file_tx,
                         metadata,
-                        // Per-link messages only apply one level deep. Nested
-                        // links receive the main message.
-                        Arc::new(HashMap::new()),
+                        // Per-link messages are keyed by full mount path, so a
+                        // nested link (e.g. `vendor/b/vendor/c`) still receives
+                        // its `--link-message`; it falls back to the main
+                        // message when no entry matches.
+                        link_messages,
                         stats,
                         link_branch,
                         tracker,
