@@ -44,6 +44,7 @@ impl Drop for TempDir {
 /// `io_uring`, or a container that blocks `io_uring_setup`, must not fail the suite — but the
 /// skip is announced, because a silent skip reads exactly like a pass.
 fn drivers() -> Vec<IoDriver> {
+    #[allow(unused_mut)]
     let mut drivers =
         vec![IoDriver::new(BackendKind::Psync).expect("psync backend is always available")];
     #[cfg(target_os = "linux")]
