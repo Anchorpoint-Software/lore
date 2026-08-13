@@ -1233,6 +1233,15 @@ pub async fn update_link_pin_by_path(
     .forward::<LinkError>("Failed to update link")
 }
 
+/// Whether a pin change also updates the working tree at the mount path.
+#[derive(Clone, Copy)]
+pub enum LinkPinRealize {
+    /// Realize the content delta on disk.
+    WorkingTree,
+    /// Leave the working tree alone.
+    StateOnly,
+}
+
 /// Atomically updates a link pin in the parent repository state.
 ///
 /// Performs the common sequence of: realize on-disk content at the mount path,
@@ -1248,6 +1257,7 @@ pub async fn stage_link_pin(
     old_signature: Hash,
     new_signature: Hash,
     new_branch: BranchId,
+    realize: LinkPinRealize,
 ) -> Result<NodeID, LinkError> {
     // Resolve the source_node in the new link state. The parent's link node
     // stores a NodeID (`link_node.child`) that points into the linked state's
@@ -1277,15 +1287,17 @@ pub async fn stage_link_pin(
     let new_source_node = new_source_link.node;
 
     // Realize on-disk content
-    realize_link_pin_change(
-        repository.clone(),
-        link_context.clone(),
-        link_path.clone(),
-        old_signature,
-        new_signature,
-        link_node.child,
-    )
-    .await?;
+    if matches!(realize, LinkPinRealize::WorkingTree) {
+        realize_link_pin_change(
+            repository.clone(),
+            link_context.clone(),
+            link_path.clone(),
+            old_signature,
+            new_signature,
+            link_node.child,
+        )
+        .await?;
+    }
 
     // Stage the link node with updated revision hash
     let mut staged_node = link_node;
@@ -1317,6 +1329,242 @@ pub async fn stage_link_pin(
         .forward::<LinkError>("Failed to update link")?;
 
     Ok(staged_link_node.node)
+}
+
+/// Which side decides a link pin that the two sides of a merge disagree on.
+pub enum LinkPinResolution {
+    /// Adopt the incoming pin only when the target left it at the base revision.
+    /// Both sides having moved it is a conflict.
+    ThreeWay(Arc<State>),
+    /// Adopt the incoming pin whatever the target holds. For an operation whose
+    /// target branch is required to already be merged into the incoming branch.
+    Incoming,
+}
+
+/// A link whose pin the staged state took from the incoming state.
+pub struct CarriedLinkPin {
+    pub link_path: String,
+    pub previous: Hash,
+    pub adopted: Hash,
+}
+
+/// A link row for [`apply_link_pins`] to write.
+pub struct PlannedLinkPin {
+    pub link_path: String,
+    link_node: Node,
+    target_pin: Hash,
+    incoming_pin: Hash,
+    branch: BranchId,
+}
+
+/// The link node at `link_path`, or `None` when the state has no link there.
+async fn link_node_at_path(
+    state: &Arc<State>,
+    repository: Arc<RepositoryContext>,
+    link_path: &str,
+) -> Result<Option<(NodeID, Node)>, LinkError> {
+    let node_link = match state.find_node_link(repository.clone(), link_path).await {
+        Ok(node_link) => node_link,
+        Err(err) if err.is_node_not_found() => return Ok(None),
+        Err(err) => return Err(err).forward::<LinkError>("Failed resolving link path"),
+    };
+    if !node_link.is_valid() || node_link.repository != repository.id {
+        return Ok(None);
+    }
+
+    let node = state
+        .node(repository, node_link.node)
+        .await
+        .forward::<LinkError>("Failed deserializing state")?;
+
+    Ok(node.is_link().then_some((node_link.node, node)))
+}
+
+/// Compare the parent's link rows across a merge and return the ones the
+/// incoming state moved on its own. A row both sides moved is an error.
+///
+/// The parent-level diff never carries a pin change, so the rows are compared
+/// here instead. Only explicitly pinned links are considered: an auto-following
+/// link's pin only means something on the parent branch whose mirror produced
+/// it, so it moves by its own branch merge. Links whose node is in `skip_nodes`
+/// keep the pin they have.
+pub async fn classify_link_pins(
+    repository: Arc<RepositoryContext>,
+    state_staged: &Arc<State>,
+    state_incoming: &Arc<State>,
+    resolution: LinkPinResolution,
+    skip_nodes: &[NodeID],
+) -> Result<Vec<PlannedLinkPin>, LinkError> {
+    let link_list = state_staged
+        .link_list(repository.clone())
+        .await
+        .forward::<LinkError>("Failed to list links")?;
+
+    // Classify every link before changing any of them, so a divergent pin stops
+    // the operation with nothing carried.
+    let mut planned = Vec::new();
+    for link_reference in &link_list {
+        if skip_nodes.contains(&link_reference.local_node) {
+            lore_debug!(
+                "Link node {} pin is owned by its own merge, leaving it",
+                link_reference.local_node
+            );
+            continue;
+        }
+
+        let link_path = state_staged
+            .node_path(repository.clone(), link_reference.local_node)
+            .await
+            .forward::<LinkError>("Failed resolving link node path")?;
+
+        let link_node = state_staged
+            .node(repository.clone(), link_reference.local_node)
+            .await
+            .forward::<LinkError>("Failed deserializing state")?;
+        let target_pin = link_node.address.hash;
+
+        // An added or removed link has no row on one side; the tree carries it.
+        let Some((incoming_node_id, incoming_node)) =
+            link_node_at_path(state_incoming, repository.clone(), &link_path).await?
+        else {
+            continue;
+        };
+        if incoming_node.address.context != link_node.address.context {
+            lore_debug!("Link {link_path} points at another repository on the incoming side");
+            continue;
+        }
+
+        let incoming_pin = incoming_node.address.hash;
+        if incoming_pin == target_pin {
+            continue;
+        }
+
+        let branch = state_incoming
+            .link_find(
+                repository.clone(),
+                link_node.address.context.into(),
+                incoming_node_id,
+            )
+            .await
+            .map_or(link_reference.branch, |reference| reference.branch);
+
+        // An auto-following row resolves against whichever branch the state ends
+        // up on, so its pin cannot travel between parent branches.
+        if branch.is_zero() {
+            lore_debug!(
+                "Link {link_path} follows the parent branch, leaving its pin to its own merge"
+            );
+            continue;
+        }
+
+        if let LinkPinResolution::ThreeWay(ref state_base) = resolution {
+            let base_pin = link_node_at_path(state_base, repository.clone(), &link_path)
+                .await?
+                .map(|(_, node)| node.address.hash);
+            match base_pin {
+                Some(base_pin) if base_pin == target_pin => {}
+                Some(base_pin) if base_pin == incoming_pin => continue,
+                // A link carrying an explicit branch cannot merge its signature
+                // automatically, so both sides moving it is a flag change; no
+                // base row at all is an add on both sides.
+                _ => {
+                    let subtype = if base_pin.is_some() {
+                        "flag change"
+                    } else {
+                        "add/add, no common base"
+                    };
+                    return Err(LinkError::internal(format!(
+                        "Link pin conflict at {link_path} ({subtype}): this branch pins \
+                         {target_pin}, the merged branch pins {incoming_pin}. Resolving a link \
+                         pin conflict in place is not supported yet. Set the row you want with \
+                         `lore link update {link_path} --pin <revision>`, commit, and merge again"
+                    )));
+                }
+            }
+        }
+
+        planned.push(PlannedLinkPin {
+            link_path,
+            link_node,
+            target_pin,
+            incoming_pin,
+            branch,
+        });
+    }
+
+    Ok(planned)
+}
+
+/// Write the rows [`classify_link_pins`] selected into the staged state.
+pub async fn apply_link_pins(
+    repository: Arc<RepositoryContext>,
+    state_staged: &Arc<State>,
+    planned: Vec<PlannedLinkPin>,
+    realize: LinkPinRealize,
+) -> Result<Vec<CarriedLinkPin>, LinkError> {
+    let mut carried = Vec::new();
+    for planned_pin in planned {
+        let PlannedLinkPin {
+            link_path,
+            link_node,
+            target_pin,
+            incoming_pin,
+            branch,
+        } = planned_pin;
+
+        let link_context = Arc::new(
+            repository
+                .to_link_context(link_node.address.context.into())
+                .await,
+        );
+
+        let link_path_rel = RelativePath::from_str(&link_path)
+            .internal_with(|| format!("Invalid link path {link_path}"))?;
+
+        lore_info!("Link {link_path} pin {target_pin} -> {incoming_pin} from merged branch");
+
+        stage_link_pin(
+            repository.clone(),
+            state_staged,
+            &link_context,
+            link_path_rel,
+            link_node,
+            target_pin,
+            incoming_pin,
+            branch,
+            realize,
+        )
+        .await?;
+
+        carried.push(CarriedLinkPin {
+            link_path,
+            previous: target_pin,
+            adopted: incoming_pin,
+        });
+    }
+
+    Ok(carried)
+}
+
+/// [`classify_link_pins`] followed by [`apply_link_pins`].
+pub async fn merge_link_pins(
+    repository: Arc<RepositoryContext>,
+    state_staged: &Arc<State>,
+    state_incoming: &Arc<State>,
+    resolution: LinkPinResolution,
+    realize: LinkPinRealize,
+    skip_nodes: &[NodeID],
+) -> Result<Vec<CarriedLinkPin>, LinkError> {
+    let planned = classify_link_pins(
+        repository.clone(),
+        state_staged,
+        state_incoming,
+        resolution,
+        skip_nodes,
+    )
+    .await?;
+
+    apply_link_pins(repository, state_staged, planned, realize).await
 }
 
 /// Result of checking whether a link is eligible for a merge operation.
