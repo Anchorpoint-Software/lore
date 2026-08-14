@@ -329,7 +329,13 @@ pub async fn push(
         .await
         .filter_slow_down()?
         .warn_map_err(|err| {
-            Status::internal(format!("failed to load current latest state: {err}"))
+            if err.is_not_found() {
+                Status::not_found(format!(
+                    "Revision '{latest}' to push to latest is not found"
+                ))
+            } else {
+                Status::internal(format!("failed to load current latest state: {err}"))
+            }
         })?;
 
     // If the incoming revision is already the latest revision the push is a no-op
@@ -902,11 +908,16 @@ mod tests {
     use std::net::Ipv4Addr;
     use std::net::SocketAddr;
 
+    use lore_revision::branch::DEFAULT_HISTORY_STEP_SIZE;
+    use rand::random;
+    use tonic::Code;
     use tonic::Request;
     use tonic::metadata::MetadataValue;
     use tonic::transport::server::TcpConnectInfo;
 
     use super::*;
+    use crate::grpc::server::RevisionListAcceleration;
+    use crate::store::test_store_create;
 
     #[test]
     fn use_x_forwarded_when_available() {
@@ -984,5 +995,57 @@ mod tests {
             extract_client_ip(&req),
             Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 42)))
         );
+    }
+
+    #[tokio::test]
+    async fn push_unknown_revision_returns_not_found() {
+        let repository_id = random::<RepositoryId>();
+        let branch_id = BranchId::from(uuid::Uuid::now_v7());
+
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store,
+                mutable_store,
+                repository_id,
+            ));
+
+            let write_token = get_write_token();
+            branch::create(
+                repository_context.clone(),
+                &write_token,
+                branch_id,
+                "test-branch",
+                branch::personal_category(),
+                "test-creator",
+                1,
+                vec![],
+                false,
+                false,
+            )
+            .await
+            .expect("Failed to create branch");
+
+            // A hash with no corresponding state data in the immutable store
+            let nonexistent_revision = random::<Hash>();
+
+            let result = push(
+                repository_context,
+                branch_id,
+                nonexistent_revision,
+                true,
+                true,
+                false,
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
+            )
+            .await;
+
+            assert!(result.is_err());
+            assert_eq!(result.err().unwrap().code(), Code::NotFound);
+        }))
+        .await;
     }
 }
