@@ -193,6 +193,9 @@ fn merge_resolved(into: &mut StoreMatchResult, from: &StoreMatchResult) {
     into.stored_durable |= from.stored_durable;
 }
 
+/// Default number of permits for the `cache_metadata` semaphore.
+pub const DEFAULT_QUERY_CACHE_SEMAPHORE_SIZE: usize = 1000;
+
 #[error_set]
 pub enum CompositeStoreBuilderError {}
 
@@ -211,9 +214,9 @@ pub struct CompositeStoreBuilder {
     durable: Option<DurableTarget>,
     /// Factory called to create a `ReplicationTarget` from a `PeerInfo`
     peer_replica_builder: Option<Arc<dyn ReplicaFactory>>,
-    /// If a `StoreMatch::MatchFull` is made and we didn't have that result to hand in our local store,
-    /// should we cache that result?
-    should_cache_query_results: bool,
+    cache_metadata: bool,
+    /// Semaphore size for write-backs. `None` uses [`DEFAULT_QUERY_CACHE_SEMAPHORE_SIZE`].
+    cache_metadata_semaphore_size: Option<usize>,
     /// If true, the local store only caches fragment metadata (no payloads).
     /// Payloads are only stored in the durable store and replicas.
     /// Local `get()` calls that hit metadata-only entries fall through to durable/replicas for payloads.
@@ -224,8 +227,16 @@ pub struct CompositeStoreBuilder {
 }
 
 impl CompositeStoreBuilder {
-    pub fn with_cache_query_results(mut self, cache_query_results: bool) -> Self {
-        self.should_cache_query_results = cache_query_results;
+    /// Cache remote metadata locally so future `query` and `get_metadata` calls can be served
+    /// in-process rather than going to the durable store. `semaphore_size` bounds concurrent
+    /// write-backs; `None` uses [`DEFAULT_QUERY_CACHE_SEMAPHORE_SIZE`].
+    pub fn with_cache_metadata(
+        mut self,
+        cache_metadata: bool,
+        semaphore_size: Option<usize>,
+    ) -> Self {
+        self.cache_metadata = cache_metadata;
+        self.cache_metadata_semaphore_size = semaphore_size;
         self
     }
 
@@ -327,6 +338,11 @@ impl CompositeStoreBuilder {
             }
         });
 
+        let cache_metadata_semaphore = Arc::new(Semaphore::new(
+            self.cache_metadata_semaphore_size
+                .unwrap_or(DEFAULT_QUERY_CACHE_SEMAPHORE_SIZE),
+        ));
+
         let provider = CompositeStoreInstrumentProvider;
         Ok(CompositeStore {
             local: Arc::new(local),
@@ -335,7 +351,8 @@ impl CompositeStoreBuilder {
             durable,
             durable_delay: self.durable_delay,
             local_durable,
-            should_cache_query_results: self.should_cache_query_results,
+            cache_metadata: self.cache_metadata,
+            cache_metadata_semaphore,
             local_metadata_only: self.local_metadata_only,
             peers_refreshed_guard: Semaphore::new(1),
             peer_replica_builder: self.peer_replica_builder,
@@ -392,8 +409,11 @@ pub struct CompositeStore {
     durable_delay: Duration,
     /// Flag if local store is durable
     local_durable: bool,
-    /// Should Query results be cached in the local store?
-    should_cache_query_results: bool,
+    /// Caching remote metadata locally means `query` and `get_metadata` can be served in-process
+    /// rather than going to the durable store on repeated lookups.
+    cache_metadata: bool,
+    /// Caps concurrent background write-backs so cache activity cannot grow unboundedly.
+    cache_metadata_semaphore: Arc<Semaphore>,
     /// If true, local store only caches metadata (no payloads)
     local_metadata_only: bool,
 
@@ -830,6 +850,25 @@ impl ImmutableStore for CompositeStore {
             }
         }
 
+        if self.cache_metadata && !self.local_durable {
+            for (pos, address) in &remaining {
+                let match_partition = &results[*pos].partition;
+                if !match_partition.is_zero()
+                    && let Ok(permit) = self.cache_metadata_semaphore.clone().try_acquire_owned()
+                {
+                    let store = self.clone();
+                    let match_partition = *match_partition;
+                    let address = *address;
+                    let cache_counter = self.instruments.counter_local_caching.clone();
+                    lore_spawn!(async move {
+                        let _permit = permit;
+                        let result = store.get_metadata(match_partition, address).await;
+                        count_result("get_metadata_after_query", &cache_counter, &result);
+                    });
+                }
+            }
+        }
+
         if let Some(failure) = failure {
             return Err(failure);
         }
@@ -924,23 +963,23 @@ impl ImmutableStore for CompositeStore {
             }
         }
 
-        // Only a full match is cached. A weaker one describes the same bytes reached under another
-        // context or partition, and writing it back under this address would manufacture an
-        // association no store below has - a later local query would then report a full match that
-        // was never true anywhere.
-        if self.should_cache_query_results
+        if self.cache_metadata
             && best_result.inner().match_made == StoreMatch::MatchFull
             && !self.local_durable
         {
             let local_store = self.local.store();
             let fragment = best_result.inner().fragment;
+            let partition = best_result.inner().partition;
+            let cache_counter = self.instruments.counter_local_caching.clone();
             lore_spawn!(async move {
-                local_store
+                let put_result = local_store
                     .put(
                         partition, address, fragment, None,  /* payload */
                         false, /* force */
                     )
-                    .await
+                    .await;
+                count_result("put_after_get_metadata", &cache_counter, &put_result);
+                put_result
             });
         }
 
