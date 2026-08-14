@@ -6,10 +6,10 @@
 //! (freeze for SWFS) from actual file operations (work against frozen snapshot).
 
 use std::path::Path;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use lore_base::error::InvalidArguments;
 use lore_base::types::Address;
 use lore_error_set::error_set;
 
@@ -24,9 +24,12 @@ use crate::repository::RepositoryContext;
 use crate::state::FilesystemDiffStats;
 use crate::state::State;
 use crate::util::path::RelativePath;
+use crate::util::path::RepositoryPath;
 
 #[error_set]
-pub enum FsError {}
+pub enum FsError {
+    InvalidArguments,
+}
 
 impl From<std::io::Error> for FsError {
     fn from(value: std::io::Error) -> Self {
@@ -93,32 +96,28 @@ pub trait FilesystemProvider: Send + Sync + 'static {
 ///
 /// Use `Repository` for paths within the working directory, and `Scratch` for temporary
 /// paths outside the repository (e.g., diff scratch directories).
+#[derive(Clone, Copy)]
 pub enum FilesystemPath<'a> {
     /// A path relative to the repository root.
-    Repository(&'a RelativePath),
+    Repository(&'a RepositoryPath),
     /// An absolute path outside the repository (scratch/temp files).
     Scratch(&'a Path),
 }
 
 impl<'a> FilesystemPath<'a> {
-    /// Convert this path to an absolute path given the repository root.
-    pub fn to_absolute(&self, repo_path: &Path) -> PathBuf {
-        match self {
-            FilesystemPath::Repository(rel) => rel.to_absolute_path(repo_path),
-            FilesystemPath::Scratch(abs) => abs.to_path_buf(),
-        }
-    }
-}
-
-impl<'a> From<&'a RelativePath> for FilesystemPath<'a> {
-    fn from(path: &'a RelativePath) -> Self {
+    pub fn from_repository(path: &'a RepositoryPath) -> Self {
         FilesystemPath::Repository(path)
     }
-}
 
-impl<'a> From<&'a Path> for FilesystemPath<'a> {
-    fn from(path: &'a Path) -> Self {
-        FilesystemPath::Scratch(path)
+    pub fn from_scratch_path(absolute_path: &'a Path) -> Self {
+        Self::Scratch(absolute_path)
+    }
+
+    pub fn as_absolute_path(&self) -> &Path {
+        match self {
+            FilesystemPath::Repository(path) => path.absolute(),
+            FilesystemPath::Scratch(abs) => abs,
+        }
     }
 }
 
@@ -190,7 +189,7 @@ pub trait InstanceOperation: Send + Sync {
     fn file_hash(
         &self,
         repository: Arc<RepositoryContext>,
-        path: &RelativePath,
+        path: FilesystemPath<'_>,
         node_hint: Option<&Node>,
     ) -> impl Future<Output = Result<Hash, FsError>> + Send;
 
@@ -203,7 +202,7 @@ pub trait InstanceOperation: Send + Sync {
         &self,
         repository: Arc<RepositoryContext>,
         address: Address,
-        path: &RelativePath,
+        path: FilesystemPath<'_>,
         known_disk_file_size: u64,
     ) -> impl Future<Output = Result<bool, FsError>> + Send;
 
@@ -350,7 +349,7 @@ impl InstanceOperation for StaticDispatchInstanceOperation {
     async fn file_hash(
         &self,
         repository: Arc<RepositoryContext>,
-        path: &RelativePath,
+        path: FilesystemPath<'_>,
         node_hint: Option<&Node>,
     ) -> Result<Hash, FsError> {
         match self {
@@ -364,7 +363,7 @@ impl InstanceOperation for StaticDispatchInstanceOperation {
         &self,
         repository: Arc<RepositoryContext>,
         address: Address,
-        path: &RelativePath,
+        path: FilesystemPath<'_>,
         known_disk_file_size: u64,
     ) -> Result<bool, FsError> {
         match self {

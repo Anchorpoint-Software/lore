@@ -53,6 +53,7 @@ use crate::state;
 use crate::state::State;
 use crate::util;
 use crate::util::path::RelativePath;
+use crate::util::path::RepositoryPath;
 use crate::util::serde::u8_as_bool;
 
 /// Source and target revisions selected for a sync.
@@ -1023,12 +1024,13 @@ pub async fn realize_conflicts(
 
 pub async fn realize_file(
     repository: Arc<RepositoryContext>,
-    path: &RelativePath,
+    path: RelativePath,
     node: Node,
     stats: Arc<SyncRealizeStats>,
 ) -> Result<(), SyncError> {
+    let path = RepositoryPath::from_relative(&repository, path)?;
     shim_with_operation(repository.file_system(), false, async |operation| {
-        crate::fs::realize::realize_file(repository, operation, path, node, stats).await
+        crate::fs::realize::realize_file(repository, operation, &path, node, stats).await
     })
     .await?
 }

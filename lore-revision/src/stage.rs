@@ -2595,7 +2595,7 @@ pub(crate) async fn stage_from_parent_revision(
             if node.is_file() {
                 sync::realize_file(
                     repository.clone(),
-                    &relative_path,
+                    relative_path.clone(),
                     node,
                     Arc::new(SyncRealizeStats::default()),
                 )
@@ -2984,7 +2984,7 @@ pub(crate) async fn stage_link_paths_from_parent_revision(
                 // link context writes to `<parent>/<mount>/<file>`.
                 sync::realize_file(
                     group.link_context.clone(),
-                    mount_path,
+                    mount_path.clone(),
                     node_t,
                     Arc::new(SyncRealizeStats::default()),
                 )

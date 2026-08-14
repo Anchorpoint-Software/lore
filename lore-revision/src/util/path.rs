@@ -6,10 +6,12 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use lore_base::error::InvalidArguments;
 use lore_error_set::prelude::*;
 
 use crate::error::LoreResultExt;
 use crate::errors::InvalidPath;
+use crate::repository::RepositoryContext;
 
 #[error_set]
 pub enum PathError {
@@ -466,6 +468,32 @@ impl RelativePath {
             }
         }
         result
+    }
+}
+
+#[derive(Clone)]
+pub struct RepositoryPath {
+    relative: RelativePath,
+    absolute: PathBuf,
+}
+
+impl RepositoryPath {
+    pub fn from_relative(
+        repository: &Arc<RepositoryContext>,
+        relative_path: RelativePath,
+    ) -> Result<Self, InvalidArguments> {
+        Ok(Self {
+            absolute: relative_path.to_absolute_path(repository.require_path()?),
+            relative: relative_path,
+        })
+    }
+
+    pub fn relative(&self) -> &RelativePath {
+        &self.relative
+    }
+
+    pub fn absolute(&self) -> &Path {
+        self.absolute.as_path()
     }
 }
 

@@ -1738,7 +1738,7 @@ async fn reset_file_realize(
 
     sync::realize_file(
         repository.clone(),
-        &relative_path,
+        relative_path,
         node,
         Arc::new(SyncRealizeStats::default()),
     )

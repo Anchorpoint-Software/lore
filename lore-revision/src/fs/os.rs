@@ -36,6 +36,7 @@ use crate::state::FilesystemDiffStats;
 use crate::state::State;
 use crate::util;
 use crate::util::path::RelativePath;
+use crate::util::path::RepositoryPath;
 
 /// OS-backed filesystem provider.
 pub struct OsFilesystem {
@@ -63,12 +64,6 @@ impl FilesystemProvider for OsFilesystem {
 /// OS-backed filesystem operation context.
 pub struct OsOperation {
     repo_path: PathBuf,
-}
-
-impl OsOperation {
-    fn absolute_path(&self, path: FilesystemPath<'_>) -> PathBuf {
-        path.to_absolute(&self.repo_path)
-    }
 }
 
 /// All operations delegate to the regular OS file system.
@@ -101,7 +96,7 @@ impl InstanceOperation for OsOperation {
 
     async fn file_info(&self, path: FilesystemPath<'_>) -> Result<FileInfo, FsError> {
         match lore_io::IoDriver::global()
-            .metadata(self.absolute_path(path))
+            .metadata(path.as_absolute_path())
             .await
         {
             Ok(metadata) => {
@@ -128,7 +123,10 @@ impl InstanceOperation for OsOperation {
         force_full_check: bool,
     ) -> Result<FileModifiedCheck, FsError> {
         let info = self
-            .file_info(FilesystemPath::Repository(&node_change.path))
+            .file_info(FilesystemPath::Repository(&RepositoryPath::from_relative(
+                &repository,
+                node_change.path.clone(),
+            )?))
             .await?;
 
         if !info.exists {
@@ -188,13 +186,12 @@ impl InstanceOperation for OsOperation {
     async fn file_hash(
         &self,
         repository: Arc<RepositoryContext>,
-        path: &RelativePath,
+        path: FilesystemPath<'_>,
         node_hint: Option<&Node>,
     ) -> Result<Hash, FsError> {
-        let absolute_path = self.absolute_path(FilesystemPath::Repository(path));
         Ok(immutable::hash_file(
             repository.clone(),
-            absolute_path.as_path(),
+            path.as_absolute_path(),
             node_hint.and_then(|node| {
                 if !node.address.is_zero() {
                     Some(node.address)
@@ -218,13 +215,13 @@ impl InstanceOperation for OsOperation {
         &self,
         repository: Arc<RepositoryContext>,
         address: Address,
-        path: &RelativePath,
+        path: FilesystemPath<'_>,
         known_disk_file_size: u64,
     ) -> Result<bool, FsError> {
         Ok(crate::state::is_file_content_equal(
             repository,
             address,
-            &self.absolute_path(FilesystemPath::Repository(path)),
+            path.as_absolute_path(),
             known_disk_file_size,
         )
         .await)
@@ -233,7 +230,7 @@ impl InstanceOperation for OsOperation {
     async fn make_executable(&self, path: FilesystemPath<'_>) -> Result<(), FsError> {
         #[cfg(unix)]
         {
-            let absolute_path = self.absolute_path(path);
+            let absolute_path = path.as_absolute_path();
             use std::os::unix::fs::PermissionsExt;
             let metadata = lore_io::IoDriver::global().metadata(&absolute_path).await?;
             let mut permissions = metadata.permissions();
@@ -255,18 +252,14 @@ impl InstanceOperation for OsOperation {
 
     async fn create_dir_all(&self, path: FilesystemPath<'_>) -> Result<(), FsError> {
         lore_io::IoDriver::global()
-            .create_dir_all(self.absolute_path(path))
+            .create_dir_all(path.as_absolute_path())
             .await?;
         Ok(())
     }
 
     async fn create_file(&self, path: FilesystemPath<'_>) -> Result<(), FsError> {
         lore_io::IoDriver::global()
-            .write_file_bytes(
-                self.absolute_path(path).as_path(),
-                bytes::Bytes::new(),
-                false,
-            )
+            .write_file_bytes(path.as_absolute_path(), bytes::Bytes::new(), false)
             .await?;
         Ok(())
     }
@@ -276,19 +269,17 @@ impl InstanceOperation for OsOperation {
         from: FilesystemPath<'_>,
         to: FilesystemPath<'_>,
     ) -> Result<(), FsError> {
-        let from_abs = self.absolute_path(from);
-        let to_abs = self.absolute_path(to);
-        util::fs::unify_name_case_rename(&from_abs, &to_abs).await?;
+        util::fs::unify_name_case_rename(from.as_absolute_path(), to.as_absolute_path()).await?;
         Ok(())
     }
 
     async fn remove(&self, path: FilesystemPath<'_>) -> Result<(), FsError> {
-        util::fs::unlink(self.absolute_path(path).as_path()).await?;
+        util::fs::unlink(path.as_absolute_path()).await?;
         Ok(())
     }
 
     async fn remove_recursive(&self, path: FilesystemPath<'_>) -> Result<(), FsError> {
-        util::fs::unlink_recursive(self.absolute_path(path).as_path()).await?;
+        util::fs::unlink_recursive(path.as_absolute_path()).await?;
         Ok(())
     }
 
@@ -303,7 +294,7 @@ impl InstanceOperation for OsOperation {
             immutable::read_into_file(
                 repository,
                 node.address,
-                self.absolute_path(path).as_path(),
+                path.as_absolute_path(),
                 None,
                 options,
             )
@@ -319,7 +310,7 @@ impl InstanceOperation for OsOperation {
         destination_path: impl AsRef<Path> + Send,
     ) -> Result<(), FsError> {
         lore_io::IoDriver::global()
-            .copy(self.absolute_path(source_path), destination_path.as_ref())
+            .copy(source_path.as_absolute_path(), destination_path.as_ref())
             .await?;
         Ok(())
     }
@@ -337,7 +328,7 @@ impl InstanceOperation for OsOperation {
 
     async fn infer_is_diffable(&self, path: FilesystemPath<'_>) -> Result<bool, FsError> {
         Ok(
-            crate::infer::infer_is_diffable_by_path(&self.absolute_path(path))
+            crate::infer::infer_is_diffable_by_path(path.as_absolute_path())
                 .await
                 .unwrap_or(false),
         )
