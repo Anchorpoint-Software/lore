@@ -8031,3 +8031,87 @@ def test_nested_link_commit_message(new_lore_repo):
         "Nested link commit should not fall back to the main message when a "
         "per-link message was supplied"
     )
+
+
+def test_push_names_parent_branch_for_parent_revision(new_lore_repo):
+    """`lore push` must attribute the parent's revision to the parent's branch.
+
+    When a parent repository links a child and both create a branch of the same
+    name, the cascade disambiguates the child's
+    branch by appending the parent branch id (child ends up with
+    ``<name>-<parent branch id>``). During push the parent walks its own history
+    and, for each revision, pushes the link first before pushing the parent's own
+    revision. The CLI stored the branch name of the most recent BranchPush event
+    in shared state, so the child's BranchPush (fired while pushing the link)
+    overwrote it. The parent's subsequent "Pushing <rev> to branch <name>" /
+    "Pushed revision N -> <rev> to branch <name>" lines then printed the child's
+    disambiguated branch name even though the revision was the parent's.
+
+    This asserts the correct, positive behaviour: the push line that reports the
+    parent's own revision names the parent's branch (``test``).
+    """
+    child_repo: Lore = new_lore_repo()
+    with child_repo.open_file("child-file.txt", "w+") as f:
+        f.writelines(["initial child content\n"])
+    child_repo.stage(scan=True)
+    child_repo.commit("Initial child")
+    child_repo.push()
+
+    # Occupy `test` in the child so the parent's cascade must disambiguate it.
+    child_repo.branch_create("test")
+    child_repo.push("test")
+    child_repo.branch_switch("main")
+
+    parent_repo: Lore = new_lore_repo()
+    with parent_repo.open_file("parent-file.txt", "w+") as f:
+        f.writelines(["parent content\n"])
+    parent_repo.stage(scan=True)
+    parent_repo.commit("Initial parent")
+    parent_repo.push()
+
+    link_path = "linked"
+    parent_repo.link_add(link_path, child_repo.get_id(), "/")
+    parent_repo.commit("Add link")
+    parent_repo.push()
+
+    parent_repo.branch_create("test")
+    parent_branch_id = parent_repo.branch_info().id
+    disambiguated_child_branch = f"test-{parent_branch_id}"
+
+    with parent_repo.open_file(f"{link_path}/child-file.txt", "w+") as f:
+        f.writelines(["updated via parent link mount\n"])
+    parent_repo.stage(f"{link_path}/child-file.txt")
+    parent_repo.commit("probe")
+
+    parent_revision = parent_repo.branch_info().local_latest
+
+    push_output = parent_repo.push()
+
+    # Key on the parent's revision signature to isolate the parent's push lines.
+    begin_match = re.search(
+        rf"Pushing {parent_revision} to branch (\S+)", push_output
+    )
+    assert begin_match, (
+        f"Expected a push line for the parent's revision {parent_revision}.\n"
+        f"Push output:\n{push_output}"
+    )
+    assert begin_match.group(1) == "test", (
+        f"The parent's revision {parent_revision} must be reported as pushed to "
+        f"the parent's branch 'test', but it named '{begin_match.group(1)}'. "
+        f"'{disambiguated_child_branch}' is the child's branch, which exists only "
+        f"in the linked repository.\nPush output:\n{push_output}"
+    )
+
+    end_match = re.search(
+        rf"Pushed revision \d+ -> {parent_revision} to branch (\S+)", push_output
+    )
+    assert end_match, (
+        f"Expected a 'Pushed revision' line for the parent's revision "
+        f"{parent_revision}.\nPush output:\n{push_output}"
+    )
+    assert end_match.group(1) == "test", (
+        f"The parent's revision {parent_revision} must be reported as pushed to "
+        f"the parent's branch 'test', but it named '{end_match.group(1)}'. "
+        f"'{disambiguated_child_branch}' is the child's branch, which exists only "
+        f"in the linked repository.\nPush output:\n{push_output}"
+    )

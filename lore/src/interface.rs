@@ -25,6 +25,7 @@ pub type LoreLogLevel = lore_base::log::LoreLogLevel;
 pub type LoreBranchLocation = lore_revision::interface::LoreBranchLocation;
 
 pub type Context = lore_storage::Context;
+pub type Partition = lore_storage::Partition;
 pub type Hash = lore_storage::Hash;
 pub type Fragment = lore_storage::Fragment;
 pub type FragmentFlags = lore_storage::FragmentFlags;

@@ -141,6 +141,10 @@ pub struct LoreBranchPushFragmentEndEventData {
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchPushBranchCreateBeginEventData {
+    /// The repository the branch is created in.
+    pub repository: RepositoryId,
+    /// The branch being created.
+    pub branch: BranchId,
     /// The local revision the branch starts from.
     pub local_revision: Hash,
 }
@@ -159,6 +163,10 @@ pub struct LoreBranchPushBranchCreateEndEventData {
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchPushRevisionPushBeginEventData {
+    /// The repository being pushed.
+    pub repository: RepositoryId,
+    /// The branch being pushed to.
+    pub branch: BranchId,
     /// The latest revision of the branch on the remote.
     pub remote_revision: Hash,
     /// The local revision being pushed.
@@ -183,6 +191,10 @@ pub struct LoreBranchPushRevisionPushUpdateEventData {
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchPushRevisionPushEndEventData {
+    /// The repository that was pushed.
+    pub repository: RepositoryId,
+    /// The branch that was pushed to.
+    pub branch: BranchId,
     /// The branch revision on the remote before the push.
     pub old_remote_revision: Hash,
     /// The branch revision on the remote after the push.
@@ -638,6 +650,8 @@ async fn collect_fragments_and_push(
         };
 
         event::LoreEvent::BranchPushBranchCreateBegin(LoreBranchPushBranchCreateBeginEventData {
+            repository: repository.id,
+            branch,
             local_revision: branch_point,
         })
         .send();
@@ -837,6 +851,8 @@ async fn collect_fragments_and_push(
         };
 
         event::LoreEvent::BranchPushRevisionPushBegin(LoreBranchPushRevisionPushBeginEventData {
+            repository: repository.id,
+            branch,
             remote_revision: remote_latest,
             local_revision: current_revision,
         })
@@ -860,6 +876,8 @@ async fn collect_fragments_and_push(
 
                     event::LoreEvent::BranchPushBranchCreateBegin(
                         LoreBranchPushBranchCreateBeginEventData {
+                            repository: repository.id,
+                            branch,
                             local_revision: remote_latest,
                         },
                     )
@@ -914,6 +932,8 @@ async fn collect_fragments_and_push(
 
                 event::LoreEvent::BranchPushRevisionPushEnd(
                     LoreBranchPushRevisionPushEndEventData {
+                        repository: repository.id,
+                        branch,
                         old_remote_revision: current_remote,
                         new_remote_revision: current_latest,
                         new_remote_revision_number: current_number,
@@ -966,6 +986,8 @@ async fn collect_fragments_and_push(
         }
 
         event::LoreEvent::BranchPushRevisionPushEnd(LoreBranchPushRevisionPushEndEventData {
+            repository: repository.id,
+            branch,
             old_remote_revision: current_remote,
             new_remote_revision: current_latest,
             new_remote_revision_number: current_number,

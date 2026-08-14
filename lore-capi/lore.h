@@ -1032,6 +1032,10 @@ typedef struct lore_branch_push_fragment_end_event_data_t {
 
 // Data for the event sent before a branch is created on the remote.
 typedef struct lore_branch_push_branch_create_begin_event_data_t {
+  // The repository the branch is created in.
+  lore_repository_id_t repository;
+  // The branch being created.
+  lore_branch_id_t branch;
   // The local revision the branch starts from.
   struct lore_hash_t local_revision;
 } lore_branch_push_branch_create_begin_event_data_t;
@@ -1044,6 +1048,10 @@ typedef struct lore_branch_push_branch_create_end_event_data_t {
 
 // Data for the event sent before a revision is pushed to the remote.
 typedef struct lore_branch_push_revision_push_begin_event_data_t {
+  // The repository being pushed.
+  lore_repository_id_t repository;
+  // The branch being pushed to.
+  lore_branch_id_t branch;
   // The latest revision of the branch on the remote.
   struct lore_hash_t remote_revision;
   // The local revision being pushed.
@@ -1062,6 +1070,10 @@ typedef struct lore_branch_push_revision_push_update_event_data_t {
 
 // Data for the event sent after a revision is pushed to the remote.
 typedef struct lore_branch_push_revision_push_end_event_data_t {
+  // The repository that was pushed.
+  lore_repository_id_t repository;
+  // The branch that was pushed to.
+  lore_branch_id_t branch;
   // The branch revision on the remote before the push.
   struct lore_hash_t old_remote_revision;
   // The branch revision on the remote after the push.
