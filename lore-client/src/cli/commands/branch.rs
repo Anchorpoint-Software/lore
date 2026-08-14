@@ -559,6 +559,21 @@ fn handle_branch_create(globals: LoreGlobalArgs, args: &BranchCreateArgs) -> u8 
                     );
                 }
             }
+            LoreEvent::LinkBranchCreate(data) => {
+                let outcome = if data.reused != 0 {
+                    "reusing existing branch"
+                } else {
+                    "created branch"
+                };
+                println!(
+                    "Link {}: {outcome} {}{}{} at revision {}",
+                    data.link_path.as_str(),
+                    BranchStyles::CURRENT_BRANCH,
+                    data.branch,
+                    anstyle::Reset,
+                    data.revision,
+                );
+            }
             LoreEvent::Complete(_) => {}
             LoreEvent::Maintenance(data) => {
                 util::handle_maintenance_event(data);

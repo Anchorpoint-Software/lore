@@ -16,7 +16,7 @@ from error_types import (
     PathExistChildrenLinkError,
     PathExistLinkError,
 )
-from lore_parsers import parse_status_json
+from lore_parsers import parse_jsonl, parse_status_json
 
 from lore import Lore
 
@@ -8030,6 +8030,302 @@ def test_nested_link_commit_message(new_lore_repo):
     assert "Main parent message" not in c_message, (
         "Nested link commit should not fall back to the main message when a "
         "per-link message was supplied"
+    )
+
+
+def _build_parent_with_link(new_lore_repo, mount: str = "vendor/lib"):
+    """Parent repo with one auto-follow link mounted at `mount`.
+
+    Returns (parent, link_repo, mount).
+    """
+    parent: Lore = new_lore_repo()
+    parent.write_commit_push("Initial parent", {"parent.txt": "parent content\n"})
+
+    link_repo: Lore = new_lore_repo()
+    link_repo.write_commit_push("Initial link", {"linked.txt": "linked content\n"})
+
+    parent.link_add(mount, link_repo.get_id(), "/")
+    parent.commit("Add link")
+    parent.push()
+
+    return parent, link_repo, mount
+
+
+@pytest.mark.smoke
+def test_link_branch_create_reuses_existing_link_branch_id(new_lore_repo):
+    """Branch creation succeeds when the linked repo already holds the
+    requested branch ID, and the existing linked branch is reused.
+
+    The auto-follow cascade creates the parent's branch ID in every linked
+    repository. When that ID is already present there, the cascade adopts it:
+    the parent branch is created, and the linked branch keeps its identity
+    and its latest revision.
+    """
+    parent, link_repo, _mount = _build_parent_with_link(new_lore_repo)
+
+    branch_id = "5b9c1d2e3f4a4b5c8d9e0f1a2b3c4d5e"
+    branch_name = "shared-feature"
+
+    link_repo.branch_create(branch_name, id=branch_id)
+    link_repo.write_commit_push("Link work on shared branch", {"on-branch.txt": "x\n"})
+    link_latest_before = link_repo.branch_info(branch_id).local_latest
+
+    parent.branch_create(branch_name, id=branch_id)
+
+    parent_branch = parent.branch_info()
+    assert parent_branch.name == branch_name, (
+        f"Parent must be on the newly created branch.\nGot: {parent_branch.name!r}"
+    )
+    assert parent_branch.id == branch_id, (
+        "Parent branch must carry the requested branch ID.\n"
+        f"Expected: {branch_id}\nGot: {parent_branch.id}"
+    )
+
+    link_branch = link_repo.branch_info(branch_id)
+    assert link_branch.name == branch_name, (
+        "The pre-existing linked branch must be reused under its own name.\n"
+        f"Expected: {branch_name!r}\nGot: {link_branch.name!r}"
+    )
+    assert link_branch.local_latest == link_latest_before, (
+        "Reusing the linked branch must leave its latest revision untouched.\n"
+        f"Expected: {link_latest_before}\nGot: {link_branch.local_latest}"
+    )
+
+    link_output = parent.link_list()
+    assert branch_name in link_output, (
+        f"link list must resolve the link to {branch_name!r}.\nOutput:\n{link_output}"
+    )
+
+
+@pytest.mark.smoke
+def test_link_branch_create_reports_reuse_in_event(new_lore_repo):
+    """Reusing a linked branch is reported as `linkBranchCreate` with
+    `reused` set.
+
+    The event carries the mount path, the linked repository, the branch ID,
+    and that branch's latest revision, so a caller can tell an adopted branch
+    from a freshly created one without parsing text output.
+    """
+    parent, link_repo, mount = _build_parent_with_link(new_lore_repo)
+
+    branch_id = "3d4e5f60718293a4b5c6d7e8f9a0b1c2"
+    branch_name = "evented-feature"
+
+    link_repo.branch_create(branch_name, id=branch_id)
+    link_repo.write_commit_push("Link work", {"evented.txt": "w\n"})
+    link_head = link_repo.branch_info(branch_id).local_latest
+
+    output = parent.branch_create(branch_name, id=branch_id, json=True)
+
+    events = parse_jsonl(output, "linkBranchCreate")
+    assert len(events) == 1, (
+        f"Expected exactly one linkBranchCreate event.\nOutput:\n{output}"
+    )
+    event = events[0]
+    assert event["reused"] is True, (
+        f"Event must mark the branch as reused.\nGot: {event}"
+    )
+    assert event["linkPath"] == mount, (
+        f"Event must name the mount path.\nExpected: {mount}\nGot: {event['linkPath']}"
+    )
+    assert event["linkRepository"] == link_repo.get_id(), (
+        "Event must name the linked repository holding the reused branch.\n"
+        f"Expected: {link_repo.get_id()}\nGot: {event['linkRepository']}"
+    )
+    assert event["branch"] == branch_id, (
+        f"Event must name the reused branch ID.\nExpected: {branch_id}\n"
+        f"Got: {event['branch']}"
+    )
+    assert event["revision"] == link_head, (
+        "Event must carry the reused branch's latest revision.\n"
+        f"Expected: {link_head}\nGot: {event['revision']}"
+    )
+
+    created = parse_jsonl(output, "branchCreate")
+    assert [entry["name"] for entry in created] == [branch_name], (
+        f"The parent branch must still be reported as created.\nOutput:\n{output}"
+    )
+
+
+@pytest.mark.smoke
+def test_link_branch_create_reports_creation_in_event(new_lore_repo):
+    """Creating a link's branch is reported as `linkBranchCreate` with
+    `reused` clear.
+
+    The cascade reports an outcome for every link it touches, not only the
+    reuse case, so a caller sees what happened in each linked repository.
+    """
+    parent, link_repo, mount = _build_parent_with_link(new_lore_repo)
+
+    branch_name = "fresh-feature"
+    output = parent.branch_create(branch_name, json=True)
+
+    events = parse_jsonl(output, "linkBranchCreate")
+    assert len(events) == 1, (
+        f"Expected exactly one linkBranchCreate event.\nOutput:\n{output}"
+    )
+    event = events[0]
+    assert event["reused"] is False, (
+        f"Event must mark the branch as newly created.\nGot: {event}"
+    )
+    assert event["linkPath"] == mount, (
+        f"Event must name the mount path.\nExpected: {mount}\nGot: {event['linkPath']}"
+    )
+    assert event["linkRepository"] == link_repo.get_id(), (
+        f"Event must name the linked repository.\nGot: {event['linkRepository']}"
+    )
+
+    branch_list = link_repo.branch_list()
+    assert branch_name in branch_list.remote_branches, (
+        f"The branch must exist in the linked repository.\nGot: {branch_list}"
+    )
+
+
+@pytest.mark.smoke
+def test_link_branch_create_reports_each_mount_of_same_repo(new_lore_repo):
+    """One outcome event per mount when a repository is linked twice.
+
+    A repository can be mounted at more than one path, so the mount path is
+    what distinguishes the two cascade entries - the repository ID is the same
+    for both.
+    """
+    parent: Lore = new_lore_repo()
+    parent.write_commit_push("Initial parent", {"parent.txt": "parent content\n"})
+
+    link_repo: Lore = new_lore_repo()
+    link_repo.write_commit_push("Initial link", {"linked.txt": "linked content\n"})
+
+    mounts = ["vendor/first", "vendor/second"]
+    for mount in mounts:
+        parent.link_add(mount, link_repo.get_id(), "/")
+        parent.commit(f"Add link at {mount}")
+        parent.push()
+
+    output = parent.branch_create("dual-mount", json=True)
+
+    events = parse_jsonl(output, "linkBranchCreate")
+    assert sorted(event["linkPath"] for event in events) == mounts, (
+        "Each mount of the linked repository must report its own outcome "
+        f"event.\nOutput:\n{output}"
+    )
+    assert {event["linkRepository"] for event in events} == {link_repo.get_id()}, (
+        "Both events must name the same linked repository, which is why the "
+        f"mount path is needed to tell them apart.\nOutput:\n{output}"
+    )
+    assert len({event["revision"] for event in events}) == 1, (
+        "Both mounts address one branch in one repository, so the cascade must "
+        "resolve it once and report the same revision for every mount rather "
+        f"than creating it per mount.\nOutput:\n{output}"
+    )
+
+
+@pytest.mark.smoke
+def test_link_branch_create_reuses_link_branch_id_under_other_name(new_lore_repo):
+    """A linked branch that already owns the requested ID keeps its own name.
+
+    Adoption is keyed on the branch ID, so a linked branch created earlier
+    under a different name is reused as-is rather than renamed or recreated.
+    """
+    parent, link_repo, _mount = _build_parent_with_link(new_lore_repo)
+
+    branch_id = "7a1b2c3d4e5f6071829304a5b6c7d8e9"
+    link_branch_name = "link-local-name"
+    parent_branch_name = "parent-name"
+
+    link_repo.branch_create(link_branch_name, id=branch_id)
+    link_repo.write_commit_push("Link work", {"link-only.txt": "y\n"})
+    link_latest_before = link_repo.branch_info(branch_id).local_latest
+
+    parent.branch_create(parent_branch_name, id=branch_id)
+
+    assert parent.branch_info().name == parent_branch_name, (
+        "Parent branch must be created under the requested name"
+    )
+
+    link_branch = link_repo.branch_info(branch_id)
+    assert link_branch.name == link_branch_name, (
+        "The linked branch must keep the name it was created with.\n"
+        f"Expected: {link_branch_name!r}\nGot: {link_branch.name!r}"
+    )
+    assert link_branch.local_latest == link_latest_before, (
+        "Adopting the linked branch must leave its latest revision untouched.\n"
+        f"Expected: {link_latest_before}\nGot: {link_branch.local_latest}"
+    )
+
+
+@pytest.mark.smoke
+def test_link_branch_create_commits_onto_reused_link_branch(new_lore_repo):
+    """Work committed through the mount lands on the reused linked branch.
+
+    Proves adoption leaves a usable link: after the parent branch is created
+    on top of a pre-existing linked branch, a commit through the mount path
+    advances that same linked branch.
+    """
+    parent, link_repo, mount = _build_parent_with_link(new_lore_repo)
+
+    branch_id = "1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f"
+    branch_name = "adopted-feature"
+
+    link_repo.branch_create(branch_name, id=branch_id)
+    link_repo.push()
+    link_latest_before = link_repo.branch_info().local_latest
+
+    parent.branch_create(branch_name, id=branch_id)
+
+    mounted_file = f"{mount}/through-mount.txt"
+    with parent.open_file(mounted_file, "w+") as f:
+        f.write("written through the mount\n")
+    parent.stage(scan=True)
+    parent.commit("Commit into adopted link branch")
+    parent.push()
+
+    link_repo.sync()
+    link_branch_after = link_repo.branch_info()
+    assert link_branch_after.id == branch_id, (
+        "The linked repo must still be on the reused branch"
+    )
+    assert link_branch_after.local_latest != link_latest_before, (
+        "Committing through the mount must advance the reused linked branch"
+    )
+    assert link_repo.file_exists("through-mount.txt"), (
+        "The file committed through the mount must be present on the reused "
+        "linked branch"
+    )
+
+
+@pytest.mark.smoke
+def test_link_update_after_reusing_link_branch_pulls_branch_head(new_lore_repo):
+    """`link update` after adoption re-pins to the reused branch's head.
+
+    The adopted branch may already carry revisions the parent's pin predates.
+    Those become available the moment the link is updated, which is the normal
+    way a pin advances.
+    """
+    parent, link_repo, mount = _build_parent_with_link(new_lore_repo)
+
+    branch_id = "2f3e4d5c6b7a8908172635445362718f"
+    branch_name = "ahead-feature"
+
+    link_repo.branch_create(branch_name, id=branch_id)
+    link_repo.write_commit_push(
+        "Work already on the linked branch", {"ahead.txt": "z\n"}
+    )
+    link_head = link_repo.branch_info(branch_id).local_latest
+
+    parent.branch_create(branch_name, id=branch_id)
+
+    parent.link_update(mount)
+    parent.commit("Update link to adopted branch head")
+    parent.push()
+
+    assert parent.file_exists(f"{mount}/ahead.txt"), (
+        "link update must materialise content from the reused branch's head"
+    )
+
+    link_output = parent.link_list()
+    assert link_head in link_output, (
+        "link list must report the reused branch's head as the pin.\n"
+        f"Expected: {link_head}\nOutput:\n{link_output}"
     )
 
 

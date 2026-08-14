@@ -15,6 +15,7 @@ use crate::bitflagsops;
 use crate::branch;
 use crate::change::NodeChange;
 use crate::errors::*;
+use crate::event;
 use crate::event::EventError;
 use crate::filter::FilterMode;
 use crate::fs::filesystem_provider::InstanceOperation;
@@ -45,6 +46,7 @@ use crate::state::State;
 use crate::state::StateError;
 use crate::util::path::RelativePath;
 use crate::util::path::RelativePathBuf;
+use crate::util::serde::u8_as_bool;
 
 pub mod add;
 pub mod list;
@@ -235,6 +237,16 @@ pub struct LoreLinkChangeEventData {
     pub action: LoreFileAction,
 }
 
+/// A link mounted at the repository root carries an empty path; report it as
+/// `/` so every link event names a path.
+fn event_link_path(link_path: &str) -> LoreString {
+    if link_path.is_empty() {
+        LoreString::from("/")
+    } else {
+        LoreString::from(link_path)
+    }
+}
+
 impl LoreLinkChangeEventData {
     fn new(
         link_path: &str,
@@ -244,17 +256,34 @@ impl LoreLinkChangeEventData {
         action: LoreFileAction,
     ) -> Self {
         Self {
-            link_path: if link_path.is_empty() {
-                LoreString::from("/")
-            } else {
-                LoreString::from(link_path)
-            },
+            link_path: event_link_path(link_path),
             link_repository,
             branch,
             revision,
             action,
         }
     }
+}
+
+/// Data for an event reporting how a link's branch was resolved in the linked
+/// repository. A repository can be linked at more than one mount path, so a
+/// consumer must key on `link_path` together with `link_repository`.
+#[repr(C)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoreLinkBranchCreateEventData {
+    /// Path of the link within the parent repository.
+    pub link_path: LoreString,
+    /// Identifier of the repository the link points to.
+    pub link_repository: RepositoryId,
+    /// Identifier of the branch in the linked repository.
+    pub branch: BranchId,
+    /// Hash of the latest revision on that branch.
+    pub revision: Hash,
+    /// Set when a branch with this identifier was already present and was
+    /// reused rather than created.
+    #[serde(with = "u8_as_bool")]
+    pub reused: u8,
 }
 
 /// Data for an event describing a single link in a repository.
@@ -295,6 +324,19 @@ bitflags! {
 }
 bitflagsops!(LinkFlags, u32);
 
+/// How a link's branch was resolved in the linked repository.
+///
+/// A repository can be linked at more than one mount path, but the branch has a
+/// single identity within it, so one outcome describes every mount that follows
+/// the same repository.
+pub struct LinkBranchOutcome {
+    /// Hash of the latest revision on the resolved branch.
+    pub revision: Hash,
+    /// Set when a branch with this identifier was already present and was
+    /// reused rather than created.
+    pub reused: bool,
+}
+
 pub async fn create_branch(
     repository: Arc<RepositoryContext>,
     remote: Arc<Connection>,
@@ -303,7 +345,7 @@ pub async fn create_branch(
     branch_category: String,
     parent_id: Context,
     parent_latest: Hash,
-) -> Result<Hash, LinkError> {
+) -> Result<LinkBranchOutcome, LinkError> {
     lore_debug!(
         "Creating link branch {branch_name} for link id {} at revision {parent_latest}",
         repository.id
@@ -321,6 +363,17 @@ pub async fn create_branch(
         .await
         .forward::<LinkError>("Not connected")?;
 
+    // The linked repository already owns this branch ID, so adopt it instead of
+    // failing the whole cascade.
+    if let Ok(existing) = branch::load_remote(remote.clone(), repository.id, branch_id).await
+        && !existing.deleted
+    {
+        return Ok(LinkBranchOutcome {
+            revision: existing.latest,
+            reused: true,
+        });
+    }
+
     let branch_name =
         if let Ok(_previous_id) = branch::load_name_to_id(repository.clone(), &branch_name).await {
             lore_debug!("Link branch with name {branch_name} already exists, appending branch ID");
@@ -329,7 +382,7 @@ pub async fn create_branch(
             branch_name
         };
 
-    revision
+    let latest = revision
         .branch_create(
             branch_id,
             &branch_name,
@@ -338,7 +391,29 @@ pub async fn create_branch(
             &branch_stack,
         )
         .await
-        .forward::<LinkError>("Failed to create branch in linked repository")
+        .forward::<LinkError>("Failed to create branch in linked repository")?;
+
+    Ok(LinkBranchOutcome {
+        revision: latest,
+        reused: false,
+    })
+}
+
+pub(crate) fn report_branch_outcome(
+    link_path: &str,
+    link_repository: RepositoryId,
+    branch: BranchId,
+    revision: Hash,
+    reused: bool,
+) {
+    event::LoreEvent::LinkBranchCreate(LoreLinkBranchCreateEventData {
+        link_path: event_link_path(link_path),
+        link_repository,
+        branch,
+        revision,
+        reused: reused as u8,
+    })
+    .send();
 }
 
 pub async fn resolve_pin(

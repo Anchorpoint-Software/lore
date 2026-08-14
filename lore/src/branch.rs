@@ -68,6 +68,12 @@ pub struct LoreBranchCreateArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::BranchCreate`](crate::interface::LoreEvent::BranchCreate) | Emitted when the branch has been successfully created, includes branch name and id |
+///
+/// ## Link Events
+///
+/// | Event | Description |
+/// |-------|-------------|
+/// | [`LoreEvent::LinkBranchCreate`](crate::interface::LoreEvent::LinkBranchCreate) | Emitted once per linked repository mount, reporting whether its branch was created or an existing one reused |
 pub async fn create(
     globals: LoreGlobalArgs,
     args: LoreBranchCreateArgs,

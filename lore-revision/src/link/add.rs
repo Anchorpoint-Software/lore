@@ -105,6 +105,13 @@ pub async fn add(
             branch::load_remote_latest(link_remote.clone(), link.id, current_branch_id).await
         {
             lore_debug!("Using existing link branch at LATEST ({link_latest})");
+            link::report_branch_outcome(
+                link_path.as_str(),
+                link.id,
+                current_branch_id,
+                link_latest,
+                true, /* reused */
+            );
             link_latest
         } else {
             let link_metadata = repository::metadata_hash(link.clone())
@@ -127,7 +134,7 @@ pub async fn add(
                     .await
                     .forward::<LinkError>("Failed getting branch metadata")?;
 
-            let link_latest = link::create_branch(
+            let outcome = link::create_branch(
                 link.clone(),
                 link_remote.clone(),
                 current_branch_id,
@@ -138,12 +145,21 @@ pub async fn add(
             )
             .await?;
 
-            lore_debug!(
-                "Created branch {} at LATEST ({link_latest}) in linked repo",
-                current_branch_id
+            link::report_branch_outcome(
+                link_path.as_str(),
+                link.id,
+                current_branch_id,
+                outcome.revision,
+                outcome.reused,
             );
 
-            link_latest
+            lore_debug!(
+                "Created branch {} at LATEST ({}) in linked repo",
+                current_branch_id,
+                outcome.revision
+            );
+
+            outcome.revision
         };
 
         let link_revision = if let Some(pin) = pin {

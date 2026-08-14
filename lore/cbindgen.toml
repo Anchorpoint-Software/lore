@@ -331,6 +331,7 @@ include = [
 "LoreLinkRemoveArgs" = "lore_link_remove_args_t"
 "LoreLinkListArgs" = "lore_link_list_args_t"
 "LoreLinkUpdateArgs" = "lore_link_update_args_t"
+"LoreLinkBranchCreateEventData" = "lore_link_branch_create_event_data_t"
 "LoreLinkChangeEventData" = "lore_link_change_event_data_t"
 "LoreLinkEntryEventData" = "lore_link_entry_event_data_t"
 "LoreLinkStagedEntryEventData" = "lore_link_staged_entry_event_data_t"

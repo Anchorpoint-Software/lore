@@ -81,6 +81,7 @@ use crate::revision::DiffItem;
 use crate::revision::DiffResult;
 use crate::revision::sync;
 use crate::state;
+use crate::state::LinkReference;
 use crate::state::State;
 use crate::state::StateData;
 use crate::state::StateError;
@@ -1735,7 +1736,12 @@ async fn create_linked_branches(
         return Ok(current_latest);
     }
 
-    let mut link_tasks = JoinSet::new();
+    // A repository can be linked at more than one mount path, and the branch has
+    // a single identity within it. Group the mounts by repository so the cascade
+    // creates that branch once instead of racing itself: concurrent creates with
+    // the same branch ID resolve to one winner, and the loser is rejected with
+    // "branch has been advanced by another instance", failing the whole create.
+    let mut link_groups: Vec<(RepositoryId, Vec<LinkReference>)> = Vec::new();
 
     for link_reference in link_list.iter() {
         if link_reference.flags & LinkFlags::DisableAutoFollow != 0 {
@@ -1746,8 +1752,19 @@ async fn create_linked_branches(
             continue;
         }
 
+        match link_groups
+            .iter_mut()
+            .find(|(link_id, _mounts)| *link_id == link_reference.repository)
+        {
+            Some((_link_id, mounts)) => mounts.push(*link_reference),
+            None => link_groups.push((link_reference.repository, vec![*link_reference])),
+        }
+    }
+
+    let mut link_tasks = JoinSet::new();
+
+    for (link_id, mounts) in link_groups {
         lore_spawn!(link_tasks, {
-            let link_id = link_reference.repository;
             let link = Arc::new(repository.to_link_context(link_id).await);
             let link_remote = link.remote().await.forward_with::<BranchError, _>(|| {
                 format!("Failed to connect to link repository {link_id}")
@@ -1758,46 +1775,66 @@ async fn create_linked_branches(
             let branch_id = branch;
             let branch_name = name.clone();
             let branch_category = category.clone();
-            let link_reference = *link_reference;
 
             async move {
-                let resolved_parent_branch = link_reference.resolve_branch(current_branch);
+                // The first mount seeds the branch point; the others adopt what
+                // it resolved to, since they all address the same branch.
+                let leader = mounts[0];
+                let resolved_parent_branch = leader.resolve_branch(current_branch);
 
-                link::create_branch(
+                let outcome = link::create_branch(
                     link.clone(),
                     link_remote,
                     branch_id,
                     branch_name,
                     branch_category,
                     resolved_parent_branch,
-                    link_reference.signature,
+                    leader.signature,
                 )
                 .await
                 .forward_with::<BranchError, _>(|| {
                     format!("Failed to create branch for link repository {link_id}")
                 })?;
 
-                // When the link uses the implicit branch convention (zero),
-                // skip update_link_pin_by_node — the branch is already
-                // implicitly correct and the signature is unchanged (the new
-                // linked branch points to the same revision). This avoids
-                // dirtying the state and producing a bookkeeping revision.
-                if !link_reference.branch.is_zero() {
-                    link::update_link_pin_by_node(
-                        &state,
-                        repository.clone(),
-                        link_reference.repository,
+                // The create is shared, the reporting is not: every mount that
+                // follows this repository reports its own outcome, keyed on its
+                // path, because the repository ID cannot tell the mounts apart.
+                for mount in mounts.iter() {
+                    let link_path = state
+                        .node_path(repository.clone(), mount.local_node)
+                        .await
+                        .unwrap_or_default();
+
+                    link::report_branch_outcome(
+                        &link_path,
+                        link_id,
                         branch_id,
-                        link_reference.signature,
-                        link_reference.local_node,
-                    )
-                    .await
-                    .forward_with::<BranchError, _>(|| {
-                        format!(
-                            "Failed to update link reference for link repository {}",
-                            link_reference.repository
+                        outcome.revision,
+                        outcome.reused,
+                    );
+
+                    // When the link uses the implicit branch convention (zero),
+                    // skip update_link_pin_by_node — the branch is already
+                    // implicitly correct and the signature is unchanged (the new
+                    // linked branch points to the same revision). This avoids
+                    // dirtying the state and producing a bookkeeping revision.
+                    if !mount.branch.is_zero() {
+                        link::update_link_pin_by_node(
+                            &state,
+                            repository.clone(),
+                            mount.repository,
+                            branch_id,
+                            mount.signature,
+                            mount.local_node,
                         )
-                    })?;
+                        .await
+                        .forward_with::<BranchError, _>(|| {
+                            format!(
+                                "Failed to update link reference for link repository {}",
+                                mount.repository
+                            )
+                        })?;
+                    }
                 }
 
                 Ok(())

@@ -128,6 +128,7 @@ use crate::layer::LoreLayerAddEventData;
 use crate::layer::LoreLayerEntryEventData;
 use crate::layer::LoreLayerRemoveEventData;
 use crate::layer::LoreLayerStagedEntryEventData;
+use crate::link::LoreLinkBranchCreateEventData;
 use crate::link::LoreLinkChangeEventData;
 use crate::link::LoreLinkEntryEventData;
 use crate::link::list::LoreLinkStagedEntryEventData;
@@ -916,6 +917,8 @@ pub enum LoreEvent {
     LayerRemove(LoreLayerRemoveEventData),
     /// One staged entry in a layer listing.
     LayerStagedEntry(LoreLayerStagedEntryEventData),
+    /// A link's branch in the linked repository was created or reused.
+    LinkBranchCreate(LoreLinkBranchCreateEventData),
     /// A link was changed.
     LinkChange(LoreLinkChangeEventData),
     /// One entry in a link listing.

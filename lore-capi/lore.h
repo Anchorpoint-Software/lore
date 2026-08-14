@@ -1551,6 +1551,23 @@ typedef struct lore_layer_staged_entry_event_data_t {
   uint64_t staged_file_count;
 } lore_layer_staged_entry_event_data_t;
 
+// Data for an event reporting how a link's branch was resolved in the linked
+// repository. A repository can be linked at more than one mount path, so a
+// consumer must key on `link_path` together with `link_repository`.
+typedef struct lore_link_branch_create_event_data_t {
+  // Path of the link within the parent repository.
+  struct lore_string_t link_path;
+  // Identifier of the repository the link points to.
+  lore_repository_id_t link_repository;
+  // Identifier of the branch in the linked repository.
+  lore_branch_id_t branch;
+  // Hash of the latest revision on that branch.
+  struct lore_hash_t revision;
+  // Set when a branch with this identifier was already present and was
+  // reused rather than created.
+  uint8_t reused;
+} lore_link_branch_create_event_data_t;
+
 // Data for an event reporting a change to a link.
 typedef struct lore_link_change_event_data_t {
   // Path of the link within the parent repository.
@@ -3164,6 +3181,8 @@ enum lore_event_id_t {
   LORE_EVENT_LAYER_REMOVE,
   // One staged entry in a layer listing.
   LORE_EVENT_LAYER_STAGED_ENTRY,
+  // A link's branch in the linked repository was created or reused.
+  LORE_EVENT_LINK_BRANCH_CREATE,
   // A link was changed.
   LORE_EVENT_LINK_CHANGE,
   // One entry in a link listing.
@@ -3508,6 +3527,7 @@ typedef struct lore_event_t {
     struct lore_layer_entry_event_data_t layer_entry;
     struct lore_layer_remove_event_data_t layer_remove;
     struct lore_layer_staged_entry_event_data_t layer_staged_entry;
+    struct lore_link_branch_create_event_data_t link_branch_create;
     struct lore_link_change_event_data_t link_change;
     struct lore_link_entry_event_data_t link_entry;
     struct lore_lock_file_acquire_begin_event_data_t lock_file_acquire_begin;
@@ -5689,6 +5709,12 @@ void lore_auth_login_interactive_async(const struct lore_global_args_t *globals,
 // | Tag | Data Type | Description |
 // |-----|-----------|-------------|
 // | `LORE_EVENT_BRANCH_CREATE` | `lore_branch_create_event_data_t` | Emitted when the branch has been successfully created, includes branch name and id |
+//
+// ## Link Events
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_LINK_BRANCH_CREATE` | `lore_link_branch_create_event_data_t` | Emitted once per linked repository mount, reporting whether its branch was created or an existing one reused |
 int32_t lore_branch_create(const struct lore_global_args_t *globals,
                            const struct lore_branch_create_args_t *args,
                            struct lore_event_callback_config_t callback);
@@ -5715,6 +5741,12 @@ int32_t lore_branch_create(const struct lore_global_args_t *globals,
 // | Tag | Data Type | Description |
 // |-----|-----------|-------------|
 // | `LORE_EVENT_BRANCH_CREATE` | `lore_branch_create_event_data_t` | Emitted when the branch has been successfully created, includes branch name and id |
+//
+// ## Link Events
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_LINK_BRANCH_CREATE` | `lore_link_branch_create_event_data_t` | Emitted once per linked repository mount, reporting whether its branch was created or an existing one reused |
 void lore_branch_create_async(const struct lore_global_args_t *globals,
                               const struct lore_branch_create_args_t *args,
                               struct lore_event_callback_config_t callback);
@@ -8208,6 +8240,7 @@ void lore_lock_file_release_async(const struct lore_global_args_t *globals,
 // |-----|-----------|-------------|
 // | `LORE_EVENT_REPOSITORY_CLONE_BEGIN` | `lore_repository_clone_begin_event_data_t` | Emitted when cloning a linked repository begins |
 // | `LORE_EVENT_REPOSITORY_CLONE_END` | `lore_repository_clone_end_event_data_t` | Emitted when cloning a linked repository completes |
+// | `LORE_EVENT_LINK_BRANCH_CREATE` | `lore_link_branch_create_event_data_t` | Emitted when branching is enabled, reporting whether the link's branch was created or an existing one reused |
 // | `LORE_EVENT_LINK_CHANGE` | `lore_link_change_event_data_t` | Emitted when the link has been added and saved |
 int32_t lore_link_add(const struct lore_global_args_t *globals,
                       const struct lore_link_add_args_t *args,
@@ -8236,6 +8269,7 @@ int32_t lore_link_add(const struct lore_global_args_t *globals,
 // |-----|-----------|-------------|
 // | `LORE_EVENT_REPOSITORY_CLONE_BEGIN` | `lore_repository_clone_begin_event_data_t` | Emitted when cloning a linked repository begins |
 // | `LORE_EVENT_REPOSITORY_CLONE_END` | `lore_repository_clone_end_event_data_t` | Emitted when cloning a linked repository completes |
+// | `LORE_EVENT_LINK_BRANCH_CREATE` | `lore_link_branch_create_event_data_t` | Emitted when branching is enabled, reporting whether the link's branch was created or an existing one reused |
 // | `LORE_EVENT_LINK_CHANGE` | `lore_link_change_event_data_t` | Emitted when the link has been added and saved |
 void lore_link_add_async(const struct lore_global_args_t *globals,
                          const struct lore_link_add_args_t *args,

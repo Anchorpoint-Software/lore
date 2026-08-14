@@ -63,6 +63,7 @@ pub type LoreRevisionSyncRevisionEventData =
     lore_revision::revision::sync::LoreRevisionSyncRevisionEventData;
 pub type LoreRevisionBisectEventData = lore_revision::revision::bisect::LoreRevisionBisectEventData;
 pub type LoreLinkChangeEventData = lore_revision::link::LoreLinkChangeEventData;
+pub type LoreLinkBranchCreateEventData = lore_revision::link::LoreLinkBranchCreateEventData;
 pub type LoreFragmentWriteEventData = lore_revision::immutable::LoreFragmentWriteEventData;
 pub type LoreCompleteEventData = lore_revision::event::LoreCompleteEventData;
 pub type LoreMaintenanceEventData = lore_revision::event::LoreMaintenanceEventData;
@@ -421,6 +422,12 @@ pub type LoreBranchCreateArgs = crate::branch::LoreBranchCreateArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_BRANCH_CREATE` | `lore_branch_create_event_data_t` | Emitted when the branch has been successfully created, includes branch name and id |
+///
+/// ## Link Events
+///
+/// | Tag | Data Type | Description |
+/// |-----|-----------|-------------|
+/// | `LORE_EVENT_LINK_BRANCH_CREATE` | `lore_link_branch_create_event_data_t` | Emitted once per linked repository mount, reporting whether its branch was created or an existing one reused |
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_branch_create(
     globals: &LoreGlobalArgs,
@@ -452,6 +459,12 @@ pub extern "C" fn lore_branch_create(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_BRANCH_CREATE` | `lore_branch_create_event_data_t` | Emitted when the branch has been successfully created, includes branch name and id |
+///
+/// ## Link Events
+///
+/// | Tag | Data Type | Description |
+/// |-----|-----------|-------------|
+/// | `LORE_EVENT_LINK_BRANCH_CREATE` | `lore_link_branch_create_event_data_t` | Emitted once per linked repository mount, reporting whether its branch was created or an existing one reused |
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_branch_create_async(
     globals: &LoreGlobalArgs,
@@ -3526,6 +3539,7 @@ pub type LoreLinkAddArgs = crate::link::LoreLinkAddArgs;
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_REPOSITORY_CLONE_BEGIN` | `lore_repository_clone_begin_event_data_t` | Emitted when cloning a linked repository begins |
 /// | `LORE_EVENT_REPOSITORY_CLONE_END` | `lore_repository_clone_end_event_data_t` | Emitted when cloning a linked repository completes |
+/// | `LORE_EVENT_LINK_BRANCH_CREATE` | `lore_link_branch_create_event_data_t` | Emitted when branching is enabled, reporting whether the link's branch was created or an existing one reused |
 /// | `LORE_EVENT_LINK_CHANGE` | `lore_link_change_event_data_t` | Emitted when the link has been added and saved |
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_link_add(
@@ -3559,6 +3573,7 @@ pub extern "C" fn lore_link_add(
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_REPOSITORY_CLONE_BEGIN` | `lore_repository_clone_begin_event_data_t` | Emitted when cloning a linked repository begins |
 /// | `LORE_EVENT_REPOSITORY_CLONE_END` | `lore_repository_clone_end_event_data_t` | Emitted when cloning a linked repository completes |
+/// | `LORE_EVENT_LINK_BRANCH_CREATE` | `lore_link_branch_create_event_data_t` | Emitted when branching is enabled, reporting whether the link's branch was created or an existing one reused |
 /// | `LORE_EVENT_LINK_CHANGE` | `lore_link_change_event_data_t` | Emitted when the link has been added and saved |
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_link_add_async(
