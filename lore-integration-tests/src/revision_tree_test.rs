@@ -30,6 +30,7 @@ mod support {
     use lore_base::types::Partition;
     use lore_revision::event::LoreErrorCode;
     use lore_revision::event::LoreEvent;
+    use lore_revision::event::revision_tree::LoreRevisionTreeInfoEventData;
     use lore_revision::event::revision_tree::LoreRevisionTreeNodeInfoEventData;
     use lore_revision::interface::LoreError;
     use lore_revision::interface::LoreEventCallback;
@@ -58,6 +59,9 @@ mod support {
         MetadataClearComplete(u64, u8, LoreErrorCode),
         BatchComplete(u64, LoreErrorCode),
         NodeInfo(Box<LoreRevisionTreeNodeInfoEventData>),
+        Info(Box<LoreRevisionTreeInfoEventData>),
+        ResolvePath(NodeID, LoreErrorCode),
+        CommitComplete(u64, Hash, Hash, LoreErrorCode),
         Child(NodeID, String),
         Complete(i32),
         Other,
@@ -95,6 +99,16 @@ mod support {
                     Captured::BatchComplete(data.batch_id, data.error_code)
                 }
                 LoreEvent::RevisionTreeNodeInfo(data) => Captured::NodeInfo(Box::new(data.clone())),
+                LoreEvent::RevisionTreeInfo(data) => Captured::Info(Box::new(data.clone())),
+                LoreEvent::RevisionTreeResolvePathComplete(data) => {
+                    Captured::ResolvePath(data.node_id, data.error_code)
+                }
+                LoreEvent::RevisionTreeCommitComplete(data) => Captured::CommitComplete(
+                    data.id,
+                    data.revision_hash,
+                    data.new_tip_hash,
+                    data.error_code,
+                ),
                 LoreEvent::RevisionTreeChild(data) => {
                     Captured::Child(data.node_id, data.name.as_str().to_string())
                 }
@@ -108,6 +122,10 @@ mod support {
 
     /// Open an in-memory store and load an empty revision tree handle on it.
     pub(super) async fn load_handle(repository: Partition) -> LoreRevisionTree {
+        load_on(open_store().await, repository, Hash::default()).await
+    }
+
+    pub(super) async fn open_store() -> u64 {
         let (sink, callback) = make_sink();
         let status = open::open(
             LoreGlobalArgs::default(),
@@ -119,16 +137,23 @@ mod support {
         )
         .await;
         assert_eq!(status, 0, "opening an in-memory store must succeed");
-        let store_handle_id = sink
-            .lock()
+        sink.lock()
             .unwrap()
             .iter()
             .find_map(|event| match event {
                 Captured::Opened(id) => Some(*id),
                 _ => None,
             })
-            .expect("open must emit StorageOpened");
+            .expect("open must emit StorageOpened")
+    }
 
+    /// Load a revision tree against an already-open store, at `revision_hash` — the
+    /// zero hash for an empty tree, or a committed revision to read it back.
+    pub(super) async fn load_on(
+        store_handle_id: u64,
+        repository: Partition,
+        revision_hash: Hash,
+    ) -> LoreRevisionTree {
         let (sink, callback) = make_sink();
         let status = load(
             LoreGlobalArgs::default(),
@@ -137,12 +162,17 @@ mod support {
                     handle_id: store_handle_id,
                 },
                 repository,
-                revision_hash: Hash::default(),
+                revision_hash,
             },
             callback,
         )
         .await;
-        assert_eq!(status, 0, "loading an empty revision tree must succeed");
+        assert_eq!(
+            status,
+            0,
+            "loading revision {revision_hash} must succeed, got {:?}",
+            sink.lock().unwrap()
+        );
         let handle_id = sink
             .lock()
             .unwrap()
@@ -2491,5 +2521,349 @@ mod delete_tests {
             "order must be entries, then the batch terminal, then Complete: {events:?}"
         );
         close_handle(handle).await;
+    }
+}
+
+/// What `commit` unblocks for the rest of the namespace: until it existed nothing
+/// this API built had ever been serialized, so every test asserted in-memory state.
+/// These read a published revision back through a fresh handle.
+#[cfg(test)]
+mod commit_tests {
+    use lore::revision_tree::add::LoreRevisionTreeAddArgs;
+    use lore::revision_tree::add::LoreRevisionTreeAddEntry;
+    use lore::revision_tree::add::add;
+    use lore::revision_tree::commit::LoreRevisionTreeCommitArgs;
+    use lore::revision_tree::commit::LoreRevisionTreeCommitOptions;
+    use lore::revision_tree::commit::commit;
+    use lore::revision_tree::handle::LoreRevisionTree;
+    use lore::revision_tree::info::LoreRevisionTreeInfoArgs;
+    use lore::revision_tree::info::info;
+    use lore::revision_tree::metadata_get::LoreRevisionTreeMetadataGetArgs;
+    use lore::revision_tree::metadata_get::LoreRevisionTreeMetadataGetEntry;
+    use lore::revision_tree::metadata_get::metadata_get;
+    use lore::revision_tree::metadata_set::LoreRevisionTreeMetadataSetArgs;
+    use lore::revision_tree::metadata_set::LoreRevisionTreeMetadataSetEntry;
+    use lore::revision_tree::metadata_set::metadata_set;
+    use lore::revision_tree::resolve_path::LoreRevisionTreeResolvePathArgs;
+    use lore::revision_tree::resolve_path::resolve_path;
+    use lore_base::types::Address;
+    use lore_base::types::Context;
+    use lore_base::types::Hash;
+    use lore_base::types::Partition;
+    use lore_revision::event::LoreErrorCode;
+    use lore_revision::interface::LoreArray;
+    use lore_revision::interface::LoreGlobalArgs;
+    use lore_revision::interface::LoreMetadata;
+    use lore_revision::interface::LoreNodeType;
+    use lore_revision::interface::LoreString;
+    use lore_revision::metadata::BRANCH;
+    use lore_revision::metadata::MESSAGE;
+    use lore_revision::node::INVALID_NODE;
+    use lore_revision::node::NodeID;
+    use lore_revision::node::ROOT_NODE;
+
+    use super::support::*;
+
+    fn add_entry(
+        entry_id: u64,
+        parent_entry_index: u32,
+        name: &str,
+        kind: LoreNodeType,
+        nested: bool,
+    ) -> LoreRevisionTreeAddEntry {
+        LoreRevisionTreeAddEntry {
+            entry_id,
+            parent_node_id: if nested { INVALID_NODE } else { ROOT_NODE },
+            parent_entry_index,
+            name: LoreString::from_str(name),
+            kind: kind as u32,
+            mode: if kind == LoreNodeType::Directory {
+                0o755
+            } else {
+                0o644
+            },
+            size: if kind == LoreNodeType::File { 12 } else { 0 },
+            address: if kind == LoreNodeType::File {
+                Address {
+                    hash: Hash::from_u64(0xc0ffee),
+                    context: Context::from(uuid::Uuid::now_v7()),
+                }
+            } else {
+                Address::default()
+            },
+        }
+    }
+
+    async fn run_add(
+        handle: LoreRevisionTree,
+        entries: Vec<LoreRevisionTreeAddEntry>,
+    ) -> Vec<Captured> {
+        let (sink, callback) = make_sink();
+        let status = add(
+            LoreGlobalArgs::default(),
+            LoreRevisionTreeAddArgs {
+                batch_id: CALL_ID,
+                handle,
+                entries: LoreArray::from_vec(entries),
+            },
+            callback,
+        )
+        .await;
+        let events = sink.lock().unwrap().clone();
+        assert_eq!(status, 0, "seeding the tree must succeed, got {events:?}");
+        events
+    }
+
+    fn added_node(events: &[Captured], entry_id: u64) -> NodeID {
+        events
+            .iter()
+            .find_map(|event| match event {
+                Captured::AddComplete(id, node_id, code) if *id == entry_id => {
+                    assert_eq!(*code, LoreErrorCode::None, "entry {entry_id} must succeed");
+                    Some(*node_id)
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("entry {entry_id} must report, got {events:?}"))
+    }
+
+    async fn set_metadata(handle: LoreRevisionTree, pairs: Vec<(&str, LoreMetadata)>) {
+        let entries = pairs
+            .into_iter()
+            .enumerate()
+            .map(|(index, (key, value))| LoreRevisionTreeMetadataSetEntry {
+                entry_id: index as u64 + 1,
+                key: LoreString::from_str(key),
+                value,
+            })
+            .collect();
+        let (sink, callback) = make_sink();
+        let status = metadata_set(
+            LoreGlobalArgs::default(),
+            LoreRevisionTreeMetadataSetArgs {
+                batch_id: CALL_ID,
+                handle,
+                entries: LoreArray::from_vec(entries),
+            },
+            callback,
+        )
+        .await;
+        assert_eq!(
+            status,
+            0,
+            "setting metadata must succeed, got {:?}",
+            sink.lock().unwrap()
+        );
+    }
+
+    async fn run_commit(handle: LoreRevisionTree) -> (i32, Hash, Vec<Captured>) {
+        let (sink, callback) = make_sink();
+        let status = commit(
+            LoreGlobalArgs::default(),
+            LoreRevisionTreeCommitArgs {
+                id: CALL_ID,
+                handle,
+                options: LoreRevisionTreeCommitOptions::default(),
+            },
+            callback,
+        )
+        .await;
+        let events = sink.lock().unwrap().clone();
+        let revision = events
+            .iter()
+            .find_map(|event| match event {
+                Captured::CommitComplete(id, revision, _, _) if *id == CALL_ID => Some(*revision),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("the commit terminal must fire, got {events:?}"));
+        (status, revision, events)
+    }
+
+    async fn resolve(handle: LoreRevisionTree, path: &str) -> NodeID {
+        let (sink, callback) = make_sink();
+        let status = resolve_path(
+            LoreGlobalArgs::default(),
+            LoreRevisionTreeResolvePathArgs {
+                id: 1,
+                handle,
+                path: LoreString::from_str(path),
+            },
+            callback,
+        )
+        .await;
+        let events = sink.lock().unwrap().clone();
+        assert_eq!(status, 0, "resolving {path} must succeed, got {events:?}");
+        events
+            .iter()
+            .find_map(|event| match event {
+                Captured::ResolvePath(node_id, LoreErrorCode::None) => Some(*node_id),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("resolving {path} must report a node, got {events:?}"))
+    }
+
+    /// The read-back a seeded handle could never do: a revision written by this API,
+    /// loaded again from its hash, has to hold exactly the tree that was committed.
+    #[tokio::test]
+    async fn a_committed_revision_reads_back_through_a_fresh_handle() {
+        let repository = Partition::from([0xF1u8; 16]);
+        let store = open_store().await;
+        let handle = load_on(store, repository, Hash::default()).await;
+
+        let seeded = run_add(
+            handle,
+            vec![
+                add_entry(1, 0, "dir", LoreNodeType::Directory, false),
+                add_entry(2, 0, "nested", LoreNodeType::Directory, true),
+                add_entry(3, 1, "a.bin", LoreNodeType::File, true),
+                add_entry(4, 0, "top.bin", LoreNodeType::File, false),
+            ],
+        )
+        .await;
+        let leaf = added_node(&seeded, 3);
+        let leaf_file_id = node_info_of(handle, leaf).await.file_id;
+
+        set_metadata(
+            handle,
+            vec![(
+                BRANCH,
+                LoreMetadata::Context(Context::from(uuid::Uuid::now_v7())),
+            )],
+        )
+        .await;
+        let (status, revision, events) = run_commit(handle).await;
+        assert_eq!(status, 0, "committing must succeed, got {events:?}");
+        close_handle(handle).await;
+
+        let reloaded = load_on(store, repository, revision).await;
+        assert_eq!(
+            child_names(reloaded, ROOT_NODE).await,
+            vec!["dir".to_string(), "top.bin".to_string()],
+            "the committed root must hold what was added"
+        );
+        let reloaded_leaf = resolve(reloaded, "dir/nested/a.bin").await;
+        assert_eq!(
+            reloaded_leaf, leaf,
+            "node ids persist across a commit, so the path must resolve to the same node"
+        );
+        let record = node_info_of(reloaded, reloaded_leaf).await;
+        assert_eq!(
+            record.revision, revision,
+            "a node read from the reloaded handle must report the committed revision"
+        );
+        // The file id is the node's identity across revisions, so it is the field a
+        // round-trip has to preserve — the node id being right proves little.
+        assert_eq!(
+            record.file_id, leaf_file_id,
+            "the committed node must keep the identity it was added with"
+        );
+        assert_eq!(
+            record.staged_action, 0,
+            "a committed node carries no staged action, got {record:?}"
+        );
+
+        close_handle(reloaded).await;
+    }
+
+    /// Metadata set on a handle is only observable in-memory until a commit writes
+    /// it, which is why both of these read it back from the published revision.
+    #[tokio::test]
+    async fn a_committed_revision_carries_the_metadata_it_was_given() {
+        let repository = Partition::from([0xF2u8; 16]);
+        let store = open_store().await;
+        let handle = load_on(store, repository, Hash::default()).await;
+        let branch = Context::from(uuid::Uuid::now_v7());
+
+        run_add(
+            handle,
+            vec![add_entry(1, 0, "a.bin", LoreNodeType::File, false)],
+        )
+        .await;
+        set_metadata(
+            handle,
+            vec![
+                (BRANCH, LoreMetadata::Context(branch)),
+                (
+                    MESSAGE,
+                    LoreMetadata::String(LoreString::from_str("import")),
+                ),
+                ("build", LoreMetadata::Numeric(42)),
+            ],
+        )
+        .await;
+        let (status, revision, events) = run_commit(handle).await;
+        assert_eq!(status, 0, "committing must succeed, got {events:?}");
+        close_handle(handle).await;
+
+        let reloaded = load_on(store, repository, revision).await;
+
+        let (sink, callback) = make_sink();
+        let status = info(
+            LoreGlobalArgs::default(),
+            LoreRevisionTreeInfoArgs {
+                id: 1,
+                handle: reloaded,
+            },
+            callback,
+        )
+        .await;
+        let events = sink.lock().unwrap().clone();
+        assert_eq!(
+            status, 0,
+            "reading revision info must succeed, got {events:?}"
+        );
+        let record = events
+            .iter()
+            .find_map(|event| match event {
+                Captured::Info(data) => Some((**data).clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("info must report the revision, got {events:?}"));
+        assert_eq!(record.revision, revision);
+        // branch, message and build from the caller, plus the timestamp the commit
+        // stamps. No identity keys: this context has no authenticated user, and the
+        // commit only stamps an author it has — that half is covered by
+        // `commit_in_memory_revision_stamps_the_timestamp_and_author_when_unset`,
+        // whose fixture supplies one.
+        assert_eq!(
+            record.metadata_key_count, 4,
+            "info must count every key the revision carries, got {record:?}",
+        );
+        assert!(
+            record.creation_timestamp > 0,
+            "a commit must record when it happened, got {record:?}"
+        );
+
+        let (sink, callback) = make_sink();
+        let status = metadata_get(
+            LoreGlobalArgs::default(),
+            LoreRevisionTreeMetadataGetArgs {
+                batch_id: CALL_ID,
+                handle: reloaded,
+                include_revision: 1,
+                entries: LoreArray::from_vec(vec![LoreRevisionTreeMetadataGetEntry {
+                    entry_id: 1,
+                    key: LoreString::from_str("build"),
+                }]),
+            },
+            callback,
+        )
+        .await;
+        let events = sink.lock().unwrap().clone();
+        assert_eq!(
+            status, 0,
+            "reading the committed value must succeed, got {events:?}"
+        );
+        assert!(
+            events.contains(&Captured::MetadataGetComplete(
+                1,
+                "build".to_string(),
+                LoreMetadata::Numeric(42),
+                LoreErrorCode::None,
+            )),
+            "the committed value must read back, got {events:?}"
+        );
+
+        close_handle(reloaded).await;
     }
 }

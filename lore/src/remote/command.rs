@@ -158,4 +158,5 @@ pub enum LoreCommand {
     RevisionTreeMetadataClear(
         crate::revision_tree::metadata_clear::LoreRevisionTreeMetadataClearArgs,
     ),
+    RevisionTreeCommit(crate::revision_tree::commit::LoreRevisionTreeCommitArgs),
 }

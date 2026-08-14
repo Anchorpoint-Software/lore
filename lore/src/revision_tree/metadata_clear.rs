@@ -133,8 +133,6 @@ fn validate_entries(
         if entry_id != 0 && !ids.insert(entry_id) {
             return Err(reject(entry_id, index, "two entries share one caller id"));
         }
-        // Sound because the entry point checked every string the call carries
-        // before dispatching it.
         if entry.key.as_str().is_empty() {
             return Err(reject(entry_id, index, "key must not be empty"));
         }

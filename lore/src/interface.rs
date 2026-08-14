@@ -7817,3 +7817,86 @@ pub extern "C" fn lore_revision_tree_metadata_clear_async(
         crate::revision_tree::metadata_clear::metadata_clear,
     );
 }
+
+pub type LoreRevisionTreeCommitArgs = crate::revision_tree::commit::LoreRevisionTreeCommitArgs;
+pub type LoreRevisionTreeCommitOptions =
+    crate::revision_tree::commit::LoreRevisionTreeCommitOptions;
+
+/// Freeze a loaded revision tree into a new revision and advance its branch tip.
+///
+/// **The branch is not an argument.** It is the revision's own, read from the
+/// `branch` metadata key: set it with `lore_revision_tree_metadata_set` to start a
+/// branch's history, and leave it unset to continue the loaded revision's branch. A
+/// key that is set must name either the loaded revision's branch or a branch whose
+/// branch point is exactly the loaded revision. A handle loaded from the zero
+/// revision has no parent to read a branch from and must set the key.
+///
+/// The revision records exactly the metadata set on the handle — nothing is
+/// inherited from the revision it was loaded on — plus the three facts about the
+/// commit the caller did not supply: the branch, the timestamp if unset, and
+/// `created-by` / `committed-by` if unset. The commit message is caller metadata like
+/// any other: set `"message"` before committing.
+///
+/// On success the handle stays usable and now *is* the new revision: node ids
+/// captured before the commit still resolve, and further edits commit on top. The
+/// pending metadata is emptied, so the next revision starts fresh.
+///
+/// A call rejected before any write — nothing staged, an unusable branch, a tree
+/// the validator refuses, or a branch tip that has already moved — leaves the
+/// handle usable, so the caller can fix the call and retry. A failure once the
+/// freeze has begun **poisons the handle**: every later call on it returns
+/// `LORE_ERROR_CODE_INVALID_ARGUMENTS`, and recovery is to close it, load a fresh
+/// handle against the new tip, re-apply the edits and commit again. When the
+/// branch had advanced, `new_tip_hash` on the terminal carries that tip, which is
+/// also how a caller tells that failure apart: neither a tip collision nor an
+/// empty commit has a `lore_error_code_t` of its own, so both report `INTERNAL`
+/// with the reason in the completion detail — the same codes the file-system
+/// commit returns.
+///
+/// `options.remote_write = 1` uploads within the call. It is a request, not a
+/// guarantee: a store bound offline or local-only, or a call passing
+/// `globals.local`, silently commits local-only. So does a store opened without a
+/// remote configuration — there is nothing to upload to, and the commit still
+/// reports success. Per-call flags contradicting the store's bound flags reject the
+/// call.
+///
+/// **Two commits in flight on one handle must agree about `remote_write`.** The
+/// resolved value is applied to the handle's shared repository context, so
+/// concurrent calls that disagree can each observe the other's — one uploading when
+/// it asked not to, or not uploading when it asked to, and neither call fails.
+/// Unlike a tip collision there is nothing to decide it. Serialize such commits or
+/// give them separate handles. The value also outlives the call: the handle carries
+/// whatever the last commit resolved.
+///
+/// | Terminal event                                | Payload                                             | Notes                                                             |
+/// |-----------------------------------------------|-----------------------------------------------------|-------------------------------------------------------------------|
+/// | `LORE_EVENT_REVISION_TREE_COMMIT_COMPLETE`    | `lore_revision_tree_commit_complete_event_data_t`   | Exactly one; carries the new revision, or the new tip on collision |
+/// | `LORE_EVENT_REVISION_COMMIT_REVISION`         | `lore_revision_commit_revision_event_data_t`        | On success, for continuity with file-system commit consumers       |
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_tree_commit(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionTreeCommitArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(
+        globals,
+        args,
+        callback,
+        crate::revision_tree::commit::commit,
+    )
+}
+
+/// Freeze a loaded revision tree into a new revision (async variant).
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_tree_commit_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionTreeCommitArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(
+        globals,
+        args,
+        callback,
+        crate::revision_tree::commit::commit,
+    );
+}

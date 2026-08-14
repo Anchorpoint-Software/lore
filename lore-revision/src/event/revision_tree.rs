@@ -299,10 +299,14 @@ pub struct LoreRevisionTreeMetadataGetCompleteEventData {
 }
 
 /// Terminal per-call event for `commit`. On success `revision_hash` is the
-/// newly-committed revision and `new_tip_hash` is `Hash::default()`. When
-/// `error_code` reports `BranchAdvanced`, `new_tip_hash` carries the
-/// observed branch tip so the caller can reload without an extra
-/// `branch::load_latest` round-trip.
+/// newly-committed revision and `new_tip_hash` is `Hash::default()`.
+///
+/// A non-zero `new_tip_hash` means the branch had advanced past the revision
+/// the handle was built on, and carries the tip to reload from so the caller
+/// needs no extra `branch::load_latest` round-trip. It is the only signal for
+/// that case: no `LoreErrorCode` value names a tip collision, so `error_code`
+/// reports `Internal` with the reason in the completion detail — the same code
+/// the file-system commit returns.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

@@ -158,8 +158,6 @@ fn validate_entries(entries: &[LoreRevisionTreeMetadataGetEntry]) -> Result<(), 
                 "two entries share one caller id",
             ));
         }
-        // Sound because the entry point checked every string the call carries
-        // before dispatching it.
         if key.is_empty() {
             return Err(reject(entry_id, index, key, "key must not be empty"));
         }
@@ -841,7 +839,6 @@ mod tests {
         let partition = Partition::from([0x39u8; 16]);
         let (handle, store_handle_id) = load_handle("md-undecodable", partition).await;
 
-        // A boolean is one byte; three bytes under that tag is not decodable.
         let internal = rt_handle::lookup(handle).expect("the handle must resolve");
         internal
             .pending_metadata
@@ -892,7 +889,9 @@ mod tests {
     }
 
     /// Bad arguments still reject the whole read, even though an absent key does
-    /// not — the exemption is from atomicity, not from argument checking.
+    /// not — the exemption is from atomicity, not from argument checking. The
+    /// rejection carries empty text for "no value": the event has no absent
+    /// variant, and a numeric zero would read as a key that really holds zero.
     #[tokio::test]
     async fn get_rejects_bad_arguments_despite_tolerating_absent_keys() {
         let partition = Partition::from([0x3au8; 16]);
@@ -905,9 +904,6 @@ mod tests {
         let (status, events) = run_get(handle, vec![get_entry(20, "a"), get_entry(20, "b")]).await;
         assert_ne!(status, 0, "a repeated non-zero caller id must reject");
         assert!(rejection_reason(&events).contains("two entries share one caller id"));
-        // The rejection names the key it was about, and carries no value: this
-        // event has no absent variant, and a numeric zero would read as a key
-        // that really holds zero.
         assert_eq!(
             get_outcomes(&events),
             vec![(

@@ -894,9 +894,13 @@ async fn collect_fragments_and_push(
                 // Server performed a fast-forward merge — push succeeded with a new revision.
                 // Store the server-created revision as local latest (marked divergent since the
                 // local working directory still reflects the original merge revision).
+                let local_latest = branch::load_latest(repository.clone(), branch)
+                    .await
+                    .unwrap_or_default();
                 branch::store_latest(
                     repository.clone(),
                     branch,
+                    local_latest,
                     response.revision,
                     BranchLatestStatus::Divergent,
                 )
@@ -985,9 +989,13 @@ async fn collect_fragments_and_push(
         && !fast_forward_merged
         && !dry_run
     {
+        let local_latest = branch::load_latest(repository.clone(), branch)
+            .await
+            .unwrap_or_default();
         branch::store_latest(
             repository.clone(),
             branch,
+            local_latest,
             current_latest,
             BranchLatestStatus::Convergent,
         )

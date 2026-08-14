@@ -407,6 +407,11 @@ impl Clone for RepositoryRuntimeSettings {
 ///   mutex is not the concurrency boundary; the token exists purely as
 ///   type-level proof of write authorization for the handle API. Gated by
 ///   [`ServerContext`].
+/// - [`InMemory`](Self::InMemory): carries nothing, for the same reason as
+///   `Server` — a path-less context has no per-path mutex to take, and the
+///   only writes it makes are content-addressed store writes and the branch
+///   tip, which the tip compare-and-swap serializes. Gated by
+///   [`InMemoryContext`].
 ///
 /// Tokens are stored as `Option<…>` on `RepositoryContext`; leaf write
 /// sites fetch via `repository.try_write_token().ok_or(WriteRequired)?`.
@@ -414,6 +419,7 @@ impl Clone for RepositoryRuntimeSettings {
 pub enum RepositoryWriteToken {
     Client(Arc<tokio::sync::OwnedMutexGuard<()>>),
     Server,
+    InMemory,
 }
 
 impl RepositoryWriteToken {
@@ -437,6 +443,17 @@ impl RepositoryWriteToken {
         Self::Server
     }
 
+    /// Mint a token for a path-less in-memory context. No mutex is taken —
+    /// there is no working-tree path to key one on.
+    ///
+    /// Gated by [`InMemoryContext`] on the same principle as
+    /// [`server`](Self::server): a crate opts in by implementing the marker
+    /// for one of its own types, so skipping the per-path mutex is a
+    /// compile-time decision rather than a call-site one.
+    pub fn in_memory<C: InMemoryContext>(_: &C) -> Self {
+        Self::InMemory
+    }
+
     /// Produce a sibling token. For [`Client`](Self::Client), the sibling
     /// refcounts the same underlying mutex guard so multi-context commands
     /// keep the mutex held until every sibling drops. For
@@ -453,9 +470,17 @@ impl RepositoryWriteToken {
         match self {
             Self::Client(guard) => Self::Client(guard.clone()),
             Self::Server => Self::Server,
+            Self::InMemory => Self::InMemory,
         }
     }
 }
+
+/// Marker trait that gates [`RepositoryWriteToken::in_memory`].
+///
+/// The counterpart to [`ServerContext`] for path-less in-memory contexts. The
+/// trait body is empty — it exists purely to make "I am an in-memory context" a
+/// compile-time prerequisite for skipping the per-path write mutex.
+pub trait InMemoryContext {}
 
 /// Marker trait that gates [`RepositoryWriteToken::server`].
 ///
@@ -1786,6 +1811,7 @@ pub async fn load_and_connect_with_token(
             None => "None",
             Some(RepositoryWriteToken::Client(_)) => "Some(Client)",
             Some(RepositoryWriteToken::Server) => "Some(Server)",
+            Some(RepositoryWriteToken::InMemory) => "Some(InMemory)",
         },
     );
 
@@ -2382,9 +2408,15 @@ async fn branch_switch_create(
     .await
     .forward::<RepositoryError>("Failed to create branch")?;
 
+    // `branch::create` has just seeded the pointer with the branch point; move it
+    // on to the tip the remote reports.
+    let created_at = branch::load_latest(repository.clone(), branch)
+        .await
+        .unwrap_or_default();
     branch::store_latest(
         repository.clone(),
         branch,
+        created_at,
         latest,
         BranchLatestStatus::Divergent,
     )
@@ -2737,9 +2769,15 @@ pub async fn branch_switch(
     }
 
     if !global.dry_run() {
+        // A switch republishes the branch's own local tip; the sync above may have
+        // moved the pointer, so compare against what it holds now.
+        let stored_latest = branch::load_latest(repository.clone(), branch.id)
+            .await
+            .unwrap_or_default();
         branch::store_latest(
             repository.clone(),
             branch.id,
+            stored_latest,
             branch_latest_local,
             if branch_location == LoreBranchLocation::Local {
                 BranchLatestStatus::Divergent

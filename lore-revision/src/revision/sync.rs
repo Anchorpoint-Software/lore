@@ -634,9 +634,13 @@ pub async fn sync(
         // If we synced to a local revision keep the branch LATEST to not lose
         // any local history when going backwards
         if location == LoreBranchLocation::Remote {
+            let local_latest = branch::load_latest(repository.clone(), branch_id)
+                .await
+                .unwrap_or_default();
             branch::store_latest(
                 repository.clone(),
                 branch_id,
+                local_latest,
                 revision,
                 BranchLatestStatus::Convergent,
             )

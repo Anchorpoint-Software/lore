@@ -404,6 +404,12 @@ struct ParentState {
 ///
 /// Returns the parent it read, which the caller keeps: every later lookup under
 /// this parent starts from the child chain it holds.
+///
+/// A discarded slot and a slot the allocator never handed out both read back as
+/// ordinary directories, so each is refused on its own terms: a child hung off a
+/// discarded slot is orphaned once the allocator reuses it, and since every
+/// non-root node has a non-empty name, a zero name length is what separates an
+/// unallocated slot from a real node.
 async fn check_existing_parent(
     state: &Arc<State>,
     context: &Arc<RepositoryContext>,
@@ -414,10 +420,6 @@ async fn check_existing_parent(
     let Ok(parent_node) = state.node(context.clone(), parent).await else {
         return Err(reject(entry_id, entry_index, "parent node id is unknown"));
     };
-    // A discarded slot keeps its name and carries neither the file nor the link
-    // flag, so it reads back as a perfectly ordinary directory. Nothing below
-    // would catch it, and a child hung off one is orphaned as soon as the
-    // allocator hands the slot out again.
     if parent_node.is_discarded() {
         return Err(reject(
             entry_id,
@@ -446,8 +448,6 @@ async fn check_existing_parent(
             "parent node is not a directory",
         ));
     }
-    // Every non-root node has a non-empty name, so a zero name length means the
-    // parent id landed on an unallocated slot rather than a real node.
     if parent != ROOT_NODE && parent_node.name_length == 0 {
         return Err(reject(
             entry_id,
@@ -460,7 +460,9 @@ async fn check_existing_parent(
 
 /// Check every entry against the tree and against the rest of the batch,
 /// producing the apply plan. Mutates nothing; the first invalid entry rejects
-/// the batch.
+/// the batch. Names are held to the rules the name table applies on write, so a
+/// name it would refuse fails here rather than part-way through the apply phase
+/// with earlier nodes already created.
 ///
 /// An existing parent is checked once per batch. Its names are looked up
 /// directly for the first entry that lands under it and, from the second entry
@@ -483,15 +485,10 @@ async fn plan_entries(
             return Err(reject(entry_id, index, "two entries share one caller id"));
         }
 
-        // Sound because the entry point checked every string the call carries
-        // before dispatching it.
         let name = entry.name.as_str();
         if name.is_empty() {
             return Err(reject(entry_id, index, "name must not be empty"));
         }
-        // The same rules the name table applies when the node is written, run
-        // here so a name it would refuse fails the batch cleanly instead of
-        // surfacing part-way through the apply phase with nodes already created.
         if let Err(error) = validate_node_name_for_store(name) {
             return Err(reject(entry_id, index, &error.to_string()));
         }
@@ -762,8 +759,6 @@ async fn apply_wave(
 
     let mut applied = 0;
     while let Some(result) = tasks.join_next().await {
-        // A task that died mid-group returns nothing; its entries simply do not
-        // count as applied, which is what the caller's shortfall measures.
         if let Ok(landed) = result {
             applied += landed.len();
             for (index, node_id) in landed {
@@ -1589,9 +1584,6 @@ mod tests {
         let partition = Partition::from([0xbbu8; 16]);
         let (handle, store_handle_id) = load_handle("add-dup-snapshot", partition).await;
 
-        // Enough existing children that the snapshot has to be genuinely ordered
-        // to be searchable: with only a couple, an unordered probe finds the
-        // collision often enough to pass by luck.
         let seeded: Vec<String> = (0..SNAPSHOT_SEED_CHILDREN)
             .map(|index| format!("seed-{index:02}"))
             .collect();

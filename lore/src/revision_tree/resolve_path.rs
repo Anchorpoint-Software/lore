@@ -457,14 +457,14 @@ mod tests {
         (added(1), added(2), added(3))
     }
 
+    /// Each level is asserted separately: resolving only the leaf would pass even
+    /// if the walk skipped or double-consumed an intermediate component.
     #[tokio::test]
     async fn resolve_existing_path_returns_node_id() {
         let repository = Partition::from([0x99u8; 16]);
         let (handle, store_handle_id) = load_handle("resolve-existing", repository).await;
         let (a, b, c) = build_nested_tree(handle).await;
 
-        // Each level is asserted separately: resolving only the leaf would pass
-        // even if the walk skipped or double-consumed an intermediate component.
         for (id, path, expected) in [(20u64, "a", a), (21, "a/b", b), (22, "a/b/c.txt", c)] {
             let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
             let status = resolve_path(

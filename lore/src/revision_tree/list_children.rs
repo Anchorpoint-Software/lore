@@ -240,7 +240,6 @@ async fn list_children_impl(
                 }
             };
 
-            // Capture the target's identity before the iterator consumes the state/context.
             let begin_repository = list_repository.id;
             let begin_revision = list_state.revision();
 

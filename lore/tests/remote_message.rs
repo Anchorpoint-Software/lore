@@ -248,6 +248,44 @@ async fn revision_tree_delete_batch_survives_the_wire() {
     }
 }
 
+/// The only revision-tree verb that publishes anything, and the one whose
+/// arguments no longer name the branch — the nested options struct is the part a
+/// hand-written encoder is most likely to flatten away.
+#[tokio::test]
+async fn revision_tree_commit_survives_the_wire() {
+    use lore::revision_tree::commit::LoreRevisionTreeCommitArgs;
+    use lore::revision_tree::commit::LoreRevisionTreeCommitOptions;
+
+    let args = LoreRevisionTreeCommitArgs {
+        id: 4242,
+        handle: LoreRevisionTree { handle_id: 9 },
+        options: LoreRevisionTreeCommitOptions { remote_write: 1 },
+    };
+
+    for (serialization, label) in [
+        (SerializationType::Json, "json"),
+        (SerializationType::Bincode, "bincode"),
+    ] {
+        let message = MessageToServer {
+            globals: LoreGlobalArgs::default(),
+            command: LoreCommand::RevisionTreeCommit(args),
+        };
+        let message_bytes = write_v1_message(message, serialization).unwrap();
+        let processed: Result<Option<(V1Header, MessageToServer)>, MessageError> =
+            blocking_read_v1_message(&mut message_bytes.as_slice());
+        let processed = processed
+            .unwrap_or_else(|error| panic!("{label} must read back: {error:?}"))
+            .expect("a whole message must be present");
+
+        match processed.1.command {
+            LoreCommand::RevisionTreeCommit(read_back) => {
+                assert_eq!(read_back, args, "{label} must carry every field unchanged");
+            }
+            other => panic!("Unexpected command: {other:?}"),
+        }
+    }
+}
+
 /// A metadata read delivers its value to the caller as an event, and an
 /// out-of-process caller only ever sees the serialized form. Binary values are
 /// the ones with no textual representation to fall back on, so they are the

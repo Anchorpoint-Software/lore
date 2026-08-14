@@ -2727,10 +2727,14 @@ typedef struct lore_revision_tree_metadata_get_complete_event_data_t {
 } lore_revision_tree_metadata_get_complete_event_data_t;
 
 // Terminal per-call event for `commit`. On success `revision_hash` is the
-// newly-committed revision and `new_tip_hash` is `Hash::default()`. When
-// `error_code` reports `BranchAdvanced`, `new_tip_hash` carries the
-// observed branch tip so the caller can reload without an extra
-// `branch::load_latest` round-trip.
+// newly-committed revision and `new_tip_hash` is `Hash::default()`.
+//
+// A non-zero `new_tip_hash` means the branch had advanced past the revision
+// the handle was built on, and carries the tip to reload from so the caller
+// needs no extra `branch::load_latest` round-trip. It is the only signal for
+// that case: no `LoreErrorCode` value names a tip collision, so `error_code`
+// reports `Internal` with the reason in the completion detail — the same code
+// the file-system commit returns.
 typedef struct lore_revision_tree_commit_complete_event_data_t {
   // Correlation id of the originating call.
   uint64_t id;
@@ -5385,6 +5389,22 @@ typedef struct lore_revision_tree_metadata_clear_args_t {
   struct lore_revision_tree_metadata_clear_entry_array_t entries;
 } lore_revision_tree_metadata_clear_args_t;
 
+// Tuneables for `lore_revision_tree_commit`.
+typedef struct lore_revision_tree_commit_options_t {
+  // Also upload the new revision to remote (local-only by default)
+  uint8_t remote_write;
+} lore_revision_tree_commit_options_t;
+
+// Arguments for `lore_revision_tree_commit`.
+typedef struct lore_revision_tree_commit_args_t {
+  // Per-call correlation id echoed back in events
+  uint64_t id;
+  // Loaded revision-tree handle to freeze and commit
+  struct lore_revision_tree_t handle;
+  // Commit tuneables (local-only vs remote-uploading)
+  struct lore_revision_tree_commit_options_t options;
+} lore_revision_tree_commit_args_t;
+
 // Arguments for `lore_revision_tree_move`.
 typedef struct lore_revision_tree_move_args_t {
   // Per-call correlation id echoed back in events
@@ -5398,24 +5418,6 @@ typedef struct lore_revision_tree_move_args_t {
   // UTF-8 name the moved node takes at the destination
   struct lore_string_t dst_name;
 } lore_revision_tree_move_args_t;
-
-// Tuneables for `lore_revision_tree_commit`.
-typedef struct lore_revision_tree_commit_options_t {
-  // Also upload the new revision to remote (local-only by default)
-  uint8_t remote_write;
-} lore_revision_tree_commit_options_t;
-
-// Arguments for `lore_revision_tree_commit`.
-typedef struct lore_revision_tree_commit_args_t {
-  // Per-call correlation id echoed back in events
-  uint64_t id;
-  // Loaded revision-tree handle to freeze and commit
-  struct lore_revision_tree_t handle;
-  // Branch whose tip is atomically advanced to the new revision
-  lore_branch_id_t branch;
-  // Commit tuneables (local-only vs remote-uploading)
-  struct lore_revision_tree_commit_options_t options;
-} lore_revision_tree_commit_args_t;
 
 // Return the tag identifying the type of an event.
 uint32_t lore_event_type(const struct lore_event_t *event);
@@ -11268,3 +11270,62 @@ int32_t lore_revision_tree_metadata_clear(const struct lore_global_args_t *globa
 void lore_revision_tree_metadata_clear_async(const struct lore_global_args_t *globals,
                                              const struct lore_revision_tree_metadata_clear_args_t *args,
                                              struct lore_event_callback_config_t callback);
+
+// Freeze a loaded revision tree into a new revision and advance its branch tip.
+//
+// **The branch is not an argument.** It is the revision's own, read from the
+// `branch` metadata key: set it with `lore_revision_tree_metadata_set` to start a
+// branch's history, and leave it unset to continue the loaded revision's branch. A
+// key that is set must name either the loaded revision's branch or a branch whose
+// branch point is exactly the loaded revision. A handle loaded from the zero
+// revision has no parent to read a branch from and must set the key.
+//
+// The revision records exactly the metadata set on the handle — nothing is
+// inherited from the revision it was loaded on — plus the three facts about the
+// commit the caller did not supply: the branch, the timestamp if unset, and
+// `created-by` / `committed-by` if unset. The commit message is caller metadata like
+// any other: set `"message"` before committing.
+//
+// On success the handle stays usable and now *is* the new revision: node ids
+// captured before the commit still resolve, and further edits commit on top. The
+// pending metadata is emptied, so the next revision starts fresh.
+//
+// A call rejected before any write — nothing staged, an unusable branch, a tree
+// the validator refuses, or a branch tip that has already moved — leaves the
+// handle usable, so the caller can fix the call and retry. A failure once the
+// freeze has begun **poisons the handle**: every later call on it returns
+// `LORE_ERROR_CODE_INVALID_ARGUMENTS`, and recovery is to close it, load a fresh
+// handle against the new tip, re-apply the edits and commit again. When the
+// branch had advanced, `new_tip_hash` on the terminal carries that tip, which is
+// also how a caller tells that failure apart: neither a tip collision nor an
+// empty commit has a `lore_error_code_t` of its own, so both report `INTERNAL`
+// with the reason in the completion detail — the same codes the file-system
+// commit returns.
+//
+// `options.remote_write = 1` uploads within the call. It is a request, not a
+// guarantee: a store bound offline or local-only, or a call passing
+// `globals.local`, silently commits local-only. So does a store opened without a
+// remote configuration — there is nothing to upload to, and the commit still
+// reports success. Per-call flags contradicting the store's bound flags reject the
+// call.
+//
+// **Two commits in flight on one handle must agree about `remote_write`.** The
+// resolved value is applied to the handle's shared repository context, so
+// concurrent calls that disagree can each observe the other's — one uploading when
+// it asked not to, or not uploading when it asked to, and neither call fails.
+// Unlike a tip collision there is nothing to decide it. Serialize such commits or
+// give them separate handles. The value also outlives the call: the handle carries
+// whatever the last commit resolved.
+//
+// | Terminal event                                | Payload                                             | Notes                                                             |
+// |-----------------------------------------------|-----------------------------------------------------|-------------------------------------------------------------------|
+// | `LORE_EVENT_REVISION_TREE_COMMIT_COMPLETE`    | `lore_revision_tree_commit_complete_event_data_t`   | Exactly one; carries the new revision, or the new tip on collision |
+// | `LORE_EVENT_REVISION_COMMIT_REVISION`         | `lore_revision_commit_revision_event_data_t`        | On success, for continuity with file-system commit consumers       |
+int32_t lore_revision_tree_commit(const struct lore_global_args_t *globals,
+                                  const struct lore_revision_tree_commit_args_t *args,
+                                  struct lore_event_callback_config_t callback);
+
+// Freeze a loaded revision tree into a new revision (async variant).
+void lore_revision_tree_commit_async(const struct lore_global_args_t *globals,
+                                     const struct lore_revision_tree_commit_args_t *args,
+                                     struct lore_event_callback_config_t callback);

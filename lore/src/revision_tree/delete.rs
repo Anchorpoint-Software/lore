@@ -161,6 +161,14 @@ struct Reached {
 /// Check every entry against the tree and against the rest of the batch,
 /// producing the apply plan. Mutates nothing; the first invalid entry rejects
 /// the batch.
+///
+/// A discarded slot and a slot the allocator never handed out both read back as
+/// ordinary empty directories, so each is refused on its own terms; a zero name
+/// length is what separates the second from a real node. Nesting is settled by
+/// walking each target's ancestors — depth per entry, where comparing every pair
+/// would cost the batch squared — with `cleared` holding the nodes already proven
+/// to have no targeted ancestor so entries sharing a chain walk it once between
+/// them.
 async fn plan_entries(
     state: &Arc<State>,
     context: &Arc<RepositoryContext>,
@@ -193,9 +201,6 @@ async fn plan_entries(
         let Ok(node) = state.node(context.clone(), entry.node_id).await else {
             return Err(reject(entry_id, index, "node id is unknown"));
         };
-        // A discarded slot and a slot the allocator never handed out both read
-        // back as an ordinary empty directory, so each needs refusing on its own
-        // terms; a zero name length is what separates the second from a real node.
         if node.is_discarded() {
             return Err(reject(entry_id, index, "node has already been discarded"));
         }
@@ -222,10 +227,6 @@ async fn plan_entries(
         });
     }
 
-    // Walking each target's ancestors costs the tree's depth per entry, where
-    // comparing every pair of entries would cost the batch squared. `cleared`
-    // holds the nodes already proven to have no targeted ancestor, so entries
-    // sharing a chain walk it once between them rather than once each.
     let mut cleared: HashSet<NodeID> = HashSet::new();
     for (index, item) in planned.iter().enumerate() {
         let mut ancestor = item.node_id;
@@ -263,6 +264,11 @@ async fn plan_entries(
 /// A node already staged for deletion ends the descent: staging a deletion
 /// stages the whole subtree, so everything below it is staged too and revisiting
 /// it would re-walk a tree that is already accounted for.
+///
+/// An entry whose subtree mixes added and pre-existing children fails instead:
+/// discarding a parent whose children are only staged would unlink a chain those
+/// children still point into, and `discard_added` skips a failed entry, so the
+/// parent stays put.
 async fn next_level(
     state: &Arc<State>,
     context: &Arc<RepositoryContext>,
@@ -288,11 +294,6 @@ async fn next_level(
                     if child.is_discarded() || child.is_staged_delete() {
                         continue;
                     }
-                    // Discarding a parent whose children are only staged would
-                    // unlink a chain those children still point into, so fail the
-                    // entry rather than corrupt the tree if a subtree is ever
-                    // mixed. `discard_added` skips a failed entry, so the parent
-                    // stays put.
                     if item.staged_add && !child.is_staged_add() {
                         failed[item.entry_index] = true;
                         break;

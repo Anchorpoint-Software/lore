@@ -147,7 +147,9 @@ struct Planned<'a> {
 }
 
 /// Check every entry and encode its value, producing the apply plan. Mutates
-/// nothing; the first invalid entry rejects the batch.
+/// nothing; the first invalid entry rejects the batch. Entries are held to the
+/// size the write itself enforces, so a batch that would not fit fails here
+/// rather than with the entries ahead of the offending one already recorded.
 ///
 /// A repeated key is **not** a rejection: entries apply in index order and a
 /// later one overwrites an earlier one, which is the contract two separate calls
@@ -165,17 +167,12 @@ fn plan_entries(
             return Err(reject(entry_id, index, "two entries share one caller id"));
         }
 
-        // Sound because the entry point checked every string the call carries
-        // before dispatching it.
         if entry.key.as_str().is_empty() {
             return Err(reject(entry_id, index, "key must not be empty"));
         }
 
         let (value, value_type) = entry.value.to_stored();
 
-        // Asked here rather than left to the apply phase: the write refuses the
-        // same pairs, and reaching that would leave the entries ahead of this
-        // one recorded.
         if !Metadata::can_hold(entry.key.as_str(), &value) {
             return Err(reject(
                 entry_id,
@@ -619,7 +616,9 @@ mod tests {
     /// own tag: a value written as an address reads back as an address, not as
     /// the text it was written from. Before these types existed on the surface a
     /// caller had to encode them as strings, which lost the tag and doubled the
-    /// stored size for the hex forms.
+    /// stored size for the hex forms. The binary case carries an embedded NUL and
+    /// a byte that is not valid UTF-8, expressible only because the value is typed
+    /// rather than text.
     #[tokio::test]
     async fn every_metadata_type_round_trips() {
         let partition = Partition::from([0x3fu8; 16]);
@@ -646,8 +645,6 @@ mod tests {
                 LoreMetadataValue::Boolean(1),
             ),
             (
-                // Embedded NUL and a byte that is not valid UTF-8: expressible
-                // only because the value is typed rather than text.
                 "blob",
                 LoreMetadata::Binary(LoreBinary::from_bytes(&[0x00, 0xff, 0x01])),
                 LoreMetadataValue::Binary(vec![0x00, 0xff, 0x01]),

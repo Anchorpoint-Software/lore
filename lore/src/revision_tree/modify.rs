@@ -155,6 +155,12 @@ struct Planned {
 /// Check every entry against the tree and against the rest of the batch,
 /// producing the apply plan. Mutates nothing; the first invalid entry rejects
 /// the batch.
+///
+/// A discarded slot and a slot the allocator never handed out both read back as
+/// ordinary directories, so each is refused on its own terms rather than left to
+/// the kind check, which would report the wrong reason. Since every allocated
+/// node has a name, a zero name length is what separates the second from a real
+/// node.
 async fn plan_entries(
     state: &Arc<State>,
     context: &Arc<RepositoryContext>,
@@ -180,18 +186,12 @@ async fn plan_entries(
         let Ok(node) = state.node(context.clone(), entry.node_id).await else {
             return Err(reject(entry_id, index, "node id is unknown"));
         };
-        // A discarded slot carries neither the file nor the link flag, so it
-        // reads back as an ordinary directory. The kind check below refuses it
-        // too, but as the wrong kind rather than as a deleted node.
         if node.is_discarded() {
             return Err(reject(entry_id, index, "node has been deleted"));
         }
         if node.is_staged_delete() {
             return Err(reject(entry_id, index, "node is staged for deletion"));
         }
-        // A slot the allocator never handed out reads back zeroed, which is a
-        // perfectly ordinary directory. Every allocated node has a name, so a
-        // zero length is what separates the two.
         if entry.node_id != ROOT_NODE && node.name_length == 0 {
             return Err(reject(
                 entry_id,
@@ -288,8 +288,6 @@ async fn apply_plan(
 
     let mut applied = 0usize;
     while let Some(result) = tasks.join_next().await {
-        // A task that died mid-bucket returns nothing; its entries simply do not
-        // count as applied, which is what the shortfall below measures.
         if let Ok(count) = result {
             applied += count;
         }
@@ -1044,7 +1042,9 @@ mod tests {
     /// and nothing holds the tree still in between. Driving the two phases
     /// separately puts that interleaving under the test's control rather than a
     /// race's, which is the only way to reach the apply phase's failure path now
-    /// that validation catches everything the arguments can get wrong.
+    /// that validation catches everything the arguments can get wrong. It runs
+    /// through the real dispatcher rather than a hand-built scope, so the events
+    /// reach the callback the way they do on any other call.
     #[tokio::test]
     async fn a_target_deleted_after_validation_fails_the_batch_as_internal() {
         let partition = Partition::from([0x2du8; 16]);
@@ -1057,8 +1057,6 @@ mod tests {
         )
         .await;
 
-        // Runs through the real dispatcher rather than a hand-built scope, so the
-        // events reach the callback the way they do on any other call.
         let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let status = revision_tree_call(
             LoreGlobalArgs::default(),

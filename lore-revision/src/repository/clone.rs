@@ -1194,9 +1194,13 @@ pub async fn clone(
                     .forward::<CloneError>("Failed to create local branch")?;
             }
             if !revision.is_zero() {
+                let local_latest = branch::load_latest(repository.clone(), branch_id)
+                    .await
+                    .unwrap_or_default();
                 branch::store_latest(
                     repository.clone(),
                     branch_id,
+                    local_latest,
                     revision,
                     BranchLatestStatus::Convergent,
                 )

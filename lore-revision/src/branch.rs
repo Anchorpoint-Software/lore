@@ -819,13 +819,27 @@ pub enum BranchLatestStatus {
     Convergent,
 }
 
+/// Advance a branch's local latest pointer from `previous` to `latest`.
+///
+/// The pointer write is a compare-and-swap against `previous`: when the stored
+/// tip is anything else the branch advanced under the caller and
+/// [`BranchError::BranchAdvanced`] is returned having written nothing. Creating
+/// a branch passes `Hash::default()`. A caller deliberately overwriting a tip it
+/// has not tracked reads it with [`load_latest`] and passes that.
 pub async fn store_latest(
     repository: Arc<RepositoryContext>,
     branch: BranchId,
+    previous: Hash,
     latest: Hash,
     status: BranchLatestStatus,
 ) -> Result<(), BranchError> {
-    mutable_store(repository.clone(), LATEST, branch, latest).await?;
+    let stored = mutable_try_store(repository.clone(), LATEST, branch, previous, latest).await?;
+    if stored != previous {
+        lore_debug!(
+            "Branch {branch} advanced to {stored} while storing latest {latest} (expected {previous})"
+        );
+        return Err(BranchAdvanced.into());
+    }
 
     // Server does not store latest status or history
     if execution_context().is_server() {
@@ -1682,6 +1696,7 @@ pub async fn create(
         store_latest(
             repository.clone(),
             branch,
+            Hash::default(),
             head,
             BranchLatestStatus::Divergent,
         )
