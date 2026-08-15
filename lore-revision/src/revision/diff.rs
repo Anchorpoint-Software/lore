@@ -38,6 +38,8 @@ pub struct LoreRevisionDiffFileEventData {
     pub old_address: Address,
     /// Address of the file content on the target side.
     pub new_address: Address,
+    /// Previous path of the file when it was moved or copied. Empty otherwise.
+    pub from_path: LoreString,
 }
 
 impl LoreRevisionDiffFileEventData {
@@ -49,6 +51,7 @@ impl LoreRevisionDiffFileEventData {
             new_is_file: new_is_file.into(),
             old_address: change.from.address,
             new_address: change.to.address,
+            from_path: change.from_path.as_ref().map(|path| path.as_str()).into(),
         }
     }
 

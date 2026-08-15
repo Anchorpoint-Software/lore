@@ -2168,6 +2168,8 @@ typedef struct lore_revision_diff_file_event_data_t {
   struct lore_address_t old_address;
   // Address of the file content on the target side.
   struct lore_address_t new_address;
+  // Previous path of the file when it was moved or copied. Empty otherwise.
+  struct lore_string_t from_path;
 } lore_revision_diff_file_event_data_t;
 
 // Data for the event reporting a revision found by a search.
