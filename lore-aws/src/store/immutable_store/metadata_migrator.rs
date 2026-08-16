@@ -38,13 +38,13 @@ pub struct RewriteStats {
     // ========================
     // Outcomes
 
-    // num fragments converted from Compressed -> Zstd and into the State table
-    pub converted_zstd: AtomicU64,
-    // num of Zstd fragments migrated to the state table without recompression
-    pub maintained_zstd: AtomicU64,
-    // num uncompressed fragments migrated to State table
-    pub converted_uncompressed: AtomicU64,
-    // num compressed metadata fragments that ended up in the new system as uncompressed fragments
+    // num fragments whose codec was accurate and not Oodle; payload re-uploaded unchanged to set S3 metadata headers
+    pub maintained: AtomicU64,
+    // num Oodle fragments recompressed to Zstd
+    pub recompressed_oodle: AtomicU64,
+    // num fragments whose declared codec mismatched the stored bytes; recompressed to Zstd
+    pub recompressed_mismatch: AtomicU64,
+    // num compressed fragments that ended up uncompressed because compression was inefficient
     pub converted_compressed_to_uncompressed: AtomicU64,
     // the num fragments that we could not read and should be abandoned
     pub could_not_deduce_payload: AtomicU64,
@@ -87,9 +87,13 @@ enum ConvertOutcome {
     // fragment claims a decompressed size exceeding FRAGMENT_SIZE_THRESHOLD;
     // treat as malicious and do not attempt to read.
     SkippedMaliciousFragment,
-    ConvertedToZstd,
-    MaintainedZstd,
-    ConvertedUncompressed,
+    // Accurate codec and not Oodle: payload re-uploaded unchanged to set S3 metadata headers.
+    Maintained,
+    // Oodle payload: recompressed to Zstd.
+    RecompressedOodle,
+    // Codec mismatch: recompressed to Zstd.
+    RecompressedMismatch,
+    // Recompression was inefficient; stored uncompressed instead.
     ConvertedCompressedToUncompressed,
 }
 
@@ -190,33 +194,63 @@ impl MetadataMigrator {
             return Ok(ConvertOutcome::SkippedObliterated);
         }
 
-        let (decompressed_fragment, decompressed) =
+        let is_oodle = original_fragment.flags & FragmentFlags::PayloadCompressedOodle2 != 0;
+
+        let (new_fragment, new_payload, outcome) =
             match decompress_hash(original_fragment, &original_payload, hash) {
-                DecompressOutcome::PayloadAccurate(f, b) => (f, b),
-                DecompressOutcome::PayloadDeduced(f, b) => {
-                    stats.payloads_deduced.fetch_add(1, Ordering::Relaxed);
-                    (f, b)
-                }
                 DecompressOutcome::CouldNotDeduce => {
                     return Ok(ConvertOutcome::CouldNotDeducePayload);
                 }
+
+                DecompressOutcome::PayloadAccurate(_, _) if !is_oodle => {
+                    // Codec is declared correctly and is not Oodle: re-upload the same payload to
+                    // set the S3 object metadata headers, then write state.
+                    (
+                        original_fragment,
+                        original_payload,
+                        ConvertOutcome::Maintained,
+                    )
+                }
+
+                DecompressOutcome::PayloadAccurate(decompressed_fragment, decompressed) => {
+                    // Oodle payload with correct codec: recompress to Zstd.
+                    recompress_to_zstd(
+                        decompressed_fragment,
+                        decompressed,
+                        ConvertOutcome::RecompressedOodle,
+                    )?
+                }
+
+                DecompressOutcome::PayloadDeduced(decompressed_fragment, decompressed) => {
+                    stats.payloads_deduced.fetch_add(1, Ordering::Relaxed);
+                    // Codec mismatch: recompress to Zstd.
+                    recompress_to_zstd(
+                        decompressed_fragment,
+                        decompressed,
+                        ConvertOutcome::RecompressedMismatch,
+                    )?
+                }
             };
 
-        let (new_fragment, new_payload, outcome) = {
-            if original_fragment.flags & FragmentFlags::PayloadCompressedZstd != 0 {
-                (
-                    original_fragment,
-                    original_payload,
-                    ConvertOutcome::MaintainedZstd,
-                )
-            } else {
-                recompress_to_zstd(original_fragment.flags, decompressed_fragment, decompressed)?
+        let mut attempt = 0;
+        loop {
+            match self
+                .store
+                .write_payload_and_state(hash, new_fragment, new_payload.clone())
+                .await
+            {
+                Ok(()) => break,
+                Err(e) => {
+                    if attempt < self.api_call_max_retries {
+                        attempt += 1;
+                        warn!(hash = %hash, error = ?e, attempt, "write_payload_and_state failed; retrying");
+                        rewrite_backoff(self.api_retry_base_delay, attempt).await;
+                        continue;
+                    }
+                    return Err(e);
+                }
             }
-        };
-
-        self.store
-            .write_payload_and_state(hash, new_fragment, new_payload)
-            .await?;
+        }
 
         Ok(outcome)
     }
@@ -259,14 +293,14 @@ impl MetadataMigrator {
             };
 
             match process_outcome {
-                ConvertOutcome::MaintainedZstd => {
-                    stats.maintained_zstd.fetch_add(1, Ordering::Relaxed);
+                ConvertOutcome::Maintained => {
+                    stats.maintained.fetch_add(1, Ordering::Relaxed);
                 }
-                ConvertOutcome::ConvertedToZstd => {
-                    stats.converted_zstd.fetch_add(1, Ordering::Relaxed);
+                ConvertOutcome::RecompressedOodle => {
+                    stats.recompressed_oodle.fetch_add(1, Ordering::Relaxed);
                 }
-                ConvertOutcome::ConvertedUncompressed => {
-                    stats.converted_uncompressed.fetch_add(1, Ordering::Relaxed);
+                ConvertOutcome::RecompressedMismatch => {
+                    stats.recompressed_mismatch.fetch_add(1, Ordering::Relaxed);
                 }
                 ConvertOutcome::ConvertedCompressedToUncompressed => {
                     stats
@@ -314,28 +348,20 @@ fn parse_metadata_entry(item: &HashMap<String, AttributeValue>) -> Option<Hash> 
     Some(entry.hash)
 }
 
-/// Decide how to store a decompressed fragment, re-compressing with Zstd if the
-/// original was compressed. Returns `(fragment, payload, outcome)` ready for writing.
+/// Compress a decompressed fragment to Zstd, tagging the success case with `on_success`.
+/// Falls back to uncompressed with `ConvertedCompressedToUncompressed` if Zstd cannot beat
+/// the size threshold.
 fn recompress_to_zstd(
-    original_flags: u32,
     decompressed_fragment: Fragment,
     decompressed: Bytes,
+    on_success: ConvertOutcome,
 ) -> Result<(Fragment, Bytes, ConvertOutcome), StoreError> {
-    if original_flags & FragmentFlags::PayloadCompressed == 0 {
-        return Ok((
-            decompressed_fragment,
-            decompressed,
-            ConvertOutcome::ConvertedUncompressed,
-        ));
-    }
-
     match lore_storage::compress(
         decompressed_fragment,
         &decompressed,
         lore_storage::CompressionMode::Zstd,
     ) {
-        Ok((fragment, payload)) => Ok((fragment, payload, ConvertOutcome::ConvertedToZstd)),
-        // Zstd could not beat the size threshold; store the content uncompressed
+        Ok((fragment, payload)) => Ok((fragment, payload, on_success)),
         Err(err) if err.is_inefficient_compression() => Ok((
             decompressed_fragment,
             decompressed,
@@ -701,17 +727,7 @@ mod tests {
     mod recompress_tests {
         use super::*;
 
-        fn uncompressed_fragment(len: usize) -> (Fragment, Bytes) {
-            let content = vec![0x42u8; len];
-            let frag = Fragment {
-                flags: 0,
-                size_payload: len as u32,
-                size_content: len as u64,
-            };
-            (frag, Bytes::from(content))
-        }
-
-        fn decompressed_of_zstd(content: &[u8]) -> (Fragment, Bytes) {
+        fn decompressed_fragment(content: &[u8]) -> (Fragment, Bytes) {
             // Simulate what decompress_hash returns: a fragment with no compression flags,
             // size_payload == size_content == content length.
             let frag = Fragment {
@@ -722,80 +738,54 @@ mod tests {
             (frag, Bytes::copy_from_slice(content))
         }
 
-        #[test]
-        fn uncompressed_original_returns_converted_uncompressed() {
-            let (frag, payload) = uncompressed_fragment(100);
-            let original_flags = 0u32; // no PayloadCompressed
-            let (out_frag, out_payload, outcome) =
-                recompress_to_zstd(original_flags, frag, payload.clone()).unwrap();
-            assert_eq!(outcome, ConvertOutcome::ConvertedUncompressed);
-            assert_eq!(
-                out_payload, payload,
-                "uncompressed payload must pass through unchanged"
-            );
-            assert_eq!(out_frag.flags & FragmentFlags::PayloadCompressed, 0);
-            assert_eq!(out_frag.size_payload as usize, out_payload.len());
-            assert_eq!(out_frag.size_content, frag.size_content);
-        }
+        mod recompress_to_zstd_tests {
+            use super::*;
 
-        #[test]
-        fn compressed_original_recompresses_to_zstd_and_round_trips() {
-            let content = vec![0xAAu8; 500]; // highly compressible
-            let (frag, decompressed) = decompressed_of_zstd(&content);
-            let original_flags = FragmentFlags::PayloadCompressedLZ4.bits(); // was compressed
+            #[test]
+            fn compressible_data_recompresses_to_zstd_and_round_trips() {
+                let content = vec![0xAAu8; 500];
+                let (frag, decompressed) = decompressed_fragment(&content);
 
-            let (out_frag, out_payload, outcome) =
-                recompress_to_zstd(original_flags, frag, decompressed).unwrap();
-            assert_eq!(outcome, ConvertOutcome::ConvertedToZstd);
-            assert_ne!(
-                out_frag.flags & FragmentFlags::PayloadCompressedZstd,
-                0,
-                "output should be zstd"
-            );
-            assert_eq!(
-                out_frag.size_content,
-                content.len() as u64,
-                "size_content preserved"
-            );
-            assert_eq!(
-                out_frag.size_payload as usize,
-                out_payload.len(),
-                "size_payload matches actual bytes"
-            );
+                let (out_frag, out_payload, outcome) =
+                    recompress_to_zstd(frag, decompressed, ConvertOutcome::RecompressedOodle)
+                        .unwrap();
+                assert_eq!(outcome, ConvertOutcome::RecompressedOodle);
+                assert_ne!(out_frag.flags & FragmentFlags::PayloadCompressedZstd, 0);
+                assert_eq!(out_frag.size_content, content.len() as u64);
+                assert_eq!(out_frag.size_payload as usize, out_payload.len());
 
-            // Round-trip: decompress the output and verify it matches the original content.
-            let (_, roundtripped) = lore_storage::decompress(out_frag, &out_payload).unwrap();
-            assert_eq!(
-                roundtripped.as_ref(),
-                content.as_slice(),
-                "decompressed output must equal original content"
-            );
-        }
+                let (_, roundtripped) = lore_storage::decompress(out_frag, &out_payload).unwrap();
+                assert_eq!(roundtripped.as_ref(), content.as_slice());
+            }
 
-        #[test]
-        fn incompressible_data_falls_back_to_uncompressed() {
-            // Random-looking bytes that Zstd cannot compress by 5%+.
-            // Use a small buffer: compress refuses payloads below FRAGMENT_COMPRESS_SIZE_LIMIT,
-            // but we need the *content* to be incompressible. Use 33 unique bytes (just above the
-            // 32-byte limit) so zstd can't beat the threshold.
-            let content: Vec<u8> = (0u8..=32).collect(); // 33 bytes, no repetition
-            let (frag, decompressed) = decompressed_of_zstd(&content);
-            let original_flags = FragmentFlags::PayloadCompressedZstd.bits();
+            #[test]
+            fn on_success_outcome_is_forwarded() {
+                let content = vec![0xBBu8; 500];
+                let (frag, decompressed) = decompressed_fragment(&content);
 
-            let (out_frag, out_payload, outcome) =
-                recompress_to_zstd(original_flags, frag, decompressed.clone()).unwrap();
-            assert_eq!(outcome, ConvertOutcome::ConvertedCompressedToUncompressed);
-            assert_eq!(
-                out_frag.flags & FragmentFlags::PayloadCompressed,
-                0,
-                "output should be uncompressed"
-            );
-            assert_eq!(
-                out_payload, decompressed,
-                "payload passed through unchanged"
-            );
-            assert_eq!(out_frag.size_content, content.len() as u64);
-            assert_eq!(out_frag.size_payload as usize, out_payload.len());
+                let (_, _, outcome) =
+                    recompress_to_zstd(frag, decompressed, ConvertOutcome::RecompressedMismatch)
+                        .unwrap();
+                assert_eq!(outcome, ConvertOutcome::RecompressedMismatch);
+            }
+
+            #[test]
+            fn incompressible_data_falls_back_to_uncompressed() {
+                let content: Vec<u8> = (0u8..=32).collect(); // 33 bytes, no repetition
+                let (frag, decompressed) = decompressed_fragment(&content);
+
+                let (out_frag, out_payload, outcome) = recompress_to_zstd(
+                    frag,
+                    decompressed.clone(),
+                    ConvertOutcome::RecompressedOodle,
+                )
+                .unwrap();
+                assert_eq!(outcome, ConvertOutcome::ConvertedCompressedToUncompressed);
+                assert_eq!(out_frag.flags & FragmentFlags::PayloadCompressed, 0);
+                assert_eq!(out_payload, decompressed);
+                assert_eq!(out_frag.size_content, content.len() as u64);
+                assert_eq!(out_frag.size_payload as usize, out_payload.len());
+            }
         }
     }
 
@@ -996,7 +986,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn converts_uncompressed_writes_state() {
+        async fn maintains_uncompressed_writes_state() {
             let fake = Fake::default();
             let migrator = make_migrator(&fake).await;
             let content = vec![0x33u8; 150];
@@ -1013,7 +1003,7 @@ mod tests {
             let stats = RewriteStats::default();
             assert_eq!(
                 migrator.process_fragment(hash, &stats).await.unwrap(),
-                ConvertOutcome::ConvertedUncompressed
+                ConvertOutcome::Maintained
             );
             assert_eq!(fake.state_of(hash), Some(FragmentState::Stored));
         }
@@ -1029,13 +1019,13 @@ mod tests {
             let stats = RewriteStats::default();
             assert_eq!(
                 migrator.process_fragment(hash, &stats).await.unwrap(),
-                ConvertOutcome::MaintainedZstd
+                ConvertOutcome::Maintained
             );
             assert_eq!(fake.state_of(hash), Some(FragmentState::Stored));
         }
 
         #[tokio::test]
-        async fn converts_lz4_to_zstd_writes_state() {
+        async fn maintains_lz4_writes_state() {
             let fake = Fake::default();
             let migrator = make_migrator(&fake).await;
             let content = vec![0x55u8; 500];
@@ -1045,7 +1035,7 @@ mod tests {
             let stats = RewriteStats::default();
             assert_eq!(
                 migrator.process_fragment(hash, &stats).await.unwrap(),
-                ConvertOutcome::ConvertedToZstd
+                ConvertOutcome::Maintained
             );
             assert_eq!(fake.state_of(hash), Some(FragmentState::Stored));
         }
@@ -1087,6 +1077,26 @@ mod tests {
             migrator.process_fragment(hash, &stats).await.unwrap();
             assert_eq!(stats.payloads_deduced.load(Ordering::Relaxed), 1);
         }
+
+        #[tokio::test]
+        async fn mismatch_recompresses_to_zstd_and_writes_state() {
+            let fake = Fake::default();
+            let migrator = make_migrator(&fake).await;
+            let content = vec![0x77u8; 500];
+            let (mut frag, compressed, hash) = make_zstd_payload(&content);
+            // Declare LZ4 but store Zstd bytes — a codec mismatch.
+            frag.flags = (frag.flags & !FragmentFlags::PayloadCompressed)
+                | FragmentFlags::PayloadCompressedLZ4.bits();
+            fake.put_object_without_metadata(hash, &compressed);
+            fake.set_legacy_metadata_row(hash, frag);
+            let stats = RewriteStats::default();
+            assert_eq!(
+                migrator.process_fragment(hash, &stats).await.unwrap(),
+                ConvertOutcome::RecompressedMismatch
+            );
+            assert_eq!(stats.payloads_deduced.load(Ordering::Relaxed), 1);
+            assert_eq!(fake.state_of(hash), Some(FragmentState::Stored));
+        }
     }
 
     mod fragment_stream_consumer_tests {
@@ -1122,7 +1132,7 @@ mod tests {
                 .fragment_stream_consumer(Arc::new(Mutex::new(rx)), &stats, aborted)
                 .await
                 .unwrap();
-            assert_eq!(stats.maintained_zstd.load(Ordering::Relaxed), 1);
+            assert_eq!(stats.maintained.load(Ordering::Relaxed), 1);
             assert_eq!(fake.state_of(hash), Some(FragmentState::Stored));
         }
 
@@ -1167,7 +1177,7 @@ mod tests {
             fake.put_object_without_metadata(zstd_hash, &zstd_compressed);
             fake.set_legacy_metadata_row(zstd_hash, zstd_frag);
 
-            // lz4 — recompressed to zstd
+            // lz4 — accurate codec, maintained in place
             let lz4_content = vec![0x50u8; 500];
             let (lz4_frag, lz4_compressed, lz4_hash) = make_lz4_payload(&lz4_content);
             fake.put_object_without_metadata(lz4_hash, &lz4_compressed);
@@ -1188,9 +1198,8 @@ mod tests {
 
             assert_eq!(stats.skipped_migrated.load(Ordering::Relaxed), 1);
             assert_eq!(stats.skipped_obliterated.load(Ordering::Relaxed), 1);
-            assert_eq!(stats.converted_uncompressed.load(Ordering::Relaxed), 1);
-            assert_eq!(stats.maintained_zstd.load(Ordering::Relaxed), 1);
-            assert_eq!(stats.converted_zstd.load(Ordering::Relaxed), 1);
+            // uncompressed, zstd, and lz4 fragments all have accurate codecs: maintained in place
+            assert_eq!(stats.maintained.load(Ordering::Relaxed), 3);
         }
 
         #[tokio::test]
@@ -1207,8 +1216,8 @@ mod tests {
                 .fragment_stream_consumer(Arc::new(Mutex::new(rx)), &stats, aborted)
                 .await
                 .unwrap();
-            assert_eq!(stats.converted_zstd.load(Ordering::Relaxed), 0);
-            assert_eq!(stats.converted_uncompressed.load(Ordering::Relaxed), 0);
+            assert_eq!(stats.maintained.load(Ordering::Relaxed), 0);
+            assert_eq!(stats.recompressed_mismatch.load(Ordering::Relaxed), 0);
         }
     }
 }
