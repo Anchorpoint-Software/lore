@@ -182,15 +182,20 @@ impl<T> CompositeStoreHit<T> {
 /// durability is whatever any of them knows, since a replica holding the fragment holds what it was
 /// told about where the payload lives. `stored_local` is the exception and stays as the local store
 /// left it: a replica reporting content on *its* disk says nothing about ours.
-fn merge_resolved(into: &mut StoreMatchResult, from: &StoreMatchResult) {
+fn merge_resolved(into: &mut StoreMatchResult, from: &StoreMatchResult) -> bool {
+    let mut is_new_stronger = false;
+
     // The partition travels with the level that won, never merged on its own: it names where *that*
     // store found the content, and pairing one store's partition with another's level would point a
     // copy at somewhere the content was never seen.
     if from.match_made > into.match_made {
         into.match_made = from.match_made;
         into.partition = from.partition;
+        is_new_stronger = true;
     }
     into.stored_durable |= from.stored_durable;
+
+    is_new_stronger
 }
 
 /// Default number of permits for the `cache_metadata` semaphore.
@@ -669,7 +674,10 @@ impl CompositeStore {
             };
             match query_result {
                 Ok(result) => {
-                    if !self.local_durable {
+                    // If the durable store was the first to answer, then either the
+                    // replicas are too slow or don't have the fragment, so we should build up
+                    // our own local cache
+                    if !self.local_durable && matches!(result, CompositeStoreHit::Durable(_)) {
                         // Cache the found result locally
                         let local_store = self.local.store();
                         let mut fragment = result.inner().fragment;
@@ -814,7 +822,7 @@ impl ImmutableStore for CompositeStore {
 
         let mut failure = None;
         while let Some(join_result) = queries.join_next().await {
-            let (is_durable, resolved) = match join_result {
+            let (is_durable_result, resolved) = match join_result {
                 Ok(joined) => joined,
                 Err(error) => {
                     failure = failure.or(Some(StoreError::internal_with_context(
@@ -827,12 +835,37 @@ impl ImmutableStore for CompositeStore {
 
             match resolved {
                 Ok(hit) => {
-                    for (resolved, (pos, _)) in hit.inner().iter().zip(remaining.iter()) {
-                        merge_resolved(&mut results[*pos], resolved);
+                    for (resolved, (pos, address)) in hit.inner().iter().zip(remaining.iter()) {
+                        let is_stronger_match = merge_resolved(&mut results[*pos], resolved);
+
+                        // If the results came from the durable store,
+                        // and answered before the replicas could (i.e. they are too slow to be
+                        // worth relying upon, or they couldn't answer),
+                        // then cache the fragment metadata locally to build up our own local cache
+                        if is_durable_result
+                            && self.cache_metadata
+                            && is_stronger_match
+                            && resolved.match_made == StoreMatch::MatchFull
+                            && !self.local_durable
+                            && let Ok(permit) =
+                                self.cache_metadata_semaphore.clone().try_acquire_owned()
+                        {
+                            let store = self.clone();
+                            let match_partition = resolved.partition;
+                            let address = *address;
+                            let cache_counter = self.instruments.counter_local_caching.clone();
+                            lore_spawn!(async move {
+                                let _permit = permit;
+                                let result = store.get_metadata(match_partition, address).await;
+                                count_result("get_metadata_after_query", &cache_counter, &result);
+                            });
+                        }
                     }
                     // Durable is the source of truth, so its answers complete the set. Short of
                     // that, replicas are only worth waiting on while something is still partial.
-                    if is_durable || results.iter().all(|result| !result.match_made.is_partial()) {
+                    if is_durable_result
+                        || results.iter().all(|result| !result.match_made.is_partial())
+                    {
                         failure = None;
                         break;
                     }
@@ -843,28 +876,9 @@ impl ImmutableStore for CompositeStore {
                 Err(error) => {
                     let is_internal_error = error.is_internal();
                     failure = failure.or(Some(error));
-                    if is_durable && !is_internal_error {
+                    if is_durable_result && !is_internal_error {
                         break;
                     }
-                }
-            }
-        }
-
-        if self.cache_metadata && !self.local_durable {
-            for (pos, address) in &remaining {
-                let match_partition = &results[*pos].partition;
-                if !match_partition.is_zero()
-                    && let Ok(permit) = self.cache_metadata_semaphore.clone().try_acquire_owned()
-                {
-                    let store = self.clone();
-                    let match_partition = *match_partition;
-                    let address = *address;
-                    let cache_counter = self.instruments.counter_local_caching.clone();
-                    lore_spawn!(async move {
-                        let _permit = permit;
-                        let result = store.get_metadata(match_partition, address).await;
-                        count_result("get_metadata_after_query", &cache_counter, &result);
-                    });
                 }
             }
         }
@@ -965,6 +979,10 @@ impl ImmutableStore for CompositeStore {
 
         if self.cache_metadata
             && best_result.inner().match_made == StoreMatch::MatchFull
+            // If the durable store was the first to answer, then either the
+            // replicas are too slow or don't have the fragment, so we should build up
+            // our own local cache
+            && matches!(best_result, CompositeStoreHit::Durable(_))
             && !self.local_durable
         {
             let local_store = self.local.store();

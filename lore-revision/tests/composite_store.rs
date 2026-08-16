@@ -991,7 +991,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_metadata_results_are_cached_locally() {
+    async fn durable_store_get_metadata_results_are_cached_locally() {
         let execution = setup_test_execution();
         LORE_CONTEXT
             .scope(execution.clone(), async move {
@@ -1079,7 +1079,275 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn query_match_full_results_are_cached_locally() {
+    async fn replicas_get_metadata_results_not_cached_locally() {
+        let execution = setup_test_execution();
+        LORE_CONTEXT
+            .scope(execution.clone(), async move {
+                let durable_store = immutable::create(
+                    None::<&Path>,
+                    immutable::ImmutableStoreCreateOptions::none(),
+                    false,
+                    ImmutableStoreSettings::default(),
+                )
+                .await
+                .expect("durable should have been created");
+                let local_store = immutable::create(
+                    None::<&Path>,
+                    immutable::ImmutableStoreCreateOptions::none(),
+                    false,
+                    ImmutableStoreSettings::default(),
+                )
+                .await
+                .expect("local should have been created");
+                let replica_store = immutable::create(
+                    None::<&Path>,
+                    immutable::ImmutableStoreCreateOptions::none(),
+                    false,
+                    ImmutableStoreSettings::default(),
+                )
+                .await
+                .expect("replica should have been created");
+
+                let store = CompositeStoreBuilder::default()
+                    .with_cache_metadata(true, None)
+                    .with_durable("test-durable".to_string(), durable_store.clone())
+                    .expect("durable should have worked")
+                    .with_local("test-local".to_string(), local_store.clone())
+                    .expect("local should have worked")
+                    .with_replica(
+                        "test-replica".to_string(),
+                        replica_store.clone(),
+                        true,
+                        true,
+                    )
+                    .build()
+                    .expect("build should have worked");
+                let composite_store = Arc::new(store);
+
+                let repository: Partition = random::<RepositoryId>();
+                let (fragment, address, payload) = generate_random();
+
+                // confirm we don't find the address via composite store
+                let result = composite_store
+                    .clone()
+                    .get_metadata(repository, address)
+                    .await
+                    .expect("Initial query failed");
+                assert!(matches!(result.match_made, StoreMatch::MatchNone));
+
+                // write to the replica store without going through composite, so we recreate
+                // the scenario where a remote store has data that our composite's local does not
+                replica_store
+                    .clone()
+                    .put(repository, address, fragment, Some(payload), false)
+                    .await
+                    .expect("Put to replica failed");
+
+                // confirm local store doesn't know about this address before going via composite
+                let result = local_store
+                    .clone()
+                    .get_metadata(repository, address)
+                    .await
+                    .expect("local confirmation failed");
+                assert!(matches!(result.match_made, StoreMatch::MatchNone));
+
+                // now composite get_metadata should find the address
+                let result = composite_store
+                    .clone()
+                    .get_metadata(repository, address)
+                    .await
+                    .expect("post-put query failed");
+                assert!(matches!(result.match_made, StoreMatch::MatchFull));
+
+                // and the local store won't have the cache because composite store won't
+                // cache read replicas
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                let result = local_store
+                    .clone()
+                    .get_metadata(repository, address)
+                    .await
+                    .expect("replica confirmation failed");
+                assert!(matches!(result.match_made, StoreMatch::MatchNone));
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn durable_store_get_results_are_cached_locally() {
+        let execution = setup_test_execution();
+        LORE_CONTEXT
+            .scope(execution.clone(), async move {
+                let durable_store = immutable::create(
+                    None::<&Path>,
+                    immutable::ImmutableStoreCreateOptions::none(),
+                    false,
+                    ImmutableStoreSettings::default(),
+                )
+                .await
+                .expect("durable should have been created");
+                let local_store = immutable::create(
+                    None::<&Path>,
+                    immutable::ImmutableStoreCreateOptions::none(),
+                    false,
+                    ImmutableStoreSettings::default(),
+                )
+                .await
+                .expect("local should have been created");
+
+                let store = CompositeStoreBuilder::default()
+                    .with_cache_metadata(true, None)
+                    .with_durable("test-durable".to_string(), durable_store.clone())
+                    .expect("durable should have worked")
+                    .with_local("test-local".to_string(), local_store.clone())
+                    .expect("local should have worked")
+                    .build()
+                    .expect("build should have worked");
+                let composite_store = Arc::new(store);
+
+                let repository: Partition = random::<RepositoryId>();
+                let (fragment, address, payload) = generate_random();
+
+                // confirm we don't find the address via composite store
+                let result = composite_store
+                    .clone()
+                    .get_metadata(repository, address)
+                    .await
+                    .expect("Initial query failed");
+                assert!(matches!(result.match_made, StoreMatch::MatchNone));
+
+                // write to the durable store without going through composite, so we recreate
+                // the scenario where a remote store has data that our composite's local does not
+                durable_store
+                    .clone()
+                    .put(repository, address, fragment, Some(payload), false)
+                    .await
+                    .expect("Put to durable failed");
+
+                // confirm local store doesn't know about this address before going via composite
+                let result = local_store
+                    .clone()
+                    .get(repository, address)
+                    .await
+                    .expect_err("get success");
+                assert!(result.is_address_not_found());
+
+                // now composite get should find the address
+                let result = composite_store
+                    .clone()
+                    .get(repository, address)
+                    .await
+                    .expect("post-put query failed");
+                assert!(matches!(result.match_made, StoreMatch::MatchFull));
+
+                // and the local store should have the cache because composite store will
+                // populate it out of band
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                let result = local_store
+                    .clone()
+                    .get(repository, address)
+                    .await
+                    .expect("local confirmation failed");
+                assert!(matches!(result.match_made, StoreMatch::MatchFull));
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn replicas_get_results_not_cached_locally() {
+        let execution = setup_test_execution();
+        LORE_CONTEXT
+            .scope(execution.clone(), async move {
+                let durable_store = immutable::create(
+                    None::<&Path>,
+                    immutable::ImmutableStoreCreateOptions::none(),
+                    false,
+                    ImmutableStoreSettings::default(),
+                )
+                .await
+                .expect("durable should have been created");
+                let local_store = immutable::create(
+                    None::<&Path>,
+                    immutable::ImmutableStoreCreateOptions::none(),
+                    false,
+                    ImmutableStoreSettings::default(),
+                )
+                .await
+                .expect("local should have been created");
+                let replica_store = immutable::create(
+                    None::<&Path>,
+                    immutable::ImmutableStoreCreateOptions::none(),
+                    false,
+                    ImmutableStoreSettings::default(),
+                )
+                .await
+                .expect("replica should have been created");
+
+                let store = CompositeStoreBuilder::default()
+                    .with_cache_metadata(true, None)
+                    .with_durable("test-durable".to_string(), durable_store.clone())
+                    .expect("durable should have worked")
+                    .with_local("test-local".to_string(), local_store.clone())
+                    .expect("local should have worked")
+                    .with_replica(
+                        "test-replica".to_string(),
+                        replica_store.clone(),
+                        true,
+                        true,
+                    )
+                    .build()
+                    .expect("build should have worked");
+                let composite_store = Arc::new(store);
+
+                let repository: Partition = random::<RepositoryId>();
+                let (fragment, address, payload) = generate_random();
+
+                // confirm we don't find the address via composite store
+                let result = composite_store
+                    .clone()
+                    .get(repository, address)
+                    .await
+                    .expect_err("get success");
+                assert!(result.is_address_not_found());
+
+                // write to the replica store without going through composite, so we recreate
+                // the scenario where a remote store has data that our composite's local does not
+                replica_store
+                    .clone()
+                    .put(repository, address, fragment, Some(payload), false)
+                    .await
+                    .expect("Put to replica failed");
+
+                // confirm local store doesn't know about this address before going via composite
+                let result = local_store
+                    .clone()
+                    .get(repository, address)
+                    .await
+                    .expect_err("get success");
+                assert!(result.is_address_not_found());
+
+                // now composite get should find the address
+                let result = composite_store
+                    .clone()
+                    .get_metadata(repository, address)
+                    .await
+                    .expect("post-put query failed");
+                assert!(matches!(result.match_made, StoreMatch::MatchFull));
+
+                // and the local store won't have the cache because composite store won't
+                // cache read replicas
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                let result = local_store
+                    .clone()
+                    .get(repository, address)
+                    .await
+                    .expect_err("get success");
+                assert!(result.is_address_not_found());
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn durable_query_match_full_results_are_cached_locally() {
         let execution = setup_test_execution();
         LORE_CONTEXT
             .scope(execution.clone(), async move {
@@ -1141,6 +1409,87 @@ mod tests {
                     .await
                     .expect("local get_metadata failed");
                 assert!(matches!(result.match_made, StoreMatch::MatchFull));
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn replica_query_match_full_results_not_cached_locally() {
+        let execution = setup_test_execution();
+        LORE_CONTEXT
+            .scope(execution.clone(), async move {
+                let durable_store = immutable::create(
+                    None::<&Path>,
+                    immutable::ImmutableStoreCreateOptions::none(),
+                    false,
+                    ImmutableStoreSettings::default(),
+                )
+                .await
+                .expect("durable should have been created");
+                let local_store = immutable::create(
+                    None::<&Path>,
+                    immutable::ImmutableStoreCreateOptions::none(),
+                    false,
+                    ImmutableStoreSettings::default(),
+                )
+                .await
+                .expect("local should have been created");
+                let replica_store = immutable::create(
+                    None::<&Path>,
+                    immutable::ImmutableStoreCreateOptions::none(),
+                    false,
+                    ImmutableStoreSettings::default(),
+                )
+                .await
+                .expect("replica should have been created");
+
+                let store = CompositeStoreBuilder::default()
+                    .with_cache_metadata(true, None)
+                    .with_durable("test-durable".to_string(), durable_store.clone())
+                    .expect("durable should have worked")
+                    .with_local("test-local".to_string(), local_store.clone())
+                    .expect("local should have worked")
+                    .with_replica(
+                        "test-replica".to_string(),
+                        replica_store.clone(),
+                        true,
+                        true,
+                    )
+                    .build()
+                    .expect("build should have worked");
+                let composite_store = Arc::new(store);
+
+                let repository: Partition = random::<RepositoryId>();
+                let (fragment, address, payload) = generate_random();
+
+                // write to replica directly so the local store has no entry
+                replica_store
+                    .clone()
+                    .put(repository, address, fragment, Some(payload), false)
+                    .await
+                    .expect("Put to durable failed");
+
+                // query via composite: replica resolves MatchFull with a non-zero partition.
+                // because the results came from the replica no caching takes place
+                let mut results = [StoreMatchResult::default()];
+                composite_store
+                    .clone()
+                    .query(repository, &[address], &mut results)
+                    .await
+                    .expect("query failed");
+                assert!(matches!(results[0].match_made, StoreMatch::MatchFull));
+                assert!(!results[0].partition.is_zero());
+
+                // wait for an erroneous background cache write-back
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+                // local store should not have the metadata cached
+                let result = local_store
+                    .clone()
+                    .get_metadata(repository, address)
+                    .await
+                    .expect("local get_metadata failed");
+                assert!(matches!(result.match_made, StoreMatch::MatchNone));
             })
             .await;
     }
