@@ -85,7 +85,14 @@ impl NotificationClient {
         let endpoint = self.endpoint.as_str();
 
         let auth_url = self.remote.auth_url.as_str();
-        let identity = execution_context().user_id().await;
+        // Fall back to the identity the connection authenticated as when the
+        // context carries none, so authorization never has to guess one.
+        let context_identity = execution_context().user_id().await;
+        let identity = if context_identity.is_empty() {
+            self.remote.identity().to_string()
+        } else {
+            context_identity
+        };
 
         loop {
             lore_debug!(
@@ -99,7 +106,13 @@ impl NotificationClient {
             match grpc::connect(Arc::downgrade(&self.remote), endpoint, true).await {
                 Ok(connection) => {
                     let auth = connection
-                        .repository_authz(auth_url, &identity, repository)
+                        .repository_authz(
+                            auth_url,
+                            &identity,
+                            repository,
+                            self.remote.identity_token(),
+                            self.remote.access_token(),
+                        )
                         .await;
                     let client =
                         notification_service_client::NotificationServiceClient::with_interceptor(

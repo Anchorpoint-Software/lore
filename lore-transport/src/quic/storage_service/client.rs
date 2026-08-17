@@ -65,6 +65,8 @@ pub struct StorageClient {
     auth_url: String,
     recipient_domain: String,
     identity: String,
+    identity_token: String,
+    access_token: String,
     partition: Partition,
     counter: AtomicUsize,
     quic: Arc<QuicConnection>,
@@ -97,6 +99,8 @@ impl StorageClient {
         identity: &str,
         partition: Partition,
         quinn: quinn::Connection,
+        identity_token: &str,
+        access_token: &str,
     ) -> Self {
         let quic = QuicConnection::with_v4(quinn, MAX_CHUNK_SIZE, true);
         StorageClient {
@@ -107,6 +111,8 @@ impl StorageClient {
             auth_url: auth_url.to_string(),
             recipient_domain: recipient_domain.to_string(),
             identity: identity.to_string(),
+            identity_token: identity_token.to_string(),
+            access_token: access_token.to_string(),
             partition,
             quic: Arc::new(quic),
             connection_establish: Semaphore::new(1),
@@ -116,6 +122,7 @@ impl StorageClient {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn connect(
         connection: Weak<Connection>,
         remote_url: &str,
@@ -123,6 +130,8 @@ impl StorageClient {
         auth_url: &str,
         identity: &str,
         partition: Partition,
+        identity_token: &str,
+        access_token: &str,
     ) -> Result<Self, ProtocolError> {
         let auth_adapter = Arc::new(StorageClientAuth {
             recipient_domain: remote_domain.clone(),
@@ -164,6 +173,8 @@ impl StorageClient {
             identity,
             partition,
             quinn,
+            identity_token,
+            access_token,
         );
 
         lore_trace!(
@@ -279,6 +290,8 @@ impl Storage for StorageClient {
                 &self.recipient_domain,
                 &self.identity,
                 partition,
+                &self.identity_token,
+                &self.access_token,
             )
             .await;
             authorization_token

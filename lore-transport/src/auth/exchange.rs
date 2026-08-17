@@ -73,12 +73,22 @@ pub fn is_expired(expires: u64) -> bool {
 /// Token store keys use `"{auth_url}/{repository_id}"` (no implementation-
 /// specific prefix). The `Authentication` implementation handles resource ID
 /// formatting internally.
+///
+/// A non-empty `identity_token` replaces the authentication token.
+///
+/// A non-empty `access_token` the authorization token.
 pub async fn exchange(
     auth_url: &str,
     identity: &str,
     repository: RepositoryId,
     recipient_domain: String,
+    identity_token: &str,
+    access_token: &str,
 ) -> Result<String, ExchangeError> {
+    if !access_token.is_empty() {
+        lore_debug!("Using the supplied access token for repository {repository}");
+        return Ok(access_token.to_string());
+    }
     if auth_url.is_empty() {
         lore_debug!("No auth url, unable to perform authz exchange");
         return Err(NotSupported {
@@ -116,7 +126,7 @@ pub async fn exchange(
         lore_trace!("Found cached authz token for {cache_key:?}");
     } else {
         lore_trace!("Check for token store authz token for {token_store_key:?}");
-        token = token_store::load_user_token(
+        token = token_store::load_user_token_from_store(
             &token_store_key,
             identity,
             tokens_only_for_recipient_domain(recipient_domain.clone()),
@@ -148,6 +158,8 @@ pub async fn exchange(
         auth_url.as_str(),
         identity,
         tokens_only_for_recipient_domain(auth_domain),
+        identity_token,
+        access_token,
     )
     .await
     else {
@@ -227,12 +239,20 @@ pub async fn exchange(
 ///
 /// The `resource_id` is used verbatim as the cache/token-store key and is
 /// passed unmodified to the auth backend.
+///
+/// `identity_token` and `access_token` are the caller-supplied credentials.
 pub async fn exchange_custom_resource(
     auth_url: &str,
     identity: &str,
     resource_id: &str,
     recipient_domain: String,
+    identity_token: &str,
+    access_token: &str,
 ) -> Result<String, ExchangeError> {
+    if !access_token.is_empty() {
+        lore_debug!("Using the supplied access token for resource {resource_id}");
+        return Ok(access_token.to_string());
+    }
     if auth_url.is_empty() {
         lore_debug!("No auth url, unable to perform authz exchange");
         return Err(NotSupported {
@@ -276,7 +296,7 @@ pub async fn exchange_custom_resource(
         lore_trace!("Found cached authz token for {cache_key:?}");
     } else {
         lore_trace!("Check for token store authz token for {token_store_key:?}");
-        token = token_store::load_user_token(
+        token = token_store::load_user_token_from_store(
             &token_store_key,
             identity,
             tokens_only_for_recipient_domain(recipient_domain.clone()),
@@ -307,6 +327,8 @@ pub async fn exchange_custom_resource(
         auth_url.as_str(),
         identity,
         tokens_only_for_recipient_domain(auth_domain),
+        identity_token,
+        access_token,
     )
     .await
     else {
@@ -385,14 +407,26 @@ pub async fn exchange_custom_resource(
 /// If `identity` is empty, iterates over available identities for the given
 /// `auth_url` and tries to find one that can authenticate (and optionally
 /// authorize for the given repository).
+///
+/// `identity_token` and `access_token` are the caller-supplied credentials.
 pub async fn auth_exchange(
     auth_url: &str,
     remote_domain: &str,
     identity: &str,
     repository: RepositoryId,
+    identity_token: &str,
+    access_token: &str,
 ) -> (String, String, String) {
     if !identity.is_empty() {
-        return auth_exchange_for_identity(auth_url, remote_domain, identity, repository).await;
+        return auth_exchange_for_identity(
+            auth_url,
+            remote_domain,
+            identity,
+            repository,
+            identity_token,
+            access_token,
+        )
+        .await;
     }
 
     // No identity given, resolve one from available identities
@@ -405,7 +439,8 @@ pub async fn auth_exchange(
         // No resource, pick first identity with a valid authn token
         for entry in &identities {
             let result =
-                auth_exchange_for_identity(auth_url, remote_domain, entry, repository).await;
+                auth_exchange_for_identity(auth_url, remote_domain, entry, repository, "", "")
+                    .await;
             if !result.0.is_empty() {
                 return result;
             }
@@ -415,7 +450,8 @@ pub async fn auth_exchange(
 
     // Try each identity: first check for cached/stored authz token, then try exchange
     for entry in &identities {
-        let result = auth_exchange_for_identity(auth_url, remote_domain, entry, repository).await;
+        let result =
+            auth_exchange_for_identity(auth_url, remote_domain, entry, repository, "", "").await;
         if !result.1.is_empty() {
             return result;
         }
@@ -430,20 +466,30 @@ async fn auth_exchange_for_identity(
     remote_domain: &str,
     identity: &str,
     repository: RepositoryId,
+    identity_token: &str,
+    access_token: &str,
 ) -> (String, String, String) {
-    let Ok(authentication_token) = token_store::load_user_token(
+    let authentication_token = token_store::load_user_token(
         auth_url,
         identity,
         tokens_only_for_recipient_domain(remote_domain.to_string()),
+        identity_token,
+        access_token,
     )
     .await
-    else {
+    .unwrap_or_default();
+
+    // A supplied access token authorizes on its own, so carry on without an
+    // authentication token: the services that need one fail where they use it,
+    // and the ones that only need authorization still work.
+    if authentication_token.is_empty() && access_token.is_empty() {
         lore_debug!("Auth exchange failed, no user authentication token found for {identity}");
         return (String::new(), String::new(), String::new());
-    };
+    }
 
-    // Reject expired authn tokens
-    if let Some(info) = lore_credential::user_info_from_token(authentication_token.clone())
+    // Reject expired authn tokens. Skip the check for user-supplied access token. It will fail when used.
+    if access_token.is_empty()
+        && let Some(info) = lore_credential::user_info_from_token(authentication_token.clone())
         && is_expired(info.expires)
     {
         lore_debug!("Skipping identity {identity}, authn token is expired");
@@ -453,12 +499,19 @@ async fn auth_exchange_for_identity(
     // This will return the cached authz token if it is still valid,
     // or perform an authz exchange if needed
     let authorization_token = if !repository.is_zero() {
-        exchange(auth_url, identity, repository, remote_domain.to_string())
-            .await
-            .inspect_err(|err| {
-                lore_debug!("Auth exchange failed for repository {repository}: {err}");
-            })
-            .unwrap_or_default()
+        exchange(
+            auth_url,
+            identity,
+            repository,
+            remote_domain.to_string(),
+            identity_token,
+            access_token,
+        )
+        .await
+        .inspect_err(|err| {
+            lore_debug!("Auth exchange failed for repository {repository}: {err}");
+        })
+        .unwrap_or_default()
     } else {
         String::new()
     };
@@ -523,6 +576,8 @@ pub async fn auth_exchange_custom_resource(
     remote_domain: &str,
     identity: &str,
     resource_id: &str,
+    identity_token: &str,
+    access_token: &str,
 ) -> (String, String, String) {
     if !identity.is_empty() {
         return auth_exchange_custom_resource_for_identity(
@@ -530,6 +585,8 @@ pub async fn auth_exchange_custom_resource(
             remote_domain,
             identity,
             resource_id,
+            identity_token,
+            access_token,
         )
         .await;
     }
@@ -539,10 +596,17 @@ pub async fn auth_exchange_custom_resource(
         return (String::new(), String::new(), String::new());
     };
 
+    // Store-resolved identities use store credentials, pass empty tokens.
     for entry in &identities {
-        let result =
-            auth_exchange_custom_resource_for_identity(auth_url, remote_domain, entry, resource_id)
-                .await;
+        let result = auth_exchange_custom_resource_for_identity(
+            auth_url,
+            remote_domain,
+            entry,
+            resource_id,
+            "",
+            "",
+        )
+        .await;
         if !result.1.is_empty() {
             return result;
         }
@@ -557,32 +621,49 @@ async fn auth_exchange_custom_resource_for_identity(
     remote_domain: &str,
     identity: &str,
     resource_id: &str,
+    identity_token: &str,
+    access_token: &str,
 ) -> (String, String, String) {
-    let Ok(authentication_token) = token_store::load_user_token(
+    let authentication_token = token_store::load_user_token(
         auth_url,
         identity,
         tokens_only_for_recipient_domain(remote_domain.to_string()),
+        identity_token,
+        access_token,
     )
     .await
-    else {
+    .unwrap_or_default();
+
+    // A supplied access token authorizes on its own, so carry on without an
+    // authentication token: the services that need one fail where they use it,
+    // and the ones that only need authorization still work.
+    if authentication_token.is_empty() && access_token.is_empty() {
         lore_debug!("Auth exchange failed, no user authentication token found for {identity}");
         return (String::new(), String::new(), String::new());
-    };
+    }
 
-    if let Some(info) = lore_credential::user_info_from_token(authentication_token.clone())
+    // Skip the expires check for user-supplied access token. It will fail when used.
+    if access_token.is_empty()
+        && let Some(info) = lore_credential::user_info_from_token(authentication_token.clone())
         && is_expired(info.expires)
     {
         lore_debug!("Skipping identity {identity}, authn token is expired");
         return (String::new(), String::new(), String::new());
     }
 
-    let authorization_token =
-        exchange_custom_resource(auth_url, identity, resource_id, remote_domain.to_string())
-            .await
-            .inspect_err(|err| {
-                lore_debug!("Auth exchange failed for resource {resource_id}: {err}");
-            })
-            .unwrap_or_default();
+    let authorization_token = exchange_custom_resource(
+        auth_url,
+        identity,
+        resource_id,
+        remote_domain.to_string(),
+        identity_token,
+        access_token,
+    )
+    .await
+    .inspect_err(|err| {
+        lore_debug!("Auth exchange failed for resource {resource_id}: {err}");
+    })
+    .unwrap_or_default();
 
     // Dedupe: same identity reselected for the same resource/domain on every
     // refresh is the steady-state — re-emit only when the inputs change.
@@ -616,4 +697,79 @@ async fn auth_exchange_custom_resource_for_identity(
         authorization_token,
         identity.to_string(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A supplied access token is the authorization token, so the exchange is
+    /// skipped entirely -- including the checks that would otherwise reject a
+    /// call with no auth URL and no identity.
+    #[tokio::test]
+    async fn supplied_access_token_replaces_the_repository_exchange() {
+        let token = exchange(
+            "",
+            "",
+            RepositoryId::default(),
+            "example.com".to_string(),
+            "",
+            "supplied-authz",
+        )
+        .await
+        .expect("the supplied access token is used as given");
+        assert_eq!(token, "supplied-authz");
+    }
+
+    #[tokio::test]
+    async fn supplied_access_token_replaces_the_resource_exchange() {
+        let token =
+            exchange_custom_resource("", "", "", "example.com".to_string(), "", "supplied-authz")
+                .await
+                .expect("the supplied access token is used as given");
+        assert_eq!(token, "supplied-authz");
+    }
+
+    /// An access token on its own authorizes without an authentication token to
+    /// trade in, and without reading one from the store. The authentication slot
+    /// comes back empty, so the services that need one fail where they use it
+    /// while the authorized ones still work.
+    #[tokio::test]
+    async fn access_token_alone_authorizes_without_an_authentication_token() {
+        let repository: RepositoryId = "00112233445566778899aabbccddeeff"
+            .parse()
+            .expect("a valid repository id");
+        let (authentication_token, authorization_token, identity) = auth_exchange(
+            "ucs-auth://auth.example.com",
+            "example.com",
+            "alice",
+            repository,
+            "",
+            "supplied-authz",
+        )
+        .await;
+
+        assert!(
+            authentication_token.is_empty(),
+            "no authentication token is invented, and none is read from the store"
+        );
+        assert_eq!(authorization_token, "supplied-authz");
+        assert_eq!(identity, "alice");
+    }
+
+    /// Without one, the same call fails: nothing about the short circuit above
+    /// leaks into the normal path.
+    #[tokio::test]
+    async fn no_supplied_access_token_still_requires_an_auth_url() {
+        let result = exchange(
+            "",
+            "",
+            RepositoryId::default(),
+            "example.com".to_string(),
+            "",
+            "",
+        )
+        .await;
+        assert!(result.is_err());
+    }
 }

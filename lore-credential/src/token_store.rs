@@ -535,7 +535,7 @@ pub async fn store_user_token(
 ///
 /// filter - You almost certainly want to filter out tokens that are invalid for the domain you want
 /// to use them against. See comment at top of `urc-core::auth` - Check Token Recipient
-pub async fn load_user_token<P>(
+pub async fn load_user_token_from_store<P>(
     auth_endpoint: &str,
     identity: &str,
     mut base_filter: P,
@@ -589,6 +589,33 @@ where
         Some(token) => decrypt_token(token).await,
         None => Err(TokenNotFound.into()),
     }
+}
+
+/// Load the authentication token for `identity`, preferring one the caller
+/// supplied over the shared store.
+pub async fn load_user_token<P>(
+    auth_endpoint: &str,
+    identity: &str,
+    base_filter: P,
+    identity_token: &str,
+    access_token: &str,
+) -> Result<String, TokenStoreError>
+where
+    P: FnMut(&&IdentityToken) -> bool,
+{
+    if !identity_token.is_empty() {
+        lore_debug!("Using the supplied identity token for {identity}");
+        return Ok(identity_token.to_string());
+    }
+
+    if !access_token.is_empty() {
+        lore_debug!(
+            "Only an access token was supplied, not reading an authentication token from the store for {identity}"
+        );
+        return Err(TokenNotFound.into());
+    }
+
+    load_user_token_from_store(auth_endpoint, identity, base_filter).await
 }
 
 /// Returns true if `remote` is the base `auth_url` or a resource-scoped entry
@@ -1378,5 +1405,112 @@ token = "tok-b"
             "https://auth.example.com/not-a-resource",
             "https://auth.example.com"
         ));
+    }
+
+    /// A supplied token is passed through untouched, so it need not be a JWT.
+    const SUPPLIED_TOKEN: &str = "supplied-authentication-token";
+
+    #[tokio::test]
+    async fn supplied_identity_token_is_used_without_the_store() {
+        // No auth endpoint and no store entry: the supplied token is returned on
+        // its own, where a store read would report TokenNotFound.
+        let token = load_user_token(
+            "",
+            "alice",
+            tokens_only_for_recipient_domain("nowhere.example".to_string()),
+            SUPPLIED_TOKEN,
+            "",
+        )
+        .await
+        .expect("the supplied token is used as given");
+        assert_eq!(token, SUPPLIED_TOKEN);
+
+        // An access token alongside it changes nothing: the identity token is
+        // still the authentication token to use.
+        let token = load_user_token(
+            "",
+            "alice",
+            tokens_only_for_recipient_domain("nowhere.example".to_string()),
+            SUPPLIED_TOKEN,
+            "supplied-access-token",
+        )
+        .await
+        .expect("the supplied token is used as given");
+        assert_eq!(token, SUPPLIED_TOKEN);
+    }
+
+    /// The caller is working from tokens they supplied, so the store is off
+    /// limits: an access token with no identity token beside it reports
+    /// TokenNotFound rather than reading whichever identity happens to be
+    /// stored. Proven against a store that does hold a matching token, so a
+    /// regression to the fallback would be visible here.
+    ///
+    /// Redirects the store to a temp directory and takes the file fallback for
+    /// the encryption key, so the developer's real keyring and tokens are never
+    /// touched.
+    #[tokio::test]
+    async fn access_token_alone_does_not_fall_back_to_the_store() {
+        const AUTH_URL: &str = "ucs-auth://store-fallback.test.invalid";
+        let store_dir = std::env::temp_dir().join("lore-token-store-fallback-test");
+        fs::create_dir_all(&store_dir).expect("a temp store directory");
+        // SAFETY: single-threaded setup for this test; no other test in this
+        // binary reads the token store.
+        unsafe {
+            std::env::set_var("LORE_AUTH_PATH", store_dir.display().to_string());
+            std::env::set_var("LORE_AUTH_STORE", "fallback");
+        }
+
+        store_user_token(
+            AUTH_URL,
+            "alice",
+            "stored-token",
+            vec!["test.invalid".to_string()],
+        )
+        .await
+        .expect("storing a token");
+
+        // Nothing supplied: the stored token is found, so the store really does
+        // answer for this identity.
+        let stored = load_user_token(
+            AUTH_URL,
+            "alice",
+            tokens_only_for_recipient_domain("test.invalid".to_string()),
+            "",
+            "",
+        )
+        .await
+        .expect("the stored token is found");
+        assert_eq!(stored, "stored-token");
+
+        // An access token supplied instead: the same lookup now refuses.
+        let refused = load_user_token(
+            AUTH_URL,
+            "alice",
+            tokens_only_for_recipient_domain("test.invalid".to_string()),
+            "",
+            "supplied-access-token",
+        )
+        .await;
+        assert!(
+            refused.is_err(),
+            "an access token must not fall back to the stored identity"
+        );
+
+        let _ = fs::remove_dir_all(&store_dir);
+    }
+
+    #[tokio::test]
+    async fn no_supplied_token_reads_the_store() {
+        // Nothing supplied, so this is a plain store read, which has no entry
+        // for an empty endpoint.
+        let result = load_user_token(
+            "",
+            "alice",
+            tokens_only_for_recipient_domain("nowhere.example".to_string()),
+            "",
+            "",
+        )
+        .await;
+        assert!(result.is_err());
     }
 }

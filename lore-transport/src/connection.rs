@@ -187,11 +187,17 @@ fn refusal_is_final(err: &ProtocolError) -> bool {
     err.is_not_authorized() || err.is_not_authenticated()
 }
 
+/// `identity_token` and `access_token` are the credentials the caller supplied
+/// for this call, empty when they supplied none. They are held on the
+/// [`Connection`] so the services it creates later -- and the background token
+/// refreshers -- keep using the credentials of the call that opened it.
 pub async fn connect(
     remote_url: &str,
     identity: &str,
     repository: RepositoryId,
     max_connections: usize,
+    identity_token: &str,
+    access_token: &str,
 ) -> Result<Arc<Connection>, ProtocolError> {
     let (remote_url, protocol) = parse(remote_url)?;
 
@@ -201,18 +207,32 @@ pub async fn connect(
         return Ok(connection);
     }
 
+    let identity_token = identity_token.to_string();
+    let access_token = access_token.to_string();
     Box::pin(async move {
-        connect_impl(protocol, remote_url, identity, repository, max_connections).await
+        connect_impl(
+            protocol,
+            remote_url,
+            identity,
+            repository,
+            max_connections,
+            identity_token,
+            access_token,
+        )
+        .await
     })
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn connect_impl(
     protocol: Arc<dyn Protocol>,
     remote_url: Url,
     identity: String,
     repository: RepositoryId,
     max_connections: usize,
+    identity_token: String,
+    access_token: String,
 ) -> Result<Arc<Connection>, ProtocolError> {
     let remote_domain = lore_credential::domain_from_url_or_url(&remote_url);
 
@@ -237,7 +257,15 @@ async fn connect_impl(
     if !auth_url.is_empty() {
         // Ensure we are authenticated if there is an auth url defined in the environment
         if identity.is_empty() {
-            let (_, _, resolved) = auth_exchange(&auth_url, &remote_domain, "", repository).await;
+            let (_, _, resolved) = auth_exchange(
+                &auth_url,
+                &remote_domain,
+                "",
+                repository,
+                &identity_token,
+                &access_token,
+            )
+            .await;
             identity = resolved;
 
             if identity.is_empty() {
@@ -250,13 +278,19 @@ async fn connect_impl(
                 }
                 return Err(ProtocolError::from(lore_base::error::NotAuthenticated));
             }
-        } else {
+        } else if access_token.is_empty() {
+            // With an access token there is no authentication token to find:
+            // the caller authorizes with what they supplied, and the services
+            // that need an authentication token fail where they use it rather
+            // than failing the whole connection here.
             lore_credential::token_store::load_user_token(
                 &auth_url,
                 &identity,
                 lore_credential::token_store::tokens_only_for_recipient_domain(
                     remote_domain.clone(),
                 ),
+                &identity_token,
+                &access_token,
             )
             .await
             .internal("loading user token")?;
@@ -271,6 +305,8 @@ async fn connect_impl(
         remote_url: remote_url.clone(),
         auth_url: auth_url.clone(),
         identity: identity.clone(),
+        identity_token: identity_token.clone(),
+        access_token: access_token.clone(),
         protocol: protocol.clone(),
         environment,
         storage_ready: ServiceReady::new(),
@@ -308,11 +344,17 @@ async fn connect_impl(
             if !repository.is_zero() {
                 if !auth_url.is_empty() {
                     lore_trace!("Token exchange for identity {identity} for {auth_url}");
-                    if let Err(err) =
-                        auth::exchange::exchange(&auth_url, &identity, repository, remote_domain)
-                            .await
-                            .inspect_err(|err| lore_debug!("Auth exchange failed: {err}"))
-                            .forward::<ProtocolError>("authorization failure")
+                    if let Err(err) = auth::exchange::exchange(
+                        &auth_url,
+                        &identity,
+                        repository,
+                        remote_domain,
+                        connection.identity_token(),
+                        connection.access_token(),
+                    )
+                    .await
+                    .inspect_err(|err| lore_debug!("Auth exchange failed: {err}"))
+                    .forward::<ProtocolError>("authorization failure")
                     {
                         connection.storage_ready.complete(Err(err.clone()));
                         connection.revision_ready.complete(Err(err.clone()));
@@ -368,6 +410,8 @@ async fn connect_impl(
                             identity.as_str(),
                             repository,
                             index,
+                            connection.identity_token(),
+                            connection.access_token(),
                         )
                         .await;
                     match result {
@@ -428,6 +472,8 @@ async fn connect_impl(
                                 auth_url.as_str(),
                                 identity.as_str(),
                                 repository,
+                                connection.identity_token(),
+                                connection.access_token(),
                             )
                             .await;
                         match result {
@@ -458,6 +504,8 @@ async fn connect_impl(
                                 auth_url.as_str(),
                                 identity.as_str(),
                                 repository,
+                                connection.identity_token(),
+                                connection.access_token(),
                             )
                             .await;
                         match result {
@@ -491,6 +539,8 @@ async fn connect_impl(
                             repository_service_url.as_str(),
                             auth_url.as_str(),
                             identity.as_str(),
+                            connection.identity_token(),
+                            connection.access_token(),
                         )
                         .await;
                     match result {
@@ -574,6 +624,13 @@ pub struct Connection {
     pub remote_url: Url,
     pub auth_url: String,
     pub identity: String,
+    /// Authentication token the opening call supplied, empty when it supplied
+    /// none. Used in place of the token store for every service on this
+    /// connection, including the ones created lazily later.
+    identity_token: String,
+    /// Authorization token the opening call supplied, empty when it supplied
+    /// none. Used in place of an authorization exchange.
+    access_token: String,
     pub environment: EnvironmentConfig,
     protocol: Arc<dyn Protocol>,
     /// Per-service readiness. Signalled by each subtask on completion (or
@@ -631,6 +688,16 @@ impl Connection {
 
     pub fn identity(&self) -> &str {
         self.identity.as_str()
+    }
+
+    /// The authentication token the opening call supplied, or an empty string.
+    pub fn identity_token(&self) -> &str {
+        self.identity_token.as_str()
+    }
+
+    /// The authorization token the opening call supplied, or an empty string.
+    pub fn access_token(&self) -> &str {
+        self.access_token.as_str()
     }
 
     /// Mark the connection failed and unregister it from the connection cache.
@@ -829,6 +896,8 @@ impl Connection {
                 self.auth_url.as_str(),
                 self.identity.as_str(),
                 repository,
+                self.identity_token.as_str(),
+                self.access_token.as_str(),
             )
             .await?;
         self.revision.insert(repository, revision.clone());
@@ -861,6 +930,8 @@ impl Connection {
                 self.auth_url.as_str(),
                 self.identity.as_str(),
                 repository,
+                self.identity_token.as_str(),
+                self.access_token.as_str(),
             )
             .await?;
         self.admin.insert(repository, admin.clone());
@@ -883,6 +954,8 @@ impl Connection {
                 self.auth_url.as_str(),
                 self.identity.as_str(),
                 repository,
+                self.identity_token.as_str(),
+                self.access_token.as_str(),
             )
             .await?;
         self.lock.insert(repository, lock.clone());
@@ -896,6 +969,8 @@ impl Connection {
             self.identity.as_str(),
             module,
             MAX_STORAGE_CONNECTIONS,
+            self.identity_token.as_str(),
+            self.access_token.as_str(),
         )
         .await
     }
@@ -919,8 +994,19 @@ impl Protocol for LoreProtocol {
         identity: &str,
         partition: Partition,
         _index: usize,
+        identity_token: &str,
+        access_token: &str,
     ) -> Result<Arc<dyn Storage>, ProtocolError> {
-        quic::storage(connection, remote_url, auth_url, identity, partition).await
+        quic::storage(
+            connection,
+            remote_url,
+            auth_url,
+            identity,
+            partition,
+            identity_token,
+            access_token,
+        )
+        .await
     }
 
     async fn revision(
@@ -930,8 +1016,19 @@ impl Protocol for LoreProtocol {
         auth_url: &str,
         identity: &str,
         repository: RepositoryId,
+        identity_token: &str,
+        access_token: &str,
     ) -> Result<Arc<dyn Revision>, ProtocolError> {
-        grpc::revision(connection, remote_url, auth_url, identity, repository).await
+        grpc::revision(
+            connection,
+            remote_url,
+            auth_url,
+            identity,
+            repository,
+            identity_token,
+            access_token,
+        )
+        .await
     }
 
     async fn repository(
@@ -940,8 +1037,18 @@ impl Protocol for LoreProtocol {
         remote_url: &str,
         auth_url: &str,
         identity: &str,
+        identity_token: &str,
+        access_token: &str,
     ) -> Result<Arc<dyn Repository>, ProtocolError> {
-        grpc::repository(connection, remote_url, auth_url, identity).await
+        grpc::repository(
+            connection,
+            remote_url,
+            auth_url,
+            identity,
+            identity_token,
+            access_token,
+        )
+        .await
     }
 
     async fn admin(
@@ -951,8 +1058,19 @@ impl Protocol for LoreProtocol {
         auth_url: &str,
         identity: &str,
         repository: RepositoryId,
+        identity_token: &str,
+        access_token: &str,
     ) -> Result<Arc<dyn Admin>, ProtocolError> {
-        grpc::admin(connection, remote_url, auth_url, identity, repository).await
+        grpc::admin(
+            connection,
+            remote_url,
+            auth_url,
+            identity,
+            repository,
+            identity_token,
+            access_token,
+        )
+        .await
     }
 
     async fn lock(
@@ -962,8 +1080,19 @@ impl Protocol for LoreProtocol {
         auth_url: &str,
         identity: &str,
         repository: RepositoryId,
+        identity_token: &str,
+        access_token: &str,
     ) -> Result<Arc<dyn Lock>, ProtocolError> {
-        grpc::lock(connection, remote_url, auth_url, identity, repository).await
+        grpc::lock(
+            connection,
+            remote_url,
+            auth_url,
+            identity,
+            repository,
+            identity_token,
+            access_token,
+        )
+        .await
     }
 
     async fn environment(
@@ -989,8 +1118,20 @@ impl Protocol for GRPCProtocol {
         identity: &str,
         partition: Partition,
         index: usize,
+        identity_token: &str,
+        access_token: &str,
     ) -> Result<Arc<dyn Storage>, ProtocolError> {
-        grpc::storage(connection, remote_url, auth_url, identity, partition, index).await
+        grpc::storage(
+            connection,
+            remote_url,
+            auth_url,
+            identity,
+            partition,
+            index,
+            identity_token,
+            access_token,
+        )
+        .await
     }
 
     async fn revision(
@@ -1000,8 +1141,19 @@ impl Protocol for GRPCProtocol {
         auth_url: &str,
         identity: &str,
         repository: RepositoryId,
+        identity_token: &str,
+        access_token: &str,
     ) -> Result<Arc<dyn Revision>, ProtocolError> {
-        grpc::revision(connection, remote_url, auth_url, identity, repository).await
+        grpc::revision(
+            connection,
+            remote_url,
+            auth_url,
+            identity,
+            repository,
+            identity_token,
+            access_token,
+        )
+        .await
     }
 
     async fn repository(
@@ -1010,8 +1162,18 @@ impl Protocol for GRPCProtocol {
         remote_url: &str,
         auth_url: &str,
         identity: &str,
+        identity_token: &str,
+        access_token: &str,
     ) -> Result<Arc<dyn Repository>, ProtocolError> {
-        grpc::repository(connection, remote_url, auth_url, identity).await
+        grpc::repository(
+            connection,
+            remote_url,
+            auth_url,
+            identity,
+            identity_token,
+            access_token,
+        )
+        .await
     }
 
     async fn admin(
@@ -1021,8 +1183,19 @@ impl Protocol for GRPCProtocol {
         auth_url: &str,
         identity: &str,
         repository: RepositoryId,
+        identity_token: &str,
+        access_token: &str,
     ) -> Result<Arc<dyn Admin>, ProtocolError> {
-        grpc::admin(connection, remote_url, auth_url, identity, repository).await
+        grpc::admin(
+            connection,
+            remote_url,
+            auth_url,
+            identity,
+            repository,
+            identity_token,
+            access_token,
+        )
+        .await
     }
 
     async fn lock(
@@ -1032,8 +1205,19 @@ impl Protocol for GRPCProtocol {
         auth_url: &str,
         identity: &str,
         repository: RepositoryId,
+        identity_token: &str,
+        access_token: &str,
     ) -> Result<Arc<dyn Lock>, ProtocolError> {
-        grpc::lock(connection, remote_url, auth_url, identity, repository).await
+        grpc::lock(
+            connection,
+            remote_url,
+            auth_url,
+            identity,
+            repository,
+            identity_token,
+            access_token,
+        )
+        .await
     }
 
     async fn environment(

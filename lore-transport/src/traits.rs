@@ -15,6 +15,7 @@ use crate::types::*;
 #[async_trait]
 pub trait Protocol: Send + Sync {
     /// Connect to remote storage service
+    #[allow(clippy::too_many_arguments)]
     async fn storage(
         &self,
         connection: Weak<Connection>,
@@ -23,9 +24,12 @@ pub trait Protocol: Send + Sync {
         identity: &str,
         partition: Partition,
         index: usize,
+        identity_token: &str,
+        access_token: &str,
     ) -> Result<Arc<dyn Storage>, ProtocolError>;
 
     /// Connect to remote revision service
+    #[allow(clippy::too_many_arguments)]
     async fn revision(
         &self,
         connection: Weak<Connection>,
@@ -33,6 +37,8 @@ pub trait Protocol: Send + Sync {
         auth_url: &str,
         identity: &str,
         repository: RepositoryId,
+        identity_token: &str,
+        access_token: &str,
     ) -> Result<Arc<dyn Revision>, ProtocolError>;
 
     /// Connect to remote repository service
@@ -42,9 +48,12 @@ pub trait Protocol: Send + Sync {
         remote_url: &str,
         auth_url: &str,
         identity: &str,
+        identity_token: &str,
+        access_token: &str,
     ) -> Result<Arc<dyn Repository>, ProtocolError>;
 
     /// Connect to remote admin service
+    #[allow(clippy::too_many_arguments)]
     async fn admin(
         &self,
         connection: Weak<Connection>,
@@ -52,9 +61,12 @@ pub trait Protocol: Send + Sync {
         auth_url: &str,
         identity: &str,
         repository: RepositoryId,
+        identity_token: &str,
+        access_token: &str,
     ) -> Result<Arc<dyn Admin>, ProtocolError>;
 
     /// Connect to remote lock service
+    #[allow(clippy::too_many_arguments)]
     async fn lock(
         &self,
         connection: Weak<Connection>,
@@ -62,6 +74,8 @@ pub trait Protocol: Send + Sync {
         auth_url: &str,
         identity: &str,
         repository: RepositoryId,
+        identity_token: &str,
+        access_token: &str,
     ) -> Result<Arc<dyn Lock>, ProtocolError>;
 
     /// Connect to remote environment service

@@ -51,7 +51,15 @@ pub(crate) fn run_synchronously<
     if let Err(error) = validate_call_text(globals, args) {
         return crate::runtime().block_on(reject_call(globals.clone(), callback, error));
     }
-    let globals = globals.clone();
+    let mut globals = globals.clone();
+    // Resolving the credentials reads their text, so it follows the check above.
+    if let Err(error) = globals.validate() {
+        return crate::runtime().block_on(reject_call(
+            globals,
+            callback,
+            ArgumentError::from(error),
+        ));
+    }
     let args = args.clone();
     crate::runtime().block_on(handler(globals, args, callback))
 }
@@ -75,7 +83,16 @@ pub(crate) fn run_asynchronously<
         )));
         return;
     }
-    let globals = globals.clone();
+    let mut globals = globals.clone();
+    // Resolving the credentials reads their text, so it follows the check above.
+    if let Err(error) = globals.validate() {
+        drop(lore_base::lore_spawn!(reject_call(
+            globals,
+            callback,
+            ArgumentError::from(error)
+        )));
+        return;
+    }
     let args = args.clone();
     drop(lore_base::lore_spawn!(handler(globals, args, callback)));
 }
@@ -469,5 +486,23 @@ mod tests {
             !reached.load(Ordering::Acquire),
             "the verb must not run on a rejected call"
         );
+    }
+
+    /// Credential arguments with no single meaning -- here an identity alongside
+    /// a token that already names one -- are rejected the same way malformed text
+    /// is, and for the same reason: the call cannot be run as asked.
+    #[test]
+    fn conflicting_identity_arguments_are_rejected_before_the_handler_runs() {
+        let globals = LoreGlobalArgs {
+            identity: LoreString::from_str("bob"),
+            identity_token: LoreString::from_str("some-token"),
+            ..LoreGlobalArgs::default()
+        };
+        let args = crate::revision_tree::close::LoreRevisionTreeCloseArgs::default();
+
+        let (status, handler_ran) = dispatch(&globals, &args);
+
+        assert_eq!(status, rejected_status());
+        assert!(!handler_ran, "the verb must not run on a rejected call");
     }
 }

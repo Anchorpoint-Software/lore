@@ -3698,6 +3698,18 @@ typedef struct lore_global_args_t {
   // this only state fragments and fragments flagged for local cache priority
   // are retained
   uint8_t cache;
+  // Authentication token to use instead of the one held in the secure token
+  // store. Authorization tokens are exchanged from it as they are needed.
+  //
+  // Supplying either token puts the call in external-credential mode: `identity`
+  // must be left empty, since it is read from the token.
+  struct lore_string_t identity_token;
+  // Authorization token to use instead of exchanging one with the auth
+  // service. If given, will not perform token exchanges.
+  //
+  // Supplying either token puts the call in external-credential mode: `identity`
+  // must be left empty, since it is read from the token.
+  struct lore_string_t access_token;
 } lore_global_args_t;
 
 // Arguments for resolving user IDs to display names via the remote auth service.

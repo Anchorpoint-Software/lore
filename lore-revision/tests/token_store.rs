@@ -173,20 +173,26 @@ mod tests {
                     .await
                     .expect("Failed to store first token");
 
-                let token =
-                    token_store::load_user_token(AUTH_ENDPOINT, identity, vulnerable_all_tokens())
-                        .await
-                        .expect("Failed to load token after store same identity");
+                let token = token_store::load_user_token_from_store(
+                    AUTH_ENDPOINT,
+                    identity,
+                    vulnerable_all_tokens(),
+                )
+                .await
+                .expect("Failed to load token after store same identity");
                 assert_eq!(token.as_str(), replaced_token);
 
                 token_store::remove_user_token(AUTH_ENDPOINT, identity)
                     .await
                     .expect("Failed to remove token");
 
-                let _ =
-                    token_store::load_user_token(AUTH_ENDPOINT, identity, vulnerable_all_tokens())
-                        .await
-                        .expect_err("Removed token still available");
+                let _ = token_store::load_user_token_from_store(
+                    AUTH_ENDPOINT,
+                    identity,
+                    vulnerable_all_tokens(),
+                )
+                .await
+                .expect_err("Removed token still available");
             }))
             .await
             .expect("Task failure");
@@ -212,13 +218,16 @@ mod tests {
                     .await
                     .expect("Failed to store 'other_identity' token");
 
-                let found_token =
-                    token_store::load_user_token(AUTH_ENDPOINT, identity, vulnerable_all_tokens())
-                        .await
-                        .expect("Failed to load token after store other identity");
+                let found_token = token_store::load_user_token_from_store(
+                    AUTH_ENDPOINT,
+                    identity,
+                    vulnerable_all_tokens(),
+                )
+                .await
+                .expect("Failed to load token after store other identity");
                 assert_eq!(found_token.as_str(), token);
 
-                let found_token = token_store::load_user_token(
+                let found_token = token_store::load_user_token_from_store(
                     AUTH_ENDPOINT,
                     other_identity,
                     vulnerable_all_tokens(),
@@ -234,14 +243,15 @@ mod tests {
                     .await
                     .expect("Failed to remove 'other_identity' token");
 
-                let _ =
-                    token_store::load_user_token(AUTH_ENDPOINT, identity, vulnerable_all_tokens())
-                        .await
-                        .expect_err(
-                            format!("Removed token is still available for {identity}").as_str(),
-                        );
+                let _ = token_store::load_user_token_from_store(
+                    AUTH_ENDPOINT,
+                    identity,
+                    vulnerable_all_tokens(),
+                )
+                .await
+                .expect_err(format!("Removed token is still available for {identity}").as_str());
 
-                let _ = token_store::load_user_token(
+                let _ = token_store::load_user_token_from_store(
                     AUTH_ENDPOINT,
                     other_identity,
                     vulnerable_all_tokens(),
@@ -281,7 +291,7 @@ mod tests {
                 .expect("Failed to store token");
 
                 // prove we do not get the token for a wrong audience
-                let load_error = token_store::load_user_token(
+                let load_error = token_store::load_user_token_from_store(
                     AUTH_ENDPOINT,
                     identity,
                     tokens_only_for_recipient_domain("aud1".into()),
@@ -292,7 +302,7 @@ mod tests {
 
                 // get token by its audience
                 for domain in audiences {
-                    token_store::load_user_token(
+                    token_store::load_user_token_from_store(
                         AUTH_ENDPOINT,
                         identity,
                         tokens_only_for_recipient_domain(domain.clone()),
@@ -302,7 +312,7 @@ mod tests {
                 }
 
                 //get token by its issuing endpoint
-                token_store::load_user_token(
+                token_store::load_user_token_from_store(
                     AUTH_ENDPOINT,
                     identity,
                     tokens_only_for_recipient_domain("storeload.auth.example.com".to_string()),
@@ -336,7 +346,7 @@ mod tests {
                 .expect("Failed to store token");
 
                 // prove we do not get the token for a wrong audience
-                let load_error = token_store::load_user_token(
+                let load_error = token_store::load_user_token_from_store(
                     AUTH_ENDPOINT,
                     identity,
                     tokens_only_for_recipient_domain("aud1".into()),
@@ -345,7 +355,7 @@ mod tests {
                 .unwrap_err();
                 assert!(load_error.is_token_not_found());
 
-                token_store::load_user_token(
+                token_store::load_user_token_from_store(
                     AUTH_ENDPOINT,
                     identity,
                     tokens_only_for_recipient_domain("lore.example.com".to_string()),
@@ -382,9 +392,13 @@ mod tests {
                 .await
                 .expect("Failed to store token");
 
-                token_store::load_user_token(AUTH_ENDPOINT, identity, vulnerable_all_tokens())
-                    .await
-                    .expect("Failed to load token");
+                token_store::load_user_token_from_store(
+                    AUTH_ENDPOINT,
+                    identity,
+                    vulnerable_all_tokens(),
+                )
+                .await
+                .expect("Failed to load token");
             }))
             .await
             .expect("Task failure");
@@ -407,7 +421,7 @@ mod tests {
                     .expect("Failed to store first token");
 
                 // prove the token gets updated by first trying to load it filtering for 'aud2'
-                let load_error = token_store::load_user_token(
+                let load_error = token_store::load_user_token_from_store(
                     AUTH_ENDPOINT,
                     identity,
                     tokens_only_for_recipient_domain("aud2".into()),
@@ -422,7 +436,7 @@ mod tests {
                     .expect("Failed to store second token");
 
                 // token can now be loaded
-                let loaded_token = token_store::load_user_token(
+                let loaded_token = token_store::load_user_token_from_store(
                     AUTH_ENDPOINT,
                     identity,
                     tokens_only_for_recipient_domain("aud2".into()),

@@ -93,6 +93,8 @@ pub async fn storage(
     auth_url: &str,
     identity: &str,
     partition: Partition,
+    identity_token: &str,
+    access_token: &str,
 ) -> Result<Arc<dyn Storage>, ProtocolError> {
     let remote_domain = domain_from_url_str_or_url(remote_url)
         .internal(&format!("remote {remote_url} is invalid"))?;
@@ -104,6 +106,8 @@ pub async fn storage(
         auth_url,
         identity,
         partition,
+        identity_token,
+        access_token,
     )
     .await
     .internal(&format!("connecting to {remote_url}"))?;
