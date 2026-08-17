@@ -78,6 +78,8 @@ use crate::revision::sync;
 use crate::revision::sync::SyncOptions;
 use crate::shared_store::get_shared_store_path_for_repo;
 use crate::state;
+use crate::state::CanReadRepository;
+use crate::state::allow_all_repositories;
 use crate::store::ImmutableStore;
 use crate::store::KeyType;
 use crate::store::MutableStore;
@@ -539,6 +541,9 @@ pub struct RepositoryContext {
     pub instance_id: crate::instance::InstanceId,
     remote: Arc<tokio::sync::RwLock<RemoteState>>,
     pub filter: Arc<Filter>,
+    /// Defaults to allowing every repository; server handlers replace it with
+    /// the requester's authorization.
+    link_read: CanReadRepository,
     pub format: RepositoryFormat,
     settings: RepositoryRuntimeSettings,
     is_link: bool,
@@ -606,6 +611,7 @@ impl RepositoryContext {
     ) -> Self {
         let file_system = Self::default_filesystem(path.as_deref().unwrap_or(Path::new("")));
         RepositoryContext {
+            link_read: allow_all_repositories(),
             path,
             immutable_store,
             mutable_store,
@@ -621,6 +627,16 @@ impl RepositoryContext {
             repo_lock: None,
             file_system,
         }
+    }
+
+    /// Propagates into every context derived from this one.
+    pub fn with_link_read(mut self, link_read: CanReadRepository) -> Self {
+        self.link_read = link_read;
+        self
+    }
+
+    pub fn can_read_link(&self, id: RepositoryId) -> bool {
+        (self.link_read)(id)
     }
 
     /// Borrow the working-tree path required by filesystem-backed operations.
@@ -815,6 +831,7 @@ impl RepositoryContext {
         id: RepositoryId,
     ) -> Self {
         RepositoryContext {
+            link_read: allow_all_repositories(),
             file_system: Self::default_filesystem(Path::new("")),
             path: None,
             immutable_store,
@@ -834,6 +851,7 @@ impl RepositoryContext {
 
     pub fn to_server_context(&self, id: RepositoryId) -> Self {
         RepositoryContext {
+            link_read: self.link_read.clone(),
             path: self.path.clone(),
             immutable_store: self.immutable_store.clone(),
             mutable_store: self.mutable_store.clone(),
@@ -856,6 +874,7 @@ impl RepositoryContext {
         mutable_store: Arc<dyn MutableStore>,
     ) -> Self {
         RepositoryContext {
+            link_read: allow_all_repositories(),
             file_system: Self::default_filesystem(Path::new("")),
             path: None,
             immutable_store,
@@ -875,6 +894,7 @@ impl RepositoryContext {
 
     pub fn to_null_context(&self) -> Self {
         RepositoryContext {
+            link_read: self.link_read.clone(),
             path: self.path.clone(),
             immutable_store: self.immutable_store.clone(),
             mutable_store: self.mutable_store.clone(),
@@ -907,6 +927,7 @@ impl RepositoryContext {
         remote: Result<Arc<Connection>, ProtocolError>,
     ) -> Self {
         RepositoryContext {
+            link_read: self.link_read.clone(),
             path: self.path.clone(),
             immutable_store: self.immutable_store.clone(),
             mutable_store: self.mutable_store.clone(),
@@ -933,6 +954,7 @@ impl RepositoryContext {
         };
         let settings = self.settings.clone();
         RepositoryContext {
+            link_read: self.link_read.clone(),
             path: self.path.clone(),
             immutable_store: self.immutable_store.clone(),
             mutable_store: self.mutable_store.clone(),
@@ -959,6 +981,7 @@ impl RepositoryContext {
         };
         let settings = self.settings.clone();
         RepositoryContext {
+            link_read: self.link_read.clone(),
             path: self.path.clone(),
             immutable_store: self.immutable_store.clone(),
             mutable_store: self.mutable_store.clone(),
@@ -978,6 +1001,7 @@ impl RepositoryContext {
 
     pub fn to_filter_context(&self, filter: Arc<Filter>) -> Self {
         RepositoryContext {
+            link_read: self.link_read.clone(),
             path: self.path.clone(),
             immutable_store: self.immutable_store.clone(),
             mutable_store: self.mutable_store.clone(),

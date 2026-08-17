@@ -460,6 +460,30 @@ impl LinkReference {
     pub fn is_tracking(&self) -> bool {
         self.branch.is_zero()
     }
+
+    pub fn repository(&self) -> RepositoryId {
+        self.repository
+    }
+
+    /// Branch the link is pinned to. Zero for a tracking link; use
+    /// [`LinkReference::resolve_branch`] to resolve it against the parent's
+    /// branch.
+    pub fn branch(&self) -> BranchId {
+        self.branch
+    }
+
+    pub fn signature(&self) -> Hash {
+        self.signature
+    }
+
+    pub fn local_node(&self) -> NodeID {
+        self.local_node
+    }
+
+    /// See [`crate::link::LinkFlags`].
+    pub fn flags(&self) -> u32 {
+        self.flags
+    }
 }
 
 /// Tracks a single link's merge state for rollback.

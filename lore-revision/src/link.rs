@@ -1067,6 +1067,86 @@ pub async fn list_staged_node_paths(
     Ok(paths)
 }
 
+#[derive(Debug, Clone)]
+pub struct LinkPinChange {
+    pub link_path: String,
+    pub link_repository: RepositoryId,
+    pub revision_from: Hash,
+    pub revision_to: Hash,
+    pub tracking_from: bool,
+    pub tracking_to: bool,
+}
+
+/// Drops stale registry entries whose node is gone from the tree.
+async fn link_pins_by_path(
+    state: &Arc<State>,
+    repository: Arc<RepositoryContext>,
+) -> Result<Vec<(String, LinkReference)>, LinkError> {
+    let links = state
+        .link_list(repository.clone())
+        .await
+        .forward::<LinkError>("Failed to list links")?;
+
+    let mut pins = Vec::with_capacity(links.len());
+    for link_reference in links.iter() {
+        match state
+            .node_path(repository.clone(), link_reference.local_node())
+            .await
+        {
+            Ok(path) => pins.push((path, *link_reference)),
+            Err(err) => {
+                lore_debug!(
+                    "Skipping link registry entry for node {} with no resolvable path: {err}",
+                    link_reference.local_node(),
+                );
+            }
+        }
+    }
+    Ok(pins)
+}
+
+/// Reports only links present in both revisions whose pin moved. A link added
+/// or removed between them already reaches a consumer as a single Add/Delete
+/// from the content walk.
+///
+/// Links are matched by path, not node id: node ids are not stable across
+/// revisions.
+pub async fn diff_link_pins(
+    repository: Arc<RepositoryContext>,
+    state_from: &Arc<State>,
+    state_to: &Arc<State>,
+) -> Result<Vec<LinkPinChange>, LinkError> {
+    let from_pins = link_pins_by_path(state_from, repository.clone()).await?;
+    let to_pins = link_pins_by_path(state_to, repository.clone()).await?;
+
+    let mut changes = Vec::new();
+
+    for (path, to_reference) in to_pins.iter() {
+        let Some(from_reference) = from_pins
+            .iter()
+            .find(|(from_path, _)| from_path == path)
+            .map(|(_, from_reference)| from_reference)
+        else {
+            continue;
+        };
+        if from_reference.signature() == to_reference.signature()
+            && from_reference.branch() == to_reference.branch()
+        {
+            continue;
+        }
+        changes.push(LinkPinChange {
+            link_path: path.clone(),
+            link_repository: to_reference.repository(),
+            revision_from: from_reference.signature(),
+            revision_to: to_reference.signature(),
+            tracking_from: from_reference.is_tracking(),
+            tracking_to: to_reference.is_tracking(),
+        });
+    }
+
+    Ok(changes)
+}
+
 /// Returns true if `staged_node` is a staged link pin change (an update to an
 /// existing link, not an add or remove) with no staged changes on the linked
 /// side.

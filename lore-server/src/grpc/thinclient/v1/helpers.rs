@@ -14,6 +14,7 @@ use lore_proto::lore::thin_client::v1::revision_tree_request;
 use lore_revision::branch;
 use lore_revision::change::FileAction;
 use lore_revision::change::NodeChange;
+use lore_revision::link::LinkPinChange;
 use lore_revision::lore::BranchId;
 use lore_revision::metadata::Metadata;
 use lore_revision::node::NodeFlags;
@@ -281,6 +282,24 @@ pub(super) fn node_change_to_diff_change(
     }
 }
 
+/// A link's content is the revision it is pinned to, so the revision
+/// signatures go in `content_from` / `content_to`.
+pub(super) fn link_pin_change_to_diff_change(
+    pin_change: &LinkPinChange,
+    link_repository_index: u32,
+) -> thin_client_v1::DiffChange {
+    thin_client_v1::DiffChange {
+        path: pin_change.link_path.clone(),
+        path_from: String::new(),
+        action: thin_client_v1::Action::Keep as i32,
+        node_type: thin_client_v1::NodeType::Link as i32,
+        content_from: pin_change.revision_from.into(),
+        content_to: pin_change.revision_to.into(),
+        automerged: false,
+        link_repository_index,
+    }
+}
+
 /// Convert a 3-way merge conflict pair `(base→from, base→to)` into a
 /// v1 `DiffConflict`. The pair's `from.address` on both halves is the
 /// common-ancestor content for that path, so `change_from.content_from
@@ -428,5 +447,32 @@ mod tests {
             3,
             "to-half carries its own index, distinct from from-half",
         );
+    }
+
+    fn make_pin_change() -> LinkPinChange {
+        LinkPinChange {
+            link_path: "libs/shared".to_string(),
+            link_repository: RepositoryId::from(uuid::Uuid::now_v7()),
+            revision_from: Hash::hash_buffer(&[1, 2, 3]),
+            revision_to: Hash::hash_buffer(&[4, 5, 6]),
+            tracking_from: false,
+            tracking_to: false,
+        }
+    }
+
+    /// A moved pin carries both revisions as the link's content addresses.
+    #[test]
+    fn pin_change_carries_both_revisions() {
+        let change = make_pin_change();
+        let mapped = link_pin_change_to_diff_change(&change, 2);
+
+        assert_eq!(mapped.path, "libs/shared");
+        assert!(mapped.path_from.is_empty());
+        assert_eq!(mapped.action, thin_client_v1::Action::Keep as i32);
+        assert_eq!(mapped.node_type, thin_client_v1::NodeType::Link as i32);
+        assert_eq!(mapped.content_from, Bytes::from(change.revision_from));
+        assert_eq!(mapped.content_to, Bytes::from(change.revision_to));
+        assert_eq!(mapped.link_repository_index, 2);
+        assert!(!mapped.automerged);
     }
 }

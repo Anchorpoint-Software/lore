@@ -891,15 +891,14 @@ pub fn handle_branch_push(globals: LoreGlobalArgs, args: &BranchPushArgs) -> u8 
                     data.local_revision
                 );
             }
-            LoreEvent::BranchPushRevisionPushBegin(data) => {
-                if data.local_revision != data.remote_revision {
+            LoreEvent::BranchPushRevisionPushBegin(data)
+                if data.local_revision != data.remote_revision => {
                     println!(
                         "Pushing {} to branch {}",
                         data.local_revision,
                         name_of(data.repository, data.branch)
                     );
                 }
-            }
             LoreEvent::BranchPushRevisionPushUpdate(data) => {
                 println!(
                     "Revision assigned number {} and rewritten to {}",
@@ -1407,15 +1406,15 @@ pub fn handle_branch_list(globals: LoreGlobalArgs, args: &BranchListArgs) -> u8 
                     }
                 }
             }
-            LoreEvent::Complete(_) => {
-                if warn_on_missing_remote && !remote_seen.load(std::sync::atomic::Ordering::Relaxed)
-                {
-                    println!(
-                        "{}Warning: Could not query remote branch list{}",
-                        LogStyles::WARNING,
-                        anstyle::Reset,
-                    );
-                }
+            LoreEvent::Complete(_)
+                if warn_on_missing_remote
+                    && !remote_seen.load(std::sync::atomic::Ordering::Relaxed) =>
+            {
+                println!(
+                    "{}Warning: Could not query remote branch list{}",
+                    LogStyles::WARNING,
+                    anstyle::Reset,
+                );
             }
             LoreEvent::Maintenance(data) => {
                 util::handle_maintenance_event(data);

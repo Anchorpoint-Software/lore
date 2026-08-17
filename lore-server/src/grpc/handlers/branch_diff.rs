@@ -6,9 +6,13 @@ use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Hash;
 use lore_proto::BranchDiffRequest;
 use lore_proto::BranchDiffResponse;
+use lore_proto::PathDiff;
 use lore_revision::branch;
 use lore_revision::lore::BranchId;
+use lore_revision::lore::RepositoryId;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::State;
+use lore_revision::state::StateError;
 use lore_telemetry::tracing::fields::REPOSITORY_ID;
 use tonic::Request;
 use tonic::Response;
@@ -17,11 +21,15 @@ use tracing::debug;
 use tracing::info;
 use tracing::warn;
 
+use crate::grpc::FilterSlowDownExt;
 use crate::grpc::extract_correlation_id;
+use crate::grpc::get_authorization;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
+use crate::grpc::handlers::path_diff::link_pin_path_diffs;
 use crate::grpc::handlers::path_diff::map_to_conflict;
 use crate::grpc::handlers::path_diff::map_to_path_diff;
+use crate::grpc::link_read_authorizer;
 use crate::util::setup_execution;
 
 #[tracing::instrument(name = "BranchDiff::handle", skip_all)]
@@ -32,6 +40,7 @@ pub async fn handler(
 ) -> Result<Response<BranchDiffResponse>, Status> {
     let repository_id = get_repository(request.metadata())?;
     let user_id = get_user_id(request.extensions());
+    let authorization = get_authorization(request.extensions()).ok();
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let req = request.into_inner().clone();
     let branch_source = BranchId::from(req.branch_source);
@@ -46,11 +55,10 @@ pub async fn handler(
 
     let execution = setup_execution(module_path!(), correlation_id, user_id);
 
-    let repository = Arc::new(RepositoryContext::new_server_context(
-        immutable_store,
-        mutable_store,
-        repository_id,
-    ));
+    let repository = Arc::new(
+        RepositoryContext::new_server_context(immutable_store, mutable_store, repository_id)
+            .with_link_read(link_read_authorizer(authorization)),
+    );
     LORE_CONTEXT
         .scope(execution, async move {
             branch_diff_handler(
@@ -64,6 +72,34 @@ pub async fn handler(
             .await
         })
         .await
+}
+
+/// Loads the two states a pin comparison needs. A failure fails the diff for
+/// the same reason [`link_pin_path_diffs`] does.
+async fn link_pin_diffs(
+    repository: &Arc<RepositoryContext>,
+    from: Hash,
+    to: Hash,
+    parent_repository_id: RepositoryId,
+) -> Result<Vec<PathDiff>, Status> {
+    if from.is_zero() || to.is_zero() || from == to {
+        return Ok(Vec::new());
+    }
+    let states = async {
+        let state_from = State::deserialize(repository.clone(), from).await?;
+        let state_to = State::deserialize(repository.clone(), to).await?;
+        Ok::<_, StateError>((state_from, state_to))
+    }
+    .await
+    .filter_slow_down()?;
+    let (state_from, state_to) = states.map_err(|err| {
+        warn!(
+            {REPOSITORY_ID} = %repository.id, %from, %to, ?err,
+            "Failed to load states for link pin comparison",
+        );
+        Status::internal(err.to_string())
+    })?;
+    link_pin_path_diffs(repository, &state_from, &state_to, parent_repository_id).await
 }
 
 async fn branch_diff_handler(
@@ -101,6 +137,7 @@ async fn branch_diff_handler(
         })?;
 
     let repository_id = repository.id;
+    let link_repository = repository.clone();
     let result = branch::diff3_collect(
         repository,
         branch_source,
@@ -115,7 +152,13 @@ async fn branch_diff_handler(
     match result {
         Ok(result) => {
             debug!("Found {} changes", result.changes.len());
-            let mut diffs = Vec::with_capacity(result.changes.len());
+            // The changes are base -> source; compare the registries over the
+            // same pair.
+            let pin_diffs =
+                link_pin_diffs(&link_repository, result.base, result.source, repository_id).await?;
+
+            let mut diffs = Vec::with_capacity(result.changes.len() + pin_diffs.len());
+            diffs.extend(pin_diffs);
             for change in &result.changes {
                 if let Some(diff) = map_to_path_diff(change, repository_id).await {
                     diffs.push(diff);

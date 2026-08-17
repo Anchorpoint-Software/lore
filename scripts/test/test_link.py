@@ -7452,6 +7452,213 @@ def test_link_diff_file_removed_in_linked_repo(new_lore_repo):
     )
 
 
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
+_DIFF_ACTIONS = frozenset({"A", "D", "M", "V", "C"})
+
+
+def _parse_revision_diff(output: str) -> list[tuple[str, str]]:
+    """Parse `lore revision diff` output into (action, path) pairs.
+
+    The CLI colourizes the action letter, so ANSI escapes are stripped first.
+    """
+    entries: list[tuple[str, str]] = []
+    for raw_line in _ANSI_ESCAPE.sub("", output).splitlines():
+        parts = raw_line.strip().split(" ", 1)
+        if len(parts) == 2 and parts[0] in _DIFF_ACTIONS:
+            entries.append((parts[0], parts[1].strip()))
+    return entries
+
+
+@pytest.mark.smoke
+def test_link_pin_update_revision_diff_reports_link_and_content(new_lore_repo):
+    """A pin update must surface both the link itself and the linked
+    repository's file changes.
+
+    The contract for the "pin updated" case:
+
+      - the link path is reported as a modification (the pin moved),
+      - the linked repository's changed files are reported under the mount
+        path,
+      - an unrelated parent-side change in the same revision is still
+        reported.
+    """
+    link_repo: Lore = new_lore_repo()
+    with link_repo.open_file("a.txt", "w+") as f:
+        f.writelines(["v1\n"])
+    link_repo.make_dirs("sub")
+    with link_repo.open_file("sub/b.txt", "w+") as f:
+        f.writelines(["b1\n"])
+    link_repo.stage(scan=True)
+    link_repo.commit("v1")
+    link_repo.push()
+    pin_v1 = link_repo.branch_info().local_latest
+
+    # v2 modifies one mounted file and adds another.
+    with link_repo.open_file("a.txt", "w+") as f:
+        f.writelines(["v2\n"])
+    with link_repo.open_file("sub/c.txt", "w+") as f:
+        f.writelines(["c1\n"])
+    link_repo.stage(scan=True)
+    link_repo.commit("v2 modifies a.txt and adds sub/c.txt")
+    link_repo.push()
+    pin_v2 = link_repo.branch_info().local_latest
+
+    parent_repo, _ = _make_parent_repo_with_baseline(new_lore_repo)
+    link_path = "libs/shared"
+
+    parent_repo.link_add(link_path, link_repo.get_id(), "/", pin=pin_v1)
+    parent_repo.commit("Add link@v1")
+    parent_repo.push()
+    pre_update_revision = parent_repo.branch_info().local_latest
+
+    # The pin update has to come first: `lore link update` refuses to run once
+    # a scan has marked the mount point dirty.
+    parent_repo.link_update(link_path, pin=pin_v2)
+    with parent_repo.open_file("README.txt", "w+") as f:
+        f.writelines(["baseline touched on this revision\n"])
+    parent_repo.stage("README.txt")
+    parent_repo.commit("Bump link to v2 and touch README")
+    parent_repo.push()
+
+    output = parent_repo.revision_diff(pre_update_revision, no_pager=True)
+    entries = _parse_revision_diff(output)
+    paths = {path: action for action, path in entries}
+
+    assert paths.get(link_path) == "M", (
+        f"`lore revision diff` must report the link path {link_path!r} as a "
+        "modification when its pin moved, so a consumer can tell the pin "
+        f"changed and which paths belong to the link.\nOutput:\n{output}"
+    )
+    assert paths.get(f"{link_path}/a.txt") == "M", (
+        "`lore revision diff` must report the modified file inside the "
+        f"linked repository under the mount path.\nOutput:\n{output}"
+    )
+    assert paths.get(f"{link_path}/sub/c.txt") == "A", (
+        "`lore revision diff` must report the file added inside the linked "
+        f"repository under the mount path.\nOutput:\n{output}"
+    )
+    assert paths.get("README.txt") == "M", (
+        "`lore revision diff` must still report the parent's own change in a "
+        f"revision that also moved a link pin.\nOutput:\n{output}"
+    )
+    assert f"{link_path}/sub/b.txt" not in paths, (
+        "`lore revision diff` must not report unchanged files inside the "
+        f"linked repository.\nOutput:\n{output}"
+    )
+
+
+@pytest.mark.smoke
+def test_link_pin_update_revision_diff_reports_link_when_content_identical(
+    new_lore_repo,
+):
+    """A pin bump that leaves the mounted subtree byte-identical must still
+    be visible in `lore revision diff`.
+
+    Setup mirrors `test_link_update_diff_reports_link_only`: the parent mounts
+    only `mounted/`, and between the two pins nothing inside it changes, so the
+    content walk finds nothing. Without an entry for the link node the diff
+    comes back empty, reading as "this revision changed nothing".
+    """
+    link_repo: Lore = new_lore_repo()
+    link_repo.make_dirs("mounted")
+    with link_repo.open_file("mounted/stable.txt", "w+") as f:
+        f.writelines(["stable mounted content\n"])
+    link_repo.make_dirs("outside")
+    with link_repo.open_file("outside/v1.txt", "w+") as f:
+        f.writelines(["outside v1\n"])
+    link_repo.stage(scan=True)
+    link_repo.commit("v1 with mounted/ + outside/")
+    link_repo.push()
+    pin_v1 = link_repo.branch_info().local_latest
+
+    with link_repo.open_file("outside/v2.txt", "w+") as f:
+        f.writelines(["outside v2\n"])
+    link_repo.stage(scan=True)
+    link_repo.commit("v2 changes only outside/")
+    link_repo.push()
+    pin_v2 = link_repo.branch_info().local_latest
+
+    parent_repo, _ = _make_parent_repo_with_baseline(new_lore_repo)
+    link_path = "libs/shared"
+
+    parent_repo.link_add(link_path, link_repo.get_id(), "/mounted", pin=pin_v1)
+    parent_repo.commit("Add link at v1, mounting mounted/")
+    parent_repo.push()
+    pre_update_revision = parent_repo.branch_info().local_latest
+
+    parent_repo.link_update(link_path, pin=pin_v2)
+    parent_repo.commit("Bump link pin to v2 (no mounted/ change)")
+    parent_repo.push()
+
+    output = parent_repo.revision_diff(pre_update_revision, no_pager=True)
+    entries = _parse_revision_diff(output)
+    paths = {path: action for action, path in entries}
+
+    assert paths.get(link_path) == "M", (
+        "`lore revision diff` must report the link path as a modification "
+        "when the pin moved, even though no mounted file changed. Otherwise "
+        f"the revision looks empty.\nOutput:\n{output}"
+    )
+    under_link = [path for path in paths if path.startswith(f"{link_path}/")]
+    assert not under_link, (
+        "`lore revision diff` must not report any file under the link path "
+        f"when the mounted subtree is unchanged. Got: {under_link}"
+        f"\nOutput:\n{output}"
+    )
+
+
+@pytest.mark.smoke
+def test_link_add_remove_revision_diff_reports_link_only(new_lore_repo):
+    """Adding or removing a link is reported as a single entry for the link
+    path; the mounted contents are never expanded into per-file changes.
+
+    Guards the asymmetry with the pin-update tests above: only an *updated*
+    link expands into the linked repository's changes.
+    """
+    link_repo, pinned_revision = _make_link_target_repo(
+        new_lore_repo, "shared.txt", "main content\n"
+    )
+    parent_repo, baseline_revision = _make_parent_repo_with_baseline(new_lore_repo)
+
+    link_path = "libs/shared"
+    linked_file = f"{link_path}/shared.txt"
+
+    parent_repo.link_add(link_path, link_repo.get_id(), "/", pin=pinned_revision)
+    parent_repo.commit("Add link libs/shared")
+    parent_repo.push()
+    post_add_revision = parent_repo.branch_info().local_latest
+
+    add_output = parent_repo.revision_diff(baseline_revision, no_pager=True)
+    add_paths = {path: action for action, path in _parse_revision_diff(add_output)}
+
+    assert add_paths.get(link_path) == "A", (
+        f"Adding a link must report {link_path!r} as an addition."
+        f"\nOutput:\n{add_output}"
+    )
+    assert linked_file not in add_paths, (
+        "Adding a link must not expand the mounted contents into per-file "
+        f"additions.\nOutput:\n{add_output}"
+    )
+
+    parent_repo.link_remove(link_path)
+    parent_repo.commit("Remove link libs/shared")
+    parent_repo.push()
+
+    remove_output = parent_repo.revision_diff(post_add_revision, no_pager=True)
+    remove_paths = {
+        path: action for action, path in _parse_revision_diff(remove_output)
+    }
+
+    assert remove_paths.get(link_path) == "D", (
+        f"Removing a link must report {link_path!r} as a deletion."
+        f"\nOutput:\n{remove_output}"
+    )
+    assert linked_file not in remove_paths, (
+        "Removing a link must not expand the previously mounted contents "
+        f"into per-file deletions.\nOutput:\n{remove_output}"
+    )
+
+
 @pytest.mark.smoke
 def test_nested_link_probe(new_lore_repo):
     """Add a nested link (a link whose path is inside another link).

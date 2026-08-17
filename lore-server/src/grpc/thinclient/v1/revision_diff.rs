@@ -18,6 +18,7 @@ use lore_revision::branch::BranchError;
 use lore_revision::change::FileAction;
 use lore_revision::change::NodeChange;
 use lore_revision::diff::diff_revision_paths;
+use lore_revision::link;
 use lore_revision::lore::BranchId;
 use lore_revision::lore::RepositoryId;
 use lore_revision::repository::RepositoryContext;
@@ -38,11 +39,15 @@ use tracing::warn;
 
 use super::helpers::diff_conflict_from_pair;
 use super::helpers::identifier_for_signature;
+use super::helpers::link_pin_change_to_diff_change;
 use super::helpers::node_change_to_diff_change;
 use super::helpers::resolve_to_identifier;
+use crate::grpc::FilterSlowDownExt;
 use crate::grpc::extract_correlation_id;
+use crate::grpc::get_authorization;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
+use crate::grpc::link_read_authorizer;
 use crate::grpc::warn_error_to_status;
 use crate::util::setup_execution;
 
@@ -113,6 +118,7 @@ pub async fn handler(
 ) -> Result<Response<RevisionDiffStream>, Status> {
     let repository_id = get_repository(request.metadata())?;
     let user_id = get_user_id(request.extensions());
+    let authorization = get_authorization(request.extensions()).ok();
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let req = request.into_inner();
 
@@ -129,11 +135,10 @@ pub async fn handler(
     let autoresolve = req.autoresolve;
 
     let execution = setup_execution(module_path!(), correlation_id, user_id);
-    let repository = Arc::new(RepositoryContext::new_server_context(
-        immutable_store,
-        mutable_store,
-        repository_id,
-    ));
+    let repository = Arc::new(
+        RepositoryContext::new_server_context(immutable_store, mutable_store, repository_id)
+            .with_link_read(link_read_authorizer(authorization)),
+    );
 
     LORE_CONTEXT
         .scope(execution, async move {
@@ -306,6 +311,24 @@ async fn run_two_way(
 ) -> Result<(), Status> {
     let (from_state, to_state) = load_state_pair(repository, from_sig, to_sig).await?;
 
+    // Compared before the header goes out so a failure aborts the call rather
+    // than truncating a stream that has already started. Streaming the content
+    // changes alone would claim no pin moved, which the consumer cannot
+    // distinguish from a pin that genuinely did not move.
+    let pin_changes = link::diff_link_pins(repository.clone(), &from_state, &to_state)
+        .await
+        .filter_slow_down()?
+        .map_err(|err| {
+            warn!(
+                {REPOSITORY_ID} = %repository.id,
+                from = %from_sig,
+                to = %to_sig,
+                ?err,
+                "Failed to compare link pins",
+            );
+            Status::internal(err.to_string())
+        })?;
+
     // Header first, before opening the producer's sender so a failure in
     // the producer setup surfaces before any header is emitted.
     let header = thin_client_v1::RevisionDiffHeader {
@@ -317,6 +340,24 @@ async fn run_two_way(
         signature_base: None,
     };
     send_header(tx, header).await?;
+
+    // Emitted ahead of the walk so a consumer sees a link before its contents.
+    let mut partitions = PartitionTable::new(repository.id);
+    for pin_change in &pin_changes {
+        let index = match partitions
+            .resolve_or_announce(pin_change.link_repository, tx)
+            .await
+        {
+            Ok(index) => index,
+            Err(SendOutcome::ReceiverDropped) => return Ok(()),
+            Err(SendOutcome::Sent) => unreachable!("resolve_or_announce returns Sent only via Ok"),
+        };
+        let payload = Payload::Change(link_pin_change_to_diff_change(pin_change, index));
+        match send_payload(tx, payload).await {
+            SendOutcome::Sent => {}
+            SendOutcome::ReceiverDropped => return Ok(()),
+        }
+    }
 
     // End-to-end streaming: bounded channel between the diff producer and
     // an adaptor loop that forwards each NodeChange onto the gRPC wire
@@ -330,8 +371,6 @@ async fn run_two_way(
     let producer = lore_spawn!(async move {
         diff_revision_paths(repo_clone, from_state, to_state, None, producer_tx).await
     });
-
-    let mut partitions = PartitionTable::new(repository.id);
     while let Some(item) = producer_rx.recv().await {
         let change = item.map_err(|err| {
             warn!(
