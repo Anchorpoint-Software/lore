@@ -15,6 +15,7 @@ use lore_base::types::Hash;
 use lore_storage::StoreError;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
@@ -97,6 +98,21 @@ enum ConvertOutcome {
     ConvertedCompressedToUncompressed,
 }
 
+pub struct OrchestrationConfig {
+    pub num_consumers: i32,
+}
+
+pub struct MetadataMigratorConfig {
+    pub dynamodb: DynamoDb,
+    pub store: Arc<AwsImmutableStore>,
+    pub metadata_table_name: Arc<str>,
+
+    pub api_call_max_retries: usize,
+    pub api_retry_base_delay: Duration,
+
+    pub scan_config: ScanConfig,
+}
+
 pub struct MetadataMigrator {
     dynamodb: DynamoDb,
     store: Arc<AwsImmutableStore>,
@@ -109,12 +125,23 @@ pub struct MetadataMigrator {
 }
 
 impl MetadataMigrator {
+    pub fn new(config: MetadataMigratorConfig) -> Self {
+        Self {
+            dynamodb: config.dynamodb,
+            store: config.store,
+            metadata_table_name: config.metadata_table_name,
+            api_call_max_retries: config.api_call_max_retries,
+            api_retry_base_delay: config.api_retry_base_delay,
+            scan_config: config.scan_config,
+        }
+    }
+
     /// Scan the metadata table page by page, enqueueing the hash of every
     /// fragment that does not have a state entry
     pub async fn discover_legacy_fragments(
-        &self,
-        tx: &mpsc::Sender<Hash>,
-        stats: &RewriteStats,
+        self: Arc<Self>,
+        tx: mpsc::Sender<Hash>,
+        stats: Arc<RewriteStats>,
         aborted: Arc<AtomicBool>,
     ) -> Result<(), StoreError> {
         let mut start_key: Option<HashMap<String, AttributeValue>> = None;
@@ -256,9 +283,9 @@ impl MetadataMigrator {
     }
 
     pub async fn fragment_stream_consumer(
-        &self,
+        self: Arc<Self>,
         rx: Arc<Mutex<mpsc::Receiver<Hash>>>,
-        stats: &RewriteStats,
+        stats: Arc<RewriteStats>,
         aborted: Arc<AtomicBool>,
     ) -> Result<(), StoreError> {
         loop {
@@ -275,7 +302,7 @@ impl MetadataMigrator {
             let process_outcome = {
                 let mut attempt = 0;
                 loop {
-                    match self.process_fragment(hash, stats).await {
+                    match self.process_fragment(hash, &stats).await {
                         Ok(outcome) => break outcome,
                         Err(e) => {
                             if attempt < self.api_call_max_retries {
@@ -495,6 +522,95 @@ fn try_codec_probes(
     None
 }
 
+pub async fn run_migrator(
+    migrator_config: MetadataMigratorConfig,
+    orchestration_config: OrchestrationConfig,
+    stats: Arc<RewriteStats>,
+    aborted: Arc<AtomicBool>,
+) -> bool {
+    info!(
+        num_consumers = orchestration_config.num_consumers,
+        segment = migrator_config.scan_config.segment,
+        total_segments = migrator_config.scan_config.total_segments,
+        "Starting migrator"
+    );
+
+    let migrator = Arc::new(MetadataMigrator::new(migrator_config));
+
+    let (tx, rx) = mpsc::channel((orchestration_config.num_consumers * 2) as usize);
+    let rx = Arc::new(Mutex::new(rx));
+
+    // no execution context in migrator runtime
+    #[allow(clippy::disallowed_methods)]
+    let discover_task = tokio::spawn(migrator.clone().discover_legacy_fragments(
+        tx,
+        stats.clone(),
+        aborted.clone(),
+    ));
+
+    let mut consumers: JoinSet<Result<(), StoreError>> = Default::default();
+    for _i in 0..orchestration_config.num_consumers {
+        // no execution context in migrator runtime
+        #[allow(clippy::disallowed_methods)]
+        consumers.spawn(migrator.clone().fragment_stream_consumer(
+            rx.clone(),
+            stats.clone(),
+            aborted.clone(),
+        ));
+    }
+
+    let mut num_consumer_errors = 0;
+    while let Some(handle) = consumers.join_next().await {
+        match handle {
+            Ok(consumer_result) => match consumer_result {
+                Ok(_) => {
+                    info!("Consumer completed");
+                }
+                Err(error) => {
+                    warn!(%error, "Consumer failed");
+                    num_consumer_errors += 1;
+                    aborted.store(true, Ordering::Relaxed);
+                }
+            },
+            Err(error) => {
+                warn!(%error, "Consumer orchestration error");
+                num_consumer_errors += 1;
+                aborted.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
+    let discovery_task_ok = match discover_task.await {
+        Ok(_) => {
+            info!("Discovery task completed");
+            true
+        }
+        Err(error) => {
+            warn!(%error, "Discovery task failed");
+            false
+        }
+    };
+
+    let num_error_stats = stats.errored.load(Ordering::Relaxed);
+    let is_aborted = aborted.load(Ordering::Relaxed);
+    info!(
+        discovery_task_ok,
+        num_consumer_errors,
+        num_error_stats,
+        is_aborted,
+        ?stats,
+        "Migrator tasks complete"
+    );
+
+    if !discovery_task_ok || num_consumer_errors > 0 || num_error_stats > 0 || is_aborted {
+        warn!("Migration segment incomplete");
+        false
+    } else {
+        info!("Migration segment completed");
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -520,15 +636,16 @@ mod tests {
     use crate::store::test_util::store;
     use crate::store::test_util::store_with_separate_metadata_table;
 
-    async fn make_migrator(fake: &Fake) -> MetadataMigrator {
-        MetadataMigrator {
+    async fn make_migrator(fake: &Fake) -> Arc<MetadataMigrator> {
+        let migrator = MetadataMigrator {
             dynamodb: crate::dynamodb::MockDynamoDb::default(),
             store: store_with_separate_metadata_table(fake).await,
             metadata_table_name: FRAGMENT_METADATA_TABLE_NAME.into(),
             api_call_max_retries: 0,
             api_retry_base_delay: Duration::ZERO,
             scan_config: ScanConfig::default(),
-        }
+        };
+        Arc::new(migrator)
     }
 
     fn make_zstd_payload(content: &[u8]) -> (Fragment, Bytes, Hash) {
@@ -829,16 +946,17 @@ mod tests {
             )])
         }
 
-        async fn make_discover_migrator(dynamodb: MockDynamoDb) -> MetadataMigrator {
+        async fn make_discover_migrator(dynamodb: MockDynamoDb) -> Arc<MetadataMigrator> {
             let fake = Fake::default();
-            MetadataMigrator {
+            let migrator = MetadataMigrator {
                 dynamodb,
                 store: store(&fake).await,
                 metadata_table_name: "test-metadata".into(),
                 api_call_max_retries: 0,
                 api_retry_base_delay: Duration::ZERO,
                 scan_config: ScanConfig::default(),
-            }
+            };
+            Arc::new(migrator)
         }
 
         #[tokio::test]
@@ -862,13 +980,12 @@ mod tests {
                 });
             let migrator = make_discover_migrator(dynamodb).await;
             let (tx, mut rx) = mpsc::channel(10);
-            let stats = RewriteStats::default();
+            let stats = Arc::new(RewriteStats::default());
             let aborted = Arc::new(AtomicBool::new(false));
             migrator
-                .discover_legacy_fragments(&tx, &stats, aborted)
+                .discover_legacy_fragments(tx, stats.clone(), aborted)
                 .await
                 .unwrap();
-            drop(tx);
             let mut received = vec![];
             while let Some(h) = rx.recv().await {
                 received.push(h);
@@ -915,13 +1032,12 @@ mod tests {
                 });
             let migrator = make_discover_migrator(dynamodb).await;
             let (tx, mut rx) = mpsc::channel(10);
-            let stats = RewriteStats::default();
+            let stats = Arc::new(RewriteStats::default());
             let aborted = Arc::new(AtomicBool::new(false));
             migrator
-                .discover_legacy_fragments(&tx, &stats, aborted)
+                .discover_legacy_fragments(tx, stats, aborted)
                 .await
                 .unwrap();
-            drop(tx);
             let mut received = vec![];
             while let Some(h) = rx.recv().await {
                 received.push(h);
@@ -937,10 +1053,10 @@ mod tests {
             dynamodb.expect_scan_page().never();
             let migrator = make_discover_migrator(dynamodb).await;
             let (tx, _rx) = mpsc::channel(10);
-            let stats = RewriteStats::default();
+            let stats = Arc::new(RewriteStats::default());
             let aborted = Arc::new(AtomicBool::new(true));
             migrator
-                .discover_legacy_fragments(&tx, &stats, aborted)
+                .discover_legacy_fragments(tx, stats.clone(), aborted)
                 .await
                 .unwrap();
             assert_eq!(stats.scanned.load(Ordering::Relaxed), 0);
@@ -1055,7 +1171,7 @@ mod tests {
                     size_content: 200,
                 },
             );
-            let stats = RewriteStats::default();
+            let stats = Arc::new(RewriteStats::default());
             assert_eq!(
                 migrator.process_fragment(hash, &stats).await.unwrap(),
                 ConvertOutcome::CouldNotDeducePayload
@@ -1107,10 +1223,10 @@ mod tests {
             let fake = Fake::default();
             let migrator = make_migrator(&fake).await;
             let (_, rx) = mpsc::channel::<Hash>(10);
-            let stats = RewriteStats::default();
+            let stats = Arc::new(RewriteStats::default());
             let aborted = Arc::new(AtomicBool::new(false));
             migrator
-                .fragment_stream_consumer(Arc::new(Mutex::new(rx)), &stats, aborted)
+                .fragment_stream_consumer(Arc::new(Mutex::new(rx)), stats.clone(), aborted)
                 .await
                 .unwrap();
         }
@@ -1126,10 +1242,10 @@ mod tests {
             let (tx, rx) = mpsc::channel(10);
             tx.send(hash).await.unwrap();
             drop(tx);
-            let stats = RewriteStats::default();
+            let stats = Arc::new(RewriteStats::default());
             let aborted = Arc::new(AtomicBool::new(false));
             migrator
-                .fragment_stream_consumer(Arc::new(Mutex::new(rx)), &stats, aborted)
+                .fragment_stream_consumer(Arc::new(Mutex::new(rx)), stats.clone(), aborted)
                 .await
                 .unwrap();
             assert_eq!(stats.maintained.load(Ordering::Relaxed), 1);
@@ -1189,10 +1305,10 @@ mod tests {
             }
             drop(tx);
 
-            let stats = RewriteStats::default();
+            let stats = Arc::new(RewriteStats::default());
             let aborted = Arc::new(AtomicBool::new(false));
             migrator
-                .fragment_stream_consumer(Arc::new(Mutex::new(rx)), &stats, aborted)
+                .fragment_stream_consumer(Arc::new(Mutex::new(rx)), stats.clone(), aborted)
                 .await
                 .unwrap();
 
@@ -1210,14 +1326,192 @@ mod tests {
             for _ in 0..5 {
                 tx.send(rand::random()).await.unwrap();
             }
-            let stats = RewriteStats::default();
+            let stats = Arc::new(RewriteStats::default());
             let aborted = Arc::new(AtomicBool::new(true));
             migrator
-                .fragment_stream_consumer(Arc::new(Mutex::new(rx)), &stats, aborted)
+                .fragment_stream_consumer(Arc::new(Mutex::new(rx)), stats.clone(), aborted)
                 .await
                 .unwrap();
             assert_eq!(stats.maintained.load(Ordering::Relaxed), 0);
             assert_eq!(stats.recompressed_mismatch.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    mod run_migrator_tests {
+        use super::*;
+        use crate::dynamodb::MockDynamoDb;
+        use crate::dynamodb::ScanPage;
+
+        async fn make_config(fake: &Fake, dynamodb: MockDynamoDb) -> MetadataMigratorConfig {
+            MetadataMigratorConfig {
+                dynamodb,
+                store: store_with_separate_metadata_table(fake).await,
+                metadata_table_name: FRAGMENT_METADATA_TABLE_NAME.into(),
+                api_call_max_retries: 0,
+                api_retry_base_delay: Duration::ZERO,
+                scan_config: ScanConfig::default(),
+            }
+        }
+
+        #[tokio::test]
+        async fn empty_scan_returns_true() {
+            let fake = Fake::default();
+            let mut dynamodb = MockDynamoDb::default();
+            dynamodb.expect_scan_page().returning(|_, _, _| {
+                Ok(ScanPage {
+                    items: vec![],
+                    last_evaluated_key: None,
+                })
+            });
+            let config = make_config(&fake, dynamodb).await;
+            let stats = Arc::new(RewriteStats::default());
+            let aborted = Arc::new(AtomicBool::new(false));
+            assert!(
+                run_migrator(
+                    config,
+                    OrchestrationConfig { num_consumers: 2 },
+                    stats,
+                    aborted
+                )
+                .await
+            );
+        }
+
+        #[tokio::test]
+        async fn pre_aborted_returns_false() {
+            let fake = Fake::default();
+            let config = make_config(&fake, MockDynamoDb::default()).await;
+            let stats = Arc::new(RewriteStats::default());
+            let aborted = Arc::new(AtomicBool::new(true));
+            assert!(
+                !run_migrator(
+                    config,
+                    OrchestrationConfig { num_consumers: 2 },
+                    stats,
+                    aborted
+                )
+                .await
+            );
+        }
+
+        #[tokio::test]
+        async fn fragments_are_migrated_and_stats_updated() {
+            let fake = Fake::default();
+
+            let content = vec![0x42u8; 500];
+            let (frag, compressed, hash) = make_zstd_payload(&content);
+            fake.put_object_without_metadata(hash, &compressed);
+            fake.set_legacy_metadata_row(hash, frag);
+
+            let item = HashMap::from([(
+                "hash".to_owned(),
+                AttributeValue::B(Blob::new(hash.data().to_vec())),
+            )]);
+            let mut dynamodb = MockDynamoDb::default();
+            dynamodb
+                .expect_scan_page()
+                .returning(move |_, start_key, _| {
+                    if start_key.is_none() {
+                        Ok(ScanPage {
+                            items: vec![item.clone()],
+                            last_evaluated_key: None,
+                        })
+                    } else {
+                        Ok(ScanPage {
+                            items: vec![],
+                            last_evaluated_key: None,
+                        })
+                    }
+                });
+
+            let config = make_config(&fake, dynamodb).await;
+            let stats = Arc::new(RewriteStats::default());
+            let aborted = Arc::new(AtomicBool::new(false));
+
+            assert!(
+                run_migrator(
+                    config,
+                    OrchestrationConfig { num_consumers: 2 },
+                    stats.clone(),
+                    aborted,
+                )
+                .await
+            );
+
+            assert_eq!(stats.maintained.load(Ordering::Relaxed), 1);
+            assert_eq!(fake.state_of(hash), Some(FragmentState::Stored));
+        }
+
+        #[tokio::test]
+        async fn consumer_error_returns_false() {
+            let fake = Fake::default();
+
+            let content = vec![0x42u8; 500];
+            let (frag, _compressed, hash) = make_zstd_payload(&content);
+            // Set up the metadata row so discovery returns the hash, but omit the S3 object.
+            // load() will hit NoSuchKey → StoreError::AddressNotFound → consumer error.
+            fake.set_legacy_metadata_row(hash, frag);
+
+            let item = HashMap::from([(
+                "hash".to_owned(),
+                AttributeValue::B(Blob::new(hash.data().to_vec())),
+            )]);
+            let mut dynamodb = MockDynamoDb::default();
+            dynamodb
+                .expect_scan_page()
+                .returning(move |_, start_key, _| {
+                    if start_key.is_none() {
+                        Ok(ScanPage {
+                            items: vec![item.clone()],
+                            last_evaluated_key: None,
+                        })
+                    } else {
+                        Ok(ScanPage {
+                            items: vec![],
+                            last_evaluated_key: None,
+                        })
+                    }
+                });
+
+            let config = make_config(&fake, dynamodb).await;
+            let stats = Arc::new(RewriteStats::default());
+            let aborted = Arc::new(AtomicBool::new(false));
+
+            assert!(
+                !run_migrator(
+                    config,
+                    OrchestrationConfig { num_consumers: 2 },
+                    stats.clone(),
+                    aborted,
+                )
+                .await
+            );
+
+            assert_eq!(stats.errored.load(Ordering::Relaxed), 1);
+        }
+
+        #[tokio::test]
+        async fn multiple_consumers_empty_scan_returns_true() {
+            let fake = Fake::default();
+            let mut dynamodb = MockDynamoDb::default();
+            dynamodb.expect_scan_page().returning(|_, _, _| {
+                Ok(ScanPage {
+                    items: vec![],
+                    last_evaluated_key: None,
+                })
+            });
+            let config = make_config(&fake, dynamodb).await;
+            let stats = Arc::new(RewriteStats::default());
+            let aborted = Arc::new(AtomicBool::new(false));
+            assert!(
+                run_migrator(
+                    config,
+                    OrchestrationConfig { num_consumers: 4 },
+                    stats,
+                    aborted
+                )
+                .await
+            );
         }
     }
 }

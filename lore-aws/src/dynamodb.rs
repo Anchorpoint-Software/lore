@@ -115,9 +115,9 @@ pub struct ConditionParts {
 
 #[derive(Default)]
 pub struct ScanConfig {
-    segment: Option<i32>,
-    total_segments: Option<i32>,
-    limit: Option<i32>,
+    pub segment: Option<i32>,
+    pub total_segments: Option<i32>,
+    pub limit: Option<i32>,
 }
 
 impl ScanConfig {
