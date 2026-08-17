@@ -324,16 +324,15 @@ pub(super) fn diff_conflict_from_pair(
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
     use std::str::FromStr;
 
     use lore_proto::lore::thin_client::v1 as thin_client_v1;
     use lore_revision::change::Flags;
     use lore_revision::change::NodeChange;
     use lore_revision::change::NodeChangeState;
-    use lore_revision::lore::RepositoryId;
     use lore_revision::node::NodeFlags;
     use lore_revision::repository::RepositoryContext;
+    use lore_revision::repository::RepositoryContextCreationArgs;
     use lore_revision::repository::RepositoryFormat;
     use lore_revision::state;
     use lore_revision::util::path::RelativePath;
@@ -360,16 +359,16 @@ mod tests {
             .await
             .expect("mutable store"),
         );
-        Arc::new(RepositoryContext::new(
-            Some(PathBuf::default()),
-            immutable,
-            mutable,
-            RepositoryId::from(uuid::Uuid::now_v7()),
-            lore_revision::instance::InstanceId::generate(),
-            Err(ProtocolError::from(lore_base::error::NoRemote)),
-            Arc::default(),
-            RepositoryFormat::Lore,
-        ))
+        Arc::new(RepositoryContext::new(RepositoryContextCreationArgs {
+            path: None,
+            immutable_store: immutable,
+            mutable_store: mutable,
+            id: Context::from(uuid::Uuid::now_v7()).into(),
+            instance_id: lore_revision::instance::InstanceId::generate(),
+            remote: Err(ProtocolError::from(lore_base::error::NoRemote)),
+            filter: Arc::default(),
+            format: RepositoryFormat::Lore,
+        }))
     }
 
     fn make_change(action: lore_revision::change::FileAction) -> NodeChange {
@@ -452,7 +451,7 @@ mod tests {
     fn make_pin_change() -> LinkPinChange {
         LinkPinChange {
             link_path: "libs/shared".to_string(),
-            link_repository: RepositoryId::from(uuid::Uuid::now_v7()),
+            link_repository: lore_base::types::RepositoryId::from(uuid::Uuid::now_v7()),
             revision_from: Hash::hash_buffer(&[1, 2, 3]),
             revision_to: Hash::hash_buffer(&[4, 5, 6]),
             tracking_from: false,

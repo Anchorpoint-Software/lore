@@ -5,22 +5,20 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc;
 
-    use lore_base::error::NoRemote;
     use lore_base::types::Address;
-    use lore_base::types::Context;
     use lore_base::types::Hash;
     use lore_revision::change;
     use lore_revision::change::NodeChange;
     use lore_revision::change::NodeChangeState;
     use lore_revision::node::NodeFlags;
     use lore_revision::repository::RepositoryContext;
-    use lore_revision::repository::RepositoryFormat;
     use lore_revision::state::State;
     use lore_revision::util::path::RelativePath;
     use lore_revision::util::path::RelativePathBuf;
     use lore_storage::local::immutable_store;
     use lore_storage::local::mutable_store;
-    use lore_transport::ProtocolError;
+
+    include!("helper.rs");
 
     pub async fn new_test_context() -> Arc<lore_revision::repository::RepositoryContext> {
         let immutable = immutable_store::LocalImmutableStore::new(
@@ -38,16 +36,9 @@ mod tests {
             .await
             .expect("Failed to create store"),
         );
-        Arc::new(RepositoryContext::new(
-            None,
-            immutable,
-            mutable,
-            Context::default().into(),
-            lore_revision::instance::InstanceId::default(),
-            Err(ProtocolError::from(NoRemote)),
-            Arc::default(),
-            RepositoryFormat::Lore,
-        ))
+        Arc::new(RepositoryContext::new(default_repository_creation_args(
+            immutable, mutable,
+        )))
     }
 
     #[test]

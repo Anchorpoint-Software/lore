@@ -6,22 +6,18 @@ mod tests {
 
     use std::sync::Arc;
 
-    use lore_base::error::NoRemote;
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::runtime::runtime;
     use lore_base::types::Address;
     use lore_base::types::CloneHeapAlloc;
-    use lore_base::types::Context;
     use lore_base::types::ZeroHeapAlloc;
     use lore_revision::node::*;
     use lore_revision::repository::RepositoryContext;
-    use lore_revision::repository::RepositoryFormat;
     use lore_revision::state::State;
     use lore_revision::state::StateData;
     use lore_revision::state::collect_new_fragments;
     use lore_storage::hash::hash_string;
     use lore_storage::local::immutable_store::LocalImmutableStore;
-    use lore_transport::ProtocolError;
     use zerocopy::IntoBytes;
 
     include!("helper.rs");
@@ -53,7 +49,6 @@ mod tests {
     async fn collect_new_name_fragments() {
         let (_immutable_store, mutable_store, execution) =
             test_store_create().await.expect("Failed to create stores");
-        let repository_id = Context::from(uuid::Uuid::now_v7());
 
         #[allow(clippy::disallowed_methods)]
         runtime()
@@ -73,14 +68,11 @@ mod tests {
                     lore_revision::repository::RepositoryWriteToken::acquire(path.as_path()).await;
                 let repository = Arc::new(
                     RepositoryContext::new(
-                        Some(path.clone()),
-                        immutable_store.clone(),
-                        mutable_store.clone(),
-                        repository_id.into(),
-                        lore_revision::instance::InstanceId::default(),
-                        Err(ProtocolError::from(NoRemote)),
-                        Arc::default(),
-                        RepositoryFormat::Lore,
+                        default_repository_creation_args(
+                            immutable_store.clone(),
+                            mutable_store.clone(),
+                        )
+                        .with_path(&path),
                     )
                     .with_write_token(write_token.share()),
                 );
@@ -306,7 +298,6 @@ mod tests {
 
         let (_, mutable_store, execution) =
             test_store_create().await.expect("Failed to create stores");
-        let repository_id = Context::from(uuid::Uuid::now_v7());
 
         #[allow(clippy::disallowed_methods)]
         runtime()
@@ -322,14 +313,8 @@ mod tests {
                 .expect("Failed to create immutable store");
 
                 let repository = Arc::new(RepositoryContext::new(
-                    Some(path),
-                    immutable_store,
-                    mutable_store,
-                    repository_id.into(),
-                    lore_revision::instance::InstanceId::default(),
-                    Err(ProtocolError::from(NoRemote)),
-                    Arc::default(),
-                    RepositoryFormat::Lore,
+                    default_repository_creation_args(immutable_store, mutable_store)
+                        .with_path(&path),
                 ));
 
                 // A non-zero hash that was never written to the store.
@@ -351,7 +336,6 @@ mod single_file_compare_result_tests {
     use std::path::Path;
     use std::sync::Arc;
 
-    use lore_base::error::NoRemote;
     use lore_base::types::Address;
     use lore_base::types::Context;
     use lore_base::types::Hash;
@@ -359,18 +343,17 @@ mod single_file_compare_result_tests {
     use lore_revision::change::FileAction;
     use lore_revision::change::NodeChange;
     use lore_revision::change::NodeChangeState;
-    use lore_revision::filter::Filter;
     use lore_revision::node::INVALID_NODE;
     use lore_revision::node::NodeFlags;
     use lore_revision::repository::RepositoryContext;
-    use lore_revision::repository::RepositoryFormat;
     use lore_revision::state::SingleFileCompareResult;
     use lore_revision::state::State;
     use lore_revision::state::detect_and_coalesce_moves;
     use lore_revision::util::path::RelativePath;
     use lore_storage::local::immutable_store;
     use lore_storage::local::mutable_store;
-    use lore_transport::ProtocolError;
+
+    use crate::tests::default_repository_creation_args;
 
     #[test]
     fn debug_format_displays_variant_names() {
@@ -443,24 +426,18 @@ mod single_file_compare_result_tests {
         )
         .await
         .expect("Failed to create store");
-        Arc::new(RepositoryContext::new(
-            None,
-            immutable.clone(),
-            Arc::new(
-                mutable_store::LocalMutableStore::new(
-                    None::<&Path>,
-                    lore_storage::MutableStoreSettings::default(),
-                    immutable,
-                )
-                .await
-                .expect("Failed to create store"),
-            ),
-            Context::default().into(),
-            lore_revision::instance::InstanceId::default(),
-            Err(ProtocolError::from(NoRemote)),
-            Arc::new(Filter::default()),
-            RepositoryFormat::Lore,
-        ))
+        let mutable = Arc::new(
+            mutable_store::LocalMutableStore::new(
+                None::<&Path>,
+                lore_storage::MutableStoreSettings::default(),
+                immutable.clone(),
+            )
+            .await
+            .expect("Failed to create store"),
+        );
+        Arc::new(RepositoryContext::new(default_repository_creation_args(
+            immutable, mutable,
+        )))
     }
 
     #[tokio::test]
@@ -808,7 +785,6 @@ mod is_file_modified_chunking_compat {
     use std::sync::Arc;
 
     use bytes::Bytes;
-    use lore_base::error::NoRemote;
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::types::Address;
     use lore_base::types::Context;
@@ -820,10 +796,8 @@ mod is_file_modified_chunking_compat {
     use lore_revision::node::Node;
     use lore_revision::node::NodeFlags;
     use lore_revision::repository::RepositoryContext;
-    use lore_revision::repository::RepositoryFormat;
     use lore_revision::state::is_file_modified;
     use lore_revision::util::path::RelativePath;
-    use lore_transport::ProtocolError;
     use rand::Rng;
     use zerocopy::IntoBytes;
 
@@ -919,14 +893,9 @@ mod is_file_modified_chunking_compat {
                 let repository_id = rand::random();
 
                 let repository = Arc::new(RepositoryContext::new(
-                    Some(dir.as_path().to_path_buf()),
-                    immutable_store,
-                    mutable_store,
-                    repository_id,
-                    lore_revision::instance::InstanceId::default(),
-                    Err(ProtocolError::from(NoRemote)),
-                    Arc::default(),
-                    RepositoryFormat::Lore,
+                    default_repository_creation_args(immutable_store, mutable_store)
+                        .with_path(dir.as_path())
+                        .with_id(repository_id),
                 ));
 
                 // Generate 128 KiB of random content
@@ -1013,14 +982,9 @@ mod is_file_modified_chunking_compat {
                 let repository_id = rand::random();
 
                 let repository = Arc::new(RepositoryContext::new(
-                    Some(dir.as_path().to_path_buf()),
-                    immutable_store,
-                    mutable_store,
-                    repository_id,
-                    lore_revision::instance::InstanceId::default(),
-                    Err(ProtocolError::from(NoRemote)),
-                    Arc::default(),
-                    RepositoryFormat::Lore,
+                    default_repository_creation_args(immutable_store, mutable_store)
+                        .with_path(dir.as_path())
+                        .with_id(repository_id),
                 ));
 
                 // Generate 640 KiB of random content

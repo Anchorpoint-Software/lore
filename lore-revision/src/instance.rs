@@ -33,6 +33,7 @@ use crate::lore::BranchId;
 use crate::lore_debug;
 use crate::metadata::Metadata;
 use crate::repository::RepositoryContext;
+use crate::repository::RepositoryContextCreationArgs;
 
 pub const INSTANCE_METADATA: &str = "instance-metadata";
 pub const ANCHOR_CURRENT: &str = "anchor-current";
@@ -226,16 +227,16 @@ pub async fn recover_instance_id(
         .ok()?;
 
     // Build a temporary repository context for metadata deserialization
-    let temp_repo = Arc::new(RepositoryContext::new(
-        None,
+    let temp_repo = Arc::new(RepositoryContext::new(RepositoryContextCreationArgs {
+        path: None,
         immutable_store,
         mutable_store,
-        repository_id,
-        InstanceId::default(),
-        Err(lore_transport::ProtocolError::from(crate::errors::NoRemote)),
-        Arc::default(),
-        crate::repository::RepositoryFormat::Lore,
-    ));
+        id: repository_id,
+        instance_id: InstanceId::default(),
+        remote: Err(lore_transport::ProtocolError::from(crate::errors::NoRemote)),
+        filter: Arc::default(),
+        format: crate::repository::RepositoryFormat::Lore,
+    }));
 
     let normalized_current = crate::util::path::clean(current_path.to_owned());
 

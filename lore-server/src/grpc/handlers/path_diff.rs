@@ -217,6 +217,7 @@ mod tests {
     use lore_revision::node::INVALID_NODE;
     use lore_revision::node::NodeFlags;
     use lore_revision::repository::RepositoryContext;
+    use lore_revision::repository::RepositoryContextCreationArgs;
     use lore_revision::repository::RepositoryFormat;
     use lore_revision::state;
     use lore_revision::util::path::RelativePath;
@@ -241,16 +242,16 @@ mod tests {
             .await
             .expect("Failed to create store"),
         );
-        Arc::new(RepositoryContext::new(
-            None,
-            immutable,
-            mutable,
-            Context::default().into(),
-            lore_revision::instance::InstanceId::generate(),
-            Err(ProtocolError::from(lore_base::error::NoRemote)),
-            Arc::default(),
-            RepositoryFormat::Lore,
-        ))
+        Arc::new(RepositoryContext::new(RepositoryContextCreationArgs {
+            path: None,
+            immutable_store: immutable,
+            mutable_store: mutable,
+            id: Context::default().into(),
+            instance_id: lore_revision::instance::InstanceId::generate(),
+            remote: Err(ProtocolError::from(lore_base::error::NoRemote)),
+            filter: Arc::default(),
+            format: RepositoryFormat::Lore,
+        }))
     }
 
     #[tokio::test]

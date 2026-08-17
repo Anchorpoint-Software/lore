@@ -573,27 +573,28 @@ fn remote_arc(state: RemoteState) -> Arc<tokio::sync::RwLock<RemoteState>> {
     Arc::new(tokio::sync::RwLock::new(state))
 }
 
+pub struct RepositoryContextCreationArgs {
+    pub path: Option<PathBuf>,
+    pub immutable_store: Arc<dyn ImmutableStore>,
+    pub mutable_store: Arc<dyn MutableStore>,
+    pub id: RepositoryId,
+    pub instance_id: crate::instance::InstanceId,
+    pub remote: Result<Arc<Connection>, ProtocolError>,
+    pub filter: Arc<Filter>,
+    pub format: RepositoryFormat,
+}
+
 impl RepositoryContext {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        path: Option<PathBuf>,
-        immutable_store: Arc<dyn ImmutableStore>,
-        mutable_store: Arc<dyn MutableStore>,
-        id: RepositoryId,
-        instance_id: crate::instance::InstanceId,
-        remote: Result<Arc<Connection>, ProtocolError>,
-        filter: Arc<Filter>,
-        format: RepositoryFormat,
-    ) -> Self {
+    pub fn new(create_args: RepositoryContextCreationArgs) -> Self {
         Self::new_with_state(
-            path,
-            immutable_store,
-            mutable_store,
-            id,
-            instance_id,
-            RemoteState::from_result(remote),
-            filter,
-            format,
+            create_args.path,
+            create_args.immutable_store,
+            create_args.mutable_store,
+            create_args.id,
+            create_args.instance_id,
+            RemoteState::from_result(create_args.remote),
+            create_args.filter,
+            create_args.format,
         )
     }
 
@@ -2281,16 +2282,16 @@ pub async fn create_local(
     // caller-supplied token authorizes those writes and keeps the per-path
     // write mutex held for the duration of setup.
     let repository = Arc::new(
-        RepositoryContext::new(
-            Some(path.to_path_buf()),
+        RepositoryContext::new(RepositoryContextCreationArgs {
+            path: Some(path.to_path_buf()),
             immutable_store,
             mutable_store,
-            repository,
+            id: repository,
             instance_id,
-            Err(ProtocolError::from(NoRemote)),
-            Arc::default(),
-            RepositoryFormat::Lore,
-        )
+            remote: Err(ProtocolError::from(NoRemote)),
+            filter: Arc::default(),
+            format: RepositoryFormat::Lore,
+        })
         .with_write_token(token.share()),
     );
 
@@ -3410,6 +3411,82 @@ pub async fn resolve_by_name(
 }
 
 #[cfg(test)]
+pub mod test_helpers {
+    use crate::instance::InstanceId;
+
+    pub fn default_repository_creation_args(
+        immutable_store: std::sync::Arc<dyn lore_storage::ImmutableStore>,
+        mutable_store: std::sync::Arc<dyn lore_storage::MutableStore>,
+    ) -> crate::repository::RepositoryContextCreationArgs {
+        crate::repository::RepositoryContextCreationArgs {
+            path: None,
+            immutable_store,
+            mutable_store,
+            id: lore_base::types::Context::from(uuid::Uuid::now_v7()).into(),
+            instance_id: InstanceId::generate(),
+            remote: Err(lore_transport::ProtocolError::from(
+                lore_base::error::NoRemote,
+            )),
+            filter: std::sync::Arc::default(),
+            format: crate::repository::RepositoryFormat::Lore,
+        }
+    }
+
+    pub trait RepositoryContextCreationArgsExt {
+        fn with_path(self, path: impl AsRef<std::path::Path>) -> Self;
+        fn with_id(self, id: crate::lore::RepositoryId) -> Self;
+        fn with_instance_id(self, id: crate::instance::InstanceId) -> Self;
+        fn with_remote(
+            self,
+            remote: Result<
+                std::sync::Arc<lore_transport::Connection>,
+                lore_transport::ProtocolError,
+            >,
+        ) -> Self;
+        fn with_filter(self, filter: std::sync::Arc<crate::filter::Filter>) -> Self;
+        fn with_format(self, format: crate::repository::RepositoryFormat) -> Self;
+    }
+
+    impl RepositoryContextCreationArgsExt for crate::repository::RepositoryContextCreationArgs {
+        fn with_path(mut self, path: impl AsRef<std::path::Path>) -> Self {
+            self.path = Some(path.as_ref().to_owned());
+            self
+        }
+
+        fn with_id(mut self, id: crate::lore::RepositoryId) -> Self {
+            self.id = id;
+            self
+        }
+
+        fn with_instance_id(mut self, id: crate::instance::InstanceId) -> Self {
+            self.instance_id = id;
+            self
+        }
+
+        fn with_remote(
+            mut self,
+            remote: Result<
+                std::sync::Arc<lore_transport::Connection>,
+                lore_transport::ProtocolError,
+            >,
+        ) -> Self {
+            self.remote = remote;
+            self
+        }
+
+        fn with_filter(mut self, filter: std::sync::Arc<crate::filter::Filter>) -> Self {
+            self.filter = filter;
+            self
+        }
+
+        fn with_format(mut self, format: crate::repository::RepositoryFormat) -> Self {
+            self.format = format;
+            self
+        }
+    }
+}
+
+#[cfg(test)]
 // These tests spawn tokio tasks directly without a LORE_CONTEXT, which is fine for
 // state-machine unit tests that don't touch the execution context.
 #[allow(clippy::disallowed_methods)]
@@ -3639,27 +3716,17 @@ mod write_token_tests {
     //! with `WriteRequired`.
     use std::sync::Arc;
 
-    use lore_transport::ProtocolError;
-
     use super::RepositoryContext;
     use super::RepositoryWriteToken;
-    use crate::errors::NoRemote;
-    use crate::lore::RepositoryId;
+    use crate::repository::test_helpers::default_repository_creation_args;
 
     async fn in_memory_context() -> Arc<RepositoryContext> {
         let (immutable, mutable) = super::create_client_memory_stores()
             .await
             .expect("in-memory stores should be creatable");
-        Arc::new(RepositoryContext::new(
-            None,
-            immutable,
-            mutable,
-            RepositoryId::default(),
-            crate::instance::InstanceId::default(),
-            Err(ProtocolError::from(NoRemote)),
-            Arc::default(),
-            crate::repository::RepositoryFormat::Lore,
-        ))
+        Arc::new(RepositoryContext::new(default_repository_creation_args(
+            immutable, mutable,
+        )))
     }
 
     /// A `NoStore` context with a `Client` write token attached must grant
@@ -3704,29 +3771,16 @@ mod path_optional_tests {
     //! optional; when constructed with `None`, the context is fully usable
     //! for store-backed operations but `require_path` rejects callers that
     //! need a working-tree path.
-    use std::sync::Arc;
-
-    use lore_transport::ProtocolError;
-
     use super::RepositoryContext;
-    use crate::errors::NoRemote;
-    use crate::lore::RepositoryId;
+    use crate::repository::test_helpers::RepositoryContextCreationArgsExt;
+    use crate::repository::test_helpers::default_repository_creation_args;
 
     #[tokio::test]
     async fn require_path_returns_invalid_arguments_when_path_is_none() {
         let (immutable, mutable) = super::create_client_memory_stores()
             .await
             .expect("in-memory stores should be creatable");
-        let ctx = RepositoryContext::new(
-            None,
-            immutable,
-            mutable,
-            RepositoryId::default(),
-            crate::instance::InstanceId::default(),
-            Err(ProtocolError::from(NoRemote)),
-            Arc::default(),
-            crate::repository::RepositoryFormat::Lore,
-        );
+        let ctx = RepositoryContext::new(default_repository_creation_args(immutable, mutable));
         ctx.require_path()
             .expect_err("path-less context should reject require_path");
     }
@@ -3738,14 +3792,7 @@ mod path_optional_tests {
             .expect("in-memory stores should be creatable");
         let path = std::path::PathBuf::from("/tmp/lore-test-require-path");
         let ctx = RepositoryContext::new(
-            Some(path.clone()),
-            immutable,
-            mutable,
-            RepositoryId::default(),
-            crate::instance::InstanceId::default(),
-            Err(ProtocolError::from(NoRemote)),
-            Arc::default(),
-            crate::repository::RepositoryFormat::Lore,
+            default_repository_creation_args(immutable, mutable).with_path(&path),
         );
         let got = ctx
             .require_path()

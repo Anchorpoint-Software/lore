@@ -29,6 +29,7 @@ use crate::lore_info;
 use crate::metadata;
 use crate::repository;
 use crate::repository::RepositoryContext;
+use crate::repository::RepositoryContextCreationArgs;
 use crate::store;
 use crate::store::ImmutableStore;
 use crate::store::KeyType;
@@ -407,16 +408,16 @@ async fn migrate_immutable_value_to_typed(
     mutable_store: Arc<MutableStore>,
     remote: &Arc<Connection>,
 ) -> Result<(), MutableStoreError> {
-    let repository = Arc::new(RepositoryContext::new(
-        None,
-        immutable_store.clone(),
-        mutable_store as Arc<dyn store::MutableStore>,
-        entry.partition,
-        crate::instance::InstanceId::default(),
-        Ok(remote.clone()),
-        Arc::default(),
-        crate::repository::RepositoryFormat::Lore,
-    ));
+    let repository = Arc::new(RepositoryContext::new(RepositoryContextCreationArgs {
+        path: None,
+        immutable_store: immutable_store.clone(),
+        mutable_store: mutable_store as Arc<dyn store::MutableStore>,
+        id: entry.partition,
+        instance_id: crate::instance::InstanceId::default(),
+        remote: Ok(remote.clone()),
+        filter: Arc::default(),
+        format: crate::repository::RepositoryFormat::Lore,
+    }));
     let hash = entry.value;
 
     if let Ok(metadata) = metadata::Metadata::deserialize(repository.clone(), hash).await {

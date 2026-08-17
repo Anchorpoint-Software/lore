@@ -5,7 +5,6 @@ mod tests {
     use std::io::Write;
     use std::sync::Arc;
 
-    use lore_base::error::NoRemote;
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::runtime::runtime;
     use lore_base::types::Context;
@@ -20,11 +19,9 @@ mod tests {
     use lore_revision::node::ROOT_NODE;
     use lore_revision::repository;
     use lore_revision::repository::RepositoryContext;
-    use lore_revision::repository::RepositoryFormat;
     use lore_revision::stage;
     use lore_revision::stage::StageOptions;
     use lore_revision::state::State;
-    use lore_transport::ProtocolError;
 
     include!("helper.rs");
 
@@ -56,14 +53,13 @@ mod tests {
 
                 let repository = Arc::new(
                     RepositoryContext::new(
-                        Some(path.clone()),
-                        immutable_store.clone(),
-                        mutable_store.clone(),
-                        repository_id,
-                        created_repo.instance_id,
-                        Err(ProtocolError::from(NoRemote)),
-                        Arc::default(),
-                        RepositoryFormat::Lore,
+                        default_repository_creation_args(
+                            immutable_store.clone(),
+                            mutable_store.clone(),
+                        )
+                        .with_path(&path)
+                        .with_id(repository_id)
+                        .with_instance_id(created_repo.instance_id),
                     )
                     .with_write_token(write_token.share()),
                 );
@@ -212,14 +208,13 @@ mod tests {
 
                 let repository = Arc::new(
                     RepositoryContext::new(
-                        Some(path.clone()),
-                        immutable_store.clone(),
-                        mutable_store.clone(),
-                        repository_id,
-                        created_repo.instance_id,
-                        Err(ProtocolError::from(NoRemote)),
-                        Arc::default(),
-                        RepositoryFormat::Lore,
+                        default_repository_creation_args(
+                            immutable_store.clone(),
+                            mutable_store.clone(),
+                        )
+                        .with_path(&path)
+                        .with_id(repository_id)
+                        .with_instance_id(created_repo.instance_id),
                     )
                     .with_write_token(write_token.share()),
                 );
@@ -357,14 +352,13 @@ mod tests {
 
                 let repository = Arc::new(
                     RepositoryContext::new(
-                        Some(path.clone()),
-                        immutable_store.clone(),
-                        mutable_store.clone(),
-                        repository_id,
-                        created_repo.instance_id,
-                        Err(ProtocolError::from(NoRemote)),
-                        Arc::default(),
-                        RepositoryFormat::Lore,
+                        default_repository_creation_args(
+                            immutable_store.clone(),
+                            mutable_store.clone(),
+                        )
+                        .with_path(&path)
+                        .with_id(repository_id)
+                        .with_instance_id(created_repo.instance_id),
                     )
                     .with_write_token(write_token.share()),
                 );
@@ -452,14 +446,13 @@ mod tests {
 
                 let repository = Arc::new(
                     RepositoryContext::new(
-                        Some(path.clone()),
-                        immutable_store.clone(),
-                        mutable_store.clone(),
-                        repository_id,
-                        created_repo.instance_id,
-                        Err(ProtocolError::from(NoRemote)),
-                        Arc::default(),
-                        RepositoryFormat::Lore,
+                        default_repository_creation_args(
+                            immutable_store.clone(),
+                            mutable_store.clone(),
+                        )
+                        .with_path(&path)
+                        .with_id(repository_id)
+                        .with_instance_id(created_repo.instance_id),
                     )
                     .with_write_token(write_token.share()),
                 );
@@ -606,14 +599,13 @@ mod tests {
 
                 let repository = Arc::new(
                     RepositoryContext::new(
-                        Some(path.clone()),
-                        immutable_store.clone(),
-                        mutable_store.clone(),
-                        repository_id,
-                        created_repo.instance_id,
-                        Err(ProtocolError::from(NoRemote)),
-                        Arc::default(),
-                        RepositoryFormat::Lore,
+                        default_repository_creation_args(
+                            immutable_store.clone(),
+                            mutable_store.clone(),
+                        )
+                        .with_path(&path)
+                        .with_id(repository_id)
+                        .with_instance_id(created_repo.instance_id),
                     )
                     .with_write_token(write_token.share()),
                 );
@@ -727,14 +719,13 @@ mod tests {
 
                 let repository = Arc::new(
                     RepositoryContext::new(
-                        Some(path.clone()),
-                        immutable_store.clone(),
-                        mutable_store.clone(),
-                        repository_id,
-                        created_repo.instance_id,
-                        Err(ProtocolError::from(NoRemote)),
-                        Arc::default(),
-                        RepositoryFormat::Lore,
+                        default_repository_creation_args(
+                            immutable_store.clone(),
+                            mutable_store.clone(),
+                        )
+                        .with_path(&path)
+                        .with_id(repository_id)
+                        .with_instance_id(created_repo.instance_id),
                     )
                     .with_write_token(write_token.share()),
                 );
@@ -852,14 +843,13 @@ mod tests {
 
                 let repository = Arc::new(
                     RepositoryContext::new(
-                        Some(path.clone()),
-                        immutable_store.clone(),
-                        mutable_store.clone(),
-                        repository_id,
-                        created_repo.instance_id,
-                        Err(ProtocolError::from(NoRemote)),
-                        Arc::default(),
-                        RepositoryFormat::Lore,
+                        default_repository_creation_args(
+                            immutable_store.clone(),
+                            mutable_store.clone(),
+                        )
+                        .with_path(&path)
+                        .with_id(repository_id)
+                        .with_instance_id(created_repo.instance_id),
                     )
                     .with_write_token(write_token.share()),
                 );
@@ -1023,14 +1013,13 @@ mod tests {
 
                 let repository = Arc::new(
                     RepositoryContext::new(
-                        Some(path.clone()),
-                        immutable_store.clone(),
-                        mutable_store.clone(),
-                        repository_id,
-                        created_repo.instance_id,
-                        Err(ProtocolError::from(NoRemote)),
-                        Arc::default(),
-                        RepositoryFormat::Lore,
+                        default_repository_creation_args(
+                            immutable_store.clone(),
+                            mutable_store.clone(),
+                        )
+                        .with_path(&path)
+                        .with_id(repository_id)
+                        .with_instance_id(created_repo.instance_id),
                     )
                     .with_write_token(write_token.share()),
                 );
@@ -1165,14 +1154,13 @@ mod tests {
 
                 let repository = Arc::new(
                     RepositoryContext::new(
-                        Some(path.clone()),
-                        immutable_store.clone(),
-                        mutable_store.clone(),
-                        repository_id,
-                        created_repo.instance_id,
-                        Err(ProtocolError::from(NoRemote)),
-                        Arc::default(),
-                        RepositoryFormat::Lore,
+                        default_repository_creation_args(
+                            immutable_store.clone(),
+                            mutable_store.clone(),
+                        )
+                        .with_path(&path)
+                        .with_id(repository_id)
+                        .with_instance_id(created_repo.instance_id),
                     )
                     .with_write_token(write_token.share()),
                 );
@@ -1303,14 +1291,13 @@ mod tests {
 
                 let repository = Arc::new(
                     RepositoryContext::new(
-                        Some(path.clone()),
-                        immutable_store.clone(),
-                        mutable_store.clone(),
-                        repository_id,
-                        created_repo.instance_id,
-                        Err(ProtocolError::from(NoRemote)),
-                        Arc::default(),
-                        RepositoryFormat::Lore,
+                        default_repository_creation_args(
+                            immutable_store.clone(),
+                            mutable_store.clone(),
+                        )
+                        .with_path(&path)
+                        .with_id(repository_id)
+                        .with_instance_id(created_repo.instance_id),
                     )
                     .with_write_token(write_token.share()),
                 );
@@ -1447,14 +1434,13 @@ mod tests {
 
                 let repository = Arc::new(
                     RepositoryContext::new(
-                        Some(path.clone()),
-                        immutable_store.clone(),
-                        mutable_store.clone(),
-                        repository_id,
-                        created_repo.instance_id,
-                        Err(ProtocolError::from(NoRemote)),
-                        Arc::default(),
-                        RepositoryFormat::Lore,
+                        default_repository_creation_args(
+                            immutable_store.clone(),
+                            mutable_store.clone(),
+                        )
+                        .with_path(&path)
+                        .with_id(repository_id)
+                        .with_instance_id(created_repo.instance_id),
                     )
                     .with_write_token(write_token.share()),
                 );
@@ -1566,14 +1552,13 @@ mod tests {
 
                 let repository = Arc::new(
                     RepositoryContext::new(
-                        Some(path.clone()),
-                        immutable_store.clone(),
-                        mutable_store.clone(),
-                        repository_id,
-                        created_repo.instance_id,
-                        Err(ProtocolError::from(NoRemote)),
-                        Arc::default(),
-                        RepositoryFormat::Lore,
+                        default_repository_creation_args(
+                            immutable_store.clone(),
+                            mutable_store.clone(),
+                        )
+                        .with_path(&path)
+                        .with_id(repository_id)
+                        .with_instance_id(created_repo.instance_id),
                     )
                     .with_write_token(write_token.share()),
                 );
@@ -1719,14 +1704,13 @@ mod tests {
 
                 let repository = Arc::new(
                     RepositoryContext::new(
-                        Some(path.clone()),
-                        immutable_store.clone(),
-                        mutable_store.clone(),
-                        repository_id,
-                        created_repo.instance_id,
-                        Err(ProtocolError::from(NoRemote)),
-                        Arc::default(),
-                        RepositoryFormat::Lore,
+                        default_repository_creation_args(
+                            immutable_store.clone(),
+                            mutable_store.clone(),
+                        )
+                        .with_path(&path)
+                        .with_id(repository_id)
+                        .with_instance_id(created_repo.instance_id),
                     )
                     .with_write_token(write_token.share()),
                 );
@@ -1854,14 +1838,13 @@ mod tests {
 
                 let repository = Arc::new(
                     RepositoryContext::new(
-                        Some(path.clone()),
-                        immutable_store.clone(),
-                        mutable_store.clone(),
-                        repository_id,
-                        created_repo.instance_id,
-                        Err(ProtocolError::from(NoRemote)),
-                        Arc::default(),
-                        RepositoryFormat::Lore,
+                        default_repository_creation_args(
+                            immutable_store.clone(),
+                            mutable_store.clone(),
+                        )
+                        .with_path(&path)
+                        .with_id(repository_id)
+                        .with_instance_id(created_repo.instance_id),
                     )
                     .with_write_token(write_token.share()),
                 );
@@ -2000,14 +1983,13 @@ mod tests {
 
                 let repository = Arc::new(
                     RepositoryContext::new(
-                        Some(path.clone()),
-                        immutable_store.clone(),
-                        mutable_store.clone(),
-                        repository_id,
-                        created_repo.instance_id,
-                        Err(ProtocolError::from(NoRemote)),
-                        Arc::default(),
-                        RepositoryFormat::Lore,
+                        default_repository_creation_args(
+                            immutable_store.clone(),
+                            mutable_store.clone(),
+                        )
+                        .with_path(&path)
+                        .with_id(repository_id)
+                        .with_instance_id(created_repo.instance_id),
                     )
                     .with_write_token(write_token.share()),
                 );
@@ -2164,14 +2146,13 @@ mod tests {
 
                 let repository = Arc::new(
                     RepositoryContext::new(
-                        Some(path.clone()),
-                        immutable_store.clone(),
-                        mutable_store.clone(),
-                        repository_id,
-                        created_repo.instance_id,
-                        Err(ProtocolError::from(NoRemote)),
-                        Arc::default(),
-                        RepositoryFormat::Lore,
+                        default_repository_creation_args(
+                            immutable_store.clone(),
+                            mutable_store.clone(),
+                        )
+                        .with_path(&path)
+                        .with_id(repository_id)
+                        .with_instance_id(created_repo.instance_id),
                     )
                     .with_write_token(write_token.share()),
                 );
@@ -2308,14 +2289,13 @@ mod tests {
 
                 let repository = Arc::new(
                     RepositoryContext::new(
-                        Some(path.clone()),
-                        immutable_store.clone(),
-                        mutable_store.clone(),
-                        repository_id,
-                        created_repo.instance_id,
-                        Err(ProtocolError::from(NoRemote)),
-                        Arc::default(),
-                        RepositoryFormat::Lore,
+                        default_repository_creation_args(
+                            immutable_store.clone(),
+                            mutable_store.clone(),
+                        )
+                        .with_path(&path)
+                        .with_id(repository_id)
+                        .with_instance_id(created_repo.instance_id),
                     )
                     .with_write_token(write_token.share()),
                 );
@@ -2496,14 +2476,13 @@ mod tests {
 
                 let repository = Arc::new(
                     RepositoryContext::new(
-                        Some(path.clone()),
-                        immutable_store.clone(),
-                        mutable_store.clone(),
-                        repository_id,
-                        created_repo.instance_id,
-                        Err(ProtocolError::from(NoRemote)),
-                        Arc::default(),
-                        RepositoryFormat::Lore,
+                        default_repository_creation_args(
+                            immutable_store.clone(),
+                            mutable_store.clone(),
+                        )
+                        .with_path(&path)
+                        .with_id(repository_id)
+                        .with_instance_id(created_repo.instance_id),
                     )
                     .with_write_token(write_token.share()),
                 );
@@ -2613,14 +2592,13 @@ mod tests {
 
                 let repository = Arc::new(
                     RepositoryContext::new(
-                        Some(path.clone()),
-                        immutable_store.clone(),
-                        mutable_store.clone(),
-                        repository_id,
-                        created_repo.instance_id,
-                        Err(ProtocolError::from(NoRemote)),
-                        Arc::default(),
-                        RepositoryFormat::Lore,
+                        default_repository_creation_args(
+                            immutable_store.clone(),
+                            mutable_store.clone(),
+                        )
+                        .with_path(&path)
+                        .with_id(repository_id)
+                        .with_instance_id(created_repo.instance_id),
                     )
                     .with_write_token(write_token.share()),
                 );
@@ -2789,14 +2767,13 @@ mod tests {
 
                 let repository = Arc::new(
                     RepositoryContext::new(
-                        Some(path.clone()),
-                        immutable_store.clone(),
-                        mutable_store.clone(),
-                        repository_id,
-                        created_repo.instance_id,
-                        Err(ProtocolError::from(NoRemote)),
-                        Arc::default(),
-                        RepositoryFormat::Lore,
+                        default_repository_creation_args(
+                            immutable_store.clone(),
+                            mutable_store.clone(),
+                        )
+                        .with_path(&path)
+                        .with_id(repository_id)
+                        .with_instance_id(created_repo.instance_id),
                     )
                     .with_write_token(write_token.share()),
                 );
@@ -2935,14 +2912,13 @@ mod tests {
 
                 let repository = Arc::new(
                     RepositoryContext::new(
-                        Some(path.clone()),
-                        immutable_store.clone(),
-                        mutable_store.clone(),
-                        repository_id,
-                        created_repo.instance_id,
-                        Err(ProtocolError::from(NoRemote)),
-                        Arc::default(),
-                        RepositoryFormat::Lore,
+                        default_repository_creation_args(
+                            immutable_store.clone(),
+                            mutable_store.clone(),
+                        )
+                        .with_path(&path)
+                        .with_id(repository_id)
+                        .with_instance_id(created_repo.instance_id),
                     )
                     .with_write_token(write_token.share()),
                 );

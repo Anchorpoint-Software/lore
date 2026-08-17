@@ -6,7 +6,6 @@ mod tests {
 
     use std::sync::Arc;
 
-    use lore_base::error::NoRemote;
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::runtime::runtime;
     use lore_base::types::Address;
@@ -22,13 +21,11 @@ mod tests {
     use lore_revision::node::*;
     use lore_revision::repository::InMemoryContext;
     use lore_revision::repository::RepositoryContext;
-    use lore_revision::repository::RepositoryFormat;
     use lore_revision::repository::RepositoryWriteToken;
     use lore_revision::state::State;
     use lore_revision::state::StateNodeChildrenIterator;
     use lore_storage::hash::hash_string;
     use lore_storage::local::immutable_store::LocalImmutableStore;
-    use lore_transport::ProtocolError;
 
     include!("helper.rs");
 
@@ -48,16 +45,10 @@ mod tests {
         .await
         .expect("Failed to create store");
         Arc::new(
-            RepositoryContext::new(
-                None,
+            RepositoryContext::new(default_repository_creation_args(
                 immutable_store,
                 mutable_store,
-                Context::from(uuid::Uuid::now_v7()).into(),
-                lore_revision::instance::InstanceId::default(),
-                Err(ProtocolError::from(NoRemote)),
-                Arc::default(),
-                RepositoryFormat::Lore,
-            )
+            ))
             .with_write_token(RepositoryWriteToken::in_memory(&IN_MEMORY_MARKER)),
         )
     }

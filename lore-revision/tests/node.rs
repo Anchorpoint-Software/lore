@@ -4,7 +4,6 @@
 mod tests {
     use std::sync::Arc;
 
-    use lore_base::error::NoRemote;
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::runtime::runtime;
     use lore_base::types::Address;
@@ -27,11 +26,9 @@ mod tests {
     use lore_revision::node::NodeFlagsV2;
     use lore_revision::repository;
     use lore_revision::repository::RepositoryContext;
-    use lore_revision::repository::RepositoryFormat;
     use lore_revision::state::State;
     use lore_storage::hash::hash_string;
     use lore_storage::options::WriteOptions;
-    use lore_transport::ProtocolError;
     use rand::Rng;
     use rand::distr::Alphanumeric;
 
@@ -82,14 +79,12 @@ mod tests {
                 .expect("Failed to create repository");
 
                 let repository = Arc::new(RepositoryContext::new(
-                    Some(path.clone()),
-                    immutable_store.clone(),
-                    mutable_store.clone(),
-                    repository_id,
-                    lore_revision::instance::InstanceId::default(),
-                    Err(ProtocolError::from(NoRemote)),
-                    Arc::default(),
-                    RepositoryFormat::Lore,
+                    default_repository_creation_args(
+                        immutable_store.clone(),
+                        mutable_store.clone(),
+                    )
+                    .with_path(&path)
+                    .with_id(repository_id),
                 ));
 
                 let mut block_v2 = NodeBlockDataV2::new_from_heap_zeroed();
@@ -295,14 +290,12 @@ mod tests {
                 .expect("Failed to create repository");
 
                 let repository = Arc::new(RepositoryContext::new(
-                    Some(path.clone()),
-                    immutable_store.clone(),
-                    mutable_store.clone(),
-                    repository_id,
-                    lore_revision::instance::InstanceId::default(),
-                    Err(ProtocolError::from(NoRemote)),
-                    Arc::default(),
-                    RepositoryFormat::Lore,
+                    default_repository_creation_args(
+                        immutable_store.clone(),
+                        mutable_store.clone(),
+                    )
+                    .with_path(path)
+                    .with_id(repository_id),
                 ));
 
                 let mut block_v0 = NodeBlockDataV0::new_from_heap_zeroed();
@@ -540,14 +533,12 @@ mod tests {
                 .expect("Failed to create repository");
 
                 let repository = Arc::new(RepositoryContext::new(
-                    Some(path.clone()),
-                    immutable_store.clone(),
-                    mutable_store.clone(),
-                    repository_id,
-                    lore_revision::instance::InstanceId::default(),
-                    Err(ProtocolError::from(NoRemote)),
-                    Arc::default(),
-                    RepositoryFormat::Lore,
+                    default_repository_creation_args(
+                        immutable_store.clone(),
+                        mutable_store.clone(),
+                    )
+                    .with_path(&path)
+                    .with_id(repository_id),
                 ));
 
                 let mut block_v2 = NodeBlockDataV2::new_from_heap_zeroed();

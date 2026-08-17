@@ -27,6 +27,7 @@ use tokio_util::task::AbortOnDropHandle;
 
 use super::RepositoryAccess;
 use super::RepositoryContext;
+use super::RepositoryContextCreationArgs;
 use super::RepositoryFormat;
 use super::RepositoryWriteToken;
 use super::SharedStoreToUseConfig;
@@ -910,16 +911,16 @@ pub async fn clone(
                 .await
                 .forward::<CloneError>("Failed to initialize repository on disk")?;
 
-        let repository = Arc::new(RepositoryContext::new(
-            Some(path.to_path_buf()),
+        let repository = Arc::new(RepositoryContext::new(RepositoryContextCreationArgs {
+            path: Some(path.to_path_buf()),
             immutable_store,
             mutable_store,
-            repository_data.id,
-            crate::instance::InstanceId::default(),
-            Ok(remote.clone()),
-            Arc::default(),
-            RepositoryFormat::Lore,
-        ));
+            id: repository_data.id,
+            instance_id: crate::instance::InstanceId::default(),
+            remote: Ok(remote.clone()),
+            filter: Arc::default(),
+            format: RepositoryFormat::Lore,
+        }));
 
         repository.set_disable_upload(true);
 

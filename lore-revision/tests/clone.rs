@@ -1,21 +1,16 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-mod helper;
-
 #[cfg(test)]
 mod tests {
     use std::path::Path;
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
 
-    use lore_base::error::NoRemote;
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::types::Address;
-    use lore_base::types::Context;
     use lore_revision::node::Node;
     use lore_revision::node::NodeFlags;
     use lore_revision::repository::RepositoryContext;
-    use lore_revision::repository::RepositoryFormat;
     use lore_revision::repository::clone::CLONE_FILE_DISCOVERY;
     use lore_revision::repository::clone::CLONE_FILE_MAX;
     use lore_revision::repository::clone::CloneOptions;
@@ -25,14 +20,12 @@ mod tests {
     use lore_revision::util::path::RelativePath;
     use lore_storage::local::immutable_store;
     use lore_storage::local::mutable_store;
-    use lore_transport::ProtocolError;
     use tokio::sync::Semaphore;
     use tokio::sync::mpsc;
 
-    use crate::helper::TempDir;
-    use crate::helper::setup_test_execution;
+    include!("helper.rs");
 
-    fn generate_tempdir() -> TempDir {
+    fn generate_clone_tempdir() -> TempDir {
         TempDir::new("lore-clone-test-")
     }
 
@@ -44,22 +37,19 @@ mod tests {
         .await
         .expect("Failed to create immutable store");
         Arc::new(RepositoryContext::new(
-            Some(path.as_ref().to_path_buf()),
-            immutable_store.clone(),
-            Arc::new(
-                mutable_store::LocalMutableStore::new(
-                    None::<&Path>,
-                    lore_storage::MutableStoreSettings::default(),
-                    immutable_store,
-                )
-                .await
-                .expect("Failed to create mutable store"),
-            ),
-            Context::default().into(),
-            lore_revision::instance::InstanceId::default(),
-            Err(ProtocolError::from(NoRemote)),
-            Arc::default(),
-            RepositoryFormat::Lore,
+            default_repository_creation_args(
+                immutable_store.clone(),
+                Arc::new(
+                    mutable_store::LocalMutableStore::new(
+                        None::<&Path>,
+                        lore_storage::MutableStoreSettings::default(),
+                        immutable_store,
+                    )
+                    .await
+                    .expect("Failed to create mutable store"),
+                ),
+            )
+            .with_path(path),
         ))
     }
 
@@ -94,7 +84,7 @@ mod tests {
         let execution = setup_test_execution();
         LORE_CONTEXT
             .scope(execution, async {
-                let temp_dir = generate_tempdir();
+                let temp_dir = generate_clone_tempdir();
                 let repository = new_test_context(&temp_dir).await;
                 let stats = Arc::new(CloneStats::default());
                 let options = Arc::new(CloneOptions::default());
@@ -137,7 +127,7 @@ mod tests {
         let execution = setup_test_execution();
         LORE_CONTEXT
             .scope(execution, async {
-                let temp_dir = generate_tempdir();
+                let temp_dir = generate_clone_tempdir();
                 let repository = new_test_context(&temp_dir).await;
                 // Start with only 3 permits; send 20 items.
                 let permit_count = 3;
@@ -178,7 +168,7 @@ mod tests {
         let execution = setup_test_execution();
         LORE_CONTEXT
             .scope(execution, async {
-                let temp_dir = generate_tempdir();
+                let temp_dir = generate_clone_tempdir();
                 let repository = new_test_context(&temp_dir).await;
                 let stats = Arc::new(CloneStats::default());
                 let options = Arc::new(CloneOptions::default());
@@ -209,7 +199,7 @@ mod tests {
         let execution = setup_test_execution();
         LORE_CONTEXT
             .scope(execution, async {
-                let temp_dir = generate_tempdir();
+                let temp_dir = generate_clone_tempdir();
                 let repository = new_test_context(&temp_dir).await;
                 let stats = Arc::new(CloneStats::default());
                 let options = Arc::new(CloneOptions::default());
@@ -247,7 +237,7 @@ mod tests {
         let execution = setup_test_execution();
         LORE_CONTEXT
             .scope(execution, async {
-                let temp_dir = generate_tempdir();
+                let temp_dir = generate_clone_tempdir();
                 let repository = new_test_context(&temp_dir).await;
                 let stats = Arc::new(CloneStats::default());
                 let options = Arc::new(CloneOptions::default());
