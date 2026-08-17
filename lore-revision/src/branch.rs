@@ -2599,6 +2599,16 @@ pub async fn diff3_with_source_cap(
     )
     .await?;
 
+    // `resolve_diff3_base` is documented never to return this, so reaching it is a
+    // bug rather than a repository state. Refuse anyway: the alternative is a diff
+    // against the empty tree that conflicts on every path in both branches.
+    if base_revision.is_zero() {
+        lore_error!(
+            "Resolved a zero base revision for branch {source_branch} revision {source_revision} and branch {target_branch} revision {target_revision}"
+        );
+        return Err(BranchError::from(Divergent));
+    }
+
     lore_info!(
         "Revision diff base {base_revision} source {source_revision} target {target_revision}"
     );
@@ -2883,9 +2893,11 @@ async fn try_auto_resolve_conflict(
 /// response header) can compute it up front and pass it into
 /// `diff3_streaming` without duplicating the work.
 ///
-/// Returns `Hash::default()` (zero) when no common ancestor exists; the
-/// caller treats that as "disjoint histories" and surfaces an appropriate
-/// error. May raise `BranchError::Divergent` or
+/// Never returns the zero revision. When no common ancestor can be established
+/// this fails with `BranchError::Divergent` instead, and when the two branches'
+/// stacks name no common branch - every branch descends from the default branch,
+/// so that is an invalid branch configuration - with
+/// `BranchError::InvalidArguments`. May also raise
 /// `BranchError::MaxHistorySearchDepth` from the divergence search.
 pub async fn resolve_diff3_base(
     repository: Arc<RepositoryContext>,
@@ -2895,7 +2907,7 @@ pub async fn resolve_diff3_base(
     target_revision: Hash,
 ) -> Result<Hash, BranchError> {
     // Find base revision from branch stack parents and branch points
-    let mut base_revision = Hash::default();
+    let mut base_revision;
     if source_branch != target_branch {
         let mut branch_source_point = Hash::default();
         let mut branch_target_point = Hash::default();
@@ -3032,26 +3044,33 @@ pub async fn resolve_diff3_base(
             } else {
                 base_revision = branch_source_point;
             }
-
-            if let Some(found_base_revision) = find_ancestor_revision(
-                repository.clone(),
-                source_branch,
-                source_revision,
-                target_branch,
-                target_revision,
-                base_revision,
-            )
-            .await
-            {
-                base_revision = found_base_revision;
-                lore_debug!(
-                    "Found new base revision from previous merges from source branch, using branch point {base_revision}"
-                );
-            } else {
-                lore_debug!(
-                    "No new base revision from previous merges from source branch found, using branch point {base_revision}"
-                );
+        } else {
+            return Err(InvalidArguments {
+                reason: format!(
+                    "source branch {source_branch} and target branch {target_branch} have no common branch in their branch stacks"
+                ),
             }
+            .into());
+        }
+
+        if let Some(found_base_revision) = find_ancestor_revision(
+            repository.clone(),
+            source_branch,
+            source_revision,
+            target_branch,
+            target_revision,
+            base_revision,
+        )
+        .await?
+        {
+            base_revision = found_base_revision;
+            lore_debug!(
+                "Found new base revision from previous merges from source branch, using branch point {base_revision}"
+            );
+        } else {
+            lore_debug!(
+                "No new base revision from previous merges from source branch found, using branch point {base_revision}"
+            );
         }
     } else {
         let base_branch_point = metadata(repository.clone(), source_branch)
@@ -3076,6 +3095,13 @@ pub async fn resolve_diff3_base(
         ))
         .await?
         .base_revision;
+    }
+
+    if base_revision.is_zero() {
+        lore_warn!(
+            "Found no common ancestor between branch {source_branch} revision {source_revision} and branch {target_branch} revision {target_revision}"
+        );
+        return Err(BranchError::from(Divergent));
     }
 
     Ok(base_revision)
@@ -3317,7 +3343,7 @@ async fn load_additional_history(
     base_revision: Hash,
     base_revision_number: u64,
 ) -> bool {
-    let mut additional = find::batch_load_history(
+    let additional = find::batch_load_history(
         repository.clone(),
         if let Some(last) = history.last() {
             *last
@@ -3327,22 +3353,29 @@ async fn load_additional_history(
     )
     .await;
 
-    if additional.is_empty() {
-        return true;
-    }
+    // `batch_load_history` yields its start revision first, and that revision is
+    // already the tail of `history`. Appending it again both duplicates work for
+    // the caller's comparison and, once the history is exhausted, keeps reporting
+    // progress that does not exist.
+    let fresh = match additional.split_first() {
+        Some((first, rest)) if Some(first) == history.last() => rest,
+        _ => additional.as_slice(),
+    };
 
-    let Ok(state) = State::deserialize(repository.clone(), *additional.last().unwrap()).await
-    else {
+    let Some(oldest) = fresh.last() else {
         return true;
     };
 
-    if state.revision_number() < base_revision_number {
+    let Ok(state) = State::deserialize(repository.clone(), *oldest).await else {
         return true;
-    }
+    };
 
-    history.append(&mut additional);
+    history.extend_from_slice(fresh);
 
-    false
+    // Below the floor there is nothing left worth loading, but the batch just
+    // added still has to be compared - it can hold the revision being searched
+    // for.
+    state.revision_number() < base_revision_number
 }
 
 struct WalkVisit {
@@ -3350,114 +3383,143 @@ struct WalkVisit {
     target: bool,
 }
 
+/// State shared by every walker of one [`find_ancestor_revision`] search.
+struct AncestorWalk {
+    /// Which of the two walks has reached each revision. A revision reached by
+    /// both is a common ancestor.
+    visited: DashMap<Hash, WalkVisit>,
+    /// Highest-numbered revision reached by both walks. Never seeded with the
+    /// caller's floor, so a search that finds nothing stays distinguishable from
+    /// one that finds the floor.
+    common: RwLock<Option<(u64, Hash)>>,
+    /// Revision the walks stop at, from the caller's base revision. Zero
+    /// searches the whole history.
+    floor_revision: Hash,
+    /// Revision number of [`Self::floor_revision`], which the walks may not go
+    /// below.
+    floor_revision_number: u64,
+    /// First read failure that cut a walk short, kept so the search can report
+    /// an incomplete history rather than an absent common ancestor.
+    failure: RwLock<Option<StateError>>,
+}
+
+impl AncestorWalk {
+    fn new(floor_revision: Hash, floor_revision_number: u64) -> Self {
+        Self {
+            visited: DashMap::new(),
+            common: RwLock::new(None),
+            floor_revision,
+            floor_revision_number,
+            failure: RwLock::new(None),
+        }
+    }
+
+    async fn prune_at_or_below(&self) -> u64 {
+        match *self.common.read().await {
+            Some((found_revision_number, _found_revision)) => {
+                std::cmp::max(found_revision_number, self.floor_revision_number)
+            }
+            None => self.floor_revision_number,
+        }
+    }
+}
+
 async fn find_ancestor_walker(
     repository: Arc<RepositoryContext>,
     revision_start: Hash,
-    revision_stop: Hash,
-    visited: Arc<DashMap<Hash, WalkVisit>>,
-    common: Arc<RwLock<Option<(u64, Hash)>>>,
+    walk: Arc<AncestorWalk>,
     is_target: bool,
 ) {
     let mut tasks = JoinSet::new();
 
     let mut revision = revision_start;
     while revision != Hash::default() {
-        if let Ok(state) = state::State::deserialize(repository.clone(), revision).await {
-            // Update bookkeeping on revision visits.
-            //
-            // Guard scope is this statement and no arm awaits, so the concurrent
-            // sibling walkers sharing `visited` cannot build a wait cycle.
-            #[allow(clippy::disallowed_methods)]
-            let both_visited = match visited.entry(revision) {
-                Entry::Occupied(mut visited) => {
-                    let visited = visited.get_mut();
-                    if is_target {
-                        // If encountering a circular dependency, iteration can stop.
-                        if visited.target {
-                            break;
-                        }
-                        visited.target = true;
-                    } else {
-                        // If encountering a circular dependency, iteration can stop.
-                        if visited.source {
-                            break;
-                        }
-                        visited.source = true;
-                    }
-                    visited.source && visited.target
+        let state = match state::State::deserialize(repository.clone(), revision).await {
+            Ok(state) => state,
+            Err(err) => {
+                lore_warn!("Could not deserialize state for {revision} - aborting walk: {err}");
+                let mut failure = walk.failure.write().await;
+                if failure.is_none() {
+                    *failure = Some(err);
                 }
-                Entry::Vacant(entry) => {
-                    entry.insert(WalkVisit {
-                        source: !is_target,
-                        target: is_target,
-                    });
-                    false
-                }
-            };
+                break;
+            }
+        };
 
-            let state_revision = state.revision();
-            let state_revision_number = state.revision_number();
-
-            // Update bookkeeping when encountering a common ancestor with a higher revision number.
-            if both_visited {
-                let mut common = common.write().await;
-
-                if let Some((found_revision_number, _found_revision)) = *common {
-                    if state_revision_number > found_revision_number {
-                        *common = Some((state_revision_number, state_revision));
+        // Update bookkeeping on revision visits.
+        //
+        // Guard scope is this statement and no arm awaits, so the concurrent
+        // sibling walkers sharing `visited` cannot build a wait cycle.
+        #[allow(clippy::disallowed_methods)]
+        let both_visited = match walk.visited.entry(revision) {
+            Entry::Occupied(mut visited) => {
+                let visited = visited.get_mut();
+                if is_target {
+                    // If encountering a circular dependency, iteration can stop.
+                    if visited.target {
+                        break;
                     }
+                    visited.target = true;
                 } else {
+                    // If encountering a circular dependency, iteration can stop.
+                    if visited.source {
+                        break;
+                    }
+                    visited.source = true;
+                }
+                visited.source && visited.target
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(WalkVisit {
+                    source: !is_target,
+                    target: is_target,
+                });
+                false
+            }
+        };
+
+        let state_revision = state.revision();
+        let state_revision_number = state.revision_number();
+
+        // Update bookkeeping when encountering a common ancestor with a higher revision number.
+        if both_visited {
+            let mut common = walk.common.write().await;
+
+            if let Some((found_revision_number, _found_revision)) = *common {
+                if state_revision_number > found_revision_number {
                     *common = Some((state_revision_number, state_revision));
                 }
-
-                // If revision has been visited by both the target and source, iteration can stop.
-                break;
+            } else {
+                *common = Some((state_revision_number, state_revision));
             }
 
-            // If a common ancestor with a higher revision number was already found, iteration can stop.
-            {
-                if let Some((found_revision_number, _found_revision)) = *common.read().await
-                    && state_revision_number <= found_revision_number
-                {
-                    break;
-                }
-            }
-
-            // If revision equals the stop revision, iteration can stop.
-            if revision == revision_stop {
-                break;
-            }
-
-            // Walk other parent, if this is a merge.
-            let parent_other = state.parent_other();
-            if parent_other != Hash::default() {
-                lore_spawn!(tasks, {
-                    let repository = repository.clone();
-                    let visited = visited.clone();
-                    let common = common.clone();
-                    async move {
-                        find_ancestor_walker_recurse(
-                            repository,
-                            parent_other,
-                            revision_stop,
-                            visited,
-                            common,
-                            is_target,
-                        )
-                        .await;
-                    }
-                });
-            }
-
-            // Walk self parent.
-            revision = state.parent_self();
-        } else {
-            lore_warn!(
-                "Could not deserialize state for {} - aborting walk",
-                revision
-            );
+            // If revision has been visited by both the target and source, iteration can stop.
             break;
         }
+
+        if state_revision_number <= walk.prune_at_or_below().await {
+            break;
+        }
+
+        // If revision equals the stop revision, iteration can stop.
+        if revision == walk.floor_revision {
+            break;
+        }
+
+        // Walk other parent, if this is a merge.
+        let parent_other = state.parent_other();
+        if parent_other != Hash::default() {
+            lore_spawn!(tasks, {
+                let repository = repository.clone();
+                let walk = walk.clone();
+                async move {
+                    find_ancestor_walker_recurse(repository, parent_other, walk, is_target).await;
+                }
+            });
+        }
+
+        // Walk self parent.
+        revision = state.parent_self();
     }
 
     while let Some(_result) = tasks.join_next().await {}
@@ -3466,21 +3528,28 @@ async fn find_ancestor_walker(
 fn find_ancestor_walker_recurse(
     repository: Arc<RepositoryContext>,
     revision_start: Hash,
-    revision_stop: Hash,
-    visited: Arc<DashMap<Hash, WalkVisit>>,
-    common: Arc<RwLock<Option<(u64, Hash)>>>,
+    walk: Arc<AncestorWalk>,
     is_target: bool,
 ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
     Box::pin(find_ancestor_walker(
         repository,
         revision_start,
-        revision_stop,
-        visited,
-        common,
+        walk,
         is_target,
     ))
 }
 
+/// Walk both branches' histories backwards for the newest revision reachable
+/// from both, which is the best available 3-way base.
+///
+/// `base_revision` is a floor, not an answer: the walks stop there and prune any
+/// revision at or below its revision number. Pass `Hash::default()` to search
+/// with no floor.
+///
+/// Returns `Ok(None)` when the walks completed without finding anything above
+/// the floor, so the caller keeps its own base. Returns `Err` when a revision
+/// state could not be read and no common ancestor was found, so a transient read
+/// failure is never reported as an absent common ancestor.
 async fn find_ancestor_revision(
     repository: Arc<RepositoryContext>,
     source_branch: BranchId,
@@ -3488,63 +3557,47 @@ async fn find_ancestor_revision(
     target_branch: BranchId,
     target_revision: Hash,
     base_revision: Hash,
-) -> Option<Hash> {
+) -> Result<Option<Hash>, BranchError> {
     let mut tasks = JoinSet::new();
 
-    // Bookkeeping to hold if a revision has been visited by the source walk and/or the target walk.
-    let visited: Arc<DashMap<Hash, WalkVisit>> = Arc::new(DashMap::new());
-
-    // Bookkeeping to hold the common ancestor with the highest revision number.
-    let base_revision_number = State::deserialize(repository.clone(), base_revision)
-        .await
-        .map(|state| state.revision_number())
-        .unwrap_or_default();
-    let common: Arc<RwLock<Option<(u64, Hash)>>> =
-        Arc::new(RwLock::new(Some((base_revision_number, base_revision))));
+    let floor_revision_number = match State::deserialize(repository.clone(), base_revision).await {
+        Ok(state) => state.revision_number(),
+        Err(err) => {
+            // Leaves the search unbounded, which still answers correctly but walks
+            // both histories to their root revisions.
+            lore_warn!(
+                "Could not read base revision {base_revision} to bound the common ancestor search: {err}"
+            );
+            0
+        }
+    };
+    let walk = Arc::new(AncestorWalk::new(base_revision, floor_revision_number));
 
     // Start walking source.
     lore_spawn!(tasks, {
         let repository = repository.clone();
-        let visited = visited.clone();
-        let common = common.clone();
+        let walk = walk.clone();
         let is_target = false;
         async move {
             lore_debug!(
                 "Walking backwards on source branch {source_branch} from {source_revision}"
             );
 
-            find_ancestor_walker(
-                repository,
-                source_revision,
-                base_revision,
-                visited,
-                common,
-                is_target,
-            )
-            .await;
+            find_ancestor_walker(repository, source_revision, walk, is_target).await;
         }
     });
 
     // Start walking target.
     lore_spawn!(tasks, {
         let repository = repository.clone();
-        let visited = visited.clone();
-        let common = common.clone();
+        let walk = walk.clone();
         let is_target = true;
         async move {
             lore_debug!(
                 "Walking backwards on target branch {target_branch} from {target_revision}"
             );
 
-            find_ancestor_walker(
-                repository,
-                target_revision,
-                base_revision,
-                visited,
-                common,
-                is_target,
-            )
-            .await;
+            find_ancestor_walker(repository, target_revision, walk, is_target).await;
         }
     });
 
@@ -3552,21 +3605,31 @@ async fn find_ancestor_revision(
     while let Some(_result) = tasks.join_next().await {}
 
     // Process results.
-    if let Some((revision_number, revision)) = *common.read().await {
-        lore_debug!(
-            "Revision {} -> {} found as common ancestor",
-            revision,
-            revision_number
-        );
+    let found = *walk.common.read().await;
+    let failure = walk.failure.write().await.take();
 
-        Some(revision)
-    } else {
-        lore_debug!(
-            "Revision {} used as common ancestor because walk found no result",
-            base_revision
-        );
+    match (found, failure) {
+        (Some((revision_number, revision)), failure) => {
+            if let Some(err) = failure {
+                lore_warn!(
+                    "Revision {revision} -> {revision_number} found as common ancestor, but part of the history could not be read, so a newer common ancestor may exist: {err}"
+                );
+            } else {
+                lore_debug!("Revision {revision} -> {revision_number} found as common ancestor");
+            }
 
-        Some(base_revision)
+            Ok(Some(revision))
+        }
+        (None, Some(err)) => Err(err).forward::<BranchError>(
+            "Failed to read revision history while searching for a common ancestor",
+        ),
+        (None, None) => {
+            lore_debug!(
+                "Walk found no common ancestor newer than revision {base_revision}, keeping it as base"
+            );
+
+            Ok(None)
+        }
     }
 }
 

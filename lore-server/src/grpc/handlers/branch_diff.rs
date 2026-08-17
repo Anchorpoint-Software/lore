@@ -182,7 +182,7 @@ async fn branch_diff_handler(
         }
         Err(err) => {
             warn!({REPOSITORY_ID} = %repository_id, %branch_source, %branch_target, ?err, "Failed to calculate diff");
-            if err.is_divergent() {
+            if err.is_divergent() || err.is_invalid_arguments() {
                 Err(Status::invalid_argument(err.to_string()))
             } else if err.is_max_history_search_depth() {
                 Err(Status::resource_exhausted(err.to_string()))
@@ -763,6 +763,213 @@ mod test {
         assert_eq!(
             response, expected,
             "Branch diff identifies the divergence point as base revision when source and target are on divergent chains of the parent branch"
+        );
+    }
+
+    /// Every branch is created from another branch, so two branch stacks always
+    /// share an entry - the default branch at the latest. Stacks that share none
+    /// are an invalid branch configuration, and the diff has to say so rather than
+    /// resolve a base from a search it has no starting point for.
+    #[tokio::test]
+    async fn no_shared_branch_in_stacks_is_rejected() {
+        let repository = random::<Context>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        let status = Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository.into(),
+            ));
+
+            let (_main_branch, main_revision) = create_test_main(repository_context.clone()).await;
+
+            // Both stacks name a branch the other side does not carry.
+            let source_branch = create_branch(
+                repository_context.clone(),
+                "branch_source",
+                vec![BranchPoint {
+                    branch: BranchId::from(uuid::Uuid::now_v7()),
+                    revision: main_revision,
+                }],
+            )
+            .await;
+            let target_branch = create_branch(
+                repository_context.clone(),
+                "branch_target",
+                vec![BranchPoint {
+                    branch: BranchId::from(uuid::Uuid::now_v7()),
+                    revision: main_revision,
+                }],
+            )
+            .await;
+
+            let source_revision = push_revision_on_branch(
+                repository_context.clone(),
+                source_branch,
+                main_revision,
+                2,
+            )
+            .await;
+            let target_revision = push_revision_on_branch(
+                repository_context.clone(),
+                target_branch,
+                main_revision,
+                2,
+            )
+            .await;
+
+            let mut request = Request::new(BranchDiffRequest {
+                branch_target: target_branch.into(),
+                branch_source: source_branch.into(),
+                revision_target: Some(target_revision.into()),
+                revision_source: Some(source_revision.into()),
+                autoresolve: false,
+            });
+            request.metadata_mut().insert_bin(
+                REPOSITORY_ID_KEY,
+                tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
+            );
+
+            handler(request, immutable_store, mutable_store).await.err()
+        }))
+        .await;
+
+        let status = status.expect("Branch diff must refuse stacks that share no branch");
+        assert_eq!(
+            status.code(),
+            tonic::Code::InvalidArgument,
+            "An unusable branch configuration is the caller's argument, not a server fault, got {status:?}"
+        );
+        assert!(
+            status
+                .message()
+                .contains("no common branch in their branch stacks"),
+            "The status must name the branch configuration as the cause, got {:?}",
+            status.message()
+        );
+    }
+
+    /*
+        (main latest)  X            X (branch B latest)
+                       |            |
+                       |           / (branch B)
+                       |          /
+         (main branch) |     X---/ (branch point, on an unrelated root)
+                       |     |
+                       X     X (no shared revision)
+                       |     |
+                       .     .
+    */
+    /// Two branch points on the same branch that share no revision leave the
+    /// divergence search with nothing to find. The base must not fall back to the
+    /// zero revision: that is the empty tree, so both branches would report every
+    /// path as an add and conflict on all of them.
+    #[tokio::test]
+    async fn disjoint_histories_are_rejected() {
+        let repository = random::<Context>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        let status = Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository.into(),
+            ));
+
+            let (main_branch, revision_1) = create_test_main(repository_context.clone()).await;
+
+            let mut main_latest_revision = revision_1;
+            for revision_number in 2..4 {
+                main_latest_revision = push_revision_on_branch(
+                    repository_context.clone(),
+                    main_branch,
+                    main_latest_revision,
+                    revision_number,
+                )
+                .await;
+            }
+
+            // A second root chain on the same branch. The offset revision numbers
+            // keep every signature distinct from the pushed chain, so the two share
+            // no revision at all.
+            let mut orphan_revision = commit_revision_on_branch(
+                repository_context.clone(),
+                main_branch,
+                Hash::default(),
+                11,
+            )
+            .await;
+            orphan_revision = commit_revision_on_branch(
+                repository_context.clone(),
+                main_branch,
+                orphan_revision,
+                12,
+            )
+            .await;
+
+            let source_branch = create_branch(
+                repository_context.clone(),
+                "branch_source",
+                vec![BranchPoint {
+                    branch: main_branch,
+                    revision: main_latest_revision,
+                }],
+            )
+            .await;
+            let target_branch = create_branch(
+                repository_context.clone(),
+                "branch_target",
+                vec![BranchPoint {
+                    branch: main_branch,
+                    revision: orphan_revision,
+                }],
+            )
+            .await;
+
+            let source_revision = push_revision_on_branch(
+                repository_context.clone(),
+                source_branch,
+                main_latest_revision,
+                4,
+            )
+            .await;
+            let target_revision = push_revision_on_branch(
+                repository_context.clone(),
+                target_branch,
+                orphan_revision,
+                13,
+            )
+            .await;
+
+            let mut request = Request::new(BranchDiffRequest {
+                branch_target: target_branch.into(),
+                branch_source: source_branch.into(),
+                revision_target: Some(target_revision.into()),
+                revision_source: Some(source_revision.into()),
+                autoresolve: false,
+            });
+            request.metadata_mut().insert_bin(
+                REPOSITORY_ID_KEY,
+                tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
+            );
+
+            handler(request, immutable_store, mutable_store).await.err()
+        }))
+        .await;
+
+        let status = status.expect("Branch diff must refuse histories that share no revision");
+        assert_eq!(
+            status.code(),
+            tonic::Code::InvalidArgument,
+            "Disjoint histories are a repository state the caller has to resolve, got {status:?}"
+        );
+        assert!(
+            status.message().contains("divergent"),
+            "The status must report divergent history rather than a zero base, got {:?}",
+            status.message()
         );
     }
 }

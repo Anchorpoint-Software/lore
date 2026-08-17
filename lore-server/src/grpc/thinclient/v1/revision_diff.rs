@@ -459,6 +459,8 @@ async fn run_three_way(
                 );
                 if err.is_divergent() {
                     Status::failed_precondition(err.to_string())
+                } else if err.is_invalid_arguments() {
+                    Status::invalid_argument(err.to_string())
                 } else if err.is_max_history_search_depth() {
                     Status::resource_exhausted(err.to_string())
                 } else {
