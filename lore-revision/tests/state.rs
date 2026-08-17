@@ -45,6 +45,105 @@ mod tests {
         assert_eq!(cloned.as_bytes(), block.as_bytes());
     }
 
+    /// A state can be serialized more than once, and the second write carries the edits
+    /// made between the two.
+    ///
+    /// Every link in that chain is asserted: `serialize` releases the blocks it wrote, so
+    /// an edit after it finds them clean, registers itself and marks the state dirty
+    /// again; the second `serialize` then has something to write and returns a signature
+    /// of its own; and the edit is read back out of that signature, because a serialize
+    /// that wrote nothing returns the first signature and is otherwise indistinguishable
+    /// from one that worked.
+    #[tokio::test]
+    async fn serialize_twice_writes_the_edits_made_between() {
+        let (_immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let tempdir = generate_tempdir();
+                let path = tempdir.to_path_buf();
+                let immutable_store = LocalImmutableStore::new(
+                    None,
+                    lore_storage::local::immutable_store::ImmutableStoreSettings::default(),
+                )
+                .await
+                .expect("Failed to create store");
+                let write_token =
+                    lore_revision::repository::RepositoryWriteToken::acquire(path.as_path()).await;
+                let repository = Arc::new(
+                    RepositoryContext::new(
+                        default_repository_creation_args(
+                            immutable_store.clone(),
+                            mutable_store.clone(),
+                        )
+                        .with_path(&path),
+                    )
+                    .with_write_token(write_token.share()),
+                );
+
+                let state = Arc::new(State::new());
+                state
+                    .node_add(
+                        repository.clone(),
+                        ROOT_NODE,
+                        Node {
+                            name_hash: hash_string("first"),
+                            ..Default::default()
+                        },
+                        "first",
+                    )
+                    .await
+                    .expect("Failed to add the first node");
+                let first = state
+                    .serialize(repository.clone(), &write_token)
+                    .await
+                    .expect("Failed to serialize");
+
+                let second_node = state
+                    .node_add(
+                        repository.clone(),
+                        ROOT_NODE,
+                        Node {
+                            name_hash: hash_string("second"),
+                            ..Default::default()
+                        },
+                        "second",
+                    )
+                    .await
+                    .expect("Failed to add the second node");
+                assert!(
+                    state.is_dirty(),
+                    "an edit after a serialize must mark the state dirty again"
+                );
+
+                let second = state
+                    .serialize(repository.clone(), &write_token)
+                    .await
+                    .expect("Failed to serialize again");
+                assert_ne!(
+                    first, second,
+                    "a state with a new edit must serialize to a new signature"
+                );
+
+                let restored = State::deserialize(repository.clone(), second)
+                    .await
+                    .expect("Failed to deserialize");
+                let node = restored
+                    .node(repository, second_node)
+                    .await
+                    .expect("Failed to read the node back");
+                assert_eq!(
+                    node.name_hash,
+                    hash_string("second"),
+                    "the second serialize must carry the edit made after the first"
+                );
+            }))
+            .await
+            .expect("Task failed");
+    }
+
     #[tokio::test]
     async fn collect_new_name_fragments() {
         let (_immutable_store, mutable_store, execution) =

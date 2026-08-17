@@ -118,20 +118,21 @@ async fn resolve_path_impl(
         async move |internal, args: LoreRevisionTreeResolvePathArgs| {
             let id = args.id;
             let path = args.path.as_str();
+            let access = internal.access_shared().await;
+            let state = access.state();
 
             if path.is_empty() {
                 emit_resolve_complete(
                     id,
                     ROOT_NODE,
                     internal.repository,
-                    internal.state.revision(),
+                    state.revision(),
                     LoreErrorCode::None,
                 );
                 return Ok(());
             }
 
-            match internal
-                .state
+            match state
                 .find_node_link(internal.repository_context.clone(), path)
                 .await
             {
@@ -191,6 +192,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;
 
+    use lore_base::runtime::LORE_CONTEXT;
     use lore_base::types::Address;
     use lore_base::types::Context;
     use lore_base::types::Hash;
@@ -205,6 +207,7 @@ mod tests {
     use lore_storage::hash::hash_string;
 
     use super::*;
+    use crate::call::setup_execution;
     use crate::revision_tree::add::LoreRevisionTreeAddArgs;
     use crate::revision_tree::add::LoreRevisionTreeAddEntry;
     use crate::revision_tree::add::add;
@@ -272,7 +275,7 @@ mod tests {
         let entry = rt_handle::REGISTRY
             .get(&handle.handle_id)
             .expect("handle registered");
-        (entry.state.clone(), entry.repository_context.clone())
+        (entry.state_for_tests(), entry.repository_context.clone())
     }
 
     /// Add a link node under root targeting `(repository, revision, target_node)`.
@@ -284,25 +287,35 @@ mod tests {
         revision: Hash,
         target_node: NodeID,
     ) -> NodeID {
-        let (state, repository_context) = handle_state(handle);
-        let node = Node {
-            flags: NodeFlags::Link.bits(),
-            name_hash: hash_string(name),
-            child: target_node,
-            address: Address {
-                hash: revision,
-                context: Context::from(repository),
-            },
-            ..Default::default()
-        };
-        state
-            .node_add(repository_context, ROOT_NODE, node, name)
+        LORE_CONTEXT
+            .scope(
+                setup_execution(LoreGlobalArgs::default(), None),
+                async move {
+                    let (state, repository_context) = handle_state(handle);
+                    let node = Node {
+                        flags: NodeFlags::Link.bits(),
+                        name_hash: hash_string(name),
+                        child: target_node,
+                        address: Address {
+                            hash: revision,
+                            context: Context::from(repository),
+                        },
+                        ..Default::default()
+                    };
+                    state
+                        .node_add(repository_context, ROOT_NODE, node, name)
+                        .await
+                        .expect("node_add must succeed")
+                },
+            )
             .await
-            .expect("node_add must succeed")
     }
 
     /// Add `child_name` under root, then serialize the state to a committed
     /// revision a link can point at. Returns the revision hash.
+    ///
+    /// Serializing reads through the store, so it runs in an execution context of
+    /// its own: every other call in these tests gets one from the dispatcher.
     async fn seal_target(handle: LoreRevisionTree, child_name: &str) -> Hash {
         let (state, repository_context) = handle_state(handle);
         let child = Node {
@@ -315,10 +328,17 @@ mod tests {
             .await
             .expect("node_add child must succeed");
         let token = RepositoryWriteToken::acquire(Path::new("link-target")).await;
-        state
-            .serialize(repository_context, &token)
+        LORE_CONTEXT
+            .scope(
+                setup_execution(LoreGlobalArgs::default(), None),
+                async move {
+                    state
+                        .serialize(repository_context, &token)
+                        .await
+                        .expect("serialize must succeed")
+                },
+            )
             .await
-            .expect("serialize must succeed")
     }
 
     async fn load_handle(label: &str, repository: Partition) -> (LoreRevisionTree, u64) {

@@ -362,7 +362,7 @@ mod tests {
                     "Expected NothingStaged, got {error}"
                 );
                 assert!(
-                    !error.tree_mutated,
+                    !error.tree_mutated(),
                     "a rejection before the freeze must leave the tree alone"
                 );
             }))
@@ -439,7 +439,7 @@ mod tests {
                     "Expected BranchAdvanced, got {error}"
                 );
                 assert!(
-                    !error.tree_mutated,
+                    !error.tree_mutated(),
                     "a tip collision is caught before any write, so the handle stays usable"
                 );
             }))
@@ -639,6 +639,140 @@ mod tests {
                     .await
                     .expect("a node id captured before the commit must still resolve");
                 assert_eq!(node.name_hash, hash_string("a.bin"));
+            }))
+            .await
+            .expect("Task failed");
+    }
+
+    /// A failure past the freeze hands back a snapshot of the tree as it was, and the
+    /// tree it describes is the staged one — still staged, still named, still there.
+    /// A file with a zero content hash and a non-zero size gets past the validator,
+    /// which checks no addresses, and is refused by the rehash inside the freeze.
+    #[tokio::test]
+    async fn commit_in_memory_revision_hands_back_a_snapshot_when_the_freeze_fails() {
+        let (_immutable, mutable, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let repository = test_repository(mutable).await;
+                let branch = branch_id();
+                let state = Arc::new(State::new());
+                let unhashed = Node {
+                    address: Address::default(),
+                    ..file("a.bin")
+                };
+                let node_id = add(&state, repository.clone(), ROOT_NODE, unhashed, "a.bin").await;
+
+                let failure = commit_in_memory_revision(
+                    repository.clone(),
+                    &token(),
+                    state.clone(),
+                    metadata_on(branch),
+                    Hash::default(),
+                    branch,
+                )
+                .await
+                .expect_err("a zero content hash must not reach a revision");
+
+                assert!(
+                    failure.tree_mutated(),
+                    "the rehash refuses inside the freeze, got {failure}"
+                );
+                assert!(
+                    !failure.restore_from.is_zero(),
+                    "a mutated tree must carry the snapshot to restore from"
+                );
+
+                let restored = State::deserialize(repository.clone(), failure.restore_from)
+                    .await
+                    .expect("the snapshot must read back");
+                let node = restored
+                    .node(repository.clone(), node_id)
+                    .await
+                    .expect("the staged node must survive in the snapshot");
+                assert_eq!(node.name_hash, hash_string("a.bin"));
+                assert!(
+                    node.is_staged(),
+                    "the snapshot is of the staged tree, so the edit is still staged: 0x{:x}",
+                    node.flags
+                );
+                assert_eq!(
+                    restored.parents()[0],
+                    Hash::default(),
+                    "the snapshot predates the commit, so it records no parent yet"
+                );
+            }))
+            .await
+            .expect("Task failed");
+    }
+
+    /// The same snapshot, taken on a state that has already published a revision — the
+    /// case a handle is actually in when a second commit fails. The blocks were
+    /// serialized once already, so the snapshot has to carry the edits made since.
+    #[tokio::test]
+    async fn commit_in_memory_revision_snapshots_a_state_that_already_committed() {
+        let (_immutable, mutable, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let repository = test_repository(mutable).await;
+                let branch = branch_id();
+                let state = Arc::new(State::new());
+                add(
+                    &state,
+                    repository.clone(),
+                    ROOT_NODE,
+                    file("a.bin"),
+                    "a.bin",
+                )
+                .await;
+                let published = commit_in_memory_revision(
+                    repository.clone(),
+                    &token(),
+                    state.clone(),
+                    metadata_on(branch),
+                    Hash::default(),
+                    branch,
+                )
+                .await
+                .expect("the first revision must commit");
+
+                let unhashed = Node {
+                    address: Address::default(),
+                    ..file("b.bin")
+                };
+                let node_id = add(&state, repository.clone(), ROOT_NODE, unhashed, "b.bin").await;
+
+                let failure = commit_in_memory_revision(
+                    repository.clone(),
+                    &token(),
+                    state.clone(),
+                    metadata_on(branch),
+                    published,
+                    branch,
+                )
+                .await
+                .expect_err("a zero content hash must not reach a revision");
+                assert!(failure.tree_mutated(), "got {failure}");
+
+                let restored = State::deserialize(repository.clone(), failure.restore_from)
+                    .await
+                    .expect("the snapshot must read back");
+                let node = restored
+                    .node(repository.clone(), node_id)
+                    .await
+                    .expect("the edit made since the last commit must be in the snapshot");
+                assert_eq!(node.name_hash, hash_string("b.bin"));
+                assert!(
+                    node.is_staged(),
+                    "the edit must still be staged in the snapshot: 0x{:x}",
+                    node.flags
+                );
+                let name = restored
+                    .node_name_clone(repository, node_id)
+                    .await
+                    .expect("the snapshot must carry the node's name");
+                assert_eq!(name, "b.bin", "the name table must survive the snapshot");
             }))
             .await
             .expect("Task failed");

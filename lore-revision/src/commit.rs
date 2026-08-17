@@ -3552,15 +3552,27 @@ fn string_key_is_unset(metadata: &Metadata, key: &str) -> bool {
 /// pointer write compares against the same observed value so a tip that advances
 /// during the freeze fails too.
 ///
-/// No rollback once the freeze starts: an error from there on can leave
-/// `state_staged` part-frozen, which [`InMemoryCommitFailure::tree_mutated`]
-/// reports so the handle owning it can be poisoned rather than reused. Blocks
-/// written before the failure are content-addressed and idempotent on a retry.
+/// The freeze cannot be undone, so it is snapshotted instead: the staged state is
+/// serialized just before it begins, and an error from there on returns that
+/// signature as [`InMemoryCommitFailure::restore_from`] for the caller to rebuild
+/// the tree from with [`State::deserialize`]. A restored state is a replacement, not
+/// a repair — the part-frozen one is dropped whole. Blocks written before the failure
+/// are content-addressed and idempotent on a retry, and the snapshot itself is
+/// unreferenced once the commit succeeds.
 ///
-/// The write tracker is drained on every path, including failure, since dropping
-/// it with leaders still running aborts them. The tip is published last, because
-/// an unreferenced revision is an orphan a retry reproduces where a tip pointing
-/// at payloads that never landed is not.
+/// The snapshot is taken after the rejections, which leave the tree untouched and need
+/// none, and before `set_parent_self`, which already belongs to the commit rather than
+/// to the state the caller built. The state is marked dirty on either side of it: a
+/// clean state serializes to its existing signature without writing, so a
+/// metadata-only commit on a handle at the zero revision would snapshot to a zero hash
+/// — indistinguishable from "the freeze never started" — and the freeze's own writes
+/// re-dirty the state only when it has something to do.
+///
+/// The write tracker is drained on every path, including failure, since dropping it
+/// with leaders still running aborts them. The tip is published last, and only once
+/// every payload is durable: an unreferenced revision is an orphan the
+/// content-addressed store tolerates and a retry reproduces, where a tip pointing at
+/// payloads that never landed is not.
 pub async fn commit_in_memory_revision(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
@@ -3595,6 +3607,18 @@ pub async fn commit_in_memory_revision(
     stamp_commit_metadata(repository.clone(), &mut metadata, branch)
         .await
         .map_err(InMemoryCommitFailure::rejected)?;
+
+    state_staged.mark_dirty();
+    let restore_from = state_staged
+        .serialize(repository.clone(), token)
+        .await
+        .forward::<CommitError>("Failed to snapshot the staged state")
+        .map_err(InMemoryCommitFailure::rejected)?;
+    debug_assert!(
+        !restore_from.is_zero(),
+        "the snapshot must be a real state, or a post-freeze failure has nothing to restore from"
+    );
+    state_staged.mark_dirty();
 
     state_staged.set_parent_self(current_revision);
     state_staged.set_parent_other(Hash::default());
@@ -3633,10 +3657,11 @@ pub async fn commit_in_memory_revision(
 
     let drain_result = tracker.await_all().await;
 
-    let signature = work_result.map_err(InMemoryCommitFailure::while_freezing)?;
+    let signature =
+        work_result.map_err(|error| InMemoryCommitFailure::while_freezing(error, restore_from))?;
     drain_result
         .forward::<CommitError>("Background fragment upload task failed during commit")
-        .map_err(InMemoryCommitFailure::while_freezing)?;
+        .map_err(|error| InMemoryCommitFailure::while_freezing(error, restore_from))?;
 
     branch::store_latest(
         repository,
@@ -3647,7 +3672,7 @@ pub async fn commit_in_memory_revision(
     )
     .await
     .forward::<CommitError>("Failed to store current branch latest")
-    .map_err(InMemoryCommitFailure::while_freezing)?;
+    .map_err(|error| InMemoryCommitFailure::while_freezing(error, restore_from))?;
 
     Ok(signature)
 }
@@ -3655,30 +3680,36 @@ pub async fn commit_in_memory_revision(
 /// Why an in-memory commit failed, and whether it had begun freezing the tree.
 ///
 /// A failure before the freeze wrote nothing to the state, so it is still exactly
-/// what the caller built and the handle holding it stays usable — a batch with
-/// nothing staged or a branch that already moved on does not cost the caller its
-/// handle. From the freeze onwards the tree may be part-frozen, and the only
-/// recovery is to load a fresh handle and re-apply.
+/// what the caller built — a batch with nothing staged or a branch that already
+/// moved on costs the caller nothing. From the freeze onwards the tree is
+/// part-frozen and cannot be trusted, and [`Self::restore_from`] carries the
+/// pre-commit snapshot to rebuild it from.
 #[derive(Debug)]
 pub struct InMemoryCommitFailure {
     /// What went wrong.
     pub error: CommitError,
-    /// Set once the freeze has started, so `state_staged` can no longer be trusted.
-    pub tree_mutated: bool,
+    /// Signature of the pre-commit state, zero until the freeze has begun. The two
+    /// facts are one: a tree nothing has mutated needs no snapshot to go back to.
+    pub restore_from: Hash,
 }
 
 impl InMemoryCommitFailure {
+    /// Whether the freeze had begun, so `state_staged` can no longer be trusted.
+    pub fn tree_mutated(&self) -> bool {
+        !self.restore_from.is_zero()
+    }
+
     fn rejected(error: impl Into<CommitError>) -> Self {
         Self {
             error: error.into(),
-            tree_mutated: false,
+            restore_from: Hash::default(),
         }
     }
 
-    fn while_freezing(error: impl Into<CommitError>) -> Self {
+    fn while_freezing(error: impl Into<CommitError>, restore_from: Hash) -> Self {
         Self {
             error: error.into(),
-            tree_mutated: true,
+            restore_from,
         }
     }
 }

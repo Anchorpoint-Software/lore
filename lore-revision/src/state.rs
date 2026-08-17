@@ -1046,6 +1046,8 @@ impl State {
             runtime.signature = address.hash;
         }
 
+        self.release_serialized_blocks(&block_dirty, &block_file_metadata_dirty);
+
         lore_trace!(
             "Serialized state to {} in repository {}",
             address.hash,
@@ -1053,6 +1055,41 @@ impl State {
         );
 
         Ok(address.hash)
+    }
+
+    /// Drop the written blocks' dirty flags and registrations, so the state matches the
+    /// store it was just written to.
+    ///
+    /// Without this a serialized state cannot be serialized again: the blocks stay
+    /// flagged dirty, so the next edit's `mark_dirty` reports "already dirty", its
+    /// caller registers nothing and does not mark the state dirty, and the next
+    /// `serialize` returns the previous signature having written none of the edits.
+    /// Only the blocks this call wrote are released — anything registered while it ran
+    /// still needs writing.
+    ///
+    /// The dirty flag cleared here is itself the membership test, so the registrations
+    /// are filtered on it rather than against a set of what was written: a block still
+    /// dirty was either registered while this call ran or re-edited since it was
+    /// written, and either way it still needs writing.
+    fn release_serialized_blocks(
+        &self,
+        block_dirty: &[(Arc<NodeBlock>, usize)],
+        block_file_metadata_dirty: &[(Arc<NodeFileMetadataBlock>, usize)],
+    ) {
+        for (block, _) in block_dirty.iter() {
+            block.write().clear_dirty();
+        }
+        for (block, _) in block_file_metadata_dirty.iter() {
+            block.write().clear_dirty();
+        }
+
+        let mut runtime = self.runtime.write();
+        runtime
+            .block_dirty
+            .retain(|(block, _)| block.read().raw().flags & NodeBlockFlags::Dirty != 0);
+        runtime.block_file_metadata_dirty.retain(|(block, _)| {
+            block.read().node_block().flags & NodeFileMetadataBlockFlags::Dirty != 0
+        });
     }
 
     pub fn format(&self) -> u32 {
@@ -1662,6 +1699,17 @@ impl State {
 
     pub fn revision(&self) -> Hash {
         self.runtime.read().signature
+    }
+
+    /// Point the state at the revision it is based on.
+    ///
+    /// [`Self::serialize`] leaves the signature at whatever it last wrote, which is
+    /// what a caller restoring a pre-commit snapshot has to undo: the state is based
+    /// on the revision the handle was loaded at, not on the snapshot it was rebuilt
+    /// from. Pair it with [`Self::mark_dirty`] — a state with unserialized edits and
+    /// a signature is exactly what an edited handle looks like.
+    pub fn set_revision(&self, signature: Hash) {
+        self.runtime.write().signature = signature;
     }
 
     pub fn state_data(&self) -> StateData {

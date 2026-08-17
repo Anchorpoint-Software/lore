@@ -84,9 +84,19 @@ pub(crate) struct RevisionTreeInternal {
     /// mutable, and (optional) remote stores. Built in the bridge helper
     /// at load time and reused across every verb on this handle.
     pub(crate) repository_context: Arc<RepositoryContext>,
-    /// Loaded revision's in-memory `State`. Internally mutable via the
-    /// `parking_lot` locks `State` holds; no outer lock is required.
-    pub(crate) state: Arc<State>,
+    /// Loaded revision's in-memory `State`.
+    ///
+    /// Private, and reachable only through [`Self::access_shared`] or
+    /// [`Self::access_exclusive`], so a call cannot touch the tree without saying
+    /// whether it can share the handle. `State` is internally
+    /// mutable, so an editing verb mutates it while holding a *shared* guard; `commit`
+    /// takes the exclusive one. That is what makes a commit atomic against the handle —
+    /// no edit lands inside the freeze, and nothing is reading the old state when a
+    /// failed commit puts the restored one back through the same guard.
+    ///
+    /// Async-aware because commit holds it across the freeze's awaits, where a
+    /// `parking_lot` guard is neither `Send` nor safe to hold.
+    state: tokio::sync::RwLock<Arc<State>>,
     /// Accumulator for `metadata_set` edits. Commit clones the buffer,
     /// serializes the clone, and on success replaces this with a fresh
     /// default.
@@ -101,7 +111,96 @@ pub(crate) struct RevisionTreeInternal {
     pub(crate) drained: Notify,
 }
 
+/// A held claim on the handle's tree, shared with other calls.
+///
+/// Every verb but `commit` works under one of these. `State` is internally mutable, so
+/// an editing verb mutates the tree through a shared claim; what the claim excludes is
+/// a commit, not another edit.
+///
+/// Keep it alive for as long as the state is in use: dropping it and holding on to the
+/// `Arc<State>` leaves a verb mutating a tree a commit believes it has to itself.
+pub(crate) struct SharedAccess<'handle>(tokio::sync::RwLockReadGuard<'handle, Arc<State>>);
+
+impl SharedAccess<'_> {
+    /// The tree this call may work on.
+    pub(crate) fn state(&self) -> Arc<State> {
+        (*self.0).clone()
+    }
+}
+
+/// A held claim on the handle's tree, to the exclusion of every other call.
+///
+/// Only `commit` takes one, because it rewrites the tree in place and replaces it
+/// outright if that fails. A caller whose event callback re-enters the API on the same
+/// handle deadlocks against this rather than corrupting a commit — which the callback
+/// contract already forbids.
+///
+/// Keep it alive for as long as the state is in use: dropping it and holding on to the
+/// `Arc<State>` leaves a commit rewriting a tree other calls can reach.
+pub(crate) struct ExclusiveAccess<'handle>(tokio::sync::RwLockWriteGuard<'handle, Arc<State>>);
+
+impl ExclusiveAccess<'_> {
+    /// The tree this call may work on.
+    pub(crate) fn state(&self) -> Arc<State> {
+        (*self.0).clone()
+    }
+
+    /// Replace the tree the handle serves — a commit restoring its pre-commit snapshot.
+    ///
+    /// Offered on the exclusive claim alone because that is what makes it sound: no
+    /// concurrent call is reading the tree being swapped out.
+    pub(crate) fn replace(&mut self, state: Arc<State>) {
+        *self.0 = state;
+    }
+}
+
 impl RevisionTreeInternal {
+    /// Build a handle's internals around a freshly loaded tree. A constructor rather
+    /// than a struct literal because [`Self::state`] is private, which is what keeps
+    /// every reader on the two access methods.
+    pub(crate) fn new(
+        store_internal: Arc<StoreInternal>,
+        parent_storage_handle_id: u64,
+        repository: Partition,
+        repository_context: Arc<RepositoryContext>,
+        state: Arc<State>,
+    ) -> Self {
+        Self {
+            store_internal,
+            parent_storage_handle_id,
+            repository,
+            repository_context,
+            state: tokio::sync::RwLock::new(state),
+            pending_metadata: parking_lot::RwLock::new(Metadata::default()),
+            in_flight: AtomicU64::new(0),
+            invalid: AtomicBool::new(false),
+            drained: Notify::new(),
+        }
+    }
+
+    /// Claim the handle's tree for a call that can share it — see [`SharedAccess`].
+    pub(crate) async fn access_shared(&self) -> SharedAccess<'_> {
+        SharedAccess(self.state.read().await)
+    }
+
+    /// Claim the handle's tree for a call that cannot — see [`ExclusiveAccess`].
+    pub(crate) async fn access_exclusive(&self) -> ExclusiveAccess<'_> {
+        ExclusiveAccess(self.state.write().await)
+    }
+
+    /// The handle's tree, for a fixture that builds or inspects it directly.
+    ///
+    /// Deliberately non-blocking and non-async: it stays callable from a synchronous
+    /// helper inside an async test, and a fixture that has in fact raced a verb fails
+    /// here instead of quietly waiting for it.
+    #[cfg(test)]
+    pub(crate) fn state_for_tests(&self) -> Arc<State> {
+        self.state
+            .try_read()
+            .expect("a fixture must not race a verb for the handle's tree")
+            .clone()
+    }
+
     /// Close sequence: mark the handle invalid so no new ops enter, then
     /// block until every in-flight op has paired its decrement. Ops that
     /// race in between increment-and-check self-abort because they see
@@ -266,19 +365,15 @@ pub(crate) mod test_support {
     //! plumbing, so the registry tests run against the same type shape
     //! the production load verb produces.
     use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
-    use std::sync::atomic::AtomicU64;
 
     use lore_base::types::Partition;
     use lore_revision::filter::Filter;
     use lore_revision::instance::InstanceId;
-    use lore_revision::metadata::Metadata;
     use lore_revision::repository::RepositoryContext;
     use lore_revision::repository::RepositoryContextCreationArgs;
     use lore_revision::repository::RepositoryFormat;
     use lore_revision::repository::create_client_memory_stores;
     use lore_revision::state::State;
-    use tokio::sync::Notify;
 
     use super::RevisionTreeInternal;
     use crate::storage::store::StoreInternal;
@@ -305,17 +400,13 @@ pub(crate) mod test_support {
             format: RepositoryFormat::Lore,
         }));
         let state = Arc::new(State::new());
-        Arc::new(RevisionTreeInternal {
+        Arc::new(RevisionTreeInternal::new(
             store_internal,
-            parent_storage_handle_id: 0,
+            0,
             repository,
             repository_context,
             state,
-            pending_metadata: parking_lot::RwLock::new(Metadata::default()),
-            in_flight: AtomicU64::new(0),
-            invalid: AtomicBool::new(false),
-            drained: Notify::new(),
-        })
+        ))
     }
 }
 

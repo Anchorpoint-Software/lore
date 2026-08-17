@@ -118,8 +118,10 @@ async fn node_path_impl(
                 return Err(invalid("node id is invalid"));
             }
 
-            let Ok(path) = internal
-                .state
+            let access = internal.access_shared().await;
+            let state = access.state();
+
+            let Ok(path) = state
                 .node_path(internal.repository_context.clone(), node_id)
                 .await
             else {
@@ -135,7 +137,7 @@ async fn node_path_impl(
             LoreEvent::RevisionTreeNodePath(LoreRevisionTreeNodePathEventData {
                 id,
                 repository: internal.repository,
-                revision: internal.state.revision(),
+                revision: state.revision(),
                 path: LoreString::from(path.as_str()),
                 error_code: LoreErrorCode::None,
             })
@@ -232,7 +234,7 @@ mod tests {
         let entry = rt_handle::REGISTRY
             .get(&handle.handle_id)
             .expect("handle registered");
-        (entry.state.clone(), entry.repository_context.clone())
+        (entry.state_for_tests(), entry.repository_context.clone())
     }
 
     /// Add a node under `parent` and return its id. `is_file` chooses a file vs

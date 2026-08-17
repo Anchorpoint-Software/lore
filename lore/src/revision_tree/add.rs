@@ -886,8 +886,10 @@ async fn add_batch(
         return Ok(());
     }
     let context = internal.repository_context.clone();
-    let planned = plan_entries(&internal.state, &context, args.entries.as_slice()).await?;
-    apply_plan(args.clone(), internal.state.clone(), context, planned).await
+    let access = internal.access_shared().await;
+    let state = access.state();
+    let planned = plan_entries(&state, &context, args.entries.as_slice()).await?;
+    apply_plan(args.clone(), state, context, planned).await
 }
 
 async fn add_impl(
@@ -1554,7 +1556,7 @@ mod tests {
             let internal = guard.internal_clone();
             let block_index = NodeBlock::index(doomed);
             let block = internal
-                .state
+                .state_for_tests()
                 .block(internal.repository_context.clone(), block_index)
                 .await
                 .expect("the parent block must be readable");

@@ -1563,6 +1563,16 @@ impl NodeBlockWriter<'_> {
         !was_dirty
     }
 
+    /// Clear the dirty flag once the block has been written out.
+    ///
+    /// [`Self::mark_dirty`] reports whether the block *became* dirty, and callers use
+    /// that to decide whether to register it for the next serialize. A block left
+    /// flagged after being written answers "already dirty" to the next edit, which then
+    /// registers nothing — so the edit is silently dropped from that serialize.
+    pub fn clear_dirty(&mut self) {
+        self.lock.data.flags &= !NodeBlockFlags::Dirty;
+    }
+
     pub fn discard_node(&mut self, block_index: usize, node_index: usize) {
         let block = &mut self.lock.data;
         if block.node_unused_count == 0 && block.node_count == BLOCK_NODE_COUNT as u32 {
@@ -2017,6 +2027,12 @@ impl NodeFileMetadataBlockWriter<'_> {
         let was_dirty = self.lock.flags & NodeFileMetadataBlockFlags::Dirty != 0;
         self.lock.flags |= NodeFileMetadataBlockFlags::Dirty;
         !was_dirty
+    }
+
+    /// Clear the dirty flag once the block has been written out. See
+    /// [`NodeBlockWriter::clear_dirty`].
+    pub fn clear_dirty(&mut self) {
+        self.lock.flags &= !NodeFileMetadataBlockFlags::Dirty;
     }
 }
 

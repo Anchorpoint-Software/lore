@@ -7,8 +7,6 @@
 //! is needed because the handle itself serves as the future correlation key.
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::AtomicU64;
 
 use lore_base::error::AddressNotFound;
 use lore_base::error::InvalidArguments;
@@ -23,11 +21,9 @@ use lore_revision::event::EventError;
 use lore_revision::event::LoreEvent;
 use lore_revision::event::revision_tree::LoreRevisionTreeLoadedEventData;
 use lore_revision::interface::LoreError;
-use lore_revision::metadata::Metadata;
 use lore_revision::state::State;
 use serde::Deserialize;
 use serde::Serialize;
-use tokio::sync::Notify;
 
 use crate::call::no_repository_call;
 use crate::call_delegation::dispatch_call;
@@ -125,17 +121,13 @@ async fn load_impl(
             .await
             .map_err(map_state_error)?;
 
-        let internal = Arc::new(RevisionTreeInternal {
+        let internal = Arc::new(RevisionTreeInternal::new(
             store_internal,
-            parent_storage_handle_id: args.store.handle_id,
-            repository: args.repository,
+            args.store.handle_id,
+            args.repository,
             repository_context,
             state,
-            pending_metadata: parking_lot::RwLock::new(Metadata::default()),
-            in_flight: AtomicU64::new(0),
-            invalid: AtomicBool::new(false),
-            drained: Notify::new(),
-        });
+        ));
         let revision_tree_handle = handle::register(internal);
         LoreEvent::RevisionTreeLoaded(LoreRevisionTreeLoadedEventData {
             handle_id: revision_tree_handle.handle_id,

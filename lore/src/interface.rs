@@ -7857,17 +7857,21 @@ pub type LoreRevisionTreeCommitOptions =
 /// captured before the commit still resolve, and further edits commit on top. The
 /// pending metadata is emptied, so the next revision starts fresh.
 ///
-/// A call rejected before any write — nothing staged, an unusable branch, a tree
-/// the validator refuses, or a branch tip that has already moved — leaves the
-/// handle usable, so the caller can fix the call and retry. A failure once the
-/// freeze has begun **poisons the handle**: every later call on it returns
-/// `LORE_ERROR_CODE_INVALID_ARGUMENTS`, and recovery is to close it, load a fresh
-/// handle against the new tip, re-apply the edits and commit again. When the
-/// branch had advanced, `new_tip_hash` on the terminal carries that tip, which is
-/// also how a caller tells that failure apart: neither a tip collision nor an
-/// empty commit has a `lore_error_code_t` of its own, so both report `INTERNAL`
-/// with the reason in the completion detail — the same codes the file-system
-/// commit returns.
+/// **A commit is all-or-nothing against the handle.** Either it succeeds and the
+/// handle is consistent on the new revision, or it fails and the handle is
+/// consistent on the state it had before the call. A call rejected before any write
+/// — nothing staged, an unusable branch, a tree the validator refuses, or a branch
+/// tip that has already moved — writes nothing at all. A failure once the freeze has
+/// begun leaves a part-frozen tree, which is discarded and rebuilt from a snapshot
+/// taken before the freeze started, so the handle comes back on the revision it was
+/// on with the edits still staged. Either way recovery is to fix what the terminal
+/// reported and retry **on the same handle**: no close, no reload, no re-applying
+/// edits. The one failure that still poisons the handle is a restore that itself
+/// fails, which reports `INTERNAL` saying so. When the branch had advanced,
+/// `new_tip_hash` on the terminal carries that tip, which is also how a caller tells
+/// that failure apart: neither a tip collision nor an empty commit has a
+/// `lore_error_code_t` of its own, so both report `INTERNAL` with the reason in the
+/// completion detail — the same codes the file-system commit returns.
 ///
 /// `options.remote_write = 1` uploads within the call. It is a request, not a
 /// guarantee: a store bound offline or local-only, or a call passing
@@ -7876,13 +7880,17 @@ pub type LoreRevisionTreeCommitOptions =
 /// reports success. Per-call flags contradicting the store's bound flags reject the
 /// call.
 ///
-/// **Two commits in flight on one handle must agree about `remote_write`.** The
-/// resolved value is applied to the handle's shared repository context, so
-/// concurrent calls that disagree can each observe the other's — one uploading when
-/// it asked not to, or not uploading when it asked to, and neither call fails.
-/// Unlike a tip collision there is nothing to decide it. Serialize such commits or
-/// give them separate handles. The value also outlives the call: the handle carries
-/// whatever the last commit resolved.
+/// **The commit holds the handle for the length of the call.** No other call on the
+/// same handle runs while the tree is frozen, so an edit issued concurrently lands
+/// wholly before the commit reads the tree or wholly after it finishes, two commits
+/// on one handle serialize, and `metadata_set` can no longer lose an edit to the
+/// commit. A commit on a large tree therefore blocks reads on that handle for its
+/// duration, and a callback that re-enters the API on the same handle deadlocks —
+/// which the callback contract already forbids. Commits from *different* handles or
+/// processes still race, and the branch tip compare-and-swap decides them.
+///
+/// `remote_write` is resolved onto the handle's shared repository context, so the
+/// value outlives the call: the handle carries whatever the last commit resolved.
 ///
 /// | Terminal event                                | Payload                                             | Notes                                                             |
 /// |-----------------------------------------------|-----------------------------------------------------|-------------------------------------------------------------------|
