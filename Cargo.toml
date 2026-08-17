@@ -176,6 +176,11 @@ incremental = true
 debug-assertions = true
 panic = "abort"
 
+# Faster to build than the `release` profile, for rapid iteration when debugging
+[profile.iteration]
+inherits = "release"
+lto = "off"
+
 # The actual release build
 [profile.release-lto]
 inherits = "release"
