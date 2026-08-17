@@ -519,6 +519,93 @@ async fn resolve_or_absent(
         .unwrap_or_default()
 }
 
+/// Uploads never sent, because an association the peer already held was duplicated instead.
+/// Process-wide, like [`CONTENT_WRITE_INFLIGHT`], and counted per fragment.
+static REMOTE_COPIES: AtomicUsize = AtomicUsize::new(0);
+
+/// See [`REMOTE_COPIES`].
+pub fn remote_copies() -> usize {
+    REMOTE_COPIES.load(Ordering::Relaxed)
+}
+
+/// Drops the count to zero, so what follows is measured on its own.
+pub fn reset_remote_copies() {
+    REMOTE_COPIES.store(0, Ordering::Relaxed);
+}
+
+/// An association the peer already holds, which a copy duplicates into the address being written.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct CopySource {
+    partition: Partition,
+    address: Address,
+}
+
+/// The association to copy from, or `None` where the payload has to be transferred instead.
+///
+/// A partial match is the level that names another association; `stored_durable` on it is what says
+/// the peer holds that one and not merely the local store; and a copy cannot be aimed at a
+/// partition nobody named. The context is passed through as found — an exact one the peer confirms
+/// with a keyed read, an unnamed one it searches the partition for.
+fn copy_source(resolved: &StoreMatchResult, address: Address) -> Option<CopySource> {
+    if !matches!(
+        resolved.match_made,
+        StoreMatch::MatchPartition | StoreMatch::MatchHash
+    ) {
+        return None;
+    }
+    if !resolved.stored_durable || resolved.partition.is_zero() {
+        return None;
+    }
+    Some(CopySource {
+        partition: resolved.partition,
+        address: resolved.source_address(address.hash),
+    })
+}
+
+/// Duplicate the association `source` names into `address` on the session's partition, reporting
+/// whether the peer now holds it durably.
+///
+/// A refusal is an outcome rather than an error — the source may be gone, the peer may never have
+/// had it, or the caller may hold no claim to its partition — and the upload the caller falls back
+/// to does everything this would have.
+async fn copy_association(
+    session: &Arc<StorageSession>,
+    source: CopySource,
+    address: Address,
+) -> bool {
+    if !session.can_copy_from(source.partition).await {
+        lore_base::lore_trace!(
+            "No claim to partition {} to copy {} from, uploading instead",
+            source.partition,
+            address.hash
+        );
+        return false;
+    }
+
+    match session
+        .copy(source.partition, source.address, address.context)
+        .await
+    {
+        Ok(()) => {
+            REMOTE_COPIES.fetch_add(1, Ordering::Relaxed);
+            lore_base::lore_trace!(
+                "Copied {} from partition {} instead of uploading its payload",
+                address,
+                source.partition
+            );
+            true
+        }
+        Err(err) => {
+            lore_base::lore_trace!(
+                "Copy of {} from partition {} refused ({err:?}), uploading instead",
+                address,
+                source.partition
+            );
+            false
+        }
+    }
+}
+
 /// Durability only counts for this address when this address is what matched. The same content
 /// under another partition is durable without our association being, and an upload skipped on that
 /// basis would leave the address registered nowhere.
@@ -539,8 +626,8 @@ fn is_fully_satisfied(
         && (remote_session.is_none() || stored_durable)
 }
 
-/// The "work" portion of [`store_fragment`]: optionally load existing local
-/// payload, compress, attempt remote upload, and write the terminal entry.
+/// The "work" portion of [`store_fragment`]: optionally duplicate an association the peer already
+/// holds, else load existing local payload, compress and upload, then write the terminal entry.
 ///
 /// Returns where the payload ended up, as `(stored_local, stored_durable)`.
 ///
@@ -563,8 +650,19 @@ async fn leader_body(
 ) -> Result<(bool, bool), StorageError> {
     let (mut stored_local, mut stored_durable) = stored_flags(&query);
 
+    // Before the payload is prepared: succeeding means neither the load nor the compression below
+    // is work this fragment has to pay for.
+    if !stored_durable
+        && let Some(session) = remote_session.as_ref()
+        && let Some(source) = copy_source(&query, address)
+    {
+        stored_durable = copy_association(session, source, address).await;
+    }
+
+    let payload_wanted = !stored_durable || cache_local;
+
     // For a partial match try loading the payload from local store instead of recompressing
-    if stored_local {
+    if payload_wanted && stored_local {
         if let Ok((stored_fragment, stored_buffer)) = store
             .clone()
             .get(partition, address)
@@ -583,11 +681,6 @@ async fn leader_body(
             } else {
                 stored_local = false;
             }
-
-            // Unless it's a full match, do not inherit existing durable storage flag
-            if query.match_made != StoreMatch::MatchFull {
-                stored_durable = false;
-            }
         } else {
             stored_local = false;
         }
@@ -595,7 +688,7 @@ async fn leader_body(
 
     // If we could not load from local store, try compressing the data
     let mode = crate::compress::CompressionMode::from_u32(COMPRESSION_MODE.load(Ordering::Relaxed));
-    if !stored_local && mode != crate::compress::CompressionMode::NoCompression {
+    if payload_wanted && !stored_local && mode != crate::compress::CompressionMode::NoCompression {
         let _compress_permit = crate::concurrency::compress_limit_acquire().await;
         if let Ok((compressed_fragment, compressed_buffer)) = crate::compress::compress(
             fragment,
@@ -1432,6 +1525,98 @@ mod tests {
             .await
             .expect("join follower")
             .expect("follower observed terminal entry stored durably");
+    }
+
+    /// Which resolutions name a source worth copying from. Everything here is about not naming one
+    /// that would cost a refused round trip and an upload afterwards.
+    mod copy_source_selection {
+        use super::*;
+
+        fn address() -> Address {
+            Address {
+                hash: crate::hash::hash_slice(b"copy source selection"),
+                context: Context::from([0x01u8; 16]),
+            }
+        }
+
+        fn durable(match_made: StoreMatch) -> StoreMatchResult {
+            StoreMatchResult {
+                match_made,
+                partition: Partition::from([0x02u8; 16]),
+                context: Context::from([0x03u8; 16]),
+                stored_local: true,
+                stored_durable: true,
+            }
+        }
+
+        #[test]
+        fn a_partition_match_names_what_the_resolution_found() {
+            let source = copy_source(&durable(StoreMatch::MatchPartition), address())
+                .expect("a durable partition match names a source");
+            assert_eq!(source.partition, Partition::from([0x02u8; 16]));
+            assert_eq!(source.address.hash, address().hash);
+            assert_eq!(source.address.context, Context::from([0x03u8; 16]));
+        }
+
+        #[test]
+        fn a_hash_match_names_the_partition_it_was_found_in() {
+            let source = copy_source(&durable(StoreMatch::MatchHash), address())
+                .expect("a durable hash match names a source");
+            assert_eq!(source.partition, Partition::from([0x02u8; 16]));
+        }
+
+        /// A resolution that named no context leaves the source naming none either, which is what
+        /// the store reads as any association in the partition.
+        #[test]
+        fn an_unnamed_context_stays_unnamed() {
+            let resolved = StoreMatchResult {
+                context: Context::default(),
+                ..durable(StoreMatch::MatchPartition)
+            };
+            let source = copy_source(&resolved, address()).expect("still names a source");
+            assert!(source.address.context.is_zero());
+        }
+
+        #[test]
+        fn a_full_match_names_nothing() {
+            assert!(copy_source(&durable(StoreMatch::MatchFull), address()).is_none());
+        }
+
+        #[test]
+        fn no_match_names_nothing() {
+            assert!(copy_source(&durable(StoreMatch::MatchNone), address()).is_none());
+        }
+
+        /// The local store holding an association says nothing about the peer holding it, and a
+        /// copy naming a source the peer never received is a round trip that can only fail.
+        #[test]
+        fn a_match_the_peer_never_received_names_nothing() {
+            let resolved = StoreMatchResult {
+                stored_durable: false,
+                ..durable(StoreMatch::MatchPartition)
+            };
+            assert!(copy_source(&resolved, address()).is_none());
+        }
+
+        #[test]
+        fn a_match_without_a_partition_names_nothing() {
+            let resolved = StoreMatchResult {
+                partition: Partition::default(),
+                ..durable(StoreMatch::MatchPartition)
+            };
+            assert!(copy_source(&resolved, address()).is_none());
+        }
+
+        /// A destination context of zero is not a self-copy: the partition match is the statement
+        /// that this tuple is not one of the associations the source names.
+        #[test]
+        fn a_zero_destination_context_still_names_a_source() {
+            let destination = Address {
+                hash: address().hash,
+                context: Context::default(),
+            };
+            assert!(copy_source(&durable(StoreMatch::MatchPartition), destination).is_some());
+        }
     }
 
     fn make_input(seed: u8) -> (Partition, Address, Fragment, Bytes) {

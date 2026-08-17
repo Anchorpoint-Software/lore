@@ -711,7 +711,7 @@ pub async fn storage_client(
     connection: Arc<GRPCConnection>,
     auth_url: &str,
     identity: &str,
-    _repository: RepositoryId,
+    _partition: Partition,
 ) -> Result<Arc<dyn Storage>, ProtocolError> {
     lore_trace!("Connecting gRPC storage client");
 
@@ -866,13 +866,13 @@ pub async fn storage(
     remote_url: &str,
     auth_url: &str,
     identity: &str,
-    repository: RepositoryId,
+    partition: Partition,
     index: usize,
 ) -> Result<Arc<dyn Storage>, ProtocolError> {
     // We open multiple storage connections, only reuse previous connections for the first
     let reuse = index == 0;
     let connection = connect(connection, remote_url, reuse).await?;
-    storage_client(connection, auth_url, identity, repository).await
+    storage_client(connection, auth_url, identity, partition).await
 }
 
 pub async fn revision(
@@ -1074,12 +1074,12 @@ impl GRPCStorage {
 impl Storage for GRPCStorage {
     async fn session_start(
         &self,
-        repository: RepositoryId,
+        partition: Partition,
         correlation_id: &str,
     ) -> Result<u32, ProtocolError> {
         let auth = self
             .connection
-            .repository_authz(&self.auth_url, &self.identity, repository)
+            .repository_authz(&self.auth_url, &self.identity, partition)
             .await;
         let token = auth.read().authorization_token.clone();
 
@@ -1089,7 +1089,7 @@ impl Storage for GRPCStorage {
         self.sessions.insert(
             session_id,
             Arc::new(storage_client::GrpcSessionContext {
-                repository,
+                partition,
                 correlation_id: correlation_id.to_string(),
                 auth_token: token,
             }),
@@ -1158,7 +1158,7 @@ impl Storage for GRPCStorage {
     async fn copy(
         &self,
         session_id: u32,
-        source_repository: RepositoryId,
+        source_partition: Partition,
         source_address: Address,
         target_context: Context,
     ) -> Result<(), ProtocolError> {
@@ -1167,7 +1167,7 @@ impl Storage for GRPCStorage {
             self.client.copy(
                 session_id,
                 &ctx,
-                source_repository,
+                source_partition,
                 source_address,
                 target_context,
             )

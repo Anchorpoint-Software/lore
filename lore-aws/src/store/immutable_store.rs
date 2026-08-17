@@ -44,6 +44,7 @@ use lore_telemetry::METRICS_OPERATION_LATENCY_METRIC_NAME;
 use lore_telemetry::timed;
 use lore_telemetry::timer::TimedResult;
 use lore_telemetry::tracing::fields::ADDRESS;
+use lore_telemetry::tracing::fields::PARTITION_ID;
 use lore_telemetry::tracing::fields::REPOSITORY_ID;
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::Counter;
@@ -345,6 +346,59 @@ impl DynamoDbQuery for FragmentsQuery {
 
     /// Obliteration deletes an association and then asks this before destroying the payload, so an
     /// eventually-consistent empty answer would take content another partition still references.
+    fn consistent_read(&self) -> bool {
+        true
+    }
+}
+
+/// Whether a partition holds any association for a hash, whatever context it is under.
+///
+/// The sort key is the partition followed by the context, so one prefix bounds every association a
+/// partition holds for a hash and the read never leaves that partition — an unassociated hash and
+/// one associated only elsewhere answer the same way, which is what isolation requires.
+///
+/// A copy asks this only when its source names no context, and pays a `Query` for it where an exact
+/// source costs a keyed read. One row settles it, for the reason on [`FragmentsQuery`].
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PartitionAssociationQuery(pub(crate) Hash, pub(crate) Partition);
+
+impl DynamoDbQuery for PartitionAssociationQuery {
+    fn key_condition_expression(&self) -> &str {
+        "#pk = :hash AND begins_with(#sk, :partition)"
+    }
+
+    fn expression_attribute_names(&self) -> HashMap<String, String> {
+        HashMap::from([
+            (
+                "#pk".to_string(),
+                FRAGMENTS_DYNAMO_PARTITION_KEY_ATTRIBUTE.to_string(),
+            ),
+            (
+                "#sk".to_string(),
+                FRAGMENTS_DYNAMO_SORT_KEY_ATTRIBUTE.to_string(),
+            ),
+        ])
+    }
+
+    fn expression_attribute_values(&self) -> HashMap<String, AttributeValue> {
+        HashMap::from([
+            (
+                ":hash".to_string(),
+                AttributeValue::B(Blob::new(self.0.data())),
+            ),
+            (
+                ":partition".to_string(),
+                AttributeValue::B(Blob::new(self.1.data())),
+            ),
+        ])
+    }
+
+    fn limit(&self) -> Option<i32> {
+        Some(1)
+    }
+
+    /// A copy acts on the answer by writing an association, so it must not be satisfied by a view
+    /// that predates an obliteration deleting the last one.
     fn consistent_read(&self) -> bool {
         true
     }
@@ -771,6 +825,7 @@ impl AwsImmutableStore {
                 match_made: StoreMatch::MatchFull,
                 // This store isolates, so it only ever matches inside the partition asked about.
                 partition,
+                context: address.context,
                 stored_local: false,
                 stored_durable: true,
             };
@@ -1110,6 +1165,37 @@ impl AwsImmutableStore {
         }
 
         Ok(states)
+    }
+
+    /// Whether `partition` holds any association for `hash`, whatever context it is under.
+    async fn has_partition_association(
+        &self,
+        partition: Partition,
+        hash: Hash,
+    ) -> Result<bool, StoreError> {
+        self.dynamodb
+            .query_single(
+                &self.fragments_table_name,
+                PartitionAssociationQuery(hash, partition),
+            )
+            .await
+            .map(|output| output.count > 0)
+            .map_err(|e| {
+                if is_dynamodb_overloaded(&e) {
+                    StoreError::from(SlowDown)
+                } else {
+                    warn!(
+                        {PARTITION_ID} = %partition,
+                        hash = %hash,
+                        error = ?e,
+                        "DynamoDb query for a partition association failed"
+                    );
+                    StoreError::internal_with_context(
+                        e,
+                        "DynamoDB partition association query failed",
+                    )
+                }
+            })
     }
 
     async fn has_associations(&self, hash: Hash) -> Result<bool, StoreError> {
@@ -2000,7 +2086,13 @@ impl ImmutableStoreTrait for AwsImmutableStore {
             context: destination_context,
         };
         timed!(self.latency_histogram, &self.labels_copy, {
-            if !self.exists(source_partition, source_address).await? {
+            let present = if source_address.context.is_zero() {
+                self.has_partition_association(source_partition, source_address.hash)
+                    .await?
+            } else {
+                self.exists(source_partition, source_address).await?
+            };
+            if !present {
                 return Err(StoreError::from(AddressNotFound::from(source_address)));
             }
 
@@ -3777,6 +3869,85 @@ mod test {
             )
             .await
             .expect_err("a different context is not a full match");
+
+        assert_eq!(fake.association_count(hash), 1);
+    }
+
+    /// A source naming no context is any association the partition holds, which is what a caller
+    /// acting on a partition match has. The payload is untouched, as for an exact source.
+    #[tokio::test]
+    async fn copy_from_an_unnamed_context_takes_any_association_in_the_partition() {
+        let fake = Fake::default();
+        let hash: Hash = random();
+        let stored = Address {
+            hash,
+            context: random(),
+        };
+        let partition: Partition = random();
+        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
+
+        let store = store(&fake).await;
+        store
+            .clone()
+            .put(partition, stored, fragment, Some(payload.clone()), false)
+            .await
+            .expect("put should succeed");
+
+        store
+            .copy(
+                partition,
+                Address::zero_context_hash(hash),
+                partition,
+                random::<Context>(),
+                true,
+            )
+            .await
+            .expect("a partition holding the hash answers a source naming no context");
+
+        assert_eq!(fake.association_count(hash), 2);
+        assert_eq!(
+            fake.object(hash).unwrap().0,
+            payload.as_ref(),
+            "copy must not rewrite the payload"
+        );
+        assert_eq!(fake.object_reads(), 0, "copy must not read S3");
+    }
+
+    /// Naming no context widens the search inside one partition, never across them — this store
+    /// isolates, so a hash held only elsewhere is not the caller's to copy from.
+    #[tokio::test]
+    async fn copy_from_an_unnamed_context_does_not_reach_another_partition() {
+        let fake = Fake::default();
+        let hash: Hash = random();
+        let stored = Address {
+            hash,
+            context: random(),
+        };
+        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
+
+        let store = store(&fake).await;
+        store
+            .clone()
+            .put(
+                random::<Partition>(),
+                stored,
+                fragment,
+                Some(payload),
+                false,
+            )
+            .await
+            .expect("put should succeed");
+
+        store
+            .copy(
+                random::<Partition>(),
+                Address::zero_context_hash(hash),
+                random::<Partition>(),
+                random::<Context>(),
+                true,
+            )
+            .await
+            .expect_err("a partition holding nothing has no association to name");
 
         assert_eq!(fake.association_count(hash), 1);
     }

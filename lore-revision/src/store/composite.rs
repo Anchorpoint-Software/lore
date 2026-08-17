@@ -185,12 +185,14 @@ impl<T> CompositeStoreHit<T> {
 fn merge_resolved(into: &mut StoreMatchResult, from: &StoreMatchResult) -> bool {
     let mut is_new_stronger = false;
 
-    // The partition travels with the level that won, never merged on its own: it names where *that*
-    // store found the content, and pairing one store's partition with another's level would point a
-    // copy at somewhere the content was never seen.
+    // The partition and the context travel with the level that won, never merged on their own: they
+    // name where *that* store found the content, and pairing one store's source with another's
+    // level would point a copy at somewhere the content was never seen. They move together for the
+    // same reason — a context is only meaningful inside the partition it was found in.
     if from.match_made > into.match_made {
         into.match_made = from.match_made;
         into.partition = from.partition;
+        into.context = from.context;
         is_new_stronger = true;
     }
     into.stored_durable |= from.stored_durable;

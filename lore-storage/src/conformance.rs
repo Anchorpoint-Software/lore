@@ -27,7 +27,8 @@
 //!    further, to the store's query scope, because a level is something to act on with another
 //!    operation rather than bytes owed here.
 //! 5. **A match names where it was found, and prefers where it was asked.** Another partition is
-//!    named only when the one asked about holds nothing.
+//!    named only when the one asked about holds nothing. The context may be left unnamed, but a
+//!    named one is an association `copy` will read from.
 //!
 //! # Known violations
 //!
@@ -72,6 +73,8 @@ pub enum Check {
     BatchResultsLineUp,
     /// A hash held by both the partition asked about and another names the one asked about.
     MatchPrefersTheAskedPartition,
+    /// The source a partition match names can be copied from, whether or not it named a context.
+    NamedSourceCanBeCopied,
     /// Obliterating one reference leaves the others readable.
     ObliterationLeavesSiblingsReadable,
     /// A fragment stored without its payload is reported and described, but not served.
@@ -88,6 +91,9 @@ pub struct Capabilities {
     pub can_put: bool,
     /// Whether the store accepts `obliterate`.
     pub can_obliterate: bool,
+    /// Whether the store accepts `copy`. The trait defaults it to unsupported, so a store that
+    /// takes the default reports a level no caller can act on and is exempted rather than failed.
+    pub can_copy: bool,
     /// Whether answers from this store cross a trust boundary. A hash held only by a partition the
     /// caller has no claim to is another tenant's content, and its existence is not the caller's to
     /// learn, so such a store must report nothing rather than a weak match.
@@ -113,6 +119,7 @@ impl Capabilities {
             label,
             can_put: true,
             can_obliterate: true,
+            can_copy: true,
             over_wire: false,
             miss_poisons_session: false,
             stores_metadata_only: false,
@@ -127,6 +134,11 @@ impl Capabilities {
 
     pub fn no_obliterate(mut self) -> Self {
         self.can_obliterate = false;
+        self
+    }
+
+    pub fn no_copy(mut self) -> Self {
+        self.can_copy = false;
         self
     }
 
@@ -216,6 +228,14 @@ pub async fn verify_immutable_store(store: Arc<dyn ImmutableStore>, caps: Capabi
         Check::MatchPrefersTheAskedPartition,
         a_match_prefers_the_partition_it_was_asked_about(&store, &caps).await,
     );
+
+    if caps.can_copy {
+        settle(
+            &caps,
+            Check::NamedSourceCanBeCopied,
+            the_source_a_match_names_can_be_copied_from(&store, &caps).await,
+        );
+    }
 
     if caps.stores_metadata_only {
         settle(
@@ -349,6 +369,12 @@ async fn assert_absent(
         "{context}: query named a source partition for content it did not match"
     );
 
+    require_eq!(
+        resolved.context,
+        Context::default(),
+        "{context}: query named a source context for content it did not match"
+    );
+
     match store.clone().get_metadata(partition, address).await {
         Ok(result) => {
             require_eq!(
@@ -402,6 +428,12 @@ async fn a_stored_address_matches_fully(
         resolved.partition,
         partition,
         "a full match must name the partition it was found in"
+    );
+    require!(
+        resolved.context == address.context || resolved.context.is_zero(),
+        "a full match named {:?} as the context it was found under, but the association it matched \
+         is the one asked about",
+        resolved.context
     );
 
     let metadata = store
@@ -480,6 +512,13 @@ async fn another_context_in_the_same_partition_never_matches_fully(
             resolved.partition,
             partition,
             "a match inside the partition asked about named a different one as its source"
+        );
+        require!(
+            resolved.context == address.context || resolved.context.is_zero(),
+            "a partition match named {:?} as its context, but the only association the store holds \
+             for this hash is under {:?}",
+            resolved.context,
+            address.context
         );
     }
 
@@ -667,6 +706,53 @@ async fn a_match_prefers_the_partition_it_was_asked_about(
             "the partition asked about holds this hash, so it is the one to name"
         );
     }
+
+    Ok(())
+}
+
+/// What a partition match is for. The level says the payload is already in the partition, so the
+/// address can be registered with a copy rather than a transfer — which is only true if the source
+/// the match names is one the store will copy from.
+///
+/// Both forms are exercised: the source as reported, and the same source with its context dropped,
+/// which is what a caller has when the answer named no context. A store may under-report the level
+/// and is exempt then, since a caller reading `MatchNone` transfers the payload as before.
+async fn the_source_a_match_names_can_be_copied_from(
+    store: &Arc<dyn ImmutableStore>,
+    caps: &Capabilities,
+) -> Result<(), String> {
+    let (partition, address, payload, fragment) = unique_content();
+    store_content(store, partition, address, fragment, payload).await?;
+
+    let wanted = Address {
+        hash: address.hash,
+        context: Context::from(rand::random::<[u8; 16]>()),
+    };
+    let resolved = query_one(store, partition, wanted)
+        .await
+        .map_err(|err| format!("query failed on {}: {err:?}", caps.label))?;
+    if resolved.match_made != StoreMatch::MatchPartition {
+        return Ok(());
+    }
+
+    for source in [
+        resolved.source_address(address.hash),
+        Address::zero_context_hash(address.hash),
+    ] {
+        store
+            .clone()
+            .copy(resolved.partition, source, partition, wanted.context, false)
+            .await
+            .map_err(|err| {
+                format!("a partition match named {source} as a source, which copy refused: {err:?}")
+            })?;
+    }
+
+    require_eq!(
+        best_match(store, partition, wanted, caps).await?,
+        StoreMatch::MatchFull,
+        "the address a copy registered does not resolve to the association it created"
+    );
 
     Ok(())
 }

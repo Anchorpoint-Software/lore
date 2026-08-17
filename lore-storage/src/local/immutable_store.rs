@@ -165,6 +165,9 @@ pub struct ImmutableStoreFindResult {
     /// The partition the matched entry belongs to. The one searched for whenever it holds the hash,
     /// since `lookup` prefers it; another only when it does not.
     pub partition: Partition,
+    /// The context the matched entry is stored under, which with the partition names the
+    /// association found rather than only where it lives.
+    pub context: Context,
 }
 
 #[repr(C)]
@@ -1421,6 +1424,104 @@ impl LocalImmutableStore {
         (match_slot, start, match_made)
     }
 
+    /// Whether the entry at `slot` is one of the associations `partition` holds for `hash`. Entries
+    /// sort by hash, then partition, then context, so those occupy one contiguous run this bounds.
+    fn in_partition_run(
+        bucket: &ImmutableStoreBucket,
+        slot: usize,
+        partition: Partition,
+        hash: Hash,
+    ) -> bool {
+        let entry = &bucket.entry[bucket.sorted_index[slot] as usize];
+        entry.address.hash == hash && entry.partition == partition
+    }
+
+    /// Whether the entry at `slot` is a tombstone, which is a representation no copy adopts.
+    fn is_obliterated(bucket: &ImmutableStoreBucket, slot: usize) -> bool {
+        bucket.entry[bucket.sorted_index[slot] as usize].data.flags
+            & FragmentFlags::PayloadObliterated.bits()
+            != 0
+    }
+
+    /// Whether `slot` is the source to read from, remembering it as the fallback where it holds the
+    /// representation without the payload.
+    fn is_copy_source(
+        bucket: &ImmutableStoreBucket,
+        slot: usize,
+        representation_only: &mut Option<usize>,
+    ) -> bool {
+        if Self::is_obliterated(bucket, slot) {
+            return false;
+        }
+        if bucket.entry[bucket.sorted_index[slot] as usize]
+            .data
+            .pack_file
+            != 0
+        {
+            return true;
+        }
+        representation_only.get_or_insert(slot);
+        false
+    }
+
+    /// The slot a copy reads its source from, or `None` where the partition holds no live
+    /// association for the hash.
+    ///
+    /// A context resolves to that one association; a zero context to any of them, which is all a
+    /// caller acting on a partition match has. Every association in the run points at the same
+    /// payload, so which one answers changes only which representation the destination adopts — and
+    /// a tombstone's is not one to adopt, so obliterated entries are skipped and one holding the
+    /// payload is preferred over one holding the representation alone.
+    ///
+    /// `lookup` lands anywhere inside the run, so both directions are walked outwards from there a
+    /// step at a time and every entry is judged as it is passed. Neither has to reach an end and
+    /// neither is exhausted before the other: the first association holding the payload answers, so
+    /// the walk stops at whichever side it is nearest on.
+    fn copy_source_slot(
+        bucket: &ImmutableStoreBucket,
+        partition: Partition,
+        address: Address,
+    ) -> Option<usize> {
+        if !address.context.is_zero() {
+            let (slot, _, matching) =
+                Self::lookup(bucket, partition, address, StoreMatch::MatchFull);
+            return (matching == StoreMatch::MatchFull && !Self::is_obliterated(bucket, slot))
+                .then_some(slot);
+        }
+
+        let (anchor, _, matching) =
+            Self::lookup(bucket, partition, address, StoreMatch::MatchPartition);
+        if matching < StoreMatch::MatchPartition {
+            return None;
+        }
+
+        let in_run = |slot: usize| {
+            slot < bucket.sorted_index.len()
+                && Self::in_partition_run(bucket, slot, partition, address.hash)
+        };
+
+        let mut representation_only = None;
+        let mut back = Some(anchor);
+        let mut forward = in_run(anchor + 1).then_some(anchor + 1);
+
+        while back.is_some() || forward.is_some() {
+            if let Some(slot) = back {
+                if Self::is_copy_source(bucket, slot, &mut representation_only) {
+                    return Some(slot);
+                }
+                back = (slot > 0 && in_run(slot - 1)).then(|| slot - 1);
+            }
+            if let Some(slot) = forward {
+                if Self::is_copy_source(bucket, slot, &mut representation_only) {
+                    return Some(slot);
+                }
+                forward = in_run(slot + 1).then_some(slot + 1);
+            }
+        }
+
+        representation_only
+    }
+
     // Assumes that payload has been validated to match the given hash prior to
     // calling this function to store the content payload - no hash validation done
     pub async fn store(
@@ -1802,6 +1903,7 @@ impl LocalImmutableStore {
         } else {
             let index = bucket.sorted_index[match_slot] as usize;
             let matched_partition = bucket.entry[index].partition;
+            let matched_context = bucket.entry[index].address.context;
             let data = &bucket.entry[index].data;
 
             let data = if data.flags & FragmentFlags::PayloadObliterated
@@ -1831,6 +1933,7 @@ impl LocalImmutableStore {
                 data,
                 matching: match_made,
                 partition: matched_partition,
+                context: matched_context,
             })
         }
     }
@@ -3222,6 +3325,7 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
                 StoreMatchResult {
                     match_made: found.matching,
                     partition: found.partition,
+                    context: found.context,
                     stored_local: found.data.pack_file != 0,
                     stored_durable: found.data.flags & FragmentFlags::PayloadStoredDurable.bits()
                         != 0
@@ -3917,7 +4021,8 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
     ) -> Result<(), StoreError> {
         // Hash is preserved across the copy; the destination address only differs in context.
         // Same hash → same bucket, so source and destination always live in one bucket — including
-        // the same-partition different-context case used for in-partition payload dedup.
+        // the same-partition different-context case used for in-partition payload dedup, and the
+        // zero-context source that names any association the source partition holds.
         let destination_address = Address {
             hash: source_address.hash,
             context: destination_context,
@@ -3953,16 +4058,10 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
                 })?;
         }
 
-        let (source_slot, _, source_match) = Self::lookup(
-            &bucket,
-            source_partition,
-            source_address,
-            StoreMatch::MatchFull,
-        );
-
-        if source_match != StoreMatch::MatchFull {
+        let Some(source_slot) = Self::copy_source_slot(&bucket, source_partition, source_address)
+        else {
             return Err(StoreError::from(AddressNotFound::from(source_address)));
-        }
+        };
 
         let source_data = bucket.entry[bucket.sorted_index[source_slot] as usize].data;
 
@@ -5231,5 +5330,375 @@ mod tests {
             store.clone().get(partition, sibling).await.is_err(),
             "an isolating store served a sibling context's payload"
         );
+    }
+
+    /// The source forms `copy` accepts: an exact association, and any association a partition
+    /// holds. A caller acting on a partition match only ever has the second.
+    mod copy_source {
+        use super::*;
+        use crate::immutable_store::ImmutableStore;
+
+        type Store = Arc<dyn ImmutableStore>;
+
+        async fn store_with(entries: &[(Partition, Context)], payload: &[u8]) -> (Store, Address) {
+            let store = create(
+                None::<&Path>,
+                ImmutableStoreCreateOptions::none(),
+                false,
+                ImmutableStoreSettings::default(),
+            )
+            .await
+            .expect("create store");
+            let address = Address {
+                hash: crate::hash::hash_slice(payload),
+                context: Context::default(),
+            };
+            let fragment = Fragment {
+                flags: 0,
+                size_payload: payload.len() as u32,
+                size_content: payload.len() as u64,
+            };
+            for (partition, context) in entries {
+                store
+                    .clone()
+                    .put(
+                        *partition,
+                        Address {
+                            hash: address.hash,
+                            context: *context,
+                        },
+                        fragment,
+                        Some(Bytes::copy_from_slice(payload)),
+                        false,
+                    )
+                    .await
+                    .expect("seed association");
+            }
+            (store, address)
+        }
+
+        async fn readable(
+            store: &Store,
+            partition: Partition,
+            address: Address,
+            payload: &[u8],
+        ) -> bool {
+            crate::read::read(
+                store.clone(),
+                partition,
+                address,
+                None,
+                crate::options::ReadOptions::default(),
+                None,
+            )
+            .await
+            .is_ok_and(|(_fragment, bytes)| bytes.as_ref() == payload)
+        }
+
+        #[tokio::test]
+        async fn a_zero_context_takes_any_association_in_the_partition() {
+            let payload = b"zero context names any association".as_slice();
+            let partition = Partition::from([0x11u8; 16]);
+            let held = Context::from([0x12u8; 16]);
+            let wanted = Context::from([0x13u8; 16]);
+            let (store, address) = store_with(&[(partition, held)], payload).await;
+
+            store
+                .clone()
+                .copy(
+                    partition,
+                    Address::zero_context_hash(address.hash),
+                    partition,
+                    wanted,
+                    false,
+                )
+                .await
+                .expect("a partition holding the hash must answer a source naming no context");
+
+            assert!(
+                readable(
+                    &store,
+                    partition,
+                    Address {
+                        hash: address.hash,
+                        context: wanted
+                    },
+                    payload
+                )
+                .await
+            );
+        }
+
+        #[tokio::test]
+        async fn a_zero_context_crosses_partitions() {
+            let payload = b"zero context across partitions".as_slice();
+            let source = Partition::from([0x21u8; 16]);
+            let destination = Partition::from([0x22u8; 16]);
+            let held = Context::from([0x23u8; 16]);
+            let wanted = Context::from([0x24u8; 16]);
+            let (store, address) = store_with(&[(source, held)], payload).await;
+
+            store
+                .clone()
+                .copy(
+                    source,
+                    Address::zero_context_hash(address.hash),
+                    destination,
+                    wanted,
+                    false,
+                )
+                .await
+                .expect("copy from a source partition naming no context");
+
+            assert!(
+                readable(
+                    &store,
+                    destination,
+                    Address {
+                        hash: address.hash,
+                        context: wanted
+                    },
+                    payload
+                )
+                .await
+            );
+        }
+
+        /// The partition is still the boundary: naming no context widens the search inside one
+        /// partition, never across them.
+        #[tokio::test]
+        async fn a_zero_context_does_not_reach_another_partition() {
+            let payload = b"zero context stays in its partition".as_slice();
+            let held_in = Partition::from([0x31u8; 16]);
+            let asked_of = Partition::from([0x32u8; 16]);
+            let (store, address) =
+                store_with(&[(held_in, Context::from([0x33u8; 16]))], payload).await;
+
+            let err = store
+                .clone()
+                .copy(
+                    asked_of,
+                    Address::zero_context_hash(address.hash),
+                    Partition::from([0x34u8; 16]),
+                    Context::from([0x35u8; 16]),
+                    false,
+                )
+                .await
+                .expect_err("a partition holding nothing has no association to name");
+            assert!(matches!(err, StoreError::AddressNotFound(_)));
+        }
+
+        /// A named context is resolved exactly. A sibling holding the same hash is not a fallback,
+        /// which is the whole difference between the two forms.
+        #[tokio::test]
+        async fn a_named_context_does_not_widen_to_a_sibling() {
+            let payload = b"an exact source is exact".as_slice();
+            let partition = Partition::from([0x41u8; 16]);
+            let (store, address) =
+                store_with(&[(partition, Context::from([0x42u8; 16]))], payload).await;
+
+            let err = store
+                .clone()
+                .copy(
+                    partition,
+                    Address {
+                        hash: address.hash,
+                        context: Context::from([0x43u8; 16]),
+                    },
+                    partition,
+                    Context::from([0x44u8; 16]),
+                    false,
+                )
+                .await
+                .expect_err("a context the partition does not hold must not resolve to a sibling");
+            assert!(matches!(err, StoreError::AddressNotFound(_)));
+        }
+
+        /// A tombstone is not a representation to adopt, so the walk passes over it and copies the
+        /// live association beside it.
+        #[tokio::test]
+        async fn a_zero_context_skips_an_obliterated_association() {
+            let payload = b"one obliterated reference, one alive".as_slice();
+            let partition = Partition::from([0x51u8; 16]);
+            let doomed = Context::from([0x52u8; 16]);
+            let alive = Context::from([0x53u8; 16]);
+            let wanted = Context::from([0x54u8; 16]);
+            let (store, address) =
+                store_with(&[(partition, doomed), (partition, alive)], payload).await;
+
+            store
+                .clone()
+                .obliterate(
+                    partition,
+                    Address {
+                        hash: address.hash,
+                        context: doomed,
+                    },
+                    Arc::new(crate::store_types::StoreObliterateStats::default()),
+                )
+                .await
+                .expect("obliterate one reference");
+
+            store
+                .clone()
+                .copy(
+                    partition,
+                    Address::zero_context_hash(address.hash),
+                    partition,
+                    wanted,
+                    false,
+                )
+                .await
+                .expect("the surviving association is the one to copy from");
+
+            assert!(
+                readable(
+                    &store,
+                    partition,
+                    Address {
+                        hash: address.hash,
+                        context: wanted
+                    },
+                    payload
+                )
+                .await
+            );
+        }
+
+        #[tokio::test]
+        async fn an_obliterated_source_is_not_copied() {
+            let payload = b"the only reference is obliterated".as_slice();
+            let partition = Partition::from([0x61u8; 16]);
+            let doomed = Context::from([0x62u8; 16]);
+            let (store, address) = store_with(&[(partition, doomed)], payload).await;
+
+            let source = Address {
+                hash: address.hash,
+                context: doomed,
+            };
+            store
+                .clone()
+                .obliterate(
+                    partition,
+                    source,
+                    Arc::new(crate::store_types::StoreObliterateStats::default()),
+                )
+                .await
+                .expect("obliterate the only reference");
+
+            for named in [source, Address::zero_context_hash(address.hash)] {
+                let err = store
+                    .clone()
+                    .copy(
+                        partition,
+                        named,
+                        partition,
+                        Context::from([0x63u8; 16]),
+                        false,
+                    )
+                    .await
+                    .expect_err("a tombstone is not an association to copy from");
+                assert!(matches!(err, StoreError::AddressNotFound(_)));
+            }
+        }
+
+        /// A hash the partition holds only the representation of. The walk records it as the
+        /// fallback rather than passing over it, so the copy still registers the destination — as it
+        /// does for an exact source that has no payload either.
+        #[tokio::test]
+        async fn a_zero_context_falls_back_to_an_association_without_its_payload() {
+            let payload = b"representation held without its payload".as_slice();
+            let partition = Partition::from([0x81u8; 16]);
+            let held = Context::from([0x82u8; 16]);
+            let wanted = Context::from([0x83u8; 16]);
+
+            let store = create(
+                None::<&Path>,
+                ImmutableStoreCreateOptions::none(),
+                false,
+                ImmutableStoreSettings::default(),
+            )
+            .await
+            .expect("create store");
+            let address = Address {
+                hash: crate::hash::hash_slice(payload),
+                context: held,
+            };
+            store
+                .clone()
+                .put(
+                    partition,
+                    address,
+                    Fragment {
+                        flags: 0,
+                        size_payload: payload.len() as u32,
+                        size_content: payload.len() as u64,
+                    },
+                    None,
+                    false,
+                )
+                .await
+                .expect("seed the representation alone");
+
+            store
+                .clone()
+                .copy(
+                    partition,
+                    Address::zero_context_hash(address.hash),
+                    partition,
+                    wanted,
+                    false,
+                )
+                .await
+                .expect("the representation alone is still a source");
+
+            let resolved = crate::immutable_store::query_one(
+                &store,
+                partition,
+                Address {
+                    hash: address.hash,
+                    context: wanted,
+                },
+            )
+            .await
+            .expect("query the destination");
+            assert_eq!(resolved.match_made, StoreMatch::MatchFull);
+        }
+
+        /// A `query` naming a context hands back a source `copy` resolves exactly, which is the
+        /// pairing the write path relies on to avoid the wider search.
+        #[tokio::test]
+        async fn a_partition_match_names_a_context_copy_resolves_exactly() {
+            let payload = b"query names the association copy reads".as_slice();
+            let partition = Partition::from([0x71u8; 16]);
+            let held = Context::from([0x72u8; 16]);
+            let wanted = Context::from([0x73u8; 16]);
+            let (store, address) = store_with(&[(partition, held)], payload).await;
+
+            let resolved = crate::immutable_store::query_one(
+                &store,
+                partition,
+                Address {
+                    hash: address.hash,
+                    context: wanted,
+                },
+            )
+            .await
+            .expect("query a sibling context");
+            assert_eq!(resolved.match_made, StoreMatch::MatchPartition);
+            assert_eq!(resolved.context, held);
+
+            store
+                .clone()
+                .copy(
+                    resolved.partition,
+                    resolved.source_address(address.hash),
+                    partition,
+                    wanted,
+                    false,
+                )
+                .await
+                .expect("the source a match named must be one copy resolves");
+        }
     }
 }

@@ -1059,6 +1059,7 @@ mod tests {
                                 results: vec![StoreMatchResult {
                                     match_made: lore_storage::StoreMatch::MatchPartition,
                                     partition: repository_partition,
+                                    context: Context::default(),
                                     stored_local: false,
                                     stored_durable: false,
                                 }],
@@ -1117,6 +1118,7 @@ mod tests {
                         let result = StoreMatchResult {
                             match_made: random_match.try_into().expect("invalid store match"),
                             partition,
+                            context: Context::default(),
                             stored_local: random(),
                             stored_durable: random(),
                         };

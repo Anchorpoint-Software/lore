@@ -23,7 +23,7 @@ use lore_base::types::Fragment;
 use lore_base::types::Hash;
 use lore_base::types::HealResult;
 use lore_base::types::KeyType;
-use lore_base::types::RepositoryId;
+use lore_base::types::Partition;
 use lore_base::types::VerifyResult;
 use lore_error_set::prelude::*;
 use tokio::sync::Semaphore;
@@ -65,7 +65,7 @@ pub struct StorageClient {
     auth_url: String,
     recipient_domain: String,
     identity: String,
-    repository: RepositoryId,
+    partition: Partition,
     counter: AtomicUsize,
     quic: Arc<QuicConnection>,
     connection_establish: Semaphore,
@@ -95,7 +95,7 @@ impl StorageClient {
         auth_url: &str,
         recipient_domain: &str,
         identity: &str,
-        repository: RepositoryId,
+        partition: Partition,
         quinn: quinn::Connection,
     ) -> Self {
         let quic = QuicConnection::with_v4(quinn, MAX_CHUNK_SIZE, true);
@@ -107,7 +107,7 @@ impl StorageClient {
             auth_url: auth_url.to_string(),
             recipient_domain: recipient_domain.to_string(),
             identity: identity.to_string(),
-            repository,
+            partition,
             quic: Arc::new(quic),
             connection_establish: Semaphore::new(1),
             counter: AtomicUsize::new(0),
@@ -122,13 +122,13 @@ impl StorageClient {
         remote_domain: String,
         auth_url: &str,
         identity: &str,
-        repository: RepositoryId,
+        partition: Partition,
     ) -> Result<Self, ProtocolError> {
         let auth_adapter = Arc::new(StorageClientAuth {
             recipient_domain: remote_domain.clone(),
             auth_url: auth_url.to_string(),
             identity: identity.to_string(),
-            repository,
+            partition,
         });
         let transport_config = TransportConfig {
             max_bytes_bandwidth_per_second: MAX_BYTES_BANDWIDTH_PER_SEC,
@@ -137,7 +137,7 @@ impl StorageClient {
             initial_cwnd: None,
         };
 
-        lore_trace!("QUIC connecting to {remote_url} for repository {repository}");
+        lore_trace!("QUIC connecting to {remote_url} for partition {partition}");
 
         let start = Instant::now();
 
@@ -162,7 +162,7 @@ impl StorageClient {
             auth_url,
             &remote_domain,
             identity,
-            repository,
+            partition,
             quinn,
         );
 
@@ -176,14 +176,14 @@ impl StorageClient {
             .create_initial_stream()
             .await
             .internal_with(|| {
-                format!("creating initial QUIC stream to {remote_url} for repository {repository}")
+                format!("creating initial QUIC stream to {remote_url} for partition {partition}")
             })?;
 
         auth_adapter.initial_authorize(storage.quic.clone()).await?;
         storage.quic.stream_count.store(1, Ordering::Relaxed);
 
         lore_debug!(
-            "QUIC connection {connection_id} to {remote_url} for repository {repository} complete in {}ms",
+            "QUIC connection {connection_id} to {remote_url} for partition {partition} complete in {}ms",
             start.elapsed().as_millis()
         );
 
@@ -269,7 +269,7 @@ impl ServiceClient for StorageClient {
 impl Storage for StorageClient {
     async fn session_start(
         &self,
-        repository: RepositoryId,
+        partition: Partition,
         correlation_id: &str,
     ) -> Result<u32, ProtocolError> {
         // Fetch auth token via token exchange (cached if already exchanged)
@@ -278,7 +278,7 @@ impl Storage for StorageClient {
                 &self.auth_url,
                 &self.recipient_domain,
                 &self.identity,
-                repository,
+                partition,
             )
             .await;
             authorization_token
@@ -288,12 +288,12 @@ impl Storage for StorageClient {
         let token_bytes = token.as_bytes();
 
         // Build Authorize start payload:
-        // action(1=0) + repository_id(16) + corr_len(1) + corr(N) + token_len(2, u16 LE) + token(M)
+        // action(1=0) + partition_id(16) + corr_len(1) + corr(N) + token_len(2, u16 LE) + token(M)
         let corr_bytes = correlation_id.as_bytes();
         let mut payload =
             BytesMut::with_capacity(1 + 16 + 1 + corr_bytes.len() + 2 + token_bytes.len());
         payload.put_u8(0); // action = start
-        payload.extend_from_slice(repository.as_bytes());
+        payload.extend_from_slice(partition.as_bytes());
         payload.put_u8(corr_bytes.len() as u8);
         payload.extend_from_slice(corr_bytes);
         payload.extend_from_slice(&(token_bytes.len() as u16).to_le_bytes());
@@ -497,17 +497,17 @@ impl Storage for StorageClient {
     async fn copy(
         &self,
         session_id: u32,
-        source_repository: RepositoryId,
+        source_partition: Partition,
         source_address: Address,
         target_context: Context,
     ) -> Result<(), ProtocolError> {
-        // Wire payload layout for Copy is: source_repository (16) + source_address (32+16) +
+        // Wire payload layout for Copy is: source_partition (16) + source_address (32+16) +
         // target_context (16) = 80 bytes. The target_context tail allows the destination's
         // dedup tag to differ from the source's without transferring the payload.
         send_normal_with_reconnect(self, Command::Copy, session_id, || {
             [
                 Bytes::default(),
-                Bytes::from_owner(source_repository),
+                Bytes::from_owner(source_partition),
                 Bytes::from_owner(source_address),
                 Bytes::from_owner(target_context),
             ]

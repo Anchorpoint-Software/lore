@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::Weak;
 
 use command_header::CommandHeader;
-use lore_base::types::RepositoryId;
+use lore_base::types::Partition;
 use lore_credential::domain_from_url_str_or_url;
 use lore_error_set::prelude::*;
 use thiserror::Error;
@@ -92,7 +92,7 @@ pub async fn storage(
     remote_url: &str,
     auth_url: &str,
     identity: &str,
-    repository: RepositoryId,
+    partition: Partition,
 ) -> Result<Arc<dyn Storage>, ProtocolError> {
     let remote_domain = domain_from_url_str_or_url(remote_url)
         .internal(&format!("remote {remote_url} is invalid"))?;
@@ -103,7 +103,7 @@ pub async fn storage(
         remote_domain,
         auth_url,
         identity,
-        repository,
+        partition,
     )
     .await
     .internal(&format!("connecting to {remote_url}"))?;

@@ -199,10 +199,11 @@ mod tests {
             }
 
             let match_made = self.match_result.unwrap_or(StoreMatch::MatchFull);
-            for result in results.iter_mut().take(addresses.len()) {
+            for (result, address) in results.iter_mut().zip(addresses.iter()) {
                 *result = lore_storage::StoreMatchResult {
                     match_made,
                     partition: _repository,
+                    context: address.context,
                     stored_local: false,
                     stored_durable: false,
                 };

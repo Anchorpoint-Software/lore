@@ -495,6 +495,19 @@ pub trait ImmutableStore: Any + Send + Sync {
     /// the hash is preserved (content-addressed) but partition and context can both differ from the
     /// source, enabling within-partition deduplication when only the dedup tag changes.
     ///
+    /// The source is named one of two ways, and the caller chooses which:
+    ///
+    /// - A context names one exact association, resolved exactly. A store that does not hold that
+    ///   tuple reports [`StoreError::AddressNotFound`] — there is no widening to a sibling context.
+    /// - A zero context names any association of the hash in `source_partition`, which is what a
+    ///   caller acting on a partition match has: that level says the partition holds the hash and
+    ///   never says under which context. Every association there names the same bytes, so which one
+    ///   answers does not change what the destination ends up holding. None at all is
+    ///   [`StoreError::AddressNotFound`] as before.
+    ///
+    /// Every store supporting `copy` supports both. The exact form is the one that can be answered
+    /// with a keyed read, so a caller holding a context passes it.
+    ///
     /// `durable` controls the destination's `PayloadStoredDurable` flag: pass `true` only when
     /// the caller has independent confirmation that the destination tuple is durably stored
     /// (typically a successful remote round-trip). The source's own durable flag never

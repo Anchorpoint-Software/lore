@@ -95,6 +95,7 @@ mod aws_store_tests {
                     StoreMatchResult {
                         match_made: StoreMatch::MatchFull,
                         partition: repository,
+                        context: address.context,
                         stored_local: true,
                         stored_durable: false,
                     }

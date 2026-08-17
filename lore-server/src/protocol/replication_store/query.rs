@@ -6,6 +6,7 @@ use bytes::Buf;
 use bytes::Bytes;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Address;
+use lore_base::types::Context;
 use lore_base::types::Partition;
 use lore_base::types::TypedBytes;
 use lore_base::types::VecBytes;
@@ -116,6 +117,7 @@ impl QueryResponse {
             results.push(StoreMatchResult {
                 match_made,
                 partition,
+                context: Context::default(),
                 stored_local,
                 stored_durable,
             });
@@ -303,18 +305,21 @@ pub mod tests {
                     StoreMatchResult {
                         match_made: StoreMatch::MatchNone,
                         partition: random::<Partition>(),
+                        context: Context::default(),
                         stored_local: false,
                         stored_durable: false,
                     },
                     StoreMatchResult {
                         match_made: StoreMatch::MatchHash,
                         partition: random::<Partition>(),
+                        context: Context::default(),
                         stored_local: true,
                         stored_durable: false,
                     },
                     StoreMatchResult {
                         match_made: StoreMatch::MatchFull,
                         partition: random::<Partition>(),
+                        context: Context::default(),
                         stored_local: true,
                         stored_durable: true,
                     },

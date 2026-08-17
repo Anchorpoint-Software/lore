@@ -153,7 +153,8 @@ impl store::ImmutableStore for RemoteImmutableStore {
             return Err(StoreError::internal("Remote store failed"));
         }
 
-        for (byte, result) in status.iter().zip(results.iter_mut()) {
+        for ((byte, result), address) in status.iter().zip(results.iter_mut()).zip(addresses.iter())
+        {
             let match_made = match byte {
                 0 => StoreMatch::MatchFull,
                 1 => StoreMatch::MatchPartition,
@@ -168,6 +169,11 @@ impl store::ImmutableStore for RemoteImmutableStore {
                     // Never anything but the partition asked about: the peer resolves within it,
                     // and a match found anywhere else collapses to absence before it is sent.
                     partition,
+                    context: if match_made == StoreMatch::MatchFull {
+                        address.context
+                    } else {
+                        Context::default()
+                    },
                     stored_local: false,
                     stored_durable: true,
                 }

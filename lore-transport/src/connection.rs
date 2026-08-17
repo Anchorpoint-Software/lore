@@ -178,6 +178,15 @@ pub fn parse(remote_url: &str) -> Result<(Url, Arc<dyn Protocol>), ProtocolError
     Ok((parsed_url, protocol))
 }
 
+/// Whether a failed `session_start` settles the question for this connection's identity, so asking
+/// again before the identity changes is a round trip that can only fail the same way.
+///
+/// Only a refusal does. Everything else — a disconnect, backpressure, an internal fault — says the
+/// answer was not obtained rather than that it is no.
+fn refusal_is_final(err: &ProtocolError) -> bool {
+    err.is_not_authorized() || err.is_not_authenticated()
+}
+
 pub async fn connect(
     remote_url: &str,
     identity: &str,
@@ -589,7 +598,7 @@ pub struct Connection {
     /// Pinning the pool keeps every session it owns alive across operations
     /// within a command, avoiding session start/stop churn between calls.
     /// Cleared by the caller (e.g. `repository_call`) when the API call completes.
-    session_cache: dashmap::DashMap<(RepositoryId, String), Arc<SessionPool>>,
+    session_cache: dashmap::DashMap<(Partition, String), Arc<SessionPool>>,
     connector: tokio::sync::Mutex<Option<Connector>>,
     pub stale: std::sync::atomic::AtomicBool,
 }
@@ -724,7 +733,7 @@ impl Connection {
         Ok(connections[counter].clone())
     }
 
-    /// Creates or reuses a `SessionPool` for the given repository and correlation
+    /// Creates or reuses a `SessionPool` for the given partition and correlation
     /// ID, returning a round-robin-picked session from it. The pool is pinned in
     /// the connection's session cache so the `Weak` in `StorageConnector` stays
     /// upgradeable for subsequent calls within the same command, keeping every
@@ -732,25 +741,25 @@ impl Connection {
     /// `release_session()` when the API call completes to release the pool.
     pub async fn session(
         self: &Arc<Self>,
-        repository: RepositoryId,
+        partition: Partition,
         correlation_id: &str,
     ) -> Result<Arc<StorageSession>, ProtocolError> {
         self.ensure_storage_connected().await?;
         let connector = self.storage_connector()?;
         let (session, pool) = connector
-            .session(repository, correlation_id, self.clone())
+            .session(partition, correlation_id, self.clone())
             .await?;
         self.session_cache
-            .insert((repository, correlation_id.to_string()), pool);
+            .insert((partition, correlation_id.to_string()), pool);
         Ok(session)
     }
 
     /// Unpin a cached session pool so its `Weak` in `StorageConnector` can
     /// expire. The pool's `Drop` releases every `Arc<StorageSession>` it owns,
     /// each of which sends `session_stop` to the server.
-    pub fn release_session(&self, repository: RepositoryId, correlation_id: &str) {
+    pub fn release_session(&self, partition: Partition, correlation_id: &str) {
         self.session_cache
-            .remove(&(repository, correlation_id.to_string()));
+            .remove(&(partition, correlation_id.to_string()));
     }
 
     /// Drop every pinned `SessionPool`. Once no other strong refs hold the
@@ -766,30 +775,42 @@ impl Connection {
         self.session_cache.clear();
     }
 
-    /// Ensure the server's per-connection `authorized_repos` set contains `repository`,
+    /// Ensure the server's per-connection `authorized_repos` set contains `partition`,
     /// without leaving a session pinned. Fast-paths via the connector's
     /// `authorized_partitions` cache: if a previous `session_start` already registered
-    /// `repository` on every underlying connection, no wire calls happen. Otherwise a
+    /// `partition` on every underlying connection, no wire calls happen. Otherwise a
     /// fresh session is started (which fans `session_start` across all connections in
     /// parallel) and immediately released; the server keeps `authorized_repos` permanent
     /// for the connection's lifetime, so the registration outlives the session.
     pub async fn ensure_partition_authorized(
         self: &Arc<Self>,
-        repository: RepositoryId,
+        partition: Partition,
         correlation_id: &str,
     ) -> Result<(), ProtocolError> {
         self.ensure_storage_connected().await?;
         let connector = self.storage_connector()?;
-        if connector.is_partition_authorized(repository) {
+        if connector.is_partition_authorized(partition) {
             return Ok(());
+        }
+        if connector.is_partition_refused(partition) {
+            return Err(ProtocolError::from(lore_base::error::NotAuthorized));
         }
         // Drive the slow path through `session()` so the `authorized_partitions` insert
         // and the standard race-resolution / pool bookkeeping all run. We immediately
         // drop the returned `StorageSession` and release the cache entry — the call's
         // only purpose was to register authz, not to keep a live session.
-        let _session = self.session(repository, correlation_id).await?;
-        self.release_session(repository, correlation_id);
-        Ok(())
+        match self.session(partition, correlation_id).await {
+            Ok(_session) => {
+                self.release_session(partition, correlation_id);
+                Ok(())
+            }
+            Err(err) => {
+                if refusal_is_final(&err) {
+                    connector.mark_partition_refused(partition);
+                }
+                Err(err)
+            }
+        }
     }
 
     pub async fn revision(
@@ -896,10 +917,10 @@ impl Protocol for LoreProtocol {
         remote_url: &str,
         auth_url: &str,
         identity: &str,
-        repository: RepositoryId,
+        partition: Partition,
         _index: usize,
     ) -> Result<Arc<dyn Storage>, ProtocolError> {
-        quic::storage(connection, remote_url, auth_url, identity, repository).await
+        quic::storage(connection, remote_url, auth_url, identity, partition).await
     }
 
     async fn revision(
@@ -966,13 +987,10 @@ impl Protocol for GRPCProtocol {
         remote_url: &str,
         auth_url: &str,
         identity: &str,
-        repository: RepositoryId,
+        partition: Partition,
         index: usize,
     ) -> Result<Arc<dyn Storage>, ProtocolError> {
-        grpc::storage(
-            connection, remote_url, auth_url, identity, repository, index,
-        )
-        .await
+        grpc::storage(connection, remote_url, auth_url, identity, partition, index).await
     }
 
     async fn revision(
@@ -1033,6 +1051,58 @@ mod tests {
 
     use super::*;
     use crate::MatchedProtocolError;
+
+    /// A copy naming a source partition asks whether it may before it tries, and a `false` costs a
+    /// `session_start`. Latching the answer bounds that at one per partition — but only for the
+    /// failure that is actually about the claim, or a disconnect would disable a legitimate source
+    /// for as long as the connection lives.
+    mod refusal_is_final {
+        use super::*;
+
+        #[test]
+        fn a_refusal_settles_it() {
+            assert!(super::super::refusal_is_final(&ProtocolError::from(
+                NotAuthorized
+            )));
+            assert!(super::super::refusal_is_final(&ProtocolError::from(
+                NotAuthenticated
+            )));
+        }
+
+        #[test]
+        fn anything_else_is_worth_asking_again() {
+            for err in [
+                ProtocolError::from(Disconnected),
+                ProtocolError::from(SlowDown),
+                ProtocolError::from(Maintenance),
+                ProtocolError::from(NotFound),
+                ProtocolError::internal("transport blew up"),
+            ] {
+                assert!(
+                    !super::super::refusal_is_final(&err),
+                    "{err:?} says the answer was not obtained, not that it is no"
+                );
+            }
+        }
+    }
+
+    /// The refusal is remembered so the round trip is paid once, and retired by the success that
+    /// proves it no longer holds.
+    #[test]
+    fn a_refusal_lasts_until_a_session_start_succeeds() {
+        let connector = crate::session::StorageConnector::new(Vec::new());
+        let partition = Partition::from([0x7au8; 16]);
+
+        assert!(!connector.is_partition_refused(partition));
+
+        connector.mark_partition_refused(partition);
+        assert!(connector.is_partition_refused(partition));
+        assert!(!connector.is_partition_authorized(partition));
+
+        connector.mark_partition_authorized(partition);
+        assert!(!connector.is_partition_refused(partition));
+        assert!(connector.is_partition_authorized(partition));
+    }
 
     #[test]
     fn not_supported_to_tonic_status() {

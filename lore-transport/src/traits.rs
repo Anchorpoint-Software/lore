@@ -21,7 +21,7 @@ pub trait Protocol: Send + Sync {
         remote_url: &str,
         auth_url: &str,
         identity: &str,
-        repository: RepositoryId,
+        partition: Partition,
         index: usize,
     ) -> Result<Arc<dyn Storage>, ProtocolError>;
 
@@ -75,13 +75,13 @@ pub trait Protocol: Send + Sync {
 /// Storage protocol
 #[async_trait]
 pub trait Storage: Send + Sync {
-    /// Start a session for the given repository and correlation ID.
+    /// Start a session for the given partition and correlation ID.
     /// Returns a raw session ID. The caller is responsible for calling
     /// `session_stop` when done. Prefer `StorageConnector::session()` for
     /// automatic lifecycle management.
     async fn session_start(
         &self,
-        repository: RepositoryId,
+        partition: Partition,
         correlation_id: &str,
     ) -> Result<u32, ProtocolError>;
 
@@ -140,8 +140,8 @@ pub trait Storage: Send + Sync {
         heal: bool,
     ) -> Result<VerifyResult, ProtocolError>;
 
-    /// Copy a fragment from `(source_repository, source_address)` to
-    /// `(session.repository, source_address.hash, target_context)`.
+    /// Copy a fragment from `(source_partition, source_address)` to
+    /// `(session.partition, source_address.hash, target_context)`.
     ///
     /// The hash is preserved by the transport (content-addressed); the target context lets the
     /// caller pivot the destination's dedup tag without ever transferring the payload — including
@@ -149,7 +149,7 @@ pub trait Storage: Send + Sync {
     async fn copy(
         &self,
         session_id: u32,
-        source_repository: RepositoryId,
+        source_partition: Partition,
         source_address: Address,
         target_context: Context,
     ) -> Result<(), ProtocolError>;

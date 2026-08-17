@@ -21,7 +21,7 @@ use lore_base::types::Fragment;
 use lore_base::types::Hash;
 use lore_base::types::HealResult;
 use lore_base::types::KeyType;
-use lore_base::types::RepositoryId;
+use lore_base::types::Partition;
 use lore_base::types::VerifyResult;
 use lore_error_set::prelude::*;
 use lore_proto::lore::model::v1 as model_v1;
@@ -52,7 +52,7 @@ const MAX_STREAM_REISSUES: usize = 8;
 /// Session context for gRPC metadata injection. Cached at `session_start` time.
 #[derive(Clone)]
 pub struct GrpcSessionContext {
-    pub repository: RepositoryId,
+    pub partition: Partition,
     pub correlation_id: String,
     pub auth_token: String,
 }
@@ -401,11 +401,11 @@ fn inject_metadata<T>(request: &mut tonic::Request<T>, ctx: &GrpcSessionContext)
     let md = request.metadata_mut();
     md.insert_bin(
         PARTITION_ID_KEY,
-        tonic::metadata::BinaryMetadataValue::from_bytes(ctx.repository.data()),
+        tonic::metadata::BinaryMetadataValue::from_bytes(ctx.partition.data()),
     );
     md.insert_bin(
         REPOSITORY_ID_KEY,
-        tonic::metadata::BinaryMetadataValue::from_bytes(ctx.repository.data()),
+        tonic::metadata::BinaryMetadataValue::from_bytes(ctx.partition.data()),
     );
     if !ctx.correlation_id.is_empty()
         && let Ok(val) = MetadataValue::from_str(&ctx.correlation_id)
@@ -624,14 +624,14 @@ impl StorageService {
         &self,
         session_id: u32,
         ctx: &GrpcSessionContext,
-        source_repository: RepositoryId,
+        source_partition: Partition,
         source_address: Address,
         target_context: Context,
     ) -> Result<(), ProtocolError> {
         lore_debug!(
-            "gRPC copy fragment: {} from repository {} (target context {})",
+            "gRPC copy fragment: {} from partition {} (target context {})",
             source_address,
-            source_repository,
+            source_partition,
             target_context
         );
 
@@ -642,7 +642,7 @@ impl StorageService {
             .internal("permit acquire")?;
 
         let request = storage_v1::CopyRequest {
-            source_repository_id: Bytes::copy_from_slice(source_repository.data()),
+            source_repository_id: Bytes::copy_from_slice(source_partition.data()),
             source_address: Some(source_address.into()),
             target_context: Bytes::copy_from_slice(zerocopy::IntoBytes::as_bytes(&target_context)),
         };
@@ -1106,7 +1106,7 @@ mod tests {
 
     fn test_context() -> GrpcSessionContext {
         GrpcSessionContext {
-            repository: RepositoryId::from(Context::from([0x11u8; 16])),
+            partition: Partition::from(Context::from([0x11u8; 16])),
             correlation_id: "rotation-test".to_string(),
             auth_token: String::new(),
         }

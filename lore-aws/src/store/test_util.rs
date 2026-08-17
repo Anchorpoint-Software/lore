@@ -51,6 +51,7 @@ use crate::store::immutable_store::FragmentState;
 use crate::store::immutable_store::FragmentStateEntry;
 use crate::store::immutable_store::FragmentsEntry;
 use crate::store::immutable_store::FragmentsQuery;
+use crate::store::immutable_store::PartitionAssociationQuery;
 use crate::store::immutable_store::RowAbsent;
 use crate::store::immutable_store::S3StoreSettings;
 use crate::store::immutable_store::StateUnchanged;
@@ -542,6 +543,24 @@ pub(crate) fn wire(fake: &Fake) -> (MockS3Impl, MockDynamoDb) {
         // The query limits itself to one row, so the service could never report more than one no
         // matter how many partitions hold the hash. Reporting the true total here would let a
         // caller that needs an actual count pass against this fake and under-report against S3.
+        Ok(QueryOutput::builder().count(i32::from(matched)).build())
+    });
+
+    let f = fake.clone();
+    dynamodb.expect_query_single().returning(move |_, query| {
+        if f.failing(Fault::AssociationCount) {
+            return Err(throughput_exceeded(
+                QueryError::ProvisionedThroughputExceededException(throttling_exception()),
+            ));
+        }
+
+        let storage = f.lock();
+        let PartitionAssociationQuery(hash, partition) = query;
+        // The service's `begins_with` on a sort key of partition followed by context.
+        let matched = storage.associations.keys().any(|(stored, sort_key)| {
+            stored == hash.data() && sort_key.starts_with(partition.data())
+        });
+
         Ok(QueryOutput::builder().count(i32::from(matched)).build())
     });
 
