@@ -802,7 +802,7 @@ impl LoreGlobalArgs {
     }
 
     /// Validates the global arguments. Can mutate the arguments after validation
-    /// E.g. if called with identity_token, sets the identity from the token.
+    /// E.g. if called with `identity_token`, sets the identity from the token.
     pub fn validate(&mut self) -> Result<(), InvalidArguments> {
         let invalid = |reason: String| Err(InvalidArguments { reason });
 

@@ -1441,7 +1441,7 @@ token = "tok-b"
 
     /// The caller is working from tokens they supplied, so the store is off
     /// limits: an access token with no identity token beside it reports
-    /// TokenNotFound rather than reading whichever identity happens to be
+    /// `TokenNotFound` rather than reading whichever identity happens to be
     /// stored. Proven against a store that does hold a matching token, so a
     /// regression to the fallback would be visible here.
     ///
