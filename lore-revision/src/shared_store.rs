@@ -11,9 +11,7 @@ use crate::error::LoreErrorExt;
 use crate::errors::*;
 use crate::event::EventError;
 use crate::event::LoreEvent;
-use crate::global;
 use crate::global::GlobalConfig;
-use crate::global::save_config;
 use crate::interface::LoreArray;
 use crate::interface::LoreError;
 use crate::interface::LoreString;
@@ -29,6 +27,7 @@ use crate::store::immutable::ImmutableStoreCreateOptions;
 use crate::store::immutable::ImmutableStoreSettings;
 use crate::store::mutable;
 use crate::util;
+use crate::util::config;
 use crate::util::url::normalize_remote_url;
 
 #[error_set]
@@ -219,7 +218,7 @@ async fn create_shared_store_at(
     })
     .send();
 
-    save_config(
+    config::save(
         &shared_store_config,
         &shared_store_path.join(SHARED_STORE_CONFIG),
     )
@@ -414,17 +413,17 @@ async fn load_shared_store_config(
     let config_path = shared_store_path.join(SHARED_STORE_CONFIG);
     let legacy_config_path = shared_store_path.join("global.toml");
     if config_path.exists() {
-        global::load_config::<SharedStoreConfig>(config_path)
+        config::load::<SharedStoreConfig>(config_path)
             .await
             .forward::<SharedStoreError>("Loading shared store config")
     } else if legacy_config_path.exists() {
         // If a config is found at the old location, save it to the correct location and delete the
         // original
-        let legacy_config = global::load_config::<SharedStoreConfig>(&legacy_config_path)
+        let legacy_config = config::load::<SharedStoreConfig>(&legacy_config_path)
             .await
             .forward::<SharedStoreError>("Loading legacy shared store config");
         if let Ok(legacy_config) = legacy_config.as_ref() {
-            save_config(legacy_config, config_path)
+            config::save(legacy_config, config_path)
                 .await
                 .forward::<SharedStoreError>("migrating global config")?;
             util::fs::unlink(&legacy_config_path)

@@ -1514,23 +1514,23 @@ def test_layer_sync_force_clears_stale_staged_pin(new_lore_repo):
 ZERO_HASH = "0" * 64
 
 
+def _layer_config_path(repo: Lore) -> str:
+    """Return the path of the repository's `layer.toml`."""
+    return os.path.join(repo.dot_path(), "layer.toml")
+
+
 def _layer_config_staged(repo: Lore, target_path: str) -> str:
     """Return the `staged` pin of the layer at `target_path` from `layer.toml`.
 
     `lore layer list` only reports the `current` pin. Returns "" when the
     config has no entry for `target_path`.
     """
-    for dot_dir in (".lore", ".urc"):
-        config_path = os.path.join(repo.path, dot_dir, "layer.toml")
-        if not os.path.isfile(config_path):
-            continue
-        with open(config_path, "rb") as config_file:
-            config = tomllib.load(config_file)
-        for layer in config.get("layers", []):
-            if layer.get("target_path") == target_path:
-                return layer.get("staged", "")
-        return ""
-    raise AssertionError(f"No layer config found under {repo.path}")
+    with open(_layer_config_path(repo), "rb") as config_file:
+        config = tomllib.load(config_file)
+    for layer in config.get("layers", []):
+        if layer.get("target_path") == target_path:
+            return layer.get("staged", "")
+    return ""
 
 
 @pytest.mark.smoke
@@ -1590,4 +1590,167 @@ def test_layer_stage_scan_unchanged_layer(new_lore_repo):
         content = out.read()
     assert content == b"layer content v2", (
         f"Expected the layer to be restored to L2 on main, got: {content}"
+    )
+
+
+@pytest.mark.smoke
+def test_layer_config_corrupt_config_surfaces_error(new_lore_repo):
+    """A `layer.toml` that cannot be parsed reports an error and is preserved.
+
+    Reading a corrupt config as an empty layer set would hand back a repository
+    that appears to have no layers, and the next save would write that empty
+    set back over the only record of the layer set.
+    """
+    repo, _ = _setup_repo_with_layer(new_lore_repo)
+    config_path = _layer_config_path(repo)
+    with open(config_path, "rb") as config_file:
+        original = config_file.read()
+
+    with open(config_path, "wb") as config_file:
+        config_file.write(b"layers = = =")
+
+    output = repo.layer_list(json=True, check=False)
+    complete = parse_complete_json(output)
+    assert complete is not None and complete.get("status") != 0, (
+        f"Expected a non-zero status for a corrupt layer config, got: {output}"
+    )
+
+    with open(config_path, "rb") as config_file:
+        assert config_file.read() == b"layers = = =", (
+            "A failed load overwrote the corrupt config instead of preserving it"
+        )
+
+    with open(config_path, "wb") as config_file:
+        config_file.write(original)
+
+    layers = parse_layer_list_json(repo.layer_list(json=True))
+    assert len(layers) == 1 and layers[0].get("targetPath") == "lay", (
+        f"Expected the layer to be listed again once the config is restored, got {layers}"
+    )
+
+
+@pytest.mark.smoke
+def test_layer_config_unreadable_config_surfaces_error(new_lore_repo):
+    """A `layer.toml` that cannot be opened reports an error.
+
+    Only an absent config means "no layers configured". A config that is
+    present but unreadable must not read as an empty layer set, since
+    `layer.toml` is the sole record of the layer set and the next save would
+    write the empty set back.
+    """
+    repo, _ = _setup_repo_with_layer(new_lore_repo)
+    config_path = _layer_config_path(repo)
+    with open(config_path, "rb") as config_file:
+        original = config_file.read()
+
+    os.remove(config_path)
+    os.mkdir(config_path)
+
+    output = repo.layer_list(json=True, check=False)
+    complete = parse_complete_json(output)
+    assert complete is not None and complete.get("status") != 0, (
+        f"Expected a non-zero status for an unreadable layer config, got: {output}"
+    )
+
+    os.rmdir(config_path)
+    with open(config_path, "wb") as config_file:
+        config_file.write(original)
+
+    layers = parse_layer_list_json(repo.layer_list(json=True))
+    assert len(layers) == 1 and layers[0].get("targetPath") == "lay", (
+        f"Expected the layer to be listed again once the config is readable, got {layers}"
+    )
+
+
+@pytest.mark.smoke
+def test_layer_config_add_refuses_on_corrupt_config(new_lore_repo):
+    """`layer add` on a corrupt `layer.toml` reports an error and keeps the file.
+
+    Treating the corrupt config as empty would make this add write a config
+    holding only the new layer, permanently dropping the configured one.
+    """
+    repo, _ = _setup_repo_with_layer(new_lore_repo)
+    second_repo: Lore = new_lore_repo(repo.name + "_second")
+    second_repo.make_dirs("sec")
+    second_repo.write_commit_push(None, {os.path.join("sec", "second.txt"): b"second"})
+
+    config_path = _layer_config_path(repo)
+    with open(config_path, "rb") as config_file:
+        original = config_file.read()
+
+    corrupt = b"\xff\xfe\x00\x80"
+    with open(config_path, "wb") as config_file:
+        config_file.write(corrupt)
+
+    output = repo.layer_add("sec", second_repo, "sec/", json=True, check=False)
+    complete = parse_complete_json(output)
+    assert complete is not None and complete.get("status") != 0, (
+        f"Expected a non-zero status for add on a corrupt layer config, got: {output}"
+    )
+
+    with open(config_path, "rb") as config_file:
+        assert config_file.read() == corrupt, (
+            "A refused add rewrote the layer config, discarding the configured layer"
+        )
+
+    with open(config_path, "wb") as config_file:
+        config_file.write(original)
+
+    layers = parse_layer_list_json(repo.layer_list(json=True))
+    assert [layer.get("targetPath") for layer in layers] == ["lay"], (
+        f"Expected the original layer to survive the refused add, got {layers}"
+    )
+    assert os.path.isfile(os.path.join(repo.path, LAYER_FILE)), (
+        "Expected the original layer's content to be intact after the refused add"
+    )
+
+
+@pytest.mark.smoke
+def test_layer_config_save_leaves_no_temporary_file(new_lore_repo):
+    """A saved `layer.toml` is complete and leaves no temporary file behind."""
+    repo, _ = _setup_repo_with_layer(new_lore_repo)
+    second_repo: Lore = new_lore_repo(repo.name + "_second")
+    second_repo.make_dirs("sec")
+    second_repo.write_commit_push(None, {os.path.join("sec", "second.txt"): b"second"})
+
+    repo.layer_add("sec", second_repo, "sec/")
+
+    config_path = _layer_config_path(repo)
+    with open(config_path, "rb") as config_file:
+        config = tomllib.load(config_file)
+    assert sorted(layer["target_path"] for layer in config["layers"]) == ["lay", "sec"], (
+        f"Expected both layers in the saved config, got {config}"
+    )
+
+    assert not os.path.exists(config_path + ".tmp"), (
+        "A successful save left its temporary file behind"
+    )
+
+
+@pytest.mark.smoke
+def test_layer_config_save_replaces_stale_temporary_file(new_lore_repo):
+    """A leftover temporary file from an interrupted save does not disturb the
+    next one: the saved config holds the new layer set and the temporary file is
+    consumed by the rename that installs it.
+    """
+    repo, _ = _setup_repo_with_layer(new_lore_repo)
+    second_repo: Lore = new_lore_repo(repo.name + "_second")
+    second_repo.make_dirs("sec")
+    second_repo.write_commit_push(None, {os.path.join("sec", "second.txt"): b"second"})
+
+    config_path = _layer_config_path(repo)
+    temp_path = config_path + ".tmp"
+    with open(temp_path, "wb") as temp_file:
+        temp_file.write(b"layers = = =")
+
+    repo.layer_add("sec", second_repo, "sec/")
+
+    with open(config_path, "rb") as config_file:
+        config = tomllib.load(config_file)
+    assert sorted(layer["target_path"] for layer in config["layers"]) == ["lay", "sec"], (
+        f"Expected both layers in the saved config, got {config}"
+    )
+
+    assert not os.path.exists(temp_path), (
+        "The stale temporary file survived the save that should have consumed it"
     )

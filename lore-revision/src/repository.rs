@@ -44,7 +44,6 @@ use serde::Deserialize;
 use serde::Serialize;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use toml;
 use zerocopy::IntoBytes;
 
 use crate::branch;
@@ -1292,27 +1291,23 @@ pub fn parse_url(url: &str, offline: bool) -> Result<(String, String), Repositor
     Ok((remote_url, name.to_string()))
 }
 
+/// Reads the repository config, defaulting only when it is absent.
+///
+/// Read synchronously — see [`util::config::load_blocking`], which carries the reasoning. A
+/// config that is present but unreadable is an error rather than a default: this file holds the
+/// remote URL, so defaulting past a read failure presents a repository that merely could not be
+/// opened as one with no remote, and the next save writes that back.
 fn load_config(config_path: impl AsRef<Path>) -> Result<RepositoryConfig, RepositoryError> {
-    // Synchronous read: tiny config file, avoids thread hop and queuing behind
-    // any store flush tasks still in flight from the previous command.
-    let config = match std::fs::read_to_string(config_path) {
-        Ok(config) => config,
-        Err(_) => return Ok(RepositoryConfig::default()),
-    };
-    Ok(toml::from_str(config.as_str()).internal("Failed to load config file")?)
+    Ok(util::config::load_blocking(config_path).internal("Failed to load config file")?)
 }
 
 async fn save_config(
     config_path: impl AsRef<Path>,
     config: &RepositoryConfig,
 ) -> Result<(), RepositoryError> {
-    let config_string = toml::to_string_pretty(&config).internal("Failed to save config file")?;
-
-    lore_io::IoDriver::global()
-        .write_file_bytes(config_path, bytes::Bytes::from(config_string), false)
+    Ok(util::config::save(config, config_path)
         .await
-        .internal("Failed to save config file")?;
-    Ok(())
+        .internal("Failed to save config file")?)
 }
 
 pub fn load_repository_config(path: impl AsRef<Path>) -> Result<RepositoryConfig, RepositoryError> {

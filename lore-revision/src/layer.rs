@@ -191,7 +191,7 @@ struct LayerConfig {
 }
 
 async fn load_config(config_path: impl AsRef<Path>) -> Result<LayerConfig, LayerError> {
-    Ok(crate::global::load_config(config_path)
+    Ok(crate::util::config::load(config_path)
         .await
         .internal("Failed to load configuration")?)
 }
@@ -201,13 +201,9 @@ async fn save_config(
     config_path: impl AsRef<Path>,
     config: &LayerConfig,
 ) -> Result<(), LayerError> {
-    let config_string = toml::to_string_pretty(&config).internal("Failed to save configuration")?;
-
-    lore_io::IoDriver::global()
-        .write_file_bytes(config_path, bytes::Bytes::from(config_string), false)
+    Ok(crate::util::config::save(config, config_path)
         .await
-        .internal("Failed to save configuration")?;
-    Ok(())
+        .internal("Failed to save configuration")?)
 }
 
 pub fn layer_config_path(repository_path: impl AsRef<Path>) -> PathBuf {
