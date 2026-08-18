@@ -1477,6 +1477,155 @@ mod aws_store_tests {
             .await
     }
 
+    /// Regression test for a silent push failure on newly created repositories.
+    ///
+    /// `branch::create` for a default branch (no commits yet) calls
+    /// `store_latest(prev=0, latest=0)`, which goes through
+    /// `compare_and_swap(expected=0, value=0)` and writes a `{value=0000…}` row
+    /// to DynamoDB. Previously the zero-expected CAS condition was
+    /// `attribute_not_exists(pk) AND attribute_not_exists(sk)` — an item-existence
+    /// check that fails when the row already exists, even with a zero value. The
+    /// handler for the resulting `ConditionalCheckFailedException` returned the
+    /// stored zero as the "previous" value, which the caller mistook for a
+    /// successful swap. The branch pointer was never advanced.
+    ///
+    /// The fix changes the condition to check the value attribute directly:
+    /// `attribute_not_exists(#v) OR #v = :expected`, which matches both an absent
+    /// row and a row whose value is zero.
+    #[tokio::test]
+    async fn test_compare_and_swap_zero_expected_succeeds_when_row_holds_zero_value() -> TestResult
+    {
+        let hash = random::<Hash>();
+        let new_value = random::<Hash>();
+        let repository = random::<RepositoryId>();
+
+        let (_immutable_store, mutable_store, execution) = initialize_store().await?;
+        LORE_CONTEXT
+            .scope(execution.clone(), async move {
+                // Replicate what branch::create does for a default branch: CAS from zero to
+                // zero, which writes {value=0000…} into DynamoDB without the caller noticing
+                // the value is the same as "no entry".
+                assert_eq!(
+                    Hash::default(),
+                    mutable_store
+                        .clone()
+                        .compare_and_swap(
+                            repository,
+                            hash,
+                            Hash::default(),
+                            Hash::default(),
+                            KeyType::BranchLatestPointer,
+                        )
+                        .await?,
+                    "initialisation CAS must succeed"
+                );
+
+                // The row now exists in DynamoDB with value=0000… . A zero value is treated
+                // as absent by both the local and AWS stores, so load returns AddressNotFound.
+                assert!(
+                    mutable_store
+                        .clone()
+                        .load(repository, hash, KeyType::BranchLatestPointer)
+                        .await
+                        .is_err(),
+                    "a zero-valued row must look absent to load"
+                );
+
+                // Now replicate the first real push: CAS from zero to a real revision hash.
+                // Before the fix this silently no-oped because the item-existence condition
+                // failed and the handler returned the stored zero as the previous value,
+                // making the caller think the swap had succeeded.
+                assert_eq!(
+                    Hash::default(),
+                    mutable_store
+                        .clone()
+                        .compare_and_swap(
+                            repository,
+                            hash,
+                            Hash::default(),
+                            new_value,
+                            KeyType::BranchLatestPointer,
+                        )
+                        .await?,
+                    "push CAS must succeed against the zero-valued row"
+                );
+
+                // The write must have actually landed — a clone would no longer be empty.
+                assert_eq!(
+                    new_value,
+                    mutable_store
+                        .clone()
+                        .load(repository, hash, KeyType::BranchLatestPointer)
+                        .await?,
+                    "branch pointer must reflect the pushed revision"
+                );
+
+                Ok(())
+            })
+            .await
+    }
+
+    /// A zero-valued row must block a CAS that expects a non-zero value.
+    ///
+    /// The stored zero does not equal the non-zero expected hash, so the swap
+    /// must not take effect. The returned previous value is zero (the actual
+    /// stored value), which differs from the non-zero expected, signalling
+    /// failure to the caller.
+    #[tokio::test]
+    async fn test_compare_and_swap_zero_value_row_blocks_nonzero_expected() -> TestResult {
+        let hash = random::<Hash>();
+        let new_value = random::<Hash>();
+        let wrong_expected = random::<Hash>(); // non-zero, does not match stored zero
+        let repository = random::<RepositoryId>();
+
+        let (_immutable_store, mutable_store, execution) = initialize_store().await?;
+        LORE_CONTEXT
+            .scope(execution.clone(), async move {
+                // Write the zero-valued row (simulating branch::create for an empty branch).
+                mutable_store
+                    .clone()
+                    .compare_and_swap(
+                        repository,
+                        hash,
+                        Hash::default(),
+                        Hash::default(),
+                        KeyType::BranchLatestPointer,
+                    )
+                    .await?;
+
+                // CAS with a non-zero expected must not swap — the stored value is zero.
+                let previous = mutable_store
+                    .clone()
+                    .compare_and_swap(
+                        repository,
+                        hash,
+                        wrong_expected,
+                        new_value,
+                        KeyType::BranchLatestPointer,
+                    )
+                    .await?;
+
+                // previous != wrong_expected signals failure to the caller.
+                assert_ne!(
+                    previous, wrong_expected,
+                    "previous must not equal wrong_expected — the swap must not have taken effect"
+                );
+
+                // The row must be unchanged — still holds zero, which loads as absent.
+                assert!(
+                    mutable_store
+                        .clone()
+                        .load(repository, hash, KeyType::BranchLatestPointer)
+                        .await
+                        .is_err(),
+                    "row must still hold zero after a failed CAS"
+                );
+
+                Ok(())
+            })
+            .await
+    }
+
     #[tokio::test]
     async fn test_list_mutable_branch_ids() -> TestResult {
         let repository = random::<RepositoryId>();
