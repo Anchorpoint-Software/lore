@@ -7646,6 +7646,73 @@ pub extern "C" fn lore_revision_tree_modify_async(
     );
 }
 
+pub type LoreRevisionTreeMoveArgs = crate::revision_tree::move_node::LoreRevisionTreeMoveArgs;
+
+/// Move a batch of nodes to new parents and/or new names in a loaded revision tree. An
+/// entry naming the node's current parent renames it where it is. Every entry is checked
+/// before any node is moved, so one bad entry rejects the call and leaves every node
+/// where it was; the reason names the offending entry's batch index, which a caller
+/// leaving `entry_id` at zero has no other way to identify. A failure after those checks
+/// pass is internal and may leave earlier entries applied.
+///
+/// A move keeps the node: its node id, its `file_id` and its children come along, and
+/// the change is recorded as a move rather than as a deletion and an addition, so the
+/// revision graph carries the node's history across it. The node reports
+/// `LORE_NODE_STAGED_ACTION_MOVE` until the commit that freezes the tree, and so does
+/// every node under a moved directory — their records do not change, but their paths do.
+/// Two exceptions: a node added through this handle stays staged as an addition wherever
+/// it lands, since it is in no revision a move could be recorded against; and a node
+/// under the moved directory that is staged for deletion keeps its deletion, since it is
+/// leaving the revision at the commit either way.
+///
+/// Both batch-level rules read the tree the whole batch produces rather than the one in
+/// front of them. A destination inside the moved node's own subtree is rejected, and so
+/// is one that lands there once the batch is applied — moving A under B and B under A is
+/// a loop neither entry shows on its own. A name a live child of the destination already
+/// holds is rejected, but a name the batch itself vacates is not: moving `x` out of a
+/// directory while moving another node to `x` in it succeeds, and two entries taking one
+/// name under one destination reject even though neither collides with the tree.
+///
+/// Entries apply one at a time, in batch order, because a move rewrites the parent and
+/// sibling pointers of two child chains where `lore_revision_tree_add` only prepends to
+/// one. For the same reason concurrent calls have more to lose here than on `add` or
+/// `modify`: two calls moving nodes that share a parent chain can interleave their
+/// unlinks, which the pre-commit validator then refuses. Moves that may touch one parent
+/// chain belong in one call.
+///
+/// | Terminal event                            | Payload                                          | Notes                                                       |
+/// |-------------------------------------------|--------------------------------------------------|-------------------------------------------------------------|
+/// | `LORE_EVENT_REVISION_TREE_MOVE_COMPLETE`  | `lore_revision_tree_move_complete_event_data_t`  | One per entry, carrying its `entry_id` and the moved node    |
+/// | `LORE_EVENT_REVISION_TREE_BATCH_COMPLETE` | `lore_revision_tree_batch_complete_event_data_t` | Exactly one, carrying the `batch_id` and the call's outcome  |
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_tree_move(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionTreeMoveArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(
+        globals,
+        args,
+        callback,
+        crate::revision_tree::move_node::move_node,
+    )
+}
+
+/// Move a batch of nodes in a loaded revision tree (async variant).
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_tree_move_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionTreeMoveArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(
+        globals,
+        args,
+        callback,
+        crate::revision_tree::move_node::move_node,
+    );
+}
+
 pub type LoreRevisionTreeMetadataSetArgs =
     crate::revision_tree::metadata_set::LoreRevisionTreeMetadataSetArgs;
 

@@ -429,6 +429,462 @@ mod tests {
             .await
             .expect("Test task failed");
     }
+
+    /// Run `body` against a fresh in-memory state, inside the execution scope the
+    /// state edits read their globals from. Nothing here serializes, so the
+    /// repository needs no path and no write token.
+    async fn with_state<F, Fut>(body: F)
+    where
+        F: FnOnce(Arc<RepositoryContext>, Arc<State>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        let (_immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let immutable_store = LocalImmutableStore::new(
+                    None,
+                    lore_storage::local::immutable_store::ImmutableStoreSettings::default(),
+                )
+                .await
+                .expect("Failed to create store");
+                let repository = Arc::new(RepositoryContext::new(
+                    default_repository_creation_args(immutable_store, mutable_store),
+                ));
+                body(repository, Arc::new(State::new())).await;
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// Add a node of `flags` under `parent`, carrying a file id of its own so a move
+    /// can be shown to keep it.
+    async fn add_node(
+        repository: &Arc<RepositoryContext>,
+        state: &Arc<State>,
+        parent: NodeID,
+        name: &str,
+        flags: NodeFlags,
+    ) -> NodeID {
+        state
+            .node_add(
+                repository.clone(),
+                parent,
+                Node {
+                    flags: flags.bits(),
+                    name_hash: hash_string(name),
+                    address: Address {
+                        hash: lore_base::types::Hash::from_u64(7),
+                        context: lore_base::types::Context::from(uuid::Uuid::now_v7()),
+                    },
+                    ..Default::default()
+                },
+                name,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("Failed to add node {name}: {error}"))
+    }
+
+    /// Reparenting rewrites the chain the node sat in, and the node it is unlinked from
+    /// is whichever one points at it: this is the case where that is a sibling rather
+    /// than the parent, which the parent's own `child` pointer never exercises.
+    #[tokio::test]
+    async fn move_node_unlinks_from_the_middle_of_a_sibling_chain() {
+        with_state(|repository, state| async move {
+            let source = add_node(&repository, &state, ROOT_NODE, "src", NodeFlags::NoFlags).await;
+            let destination =
+                add_node(&repository, &state, ROOT_NODE, "dst", NodeFlags::NoFlags).await;
+            let first = add_node(&repository, &state, source, "first", NodeFlags::File).await;
+            let middle = add_node(&repository, &state, source, "middle", NodeFlags::File).await;
+            let last = add_node(&repository, &state, source, "last", NodeFlags::File).await;
+
+            state
+                .move_node(repository.clone(), middle, destination, "middle")
+                .await
+                .expect("Failed to move the middle child");
+
+            assert_eq!(
+                state
+                    .node_children(repository.clone(), source)
+                    .await
+                    .expect("Failed to walk the source chain"),
+                vec![last, first],
+                "the chain the node left must close over it, keeping its order"
+            );
+            assert_eq!(
+                state
+                    .node_children(repository.clone(), destination)
+                    .await
+                    .expect("Failed to walk the destination chain"),
+                vec![middle],
+                "the node must be the destination's only child"
+            );
+            assert_eq!(
+                state
+                    .node(repository.clone(), middle)
+                    .await
+                    .expect("Failed to read the moved node")
+                    .parent,
+                destination,
+                "the moved node must point at the parent it arrived at"
+            );
+        })
+        .await;
+    }
+
+    /// A move keeps the node: the same slot, the same file id, the same children —
+    /// which is what makes the record a move rather than a delete and an add. The
+    /// subtree is recorded as moved with it, since its paths change.
+    #[tokio::test]
+    async fn move_node_renames_in_place_and_keeps_identity() {
+        with_state(|repository, state| async move {
+            let directory =
+                add_node(&repository, &state, ROOT_NODE, "before", NodeFlags::NoFlags).await;
+            let child =
+                add_node(&repository, &state, directory, "child.bin", NodeFlags::File).await;
+            let before = state
+                .node(repository.clone(), directory)
+                .await
+                .expect("Failed to read the directory");
+            state
+                .node_mark_staged(
+                    repository.clone(),
+                    directory,
+                    NodeFlags::NoFlags,
+                    NodeFlags::NoFlags,
+                )
+                .await
+                .expect("Failed to settle the directory");
+            state
+                .node_mark_staged(
+                    repository.clone(),
+                    child,
+                    NodeFlags::NoFlags,
+                    NodeFlags::NoFlags,
+                )
+                .await
+                .expect("Failed to settle the child");
+
+            state
+                .move_node(repository.clone(), directory, ROOT_NODE, "after")
+                .await
+                .expect("Failed to rename the directory");
+
+            let after = state
+                .node(repository.clone(), directory)
+                .await
+                .expect("Failed to read the directory back");
+            assert_eq!(
+                state
+                    .node_name_clone(repository.clone(), directory)
+                    .await
+                    .expect("Failed to read the name"),
+                "after",
+                "the stored name must be the new one"
+            );
+            assert_eq!(
+                after.name_hash,
+                hash_string("after"),
+                "the name hash must follow the stored name, which the commit verifier checks"
+            );
+            assert_eq!(
+                after.address.context, before.address.context,
+                "the file id must survive the rename"
+            );
+            assert!(
+                after.is_staged_move(),
+                "the node must carry the move for the commit to record"
+            );
+            assert_eq!(
+                state
+                    .node_children(repository.clone(), directory)
+                    .await
+                    .expect("Failed to walk the children"),
+                vec![child],
+                "the children come along without being relinked"
+            );
+            assert!(
+                state
+                    .node(repository.clone(), child)
+                    .await
+                    .expect("Failed to read the child")
+                    .is_staged_move(),
+                "a child's path changed with its parent's, so it is recorded as moved too"
+            );
+        })
+        .await;
+    }
+
+    /// A node whose parent pointer names a directory it is not a child of cannot be
+    /// unlinked, and the move fails there — after every check has passed. Nothing may be
+    /// half-written at that point: the node must be where it was, under the name it had,
+    /// and the chain it really sits in must still be whole.
+    #[tokio::test]
+    async fn move_node_that_cannot_unlink_writes_nothing() {
+        with_state(|repository, state| async move {
+            let source = add_node(&repository, &state, ROOT_NODE, "src", NodeFlags::NoFlags).await;
+            let destination =
+                add_node(&repository, &state, ROOT_NODE, "dst", NodeFlags::NoFlags).await;
+            let first = add_node(&repository, &state, source, "first.bin", NodeFlags::File).await;
+            let second = add_node(&repository, &state, source, "second.bin", NodeFlags::File).await;
+
+            // Point the node at a parent whose chain does not hold it, which is the shape
+            // a broken hierarchy takes and the one the unlink refuses to guess at.
+            let block = state
+                .block(repository.clone(), NodeBlock::index(second))
+                .await
+                .expect("Failed to read the block");
+            block.write().node(Node::index(second)).parent = destination;
+
+            let failure = state
+                .move_node(repository.clone(), second, ROOT_NODE, "second.bin")
+                .await
+                .expect_err("a node missing from its parent's chain cannot be moved");
+            assert!(
+                failure.to_string().contains("not in the child chain"),
+                "the failure must name what it could not do, got {failure}"
+            );
+
+            // Read the links rather than walking them: the fixture's own corruption is
+            // what a chain walk refuses, and it is the links this has to pin.
+            let source_node = state
+                .node(repository.clone(), source)
+                .await
+                .expect("Failed to read the source");
+            let moved_node = state
+                .node(repository.clone(), second)
+                .await
+                .expect("Failed to read the node");
+            let destination_node = state
+                .node(repository.clone(), destination)
+                .await
+                .expect("Failed to read the destination");
+            assert_eq!(
+                source_node.child, second,
+                "the chain the node really sits in must still start at it"
+            );
+            assert_eq!(moved_node.sibling, first, "and must still run through it");
+            assert!(
+                destination_node.child().is_none(),
+                "and the node must not have been linked in anywhere else"
+            );
+            assert_eq!(
+                state
+                    .node_name_clone(repository.clone(), second)
+                    .await
+                    .expect("Failed to read the name"),
+                "second.bin",
+                "nor renamed on the way to a failure"
+            );
+        })
+        .await;
+    }
+
+    /// The reason a refused move gave. Several distinct rules all report invalid
+    /// arguments, so a test that only asserts "some error" cannot tell which one fired —
+    /// or notice when a later change makes a different one fire first.
+    async fn move_failure(
+        repository: &Arc<RepositoryContext>,
+        state: &Arc<State>,
+        node_id: NodeID,
+        destination_parent_id: NodeID,
+        dst_name: &str,
+    ) -> String {
+        state
+            .move_node(repository.clone(), node_id, destination_parent_id, dst_name)
+            .await
+            .expect_err("the move must be refused")
+            .to_string()
+    }
+
+    /// The checks that are about a node's *staging state* rather than the tree's shape. The
+    /// verb refuses all three before the primitive sees them, so these are what any other
+    /// `lore-revision` caller gets — and what stops a move recording a path change for a
+    /// node that is on its way out.
+    #[tokio::test]
+    async fn move_node_rejects_a_node_the_revision_is_letting_go() {
+        with_state(|repository, state| async move {
+            let destination =
+                add_node(&repository, &state, ROOT_NODE, "dst", NodeFlags::NoFlags).await;
+            let deleted = add_node(
+                &repository,
+                &state,
+                ROOT_NODE,
+                "deleted.bin",
+                NodeFlags::File,
+            )
+            .await;
+            let discarded = add_node(
+                &repository,
+                &state,
+                ROOT_NODE,
+                "discarded.bin",
+                NodeFlags::File,
+            )
+            .await;
+            let doomed_parent =
+                add_node(&repository, &state, ROOT_NODE, "doomed", NodeFlags::NoFlags).await;
+            let mover =
+                add_node(&repository, &state, ROOT_NODE, "mover.bin", NodeFlags::File).await;
+
+            state
+                .node_delete(repository.clone(), deleted)
+                .await
+                .expect("Failed to stage the deletion");
+            state
+                .node_delete(repository.clone(), doomed_parent)
+                .await
+                .expect("Failed to stage the destination's deletion");
+            lore_revision::state::node_discard_patch(
+                state.clone(),
+                repository.clone(),
+                discarded,
+                |_node_id, _flags| {},
+            )
+            .await
+            .expect("Failed to discard the node");
+
+            let reason =
+                move_failure(&repository, &state, deleted, destination, "deleted.bin").await;
+            assert!(
+                reason.contains("staged for deletion"),
+                "a node staged for deletion is leaving the revision, not moving in it: {reason}"
+            );
+            let reason =
+                move_failure(&repository, &state, discarded, destination, "discarded.bin").await;
+            assert!(
+                reason.contains("discarded"),
+                "a discarded node is gone; its slot reads back as an empty directory: {reason}"
+            );
+            let reason = move_failure(&repository, &state, mover, doomed_parent, "mover.bin").await;
+            assert!(
+                reason.contains("would go with it"),
+                "a destination staged for deletion would take the moved node with it: {reason}"
+            );
+
+            assert_eq!(
+                state
+                    .node(repository.clone(), mover)
+                    .await
+                    .expect("Failed to read the node")
+                    .parent,
+                ROOT_NODE,
+                "every rejection must leave the node where it was"
+            );
+            assert!(
+                state
+                    .node_children(repository.clone(), destination)
+                    .await
+                    .expect("Failed to walk the destination")
+                    .is_empty(),
+                "and the destination empty"
+            );
+        })
+        .await;
+    }
+
+    /// The rejections that are properties of the tree rather than of one call, each
+    /// refused before anything is relinked.
+    #[tokio::test]
+    async fn move_node_rejects_what_would_break_the_tree() {
+        with_state(|repository, state| async move {
+            let directory =
+                add_node(&repository, &state, ROOT_NODE, "dir", NodeFlags::NoFlags).await;
+            let nested =
+                add_node(&repository, &state, directory, "nested", NodeFlags::NoFlags).await;
+            let file = add_node(&repository, &state, ROOT_NODE, "leaf.bin", NodeFlags::File).await;
+
+            let reason = move_failure(&repository, &state, ROOT_NODE, directory, "root").await;
+            assert!(
+                reason.contains("does not name a movable node"),
+                "the root is the revision itself and has no parent to move it under: {reason}"
+            );
+            let reason = move_failure(&repository, &state, directory, nested, "dir").await;
+            assert!(
+                reason.contains("descendants"),
+                "a node moved into its own subtree takes the subtree out of the tree: {reason}"
+            );
+            let reason = move_failure(&repository, &state, directory, directory, "dir").await;
+            assert!(
+                reason.contains("descendants"),
+                "and so does a node moved into itself: {reason}"
+            );
+            let reason = move_failure(&repository, &state, file, file, "leaf.bin").await;
+            assert!(
+                reason.contains("not a directory"),
+                "only a directory holds children: {reason}"
+            );
+            let reason = move_failure(&repository, &state, file, ROOT_NODE, "leaf.bin").await;
+            assert!(
+                reason.contains("already under that parent by that name"),
+                "a move that changes nothing would record a move the tree never made: {reason}"
+            );
+            let reason = move_failure(&repository, &state, file, ROOT_NODE, "with/slash").await;
+            assert!(
+                reason.contains("not storable"),
+                "a name the name table would refuse is caught before anything is relinked: {reason}"
+            );
+
+            assert_eq!(
+                state
+                    .node(repository.clone(), directory)
+                    .await
+                    .expect("Failed to read the directory")
+                    .parent,
+                ROOT_NODE,
+                "every rejection must leave the tree as it was"
+            );
+            assert_eq!(
+                state
+                    .node_children(repository.clone(), ROOT_NODE)
+                    .await
+                    .expect("Failed to walk the root"),
+                vec![file, directory],
+                "including the chain a relink would have rewritten"
+            );
+        })
+        .await;
+    }
+
+    /// The name check belongs to the caller, as it does on `node_add`: a batch caller
+    /// has to hold a name against the tree its whole batch produces, which this cannot
+    /// see. Two siblings under one name is what the commit's validator refuses.
+    #[tokio::test]
+    async fn move_node_leaves_the_name_check_to_the_caller() {
+        with_state(|repository, state| async move {
+            let destination =
+                add_node(&repository, &state, ROOT_NODE, "dst", NodeFlags::NoFlags).await;
+            add_node(
+                &repository,
+                &state,
+                destination,
+                "taken.bin",
+                NodeFlags::File,
+            )
+            .await;
+            let node_id =
+                add_node(&repository, &state, ROOT_NODE, "taken.bin", NodeFlags::File).await;
+
+            state
+                .move_node(repository.clone(), node_id, destination, "taken.bin")
+                .await
+                .expect("the primitive moves what it is told to move");
+
+            assert_eq!(
+                state
+                    .node_children(repository.clone(), destination)
+                    .await
+                    .expect("Failed to walk the destination")
+                    .len(),
+                2,
+                "both children are there under one name, for the caller's check to have \
+                 prevented"
+            );
+        })
+        .await;
+    }
 }
 
 mod single_file_compare_result_tests {

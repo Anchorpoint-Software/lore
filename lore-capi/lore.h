@@ -5348,6 +5348,37 @@ typedef struct lore_revision_tree_modify_args_t {
   struct lore_revision_tree_modify_entry_array_t entries;
 } lore_revision_tree_modify_args_t;
 
+// One node to move. The node must already exist and must not be the root.
+typedef struct lore_revision_tree_move_entry_t {
+  // Caller-chosen id echoed back as `entry_id` on this entry's `MOVE_COMPLETE`
+  uint64_t entry_id;
+  // Node to move; its `file_id` is preserved across the move
+  lore_node_id_t node_id;
+  // Parent node the moved node is reparented under; its current parent renames it
+  lore_node_id_t destination_parent_id;
+  // UTF-8 name the moved node takes at the destination
+  struct lore_string_t dst_name;
+} lore_revision_tree_move_entry_t;
+
+// A contiguous array of elements described by a pointer and a count.
+// Holds zero or more values of the element type laid out one after another.
+typedef struct lore_revision_tree_move_entry_array_t {
+  // Pointer to the first element.
+  const struct lore_revision_tree_move_entry_t *ptr;
+  // Number of elements in the array.
+  uintptr_t count;
+} lore_revision_tree_move_entry_array_t;
+
+// Arguments for `lore_revision_tree_move`.
+typedef struct lore_revision_tree_move_args_t {
+  // Caller-chosen id echoed back as `batch_id` on `BATCH_COMPLETE`
+  uint64_t batch_id;
+  // Loaded revision-tree handle to mutate
+  struct lore_revision_tree_t handle;
+  // Nodes to move; each emits its own `MOVE_COMPLETE`
+  struct lore_revision_tree_move_entry_array_t entries;
+} lore_revision_tree_move_args_t;
+
 // One metadata pair to record. `value` is a typed value that carries its own
 // kind, so there is no separate format tag and nothing to parse.
 typedef struct lore_revision_tree_metadata_set_entry_t {
@@ -5450,20 +5481,6 @@ typedef struct lore_revision_tree_commit_args_t {
   // Commit tuneables (local-only vs remote-uploading)
   struct lore_revision_tree_commit_options_t options;
 } lore_revision_tree_commit_args_t;
-
-// Arguments for `lore_revision_tree_move`.
-typedef struct lore_revision_tree_move_args_t {
-  // Per-call correlation id echoed back in events
-  uint64_t id;
-  // Loaded revision-tree handle to mutate
-  struct lore_revision_tree_t handle;
-  // Node to move; its `file_id` is preserved across the move
-  lore_node_id_t node_id;
-  // Parent node the moved node is reparented under
-  lore_node_id_t destination_parent_id;
-  // UTF-8 name the moved node takes at the destination
-  struct lore_string_t dst_name;
-} lore_revision_tree_move_args_t;
 
 // Return the tag identifying the type of an event.
 uint32_t lore_event_type(const struct lore_event_t *event);
@@ -11211,6 +11228,51 @@ int32_t lore_revision_tree_modify(const struct lore_global_args_t *globals,
 void lore_revision_tree_modify_async(const struct lore_global_args_t *globals,
                                      const struct lore_revision_tree_modify_args_t *args,
                                      struct lore_event_callback_config_t callback);
+
+// Move a batch of nodes to new parents and/or new names in a loaded revision tree. An
+// entry naming the node's current parent renames it where it is. Every entry is checked
+// before any node is moved, so one bad entry rejects the call and leaves every node
+// where it was; the reason names the offending entry's batch index, which a caller
+// leaving `entry_id` at zero has no other way to identify. A failure after those checks
+// pass is internal and may leave earlier entries applied.
+//
+// A move keeps the node: its node id, its `file_id` and its children come along, and
+// the change is recorded as a move rather than as a deletion and an addition, so the
+// revision graph carries the node's history across it. The node reports
+// `LORE_NODE_STAGED_ACTION_MOVE` until the commit that freezes the tree, and so does
+// every node under a moved directory — their records do not change, but their paths do.
+// Two exceptions: a node added through this handle stays staged as an addition wherever
+// it lands, since it is in no revision a move could be recorded against; and a node
+// under the moved directory that is staged for deletion keeps its deletion, since it is
+// leaving the revision at the commit either way.
+//
+// Both batch-level rules read the tree the whole batch produces rather than the one in
+// front of them. A destination inside the moved node's own subtree is rejected, and so
+// is one that lands there once the batch is applied — moving A under B and B under A is
+// a loop neither entry shows on its own. A name a live child of the destination already
+// holds is rejected, but a name the batch itself vacates is not: moving `x` out of a
+// directory while moving another node to `x` in it succeeds, and two entries taking one
+// name under one destination reject even though neither collides with the tree.
+//
+// Entries apply one at a time, in batch order, because a move rewrites the parent and
+// sibling pointers of two child chains where `lore_revision_tree_add` only prepends to
+// one. For the same reason concurrent calls have more to lose here than on `add` or
+// `modify`: two calls moving nodes that share a parent chain can interleave their
+// unlinks, which the pre-commit validator then refuses. Moves that may touch one parent
+// chain belong in one call.
+//
+// | Terminal event                            | Payload                                          | Notes                                                       |
+// |-------------------------------------------|--------------------------------------------------|-------------------------------------------------------------|
+// | `LORE_EVENT_REVISION_TREE_MOVE_COMPLETE`  | `lore_revision_tree_move_complete_event_data_t`  | One per entry, carrying its `entry_id` and the moved node    |
+// | `LORE_EVENT_REVISION_TREE_BATCH_COMPLETE` | `lore_revision_tree_batch_complete_event_data_t` | Exactly one, carrying the `batch_id` and the call's outcome  |
+int32_t lore_revision_tree_move(const struct lore_global_args_t *globals,
+                                const struct lore_revision_tree_move_args_t *args,
+                                struct lore_event_callback_config_t callback);
+
+// Move a batch of nodes in a loaded revision tree (async variant).
+void lore_revision_tree_move_async(const struct lore_global_args_t *globals,
+                                   const struct lore_revision_tree_move_args_t *args,
+                                   struct lore_event_callback_config_t callback);
 
 // Record a batch of `(key, value)` pairs on a loaded revision tree's in-progress
 // metadata.

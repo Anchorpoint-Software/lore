@@ -2404,6 +2404,368 @@ impl State {
         .await
     }
 
+    /// The staged and dirty change a move records on `node`.
+    ///
+    /// A node staged for addition stays staged for addition: it is in no revision a move
+    /// could be recorded against, and its addition already carries whatever parent and
+    /// name it ends up under.
+    pub fn staged_move_flags(node: &Node) -> (NodeFlags, NodeFlags) {
+        if node.is_staged_add() {
+            (NodeFlags::StagedAdd, NodeFlags::DirtyAdd)
+        } else {
+            (NodeFlags::StagedMove, NodeFlags::DirtyMove)
+        }
+    }
+
+    /// Reparent and/or rename a node, keeping the identity it already has.
+    ///
+    /// The node keeps its node id, its `file_id` and its children, and the change is
+    /// recorded as a **move**: the delta a commit writes names the same node, so a
+    /// consumer reads one move rather than a delete of one node and an add of another.
+    /// Naming the node's current parent renames it where it is.
+    ///
+    /// Every node under a moved directory is recorded as moved as well, as the
+    /// working-tree staging path records them. Their own records do not change — the
+    /// subtree travels by its parent pointers — but their paths do, and the per-node delta
+    /// is what `file history` reads to report the move against each of them. The work is
+    /// therefore proportional to the subtree rather than to the one node named.
+    ///
+    /// A node under the moved directory that is staged for deletion keeps its deletion and
+    /// is not descended into: it leaves the revision at the commit that freezes the tree,
+    /// and recording a move over it would take the deletion off it.
+    ///
+    /// Rejected are the root, an unknown or discarded node, a node staged for deletion, a
+    /// destination that is not a directory or is itself staged for deletion, a destination
+    /// inside the node's own subtree, a destination the node already sits under by the
+    /// name it already has, and a name the node name table would refuse.
+    ///
+    /// **Everything that can fail runs before anything is rewritten**, in the order the
+    /// tree can absorb: the destination's block is read, then the rename is stored, then
+    /// the node is unlinked, and only then is it linked in and its record pointed at its
+    /// new parent. The rename is what forces the order — the name table can refuse a name
+    /// on capacity alone, which validating the name cannot rule out — and a failure at the
+    /// unlink therefore leaves a renamed node where it was rather than one linked into two
+    /// chains at once.
+    ///
+    /// **A name a child of the destination already holds is not rejected here.** Like
+    /// [`Self::node_add`], this is always-move rather than move-if-vacant, and the check
+    /// belongs to the caller: a batch caller has to hold the name against the tree its
+    /// whole batch produces rather than the one in front of it, since moving `x` out of a
+    /// directory while moving another `x` into it is legal as a batch and would fail under
+    /// every ordering if each step checked the name against the intermediate tree.
+    ///
+    /// # Concurrency
+    ///
+    /// **Not** safe to run concurrently with another move, an add or a discard touching
+    /// either parent. Reparenting rewrites the parent and sibling pointers around the
+    /// node, which the CAS prepend in [`Self::node_add`] protects only against other
+    /// prepends, and the checks and the rewrite do not share a lock. Callers serialize
+    /// moves, as they serialize [`node_discard_patch`].
+    pub async fn move_node(
+        self: &Arc<Self>,
+        repository: Arc<RepositoryContext>,
+        node_id: NodeID,
+        destination_parent_id: NodeID,
+        dst_name: &str,
+    ) -> Result<(), StateError> {
+        if !node_id.is_valid_node_id() {
+            return Err(StateError::from(InvalidArguments {
+                reason: "node id does not name a movable node".into(),
+            }));
+        }
+        if !destination_parent_id.is_valid_or_root_node_id() {
+            return Err(StateError::from(InvalidArguments {
+                reason: "destination parent id does not name a node".into(),
+            }));
+        }
+        if let Err(error) = validate_node_name_for_store(dst_name) {
+            return Err(StateError::from(InvalidArguments {
+                reason: format!("destination name is not storable: {error}"),
+            }));
+        }
+
+        let block_index = NodeBlock::index(node_id);
+        let node_index = Node::index(node_id);
+        let block = self
+            .block_with_nametable(repository.clone(), block_index)
+            .await?;
+        let node = block.node(node_index);
+        if node.is_discarded() {
+            return Err(StateError::from(InvalidArguments {
+                reason: "cannot move a discarded node".into(),
+            }));
+        }
+        if node.is_staged_delete() {
+            return Err(StateError::from(InvalidArguments {
+                reason: "cannot move a node staged for deletion".into(),
+            }));
+        }
+        if node.name_length == 0 {
+            return Err(StateError::from(InvalidArguments {
+                reason: "node id does not resolve to a named node".into(),
+            }));
+        }
+
+        let destination = self.node(repository.clone(), destination_parent_id).await?;
+        if destination.is_discarded() {
+            return Err(StateError::from(InvalidArguments {
+                reason: "destination parent has been deleted".into(),
+            }));
+        }
+        if destination.is_staged_delete() {
+            return Err(StateError::from(InvalidArguments {
+                reason: "destination parent is staged for deletion, so the moved node \
+                         would go with it"
+                    .into(),
+            }));
+        }
+        if destination.is_link() {
+            return Err(StateError::from(InvalidArguments {
+                reason: "destination parent is a link, which addresses a revision this \
+                         state does not hold"
+                    .into(),
+            }));
+        }
+        if !destination.is_directory() {
+            return Err(StateError::from(InvalidArguments {
+                reason: "destination parent is not a directory".into(),
+            }));
+        }
+        if destination_parent_id != ROOT_NODE && destination.name_length == 0 {
+            return Err(StateError::from(InvalidArguments {
+                reason: "destination parent id does not resolve to a named node".into(),
+            }));
+        }
+        if self
+            .is_inside_subtree(repository.clone(), destination_parent_id, node_id)
+            .await?
+        {
+            return Err(StateError::from(InvalidArguments {
+                reason: "destination parent is the node itself or one of its descendants".into(),
+            }));
+        }
+
+        // The hash is case-insensitive, so only a matching hash needs the stored name
+        // read back to tell a rename that changes the case from one that changes nothing.
+        let name_hash = hash::hash_string(dst_name);
+        let renamed = node.name_hash != name_hash
+            || block
+                .node_name_clone(node_index)
+                .internal("Node name")
+                .map_err(StateError::from)?
+                != dst_name;
+        let source_parent_id = node.parent;
+        if !renamed && source_parent_id == destination_parent_id {
+            return Err(StateError::from(InvalidArguments {
+                reason: "the node is already under that parent by that name".into(),
+            }));
+        }
+
+        let reparented = source_parent_id != destination_parent_id;
+        let parent_block_index = NodeBlock::index(destination_parent_id);
+        let parent_node_index = Node::index(destination_parent_id);
+        let parent_block = if reparented {
+            Some(self.block(repository.clone(), parent_block_index).await?)
+        } else {
+            None
+        };
+
+        if renamed {
+            let dirtied = {
+                let mut writer = block.write();
+                let (name_offset, name_length) = writer
+                    .node_name_store(dst_name, node.name_offset, node.name_length)
+                    .forward::<StateError>("Storing the moved node's name")?;
+                let record = writer.node(node_index);
+                record.name_offset = name_offset;
+                record.name_length = name_length;
+                record.name_hash = name_hash;
+                writer.mark_dirty()
+            };
+            if dirtied {
+                self.block_modified(block.clone(), block_index);
+            }
+            self.mark_dirty();
+        }
+
+        if let Some(parent_block) = parent_block {
+            self.unlink_child(repository.clone(), node_id, source_parent_id, node.sibling)
+                .await?;
+
+            let (sibling, parent_dirtied) = {
+                let mut writer = parent_block.write();
+                let parent = writer.node(parent_node_index);
+                let head = parent.child;
+                parent.child = node_id;
+                (head, writer.mark_dirty())
+            };
+            if parent_dirtied {
+                self.block_modified(parent_block, parent_block_index);
+            }
+
+            let dirtied = {
+                let mut writer = block.write();
+                let record = writer.node(node_index);
+                record.parent = destination_parent_id;
+                record.sibling = sibling;
+                writer.mark_dirty()
+            };
+            if dirtied {
+                self.block_modified(block, block_index);
+            }
+            self.mark_dirty();
+        }
+
+        let (staged, dirty) = Self::staged_move_flags(&node);
+        self.node_mark_staged(repository.clone(), node_id, staged, dirty)
+            .await?;
+        if node.is_directory() {
+            self.mark_subtree_moved(repository.clone(), node_id).await?;
+        }
+
+        // The source parent lost a child, so the hash a commit derives for it changes —
+        // and `rehash_directory` skips a directory that is not staged.
+        if reparented {
+            self.node_mark(
+                repository.clone(),
+                source_parent_id,
+                NodeFlags::Staged,
+                false,
+            )
+            .await?;
+            self.node_mark_dirty(repository, source_parent_id, NodeFlags::Dirty, false)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    /// Whether `candidate` is `node_id` itself or one of its descendants, so moving
+    /// `node_id` onto it would detach the subtree from the tree.
+    ///
+    /// Walks `candidate`'s ancestors rather than `node_id`'s subtree: an ancestor chain is
+    /// one node per level, where the subtree can be the whole tree. The walk is guarded
+    /// against a cycle the chain should not contain, so a corrupt state fails here rather
+    /// than hangs.
+    async fn is_inside_subtree(
+        &self,
+        repository: Arc<RepositoryContext>,
+        candidate: NodeID,
+        node_id: NodeID,
+    ) -> Result<bool, StateError> {
+        let mut ancestor = candidate;
+        let mut cycle = SiblingCycleGuard::new(node_id);
+        while ancestor.is_valid_node_id() {
+            if ancestor == node_id {
+                return Ok(true);
+            }
+            cycle.observe(ancestor).map_err(StateError::from)?;
+            ancestor = self.node(repository.clone(), ancestor).await?.parent;
+        }
+        Ok(false)
+    }
+
+    /// Remove `node_id` from `parent_id`'s child chain, splicing `sibling` — the node's
+    /// own next — in over it.
+    ///
+    /// Serial by contract, as [`node_discard_patch`] is: each link is read and then
+    /// rewritten without holding the read across the write, so a concurrent walk of the
+    /// same chain can see the node in neither position.
+    async fn unlink_child(
+        &self,
+        repository: Arc<RepositoryContext>,
+        node_id: NodeID,
+        parent_id: NodeID,
+        sibling: NodeID,
+    ) -> Result<(), StateError> {
+        let parent_block_index = NodeBlock::index(parent_id);
+        let parent_node_index = Node::index(parent_id);
+        let parent_block = self.block(repository.clone(), parent_block_index).await?;
+        let head = parent_block.node(parent_node_index).child;
+        if head == node_id {
+            let dirtied = {
+                let mut writer = parent_block.write();
+                writer.node(parent_node_index).child = sibling;
+                writer.mark_dirty()
+            };
+            if dirtied {
+                self.block_modified(parent_block, parent_block_index);
+            }
+            self.mark_dirty();
+            return Ok(());
+        }
+
+        let mut previous_id = head;
+        let mut cycle = SiblingCycleGuard::new(parent_id);
+        while previous_id.is_valid_node_id() {
+            cycle.observe(previous_id).map_err(StateError::from)?;
+            let previous_block_index = NodeBlock::index(previous_id);
+            let previous_node_index = Node::index(previous_id);
+            let previous_block = self.block(repository.clone(), previous_block_index).await?;
+            let next = previous_block.node(previous_node_index).sibling;
+            if next == node_id {
+                let dirtied = {
+                    let mut writer = previous_block.write();
+                    writer.node(previous_node_index).sibling = sibling;
+                    writer.mark_dirty()
+                };
+                if dirtied {
+                    self.block_modified(previous_block, previous_block_index);
+                }
+                self.mark_dirty();
+                return Ok(());
+            }
+            previous_id = next;
+        }
+
+        let chain = format_parent_child_chain(self, &repository, parent_id).await;
+        Err(StateError::internal(format!(
+            "Move hierarchy broken: node {node_id} not in the child chain of its parent \
+             {parent_id} (observed: {chain})"
+        )))
+    }
+
+    /// Record a move on every node under `node_id`.
+    ///
+    /// Each node's flag pair is decided from its own staging state rather than inherited,
+    /// so a node this handle added stays an addition while a node the revision holds
+    /// becomes a move. A node staged for deletion is left as it is and not descended
+    /// into: the action bits hold one change at a time, so recording a move over it would
+    /// take the deletion off it, and its whole subtree is staged for deletion with it.
+    ///
+    /// Descent stops at a link too, whose children belong to the linked repository's tree
+    /// and not to this one.
+    ///
+    /// Walks with [`StateNodeChildrenIterator`], which carries each child's record with
+    /// its id and holds one block across the siblings that share it — so the walk costs
+    /// one read per node and allocates nothing per directory. The pending list holds ids
+    /// rather than records, since it can grow to the directory count of the subtree.
+    async fn mark_subtree_moved(
+        self: &Arc<Self>,
+        repository: Arc<RepositoryContext>,
+        node_id: NodeID,
+    ) -> Result<(), StateError> {
+        let mut pending = vec![node_id];
+        while let Some(parent_id) = pending.pop() {
+            let mut children =
+                StateNodeChildrenIterator::new(self.clone(), repository.clone(), parent_id).await?;
+            while let Some((child_id, child)) = children.next().await? {
+                if child.is_staged_delete() || child.is_discarded() {
+                    continue;
+                }
+                let (staged, dirty) = Self::staged_move_flags(&child);
+                self.node_mark(repository.clone(), child_id, staged, false)
+                    .await?;
+                self.node_mark_dirty(repository.clone(), child_id, dirty, false)
+                    .await?;
+                if child.is_directory() {
+                    pending.push(child_id);
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub async fn node_children(
         &self,
         repository: Arc<RepositoryContext>,
@@ -4259,9 +4621,10 @@ where
 
 /// Read-only walk of `parent_node_id`'s `child → sibling → …` chain
 /// formatted for diagnostic error messages. Called only from the error
-/// path of [`node_discard_patch`] so it never costs on the hot path.
+/// paths of [`node_discard_patch`] and [`State::move_node`], so it never
+/// costs on the hot path.
 async fn format_parent_child_chain(
-    state: &Arc<State>,
+    state: &State,
     repository: &Arc<RepositoryContext>,
     parent_node_id: NodeID,
 ) -> String {

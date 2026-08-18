@@ -54,6 +54,7 @@ mod support {
         AddComplete(u64, NodeID, LoreErrorCode),
         DeleteComplete(u64, u64, LoreErrorCode),
         ModifyComplete(u64, NodeID, LoreErrorCode),
+        MoveComplete(u64, NodeID, LoreErrorCode),
         MetadataSetComplete(u64, LoreErrorCode),
         MetadataGetComplete(u64, String, LoreMetadata, LoreErrorCode),
         MetadataClearComplete(u64, u8, LoreErrorCode),
@@ -82,6 +83,9 @@ mod support {
                 }
                 LoreEvent::RevisionTreeModifyComplete(data) => {
                     Captured::ModifyComplete(data.entry_id, data.node_id, data.error_code)
+                }
+                LoreEvent::RevisionTreeMoveComplete(data) => {
+                    Captured::MoveComplete(data.entry_id, data.node_id, data.error_code)
                 }
                 LoreEvent::RevisionTreeMetadataSetComplete(data) => {
                     Captured::MetadataSetComplete(data.entry_id, data.error_code)
@@ -187,6 +191,18 @@ mod support {
 
     /// Every batch terminal in emission order, so a test can pin that exactly one
     /// fired and what it carried.
+    /// Every move terminal in emission order, so a test can pin what each entry reported
+    /// as well as that the call as a whole finished.
+    pub(super) fn move_outcomes(events: &[Captured]) -> Vec<(u64, NodeID, LoreErrorCode)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Captured::MoveComplete(id, node_id, code) => Some((*id, *node_id, *code)),
+                _ => None,
+            })
+            .collect()
+    }
+
     pub(super) fn batch_outcomes(events: &[Captured]) -> Vec<(u64, LoreErrorCode)> {
         events
             .iter()
@@ -2865,5 +2881,374 @@ mod commit_tests {
         );
 
         close_handle(reloaded).await;
+    }
+}
+
+/// `move` over the real capi path, on nodes a commit has settled.
+///
+/// The unit tests fake a settled node by clearing its staging flags through
+/// `RevisionTreeInternal`, which is `pub(crate)`; here a commit does it, and a fresh handle
+/// loaded on the published revision is the only place the whole claim can be checked — that
+/// a moved node is under its new parent, with the identity it had, in a revision somebody
+/// else can read.
+#[cfg(test)]
+mod move_tests {
+    use lore::revision_tree::add::LoreRevisionTreeAddArgs;
+    use lore::revision_tree::add::LoreRevisionTreeAddEntry;
+    use lore::revision_tree::add::add;
+    use lore::revision_tree::commit::LoreRevisionTreeCommitArgs;
+    use lore::revision_tree::commit::LoreRevisionTreeCommitOptions;
+    use lore::revision_tree::commit::commit;
+    use lore::revision_tree::handle::LoreRevisionTree;
+    use lore::revision_tree::metadata_set::LoreRevisionTreeMetadataSetArgs;
+    use lore::revision_tree::metadata_set::LoreRevisionTreeMetadataSetEntry;
+    use lore::revision_tree::metadata_set::metadata_set;
+    use lore::revision_tree::move_node::LoreRevisionTreeMoveArgs;
+    use lore::revision_tree::move_node::LoreRevisionTreeMoveEntry;
+    use lore::revision_tree::move_node::move_node;
+    use lore_base::types::Address;
+    use lore_base::types::Context;
+    use lore_base::types::Hash;
+    use lore_base::types::Partition;
+    use lore_revision::event::LoreErrorCode;
+    use lore_revision::interface::LoreArray;
+    use lore_revision::interface::LoreGlobalArgs;
+    use lore_revision::interface::LoreMetadata;
+    use lore_revision::interface::LoreNodeType;
+    use lore_revision::interface::LoreString;
+    use lore_revision::metadata::BRANCH;
+    use lore_revision::node::INVALID_NODE;
+    use lore_revision::node::NodeID;
+    use lore_revision::node::ROOT_NODE;
+
+    use super::support::*;
+
+    fn add_entry(
+        entry_id: u64,
+        parent_node_id: NodeID,
+        name: &str,
+        kind: LoreNodeType,
+    ) -> LoreRevisionTreeAddEntry {
+        LoreRevisionTreeAddEntry {
+            entry_id,
+            parent_node_id,
+            parent_entry_index: 0,
+            name: LoreString::from_str(name),
+            kind: kind as u32,
+            mode: 0o644,
+            size: 8,
+            address: Address {
+                hash: Hash::from_u64(0x5eed),
+                context: Context::from(uuid::Uuid::now_v7()),
+            },
+        }
+    }
+
+    fn entry(
+        entry_id: u64,
+        node_id: NodeID,
+        destination_parent_id: NodeID,
+        dst_name: &str,
+    ) -> LoreRevisionTreeMoveEntry {
+        LoreRevisionTreeMoveEntry {
+            entry_id,
+            node_id,
+            destination_parent_id,
+            dst_name: LoreString::from_str(dst_name),
+        }
+    }
+
+    async fn run_add(
+        handle: LoreRevisionTree,
+        entries: Vec<LoreRevisionTreeAddEntry>,
+    ) -> Vec<Captured> {
+        let (sink, callback) = make_sink();
+        let status = add(
+            LoreGlobalArgs::default(),
+            LoreRevisionTreeAddArgs {
+                batch_id: 1,
+                handle,
+                entries: LoreArray::from_vec(entries),
+            },
+            callback,
+        )
+        .await;
+        let events = sink.lock().unwrap().clone();
+        assert_eq!(status, 0, "seeding must succeed, got {events:?}");
+        events
+    }
+
+    fn added_node(events: &[Captured], entry_id: u64) -> NodeID {
+        events
+            .iter()
+            .find_map(|event| match event {
+                Captured::AddComplete(id, node_id, code) if *id == entry_id => {
+                    assert_eq!(*code, LoreErrorCode::None, "entry {entry_id} must succeed");
+                    Some(*node_id)
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("entry {entry_id} must report, got {events:?}"))
+    }
+
+    async fn run_move(
+        handle: LoreRevisionTree,
+        entries: Vec<LoreRevisionTreeMoveEntry>,
+    ) -> (i32, Vec<Captured>) {
+        let (sink, callback) = make_sink();
+        let status = move_node(
+            LoreGlobalArgs::default(),
+            LoreRevisionTreeMoveArgs {
+                batch_id: CALL_ID,
+                handle,
+                entries: LoreArray::from_vec(entries),
+            },
+            callback,
+        )
+        .await;
+        let events = sink.lock().unwrap().clone();
+        (status, events)
+    }
+
+    async fn commit_on(handle: LoreRevisionTree, branch: Option<Context>) -> Hash {
+        if let Some(branch) = branch {
+            let (sink, callback) = make_sink();
+            let status = metadata_set(
+                LoreGlobalArgs::default(),
+                LoreRevisionTreeMetadataSetArgs {
+                    batch_id: CALL_ID,
+                    handle,
+                    entries: LoreArray::from_vec(vec![LoreRevisionTreeMetadataSetEntry {
+                        entry_id: 1,
+                        key: LoreString::from_str(BRANCH),
+                        value: LoreMetadata::Context(branch),
+                    }]),
+                },
+                callback,
+            )
+            .await;
+            assert_eq!(
+                status,
+                0,
+                "naming the branch must succeed, got {:?}",
+                sink.lock().unwrap()
+            );
+        }
+
+        let (sink, callback) = make_sink();
+        let status = commit(
+            LoreGlobalArgs::default(),
+            LoreRevisionTreeCommitArgs {
+                id: CALL_ID,
+                handle,
+                options: LoreRevisionTreeCommitOptions::default(),
+            },
+            callback,
+        )
+        .await;
+        let events = sink.lock().unwrap().clone();
+        assert_eq!(status, 0, "committing must succeed, got {events:?}");
+        events
+            .iter()
+            .find_map(|event| match event {
+                Captured::CommitComplete(id, revision, _, _) if *id == CALL_ID => Some(*revision),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("the commit terminal must fire, got {events:?}"))
+    }
+
+    /// The whole claim of the verb, end to end: a node the revision holds changes parent,
+    /// the change is committed, and a handle that knows nothing of this one reads it back
+    /// under its new parent with the identity it had.
+    #[tokio::test]
+    async fn a_move_survives_a_commit_and_reads_back_through_a_fresh_handle() {
+        let store = open_store().await;
+        let repository = Partition::from([0xa1u8; 16]);
+        let handle = load_on(store, repository, Hash::default()).await;
+
+        let seeded = run_add(
+            handle,
+            vec![
+                add_entry(1, ROOT_NODE, "src", LoreNodeType::Directory),
+                add_entry(2, ROOT_NODE, "dst", LoreNodeType::Directory),
+            ],
+        )
+        .await;
+        let source = added_node(&seeded, 1);
+        let destination = added_node(&seeded, 2);
+        let leaf = added_node(
+            &run_add(
+                handle,
+                vec![add_entry(3, source, "data.bin", LoreNodeType::File)],
+            )
+            .await,
+            3,
+        );
+        let first_revision = commit_on(handle, Some(Context::from(uuid::Uuid::now_v7()))).await;
+
+        let settled = load_on(store, repository, first_revision).await;
+        let file_id_before = node_info_of(settled, leaf).await.file_id;
+        assert!(
+            !file_id_before.is_zero(),
+            "the fixture must start from a file carrying an identity"
+        );
+
+        let (status, events) =
+            run_move(settled, vec![entry(10, leaf, destination, "data.bin")]).await;
+        assert_eq!(
+            status, 0,
+            "moving a settled node must succeed, got {events:?}"
+        );
+        assert_eq!(
+            move_outcomes(&events),
+            vec![(10, leaf, LoreErrorCode::None)],
+            "the terminal must echo the moved node"
+        );
+        let second_revision = commit_on(settled, None).await;
+        assert_ne!(
+            second_revision, first_revision,
+            "the move must produce a revision of its own"
+        );
+
+        let reloaded = load_on(store, repository, second_revision).await;
+        assert_eq!(
+            child_names(reloaded, destination).await,
+            vec!["data.bin".to_string()],
+            "the published revision must hold the file under the parent it moved to"
+        );
+        assert!(
+            child_names(reloaded, source).await.is_empty(),
+            "and nothing under the one it left"
+        );
+        let record = node_info_of(reloaded, leaf).await;
+        assert_eq!(
+            record.parent_id, destination,
+            "the node id survives the commit and points at its new parent"
+        );
+        assert_eq!(
+            record.file_id, file_id_before,
+            "with the identity it had, which is what makes the delta a move"
+        );
+
+        close_handle(reloaded).await;
+        close_handle(settled).await;
+        close_handle(handle).await;
+    }
+
+    /// Two entries exchange names in one call. Neither could run alone — each wants a name
+    /// the other still holds — so this is the batch rule reaching the caller through the
+    /// real argument marshalling rather than an in-process call.
+    #[tokio::test]
+    async fn a_batch_swaps_two_names_over_the_capi() {
+        let store = open_store().await;
+        let repository = Partition::from([0xa2u8; 16]);
+        let handle = load_on(store, repository, Hash::default()).await;
+
+        let seeded = run_add(
+            handle,
+            vec![
+                add_entry(1, ROOT_NODE, "a", LoreNodeType::Directory),
+                add_entry(2, ROOT_NODE, "b", LoreNodeType::Directory),
+            ],
+        )
+        .await;
+        let first = added_node(&seeded, 1);
+        let second = added_node(&seeded, 2);
+        let leaves = run_add(
+            handle,
+            vec![
+                add_entry(3, first, "x.bin", LoreNodeType::File),
+                add_entry(4, second, "x.bin", LoreNodeType::File),
+            ],
+        )
+        .await;
+        let from_first = added_node(&leaves, 3);
+        let from_second = added_node(&leaves, 4);
+        let revision = commit_on(handle, Some(Context::from(uuid::Uuid::now_v7()))).await;
+
+        let settled = load_on(store, repository, revision).await;
+        let (status, events) = run_move(
+            settled,
+            vec![
+                entry(10, from_first, second, "x.bin"),
+                entry(11, from_second, first, "x.bin"),
+            ],
+        )
+        .await;
+        assert_eq!(status, 0, "a swap must succeed, got {events:?}");
+        assert_eq!(
+            move_outcomes(&events),
+            vec![
+                (10, from_first, LoreErrorCode::None),
+                (11, from_second, LoreErrorCode::None),
+            ],
+            "both entries report their own node"
+        );
+        assert_eq!(
+            parent_of(settled, from_first).await,
+            second,
+            "the first node must have taken the second's place"
+        );
+        assert_eq!(
+            parent_of(settled, from_second).await,
+            first,
+            "and the second the first's"
+        );
+
+        close_handle(settled).await;
+        close_handle(handle).await;
+    }
+
+    /// One bad entry rejects the call and moves nothing — the atomicity contract, asserted
+    /// on the status the capi returns rather than on an in-process error type.
+    #[tokio::test]
+    async fn a_rejected_batch_moves_nothing_over_the_capi() {
+        let store = open_store().await;
+        let repository = Partition::from([0xa3u8; 16]);
+        let handle = load_on(store, repository, Hash::default()).await;
+
+        let seeded = run_add(
+            handle,
+            vec![
+                add_entry(1, ROOT_NODE, "dst", LoreNodeType::Directory),
+                add_entry(2, ROOT_NODE, "data.bin", LoreNodeType::File),
+            ],
+        )
+        .await;
+        let destination = added_node(&seeded, 1);
+        let leaf = added_node(&seeded, 2);
+        let revision = commit_on(handle, Some(Context::from(uuid::Uuid::now_v7()))).await;
+
+        let settled = load_on(store, repository, revision).await;
+        let (status, events) = run_move(
+            settled,
+            vec![
+                entry(10, leaf, destination, "data.bin"),
+                entry(11, INVALID_NODE, destination, "other.bin"),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status, REJECTED_STATUS,
+            "a batch with a bad entry must be rejected during validation, got {events:?}"
+        );
+        assert_eq!(
+            move_outcomes(&events),
+            vec![(11, INVALID_NODE, LoreErrorCode::InvalidArguments)],
+            "only the offending entry reports"
+        );
+        assert_eq!(
+            batch_outcomes(&events),
+            vec![(CALL_ID, LoreErrorCode::InvalidArguments)],
+            "and the batch terminal carries the call's outcome exactly once"
+        );
+        assert_eq!(
+            parent_of(settled, leaf).await,
+            ROOT_NODE,
+            "the entry that passed its own checks must not have been applied"
+        );
+
+        close_handle(settled).await;
+        close_handle(handle).await;
     }
 }
