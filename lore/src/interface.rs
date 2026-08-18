@@ -33,6 +33,10 @@ pub use lore_base::types::FRAGMENT_SIZE_THRESHOLD;
 pub type LoreString = lore_revision::interface::LoreString;
 pub type LoreArray<T> = lore_revision::interface::LoreArray<T>;
 
+/// Named by `lore_repository_create_args_t::use_shared_store`; re-exported so callers need no
+/// dependency on `lore_revision`.
+pub use lore_revision::repository::LoreSharedStoreMode;
+
 use crate::call_delegation::run_asynchronously;
 use crate::call_delegation::run_synchronously;
 use crate::log;
