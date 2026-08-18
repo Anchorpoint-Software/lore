@@ -189,7 +189,11 @@ impl lore_revision::notification::NotificationClient for NotificationClient {
             LoreEvent::NotificationSubscribed(LoreNotificationSubscribedEventData { repository })
                 .send();
 
-            event_loop(repository, stream, stop).await;
+            event_loop(repository, stream, stop.clone()).await;
+
+            // The loop may have exited on its own, for example because the
+            // stream broke. Cancel so the subscription reads as inactive.
+            stop.cancel();
 
             LoreEvent::NotificationUnsubscribed(LoreNotificationUnsubscribedEventData {
                 repository,
