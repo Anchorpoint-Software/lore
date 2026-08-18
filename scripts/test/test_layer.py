@@ -1594,6 +1594,186 @@ def test_layer_stage_scan_unchanged_layer(new_lore_repo):
 
 
 @pytest.mark.smoke
+def test_layer_remove_refused_with_staged_layer_content(new_lore_repo):
+    """`layer remove` is refused without `--force` when the layer holds staged
+    changes, and the staged work survives the refusal.
+
+    Staged changes have already been reconciled with disk, so the local
+    modification gate does not see them.
+    """
+    from error_types import LocalModificationsError
+
+    repo, layer_repo = _setup_repo_with_layer(new_lore_repo)
+    _stage_layer_change(repo)
+
+    with pytest.raises(LocalModificationsError):
+        repo.layer_remove("lay", layer_repo)
+
+    layers = parse_layer_list_json(repo.layer_list(json=True))
+    assert [layer.get("targetPath") for layer in layers] == ["lay"], (
+        f"The refused remove dropped the layer from the config, got {layers}"
+    )
+
+    status_entries = parse_status_json(repo.status(json=True))
+    paths = [entry.get("path") for entry in status_entries if entry.get("flagStaged")]
+    assert paths == ["lay/staged_new.txt"], (
+        f"The staged layer content should survive the refused remove, got {paths}"
+    )
+    assert os.path.isfile(os.path.join(repo.path, LAYER_STAGED_FILE)), (
+        "The staged file should still be on disk after the refused remove"
+    )
+
+
+@pytest.mark.smoke
+def test_layer_remove_force_cleans_staged_add(new_lore_repo):
+    """`layer remove --force` counts and deletes a staged add.
+
+    A staged add is absent from the layer's `current` revision, so it has to be
+    taken from the staged state to be cleaned up.
+    """
+    repo, layer_repo = _setup_repo_with_layer(new_lore_repo)
+    _stage_layer_change(repo)
+
+    remove_output = repo.layer_remove("lay", layer_repo, force=True, json=True)
+    remove_event = parse_layer_remove_json(remove_output)
+    assert remove_event is not None, (
+        f"Expected a layerRemove event, got: {remove_output}"
+    )
+    assert remove_event.get("fileCount") == 2, (
+        f"Expected the staged add to be counted alongside the tracked file, got {remove_event}"
+    )
+    assert remove_event.get("forced") == 1, (
+        f"Expected the remove to report that force was required, got {remove_event}"
+    )
+    assert remove_event.get("modifiedCount") == 0, (
+        f"A cleanly staged add is not a local modification, got {remove_event}"
+    )
+
+    assert not os.path.exists(os.path.join(repo.path, LAYER_STAGED_FILE)), (
+        "The staged add was left on disk as untracked debris"
+    )
+    assert not os.path.exists(os.path.join(repo.path, "lay")), (
+        "The layer mount directory should be gone once its files are removed"
+    )
+
+    layers = parse_layer_list_json(repo.layer_list(json=True))
+    assert layers == [], f"Expected no layers configured after remove, got {layers}"
+
+
+@pytest.mark.smoke
+def test_layer_remove_staged_delete_is_not_a_modification(new_lore_repo):
+    """A staged delete gates the remove by count, but the file it removed from
+    disk is not reported as a locally modified file.
+
+    Staging the delete is what unlinked the file, so its absence is the expected
+    state and must not be mistaken for the user having deleted it behind Lore's
+    back.
+    """
+    from error_types import LocalModificationsError
+
+    repo, layer_repo = _setup_repo_with_layer(new_lore_repo)
+    os.remove(os.path.join(repo.path, LAYER_FILE))
+    repo.stage(scan=True)
+
+    with pytest.raises(LocalModificationsError):
+        repo.layer_remove("lay", layer_repo)
+
+    remove_event = parse_layer_remove_json(
+        repo.layer_remove("lay", layer_repo, force=True, json=True)
+    )
+    assert remove_event.get("modifiedCount") == 0, (
+        f"A staged delete is not a local modification, got {remove_event}"
+    )
+    assert remove_event.get("fileCount") == 0, (
+        f"A staged-deleted file is already off disk, got {remove_event}"
+    )
+    assert not os.path.exists(os.path.join(repo.path, "lay")), (
+        "The layer mount directory should be gone once its files are removed"
+    )
+
+
+@pytest.mark.smoke
+def test_layer_remove_staged_modify_edited_again_is_gated(new_lore_repo):
+    """A file staged and then edited again on disk is still gated, by the staged
+    count rather than by the modified list.
+
+    A staged node carries no content address the edit can be measured against -
+    a staged modify keeps the pre-stage hash - so the modification check is
+    skipped and `modifiedCount` stays 0. The staged gate is what refuses here,
+    which is why it cannot be folded into the local-modification check.
+    """
+    from error_types import LocalModificationsError
+
+    repo, layer_repo = _setup_repo_with_layer(new_lore_repo)
+
+    repo.write_files({LAYER_FILE: b"layer content staged"})
+    repo.stage(LAYER_FILE)
+    repo.write_files({LAYER_FILE: b"layer content edited after staging"})
+
+    with pytest.raises(LocalModificationsError):
+        repo.layer_remove("lay", layer_repo)
+
+    remove_event = parse_layer_remove_json(
+        repo.layer_remove("lay", layer_repo, force=True, json=True)
+    )
+    assert remove_event.get("forced") == 1, (
+        f"Expected the remove to report that force was required, got {remove_event}"
+    )
+    assert remove_event.get("modifiedCount") == 0, (
+        f"A staged node has no comparable content address, got {remove_event}"
+    )
+    assert not os.path.exists(os.path.join(repo.path, "lay")), (
+        "The layer mount directory should be gone once its files are removed"
+    )
+
+
+@pytest.mark.smoke
+def test_layer_remove_refused_reports_staged_and_modified(new_lore_repo):
+    """A layer that is both staged and modified names both reasons in one
+    refusal, so a single `--force` covers everything that would be lost.
+    """
+    from error_types import LocalModificationsError
+
+    repo, layer_repo = _setup_repo_with_layer(new_lore_repo)
+    _stage_layer_change(repo)
+    repo.write_files({LAYER_FILE: b"layer content modified on disk"})
+
+    with pytest.raises(LocalModificationsError) as excinfo:
+        repo.layer_remove("lay", layer_repo)
+
+    output = str(excinfo.value)
+    assert "1 staged file(s)" in output, (
+        f"The refusal should name the staged count, got:\n{output}"
+    )
+    assert "locally modified files" in output, (
+        f"The refusal should also name the modified files, got:\n{output}"
+    )
+
+
+@pytest.mark.smoke
+def test_layer_remove_purge_refused_with_staged_layer_content(new_lore_repo):
+    """`--purge` deletes the whole mount including untracked content, so it is
+    gated on staged work exactly like a plain remove rather than bypassing it.
+    """
+    from error_types import LocalModificationsError
+
+    repo, layer_repo = _setup_repo_with_layer(new_lore_repo)
+    _stage_layer_change(repo)
+
+    with pytest.raises(LocalModificationsError):
+        repo.layer_remove("lay", layer_repo, purge=True)
+
+    assert os.path.isfile(os.path.join(repo.path, LAYER_STAGED_FILE)), (
+        "The refused purge should leave the staged file on disk"
+    )
+
+    repo.layer_remove("lay", layer_repo, purge=True, force=True)
+    assert not os.path.exists(os.path.join(repo.path, "lay")), (
+        "A forced purge should remove the whole layer mount"
+    )
+
+
+@pytest.mark.smoke
 def test_layer_config_corrupt_config_surfaces_error(new_lore_repo):
     """A `layer.toml` that cannot be parsed reports an error and is preserved.
 

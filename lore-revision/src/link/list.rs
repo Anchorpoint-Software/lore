@@ -14,11 +14,8 @@ use crate::link::LoreLinkEntryEventData;
 use crate::lore::BranchId;
 use crate::lore::RepositoryId;
 use crate::lore_debug;
-use crate::lore_warn;
-use crate::node::NodeID;
 use crate::repository::RepositoryContext;
 use crate::state::State;
-use crate::state::StateNodeChildrenIterator;
 
 pub async fn list(repository: Arc<RepositoryContext>) -> Result<(), LinkError> {
     let (_state_current, state_staged, parent_branch) =
@@ -221,8 +218,12 @@ async fn list_staged_recursive(
             .forward::<LinkError>("Failed deserializing state node block")?;
 
         if node.is_staged() && !node.is_staged_add() {
-            let staged_file_count =
-                count_staged_files(link_repository.clone(), link_state.clone(), node.child).await;
+            let staged_file_count = crate::state::count_staged_files(
+                link_repository.clone(),
+                link_state.clone(),
+                node.child,
+            )
+            .await;
 
             event::LoreEvent::LinkStagedEntry(LoreLinkStagedEntryEventData {
                 path: LoreString::from_str(&full_path),
@@ -253,39 +254,4 @@ async fn list_staged_recursive(
     }
 
     Ok(())
-}
-
-async fn count_staged_files(
-    repository: Arc<RepositoryContext>,
-    state: Arc<State>,
-    node_id: NodeID,
-) -> u64 {
-    let mut count = 0u64;
-    let children =
-        match StateNodeChildrenIterator::new(state.clone(), repository.clone(), node_id).await {
-            Ok(iter) => iter,
-            Err(err) => {
-                lore_warn!("Failed to iterate children for staged file count: {err}");
-                return 0;
-            }
-        };
-
-    let mut iter = children;
-    while let Ok(Some((child_id, child_node))) = iter.next().await {
-        if !child_node.is_staged() {
-            continue;
-        }
-        if child_node.is_file() {
-            count += 1;
-        } else if child_node.is_directory() {
-            count += Box::pin(count_staged_files(
-                repository.clone(),
-                state.clone(),
-                child_id,
-            ))
-            .await;
-        }
-    }
-
-    count
 }

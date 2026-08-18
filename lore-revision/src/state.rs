@@ -6958,6 +6958,45 @@ fn diff_filesystem_subtree_recurse(
     Box::pin(async move { diff_filesystem_subtree_impl(ctx).await })
 }
 
+/// Count the files flagged staged in the subtree rooted at `node_id`.
+///
+/// An unreadable subtree is reported and counted as zero rather than raised:
+/// callers use this to describe staged work, and failing the whole operation
+/// because one directory would not load is worse than under-reporting it.
+pub async fn count_staged_files(
+    repository: Arc<RepositoryContext>,
+    state: Arc<State>,
+    node_id: NodeID,
+) -> u64 {
+    let mut iter =
+        match StateNodeChildrenIterator::new(state.clone(), repository.clone(), node_id).await {
+            Ok(iter) => iter,
+            Err(err) => {
+                lore_warn!("Failed to iterate children for staged file count: {err}");
+                return 0;
+            }
+        };
+
+    let mut count = 0u64;
+    while let Ok(Some((child_id, child_node))) = iter.next().await {
+        if !child_node.is_staged() {
+            continue;
+        }
+        if child_node.is_file() {
+            count += 1;
+        } else if child_node.is_directory() {
+            count += Box::pin(count_staged_files(
+                repository.clone(),
+                state.clone(),
+                child_id,
+            ))
+            .await;
+        }
+    }
+
+    count
+}
+
 // TODO(UCS-13059): Extend with file mode check
 /// Content comparison size limit: files larger than this skip the fallback
 /// content comparison when hash mismatches occur due to chunking strategy

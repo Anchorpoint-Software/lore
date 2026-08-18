@@ -742,15 +742,15 @@ async fn sync_reject_staged_layers(
     layer_revisions: &[(Layer, Hash)],
 ) -> Result<(), SyncError> {
     for (layer, layer_revision) in layer_revisions {
-        if layer.staged.is_zero()
-            || layer.staged == layer.current
-            || *layer_revision == layer.current
-        {
+        let Some(staged) = layer.staged_revision() else {
+            continue;
+        };
+        if *layer_revision == layer.current {
             continue;
         }
 
         let layer_repository = Arc::new(repository.to_layer_context(layer.repository).await);
-        let state_staged = state::State::deserialize(layer_repository.clone(), layer.staged)
+        let state_staged = state::State::deserialize(layer_repository.clone(), staged)
             .await
             .forward::<SyncError>("Failed to deserialize layer staged state")?;
         if state_staged

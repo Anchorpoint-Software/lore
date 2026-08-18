@@ -219,6 +219,15 @@ pub struct LayerState {
 }
 
 impl Layer {
+    /// The layer's staged revision, if it holds staging distinct from `current`.
+    ///
+    /// A zero pin means the layer was never staged; a pin equal to `current`
+    /// means the stage has since been committed or reverted. Neither carries
+    /// staged nodes, so both read as "no staged revision".
+    pub fn staged_revision(&self) -> Option<Hash> {
+        (!self.staged.is_zero() && self.staged != self.current).then_some(self.staged)
+    }
+
     pub async fn deserialize_current_and_staged(
         &self,
         repository: Arc<RepositoryContext>,
@@ -229,12 +238,11 @@ impl Layer {
             .await
             .forward::<LayerError>("Failed deserializing state")?;
 
-        let state_staged = if !self.staged.is_zero() {
-            State::deserialize(repository.clone(), self.staged)
+        let state_staged = match self.staged_revision() {
+            Some(staged) => State::deserialize(repository.clone(), staged)
                 .await
-                .forward::<LayerError>("Failed deserializing state")?
-        } else {
-            state_current.clone()
+                .forward::<LayerError>("Failed deserializing state")?,
+            None => state_current.clone(),
         };
 
         Ok(LayerState {
@@ -499,10 +507,16 @@ pub async fn remove(
     let layer_index = resolve_layer_index(&config.layers, target_path.as_str(), source_repository)?;
     let layer = config.layers[layer_index].clone();
 
-    let layer_repository = Arc::new(repository.to_layer_context(layer.repository).await);
-    let layer_state = State::deserialize(layer_repository.clone(), layer.current)
-        .await
-        .forward::<LayerError>("Failed to deserialize layer state")?;
+    // Walk the staged state, not `current`: a staged add exists only there, so
+    // walking `current` would leave it on disk as untracked debris once the
+    // layer is gone.
+    let LayerState {
+        repository: layer_repository,
+        state_staged: layer_state,
+        ..
+    } = layer
+        .deserialize_current_and_staged(repository.clone())
+        .await?;
 
     let source_path = RelativePath::new_from_initial_path(layer.source_path.as_str())
         .forward_with::<LayerError, _>(|| {
@@ -513,7 +527,13 @@ pub async fn remove(
         .await
         .forward::<LayerError>("Failed to locate layer source node")?;
 
-    let force = execution_context().globals().force();
+    let staged_file_count = state::count_staged_files(
+        layer_repository.clone(),
+        layer_state.clone(),
+        source_node_link.node,
+    )
+    .await;
+
     let mut tracked_files: Vec<RelativePath> = Vec::new();
     let mut tracked_directories: Vec<RelativePath> = Vec::new();
     let mut modified: Vec<String> = Vec::new();
@@ -529,12 +549,23 @@ pub async fn remove(
     )
     .await?;
 
-    if !modified.is_empty() && !force {
-        lore_warn!(
-            "Layer at '{}' has locally modified files (use --force to discard): {}",
-            target_path.as_str(),
-            modified.join(", ")
-        );
+    // Both reasons are reported before returning so a layer that is both staged
+    // and modified does not hide one behind the other across two --force runs.
+    let force = execution_context().globals().force();
+    if !force && (staged_file_count > 0 || !modified.is_empty()) {
+        if staged_file_count > 0 {
+            lore_warn!(
+                "Layer at '{}' has {staged_file_count} staged file(s) (use --force to discard)",
+                target_path.as_str()
+            );
+        }
+        if !modified.is_empty() {
+            lore_warn!(
+                "Layer at '{}' has locally modified files (use --force to discard): {}",
+                target_path.as_str(),
+                modified.join(", ")
+            );
+        }
         return Err(LocalModifications.into());
     }
 
@@ -596,7 +627,7 @@ pub async fn remove(
         source_repository: layer.repository,
         source_path: LoreString::from_str(&layer.source_path),
         revision: layer.current,
-        forced: (force && modified_count > 0) as u8,
+        forced: (force && (modified_count > 0 || staged_file_count > 0)) as u8,
         purged: purge as u8,
         file_count,
         directory_count,
@@ -649,24 +680,26 @@ fn walk_layer_subtree<'a>(
                     modified,
                 )
                 .await?;
-            } else {
+            } else if !child_node.is_staged_delete() {
                 let absolute = child_path.to_absolute_path(layer_repository.require_path()?);
                 match lore_io::IoDriver::global().metadata(&absolute).await {
                     Ok(metadata) if metadata.is_file() => {
                         let (file_mtime, file_size) =
                             crate::util::fs::file_mtime_and_size(&metadata);
-                        let is_modified = state::is_file_modified(
-                            layer_repository.clone(),
-                            &child_node,
-                            file_mtime,
-                            file_size,
-                            &child_path,
-                            true,
-                        )
-                        .await
-                        .map_or(true, |(m, _)| m);
-                        if is_modified {
-                            modified.push(child_path.as_str().to_string());
+                        if !child_node.is_staged() {
+                            let is_modified = state::is_file_modified(
+                                layer_repository.clone(),
+                                &child_node,
+                                file_mtime,
+                                file_size,
+                                &child_path,
+                                true,
+                            )
+                            .await
+                            .map_or(true, |(m, _)| m);
+                            if is_modified {
+                                modified.push(child_path.as_str().to_string());
+                            }
                         }
                         tracked_files.push(child_path);
                     }
@@ -714,11 +747,11 @@ pub async fn list_staged(
     let layers = list(repository.clone()).await?;
     let mut result = Vec::new();
     for layer in layers {
-        if layer.staged.is_zero() || layer.staged == layer.current {
+        let Some(staged) = layer.staged_revision() else {
             continue;
-        }
+        };
         let layer_repository = Arc::new(repository.to_layer_context(layer.repository).await);
-        let staged_state = State::deserialize(layer_repository.clone(), layer.staged)
+        let staged_state = State::deserialize(layer_repository.clone(), staged)
             .await
             .forward::<LayerError>("Failed to deserialize layer staged state")?;
 
@@ -727,7 +760,7 @@ pub async fn list_staged(
             .find_node_link(layer_repository.clone(), &layer.source_path)
             .await
             .forward::<LayerError>("Failed to locate layer source node")?;
-        let staged_file_count = count_staged_files(
+        let staged_file_count = state::count_staged_files(
             layer_repository.clone(),
             staged_state,
             source_node_link.node,
@@ -754,46 +787,6 @@ pub async fn list_staged(
         result.push(info);
     }
     Ok(result)
-}
-
-async fn count_staged_files(
-    repository: Arc<RepositoryContext>,
-    state: Arc<State>,
-    node_id: NodeID,
-) -> u64 {
-    let mut count = 0u64;
-    let children = match crate::state::StateNodeChildrenIterator::new(
-        state.clone(),
-        repository.clone(),
-        node_id,
-    )
-    .await
-    {
-        Ok(iter) => iter,
-        Err(err) => {
-            lore_warn!("Failed to iterate children for layer staged file count: {err}");
-            return 0;
-        }
-    };
-
-    let mut iter = children;
-    while let Ok(Some((child_id, child_node))) = iter.next().await {
-        if !child_node.is_staged() {
-            continue;
-        }
-        if child_node.is_file() {
-            count += 1;
-        } else if child_node.is_directory() {
-            count += Box::pin(count_staged_files(
-                repository.clone(),
-                state.clone(),
-                child_id,
-            ))
-            .await;
-        }
-    }
-
-    count
 }
 
 pub async fn sync(
