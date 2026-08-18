@@ -2668,6 +2668,7 @@ dependencies = [
  "lore-server",
  "lore-storage",
  "rand",
+ "rcgen",
  "reqwest",
  "ring",
  "rs-consul",
