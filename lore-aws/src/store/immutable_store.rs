@@ -2160,7 +2160,6 @@ impl InstrumentProvider for AwsImmutableStoreInstrumentProvider {
 mod test {
     use std::sync::atomic::Ordering;
 
-    use lore_base::runtime::LORE_CONTEXT;
     use lore_base::types::FragmentFlags;
     use lore_storage::ImmutableStore;
     use rand::random;
@@ -2168,7 +2167,6 @@ mod test {
 
     use super::*;
     use crate::store::object_metadata::PAYLOAD_FLAGS;
-    use crate::store::setup_execution;
     use crate::store::test_util::*;
 
     #[tokio::test]
@@ -4066,30 +4064,5 @@ mod test {
                 "the bytes must be the ones the winning writer uploaded, not a mix"
             );
         }
-    }
-
-    /// The store contract, checked against this store the same way it is checked against every
-    /// other one.
-    ///
-    /// Note what this does *not* reach. The store is built without the legacy metadata table, so
-    /// nothing here exercises the fallback resolution that table turns on, nor the gap that comes
-    /// with it: a hash with no state row is left associated by `obliterate` and goes on matching
-    /// through the fallback. Those paths are covered separately, on
-    /// [`store_with_separate_metadata_table`], where the two tables are genuinely distinct.
-    #[tokio::test]
-    async fn satisfies_the_immutable_store_contract() {
-        let fake = Fake::default();
-        let store = store(&fake).await;
-
-        let execution = setup_execution("test".to_string());
-        LORE_CONTEXT
-            .scope(execution, async move {
-                lore_storage::conformance::verify_immutable_store(
-                    store,
-                    lore_storage::conformance::Capabilities::new("AwsImmutableStore"),
-                )
-                .await;
-            })
-            .await;
     }
 }

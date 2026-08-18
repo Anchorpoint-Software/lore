@@ -79,6 +79,14 @@ pub enum Check {
     ObliterationLeavesSiblingsReadable,
     /// A fragment stored without its payload is reported and described, but not served.
     MetadataOnlyIsDescribedNotServed,
+    /// `get` and `get_metadata` agree on the stored payload's `size_content` and `size_payload`.
+    GetFragmentMatchesMetadata,
+    /// After a put with payload, the query result reports `stored_local` or `stored_durable`.
+    StoredPayloadIsAccountedFor,
+    /// After a copy, `get` on the destination serves the same bytes as the original.
+    CopiedAddressIsServable,
+    /// After a copy, `get` on the source still serves the original bytes.
+    CopySourceRemainsReadable,
 }
 
 /// What the store under test can do, so the battery runs the subset that applies.
@@ -214,6 +222,16 @@ pub async fn verify_immutable_store(store: Arc<dyn ImmutableStore>, caps: Capabi
     );
     settle(
         &caps,
+        Check::GetFragmentMatchesMetadata,
+        get_and_get_metadata_report_the_same_fragment(&store, &caps).await,
+    );
+    settle(
+        &caps,
+        Check::StoredPayloadIsAccountedFor,
+        stored_content_is_accounted_for(&store, &caps).await,
+    );
+    settle(
+        &caps,
         Check::OtherContextNeverMatchesFully,
         another_context_in_the_same_partition_never_matches_fully(&store, &caps).await,
     );
@@ -234,6 +252,16 @@ pub async fn verify_immutable_store(store: Arc<dyn ImmutableStore>, caps: Capabi
             &caps,
             Check::NamedSourceCanBeCopied,
             the_source_a_match_names_can_be_copied_from(&store, &caps).await,
+        );
+        settle(
+            &caps,
+            Check::CopiedAddressIsServable,
+            a_copied_address_is_servable(&store, &caps).await,
+        );
+        settle(
+            &caps,
+            Check::CopySourceRemainsReadable,
+            a_copy_leaves_the_source_readable(&store, &caps).await,
         );
     }
 
@@ -854,6 +882,162 @@ async fn a_metadata_only_entry_is_described_but_not_served(
         store.clone().get(partition, address).await.is_err(),
         "get returned something for a fragment whose payload was never stored — the layer above \
          reads that failure as its signal to fetch from upstream"
+    );
+
+    Ok(())
+}
+
+/// Clause 4 applied across the two read methods. `get` and `get_metadata` both describe the same
+/// stored payload and must agree on what it is. A store that reads `size_content` from one
+/// backend for `get_metadata` and from another for `get` will diverge when those backends fall
+/// out of sync — this pins the agreement rather than assuming it.
+async fn get_and_get_metadata_report_the_same_fragment(
+    store: &Arc<dyn ImmutableStore>,
+    caps: &Capabilities,
+) -> Result<(), String> {
+    let (partition, address, payload, fragment) = unique_content();
+    store_content(store, partition, address, fragment, payload).await?;
+
+    let described = store
+        .clone()
+        .get_metadata(partition, address)
+        .await
+        .map_err(|err| format!("get_metadata failed on {}: {err:?}", caps.label))?;
+
+    let (served_fragment, _bytes) = store
+        .clone()
+        .get(partition, address)
+        .await
+        .and_then(StoreGetData::into_payload)
+        .map_err(|err| format!("get failed on {}: {err:?}", caps.label))?;
+
+    require_eq!(
+        described.fragment.size_content,
+        served_fragment.size_content,
+        "get_metadata and get reported different size_content for the same stored payload"
+    );
+    require_eq!(
+        described.fragment.size_payload,
+        served_fragment.size_payload,
+        "get_metadata and get reported different size_payload for the same stored payload"
+    );
+
+    Ok(())
+}
+
+/// Clause 1 applied to the durability bookkeeping. A full match promises the association is real
+/// and the representation is present; `stored_local` and `stored_durable` say where. A store that
+/// reports a full match while clearing both flags has hidden whether the payload is available
+/// locally, durably, or nowhere — callers use those flags to decide whether to fetch again.
+async fn stored_content_is_accounted_for(
+    store: &Arc<dyn ImmutableStore>,
+    caps: &Capabilities,
+) -> Result<(), String> {
+    let (partition, address, payload, fragment) = unique_content();
+    store_content(store, partition, address, fragment, payload).await?;
+
+    let resolved = query_one(store, partition, address)
+        .await
+        .map_err(|err| format!("query failed on {}: {err:?}", caps.label))?;
+
+    require_eq!(
+        resolved.match_made,
+        StoreMatch::MatchFull,
+        "stored content must report a full match (prerequisite for durability check)"
+    );
+    require!(
+        resolved.stored_local || resolved.stored_durable,
+        "a full match for stored content must set stored_local or stored_durable: \
+         stored_local={}, stored_durable={}",
+        resolved.stored_local,
+        resolved.stored_durable
+    );
+
+    Ok(())
+}
+
+/// A copy creates an association the store can serve, not just one it can report. The partner
+/// check `NamedSourceCanBeCopied` establishes that the copy operation succeeds and that `query`
+/// reports a full match afterwards. This check establishes that `get` also returns the original
+/// bytes — a store that registers the `DynamoDB` row without arranging for the payload to be
+/// accessible satisfies `NamedSourceCanBeCopied` and breaks this one.
+async fn a_copied_address_is_servable(
+    store: &Arc<dyn ImmutableStore>,
+    caps: &Capabilities,
+) -> Result<(), String> {
+    let (partition, address, payload, fragment) = unique_content();
+    store_content(store, partition, address, fragment, payload.clone()).await?;
+
+    let wanted = Address {
+        hash: address.hash,
+        context: Context::from(rand::random::<[u8; 16]>()),
+    };
+    let resolved = query_one(store, partition, wanted)
+        .await
+        .map_err(|err| format!("query failed on {}: {err:?}", caps.label))?;
+
+    if resolved.match_made != StoreMatch::MatchPartition {
+        // Under-reporting is allowed; if the store does not offer the copy shortcut a caller
+        // transfers the payload instead, which is always safe. Skip rather than fail.
+        return Ok(());
+    }
+
+    let source = resolved.source_address(address.hash);
+    store
+        .clone()
+        .copy(resolved.partition, source, partition, wanted.context, false)
+        .await
+        .map_err(|err| format!("copy from a named source failed: {err:?}"))?;
+
+    let (_frag, served) = store
+        .clone()
+        .get(partition, wanted)
+        .await
+        .and_then(StoreGetData::into_payload)
+        .map_err(|err| format!("get on a copied address failed: {err:?}"))?;
+
+    require!(
+        served.as_ref() == payload.as_ref(),
+        "get on a copied address returned different bytes than were originally stored"
+    );
+
+    Ok(())
+}
+
+/// A copy is a new registration, not a move. The local store test
+/// `copy_same_partition_new_context_adopts_payload_without_transfer` demonstrates this: after
+/// copying from a source address to a new context, `get` on the source returns the same bytes as
+/// before. A store that removes or poisons the source entry after a copy would break every caller
+/// that holds an existing reference to that address.
+async fn a_copy_leaves_the_source_readable(
+    store: &Arc<dyn ImmutableStore>,
+    caps: &Capabilities,
+) -> Result<(), String> {
+    let (partition, address, payload, fragment) = unique_content();
+    store_content(store, partition, address, fragment, payload.clone()).await?;
+
+    let destination_context = Context::from(rand::random::<[u8; 16]>());
+    store
+        .clone()
+        .copy(partition, address, partition, destination_context, false)
+        .await
+        .map_err(|err| {
+            format!(
+                "copy from the stored address failed on {}: {err:?}",
+                caps.label
+            )
+        })?;
+
+    let (_frag, source_bytes) = store
+        .clone()
+        .get(partition, address)
+        .await
+        .and_then(StoreGetData::into_payload)
+        .map_err(|err| format!("get on source after copy failed on {}: {err:?}", caps.label))?;
+
+    require!(
+        source_bytes.as_ref() == payload.as_ref(),
+        "get on the source address returned different bytes after copying from it"
     );
 
     Ok(())

@@ -46,6 +46,7 @@ mod aws_store_tests {
     use rand::random;
 
     use crate::common::aws_common::FRAGMENT_METADATA_TABLE_NAME;
+    use crate::common::aws_common::FRAGMENT_STATE_TABLE_NAME;
     use crate::common::aws_common::FRAGMENTS_TABLE_NAME;
     use crate::common::aws_common::MUTABLE_STORE_TABLE_NAME;
     use crate::common::aws_common::STORE_BUCKET_NAME;
@@ -1803,6 +1804,40 @@ mod aws_store_tests {
                 expected.sort_by_key(|(k, _)| *k);
                 results.sort_by_key(|(k, _)| *k);
                 assert_eq!(results, expected);
+
+                Ok(())
+            })
+            .await
+    }
+
+    /// The contract every `ImmutableStore` owes its callers, checked against the AWS store
+    /// backed by real S3 and DynamoDB. This is the authoritative conformance check for the AWS
+    /// implementation: unit tests can only validate logic against the in-process model of what AWS
+    /// services do, whereas this test runs the full battery against the actual services and will
+    /// catch any divergence between that model and reality.
+    #[tokio::test]
+    async fn aws_immutable_store_satisfies_the_conformance_contract() -> TestResult {
+        let execution = setup_execution("test".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let (s3, dynamo, _) =
+                    setup(vec![FRAGMENTS_TABLE_NAME, FRAGMENT_STATE_TABLE_NAME]).await?;
+
+                let settings = AwsImmutableStoreSettings::new(
+                    S3StoreSettings::new(STORE_BUCKET_NAME.to_string()),
+                    DynamoDbImmutableStoreSettings::new(
+                        FRAGMENTS_TABLE_NAME.to_string(),
+                        FRAGMENT_STATE_TABLE_NAME.to_string(),
+                    ),
+                    false,
+                );
+                let store = Arc::new(AwsImmutableStore::new(s3, dynamo, &settings));
+
+                lore_storage::conformance::verify_immutable_store(
+                    store,
+                    lore_storage::conformance::Capabilities::new("AwsImmutableStore/integration"),
+                )
+                .await;
 
                 Ok(())
             })

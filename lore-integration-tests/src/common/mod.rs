@@ -31,6 +31,7 @@ pub(crate) mod aws_common {
     pub const STORE_BUCKET_NAME: &str = "lore-immutable-store-local";
     pub const MUTABLE_STORE_TABLE_NAME: &str = "lore-mutable-store-local";
     pub const FRAGMENTS_TABLE_NAME: &str = "lore-fragments-local";
+    pub const FRAGMENT_STATE_TABLE_NAME: &str = "lore-fragment-state-local";
     pub const FRAGMENT_METADATA_TABLE_NAME: &str = "lore-fragment-metadata-local";
 
     // NOTE: these credentials are just hardcoded in lore-integration-tests/compose.yaml
@@ -375,6 +376,46 @@ pub(crate) mod aws_common {
         }
     }
 
+    async fn create_fragment_state_table(
+        client: &aws_sdk_dynamodb::Client,
+    ) -> Result<(), Box<dyn Error>> {
+        let result = client
+            .create_table()
+            .table_name(FRAGMENT_STATE_TABLE_NAME)
+            .attribute_definitions(
+                AttributeDefinition::builder()
+                    .attribute_name("hash")
+                    .set_attribute_type(Some(ScalarAttributeType::B))
+                    .build()?,
+            )
+            .key_schema(
+                KeySchemaElement::builder()
+                    .attribute_name("hash")
+                    .set_key_type(Some(KeyType::Hash))
+                    .build()?,
+            )
+            .provisioned_throughput(
+                ProvisionedThroughput::builder()
+                    .set_read_capacity_units(Some(5000))
+                    .set_write_capacity_units(Some(5000))
+                    .build()?,
+            )
+            .send()
+            .await;
+
+        match result {
+            Err(e) => {
+                let err = e.as_service_error().unwrap();
+                if let CreateTableError::ResourceInUseException(_) = err {
+                    return Ok(());
+                }
+
+                Err(e.into())
+            }
+            _ => Ok(()),
+        }
+    }
+
     async fn create_fragment_metadata_table(
         client: &aws_sdk_dynamodb::Client,
     ) -> Result<(), Box<dyn Error>> {
@@ -452,6 +493,9 @@ pub(crate) mod aws_common {
                             }
                             FRAGMENTS_TABLE_NAME => {
                                 create_fragments_table(client.sdk_client()).await?;
+                            }
+                            FRAGMENT_STATE_TABLE_NAME => {
+                                create_fragment_state_table(client.sdk_client()).await?;
                             }
                             FRAGMENT_METADATA_TABLE_NAME => {
                                 create_fragment_metadata_table(client.sdk_client()).await?;
