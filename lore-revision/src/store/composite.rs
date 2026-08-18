@@ -38,6 +38,7 @@ use crate::fragment::FragmentFlags;
 use crate::lore::Address;
 use crate::lore::Context;
 use crate::lore::Fragment;
+use crate::lore::Hash;
 use crate::lore::Partition;
 use crate::lore_debug;
 use crate::lore_error;
@@ -151,16 +152,6 @@ impl<T> CompositeStoreHit<T> {
         }
     }
 
-    fn map<U, F: FnOnce(T) -> U>(self, op: F) -> CompositeStoreHit<U> {
-        match self {
-            CompositeStoreHit::Local(v) => CompositeStoreHit::Local(op(v)),
-            CompositeStoreHit::Durable(v) => CompositeStoreHit::Durable(op(v)),
-            CompositeStoreHit::Replica(v) => CompositeStoreHit::Replica(op(v)),
-            CompositeStoreHit::Mixed(v) => CompositeStoreHit::Mixed(op(v)),
-            CompositeStoreHit::Miss(v) => CompositeStoreHit::Miss(op(v)),
-        }
-    }
-
     /// Consume the inner value, wrapping it as a `Result::Ok`, while also counting a metric labeled
     /// with the type of hit.
     fn into_counted_result<E>(self, counter: &Counter<u64>) -> Result<T, E> {
@@ -198,6 +189,26 @@ fn merge_resolved(into: &mut StoreMatchResult, from: &StoreMatchResult) -> bool 
     into.stored_durable |= from.stored_durable;
 
     is_new_stronger
+}
+
+/// The association a put can be satisfied by copying, or `None` where its payload has to be stored.
+///
+/// A partial match is what names another association, `stored_durable` on it is what says the durable
+/// store has that one rather than only the cache, and a match naming no partition cannot be aimed at.
+/// A supplied payload is the remaining condition, checked by the caller: ingress verifies it against
+/// the address, so a caller holding one could have stored the content the long way for the same
+/// result.
+fn can_put_use_copy(resolved: &StoreMatchResult, hash: Hash) -> Option<(Partition, Address)> {
+    if !matches!(
+        resolved.match_made,
+        StoreMatch::MatchPartition | StoreMatch::MatchHash
+    ) {
+        return None;
+    }
+    if !resolved.stored_durable || resolved.partition.is_zero() {
+        return None;
+    }
+    Some((resolved.partition, resolved.source_address(hash)))
 }
 
 /// Default number of permits for the `cache_metadata` semaphore.
@@ -630,6 +641,52 @@ impl CompositeStore {
         }
     }
 
+    /// Detached fan-out of a put to every write replica, skipped where a topology refresh holds the
+    /// list: replicas accelerate reads rather than own content, so waiting on it is not worth a put.
+    fn replicate_put(
+        &self,
+        partition: Partition,
+        address: Address,
+        fragment: Fragment,
+        payload: Option<Bytes>,
+        force: bool,
+    ) {
+        let Ok(write_replicas) = self.write_replicas.try_read() else {
+            return;
+        };
+        for replica in write_replicas.iter() {
+            let replica_store = replica.store();
+            let payload = payload.clone();
+            lore_spawn!(async move {
+                replica_store
+                    .put(partition, address, fragment, payload, force)
+                    .await
+            });
+        }
+    }
+
+    /// Detached fan-out of a copy to every write replica, skipped for the reason on
+    /// [`Self::replicate_put`].
+    fn replicate_copy(
+        &self,
+        source_partition: Partition,
+        source_address: Address,
+        partition: Partition,
+        context: Context,
+    ) {
+        let Ok(write_replicas) = self.write_replicas.try_read() else {
+            return;
+        };
+        for replica in write_replicas.iter() {
+            let replica_store = replica.store();
+            lore_spawn!(async move {
+                replica_store
+                    .copy(source_partition, source_address, partition, context, true)
+                    .await
+            });
+        }
+    }
+
     async fn get_from_remotes(
         self: Arc<Self>,
         partition: Partition,
@@ -1039,6 +1096,11 @@ impl ImmutableStore for CompositeStore {
         }
     }
 
+    /// A full match is written nowhere. A weaker one the durable store holds is written by
+    /// duplicating that association — see [`can_put_use_copy`] — and the payload is released before
+    /// the round trip, so a refused copy has nothing to fall back on and fails the put. Recovery is
+    /// the caller's: it still holds the payload and retries. Replicas are issued the same copy, and
+    /// one that cannot answer it simply does not hold the association.
     async fn put(
         self: Arc<Self>,
         partition: Partition,
@@ -1047,17 +1109,15 @@ impl ImmutableStore for CompositeStore {
         payload: Option<Bytes>,
         force: bool,
     ) -> Result<(), StoreError> {
-        // Check if address already exists, if so it does not need to be written anywhere as it has
-        // already been stored durably at least once
-        if !force
-            && let Ok(match_made) = query_one(&self.local.store(), partition, address)
+        let resolved = if force {
+            StoreMatchResult::default()
+        } else {
+            query_one(&self.local.store(), partition, address)
                 .await
-                .map(|resolved| CompositeStoreHit::Local(resolved.match_made))
-            && match_made.inner() == &StoreMatch::MatchFull
-        {
-            return match_made
-                .map(|_| ())
-                .into_counted_result(&self.instruments.counter_put);
+                .unwrap_or_default()
+        };
+        if resolved.match_made == StoreMatch::MatchFull {
+            return CompositeStoreHit::Local(()).into_counted_result(&self.instruments.counter_put);
         }
 
         let mut fragment = fragment;
@@ -1067,6 +1127,29 @@ impl ImmutableStore for CompositeStore {
             FragmentFlags::PayloadStoredDurable
         };
         let behaviour = sanitise_fragment_behavior_flags(&mut fragment);
+
+        if payload.is_some()
+            && let Some((source_partition, source_address)) =
+                can_put_use_copy(&resolved, address.hash)
+        {
+            drop(payload);
+
+            self.clone()
+                .copy(
+                    source_partition,
+                    source_address,
+                    partition,
+                    address.context,
+                    true,
+                )
+                .await?;
+            if !behaviour.do_not_replicate {
+                self.replicate_copy(source_partition, source_address, partition, address.context);
+            }
+
+            return CompositeStoreHit::Durable(())
+                .into_counted_result(&self.instruments.counter_put);
+        }
 
         // Store durably
         self.durable
@@ -1094,18 +1177,8 @@ impl ImmutableStore for CompositeStore {
             });
         }
 
-        // Detached send to all write replicas
         if !behaviour.do_not_replicate {
-            let write_replicas = self.write_replicas.read().await;
-            for replica in write_replicas.iter() {
-                let replica_store = replica.store();
-                let payload = payload.clone();
-                lore_spawn!(async move {
-                    replica_store
-                        .put(partition, address, fragment, payload, force)
-                        .await
-                });
-            }
+            self.replicate_put(partition, address, fragment, payload, force);
         }
 
         CompositeStoreHit::Miss(()).into_counted_result(&self.instruments.counter_put)

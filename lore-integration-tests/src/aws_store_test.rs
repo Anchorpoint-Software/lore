@@ -322,6 +322,328 @@ mod aws_store_tests {
             .await
     }
 
+    /// Wraps the durable store to record which write verb it was asked for, so a test can say the
+    /// payload never reached S3 a second time rather than only that the read works.
+    struct CountingDurable {
+        inner: Arc<dyn ImmutableStore>,
+        puts: std::sync::atomic::AtomicUsize,
+        copies: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingDurable {
+        fn new(inner: Arc<dyn ImmutableStore>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                puts: std::sync::atomic::AtomicUsize::new(0),
+                copies: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+
+        fn puts(&self) -> usize {
+            self.puts.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn copies(&self) -> usize {
+            self.copies.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl ImmutableStore for CountingDurable {
+        fn is_local(&self) -> bool {
+            self.inner.is_local()
+        }
+
+        fn isolates_partitions(&self) -> bool {
+            self.inner.isolates_partitions()
+        }
+
+        fn read_scope(&self) -> StoreMatch {
+            self.inner.read_scope()
+        }
+
+        fn query_scope(&self) -> StoreMatch {
+            self.inner.query_scope()
+        }
+
+        async fn get(
+            self: Arc<Self>,
+            partition: Partition,
+            address: Address,
+        ) -> Result<StoreGetData, StoreError> {
+            self.inner.clone().get(partition, address).await
+        }
+
+        async fn get_metadata(
+            self: Arc<Self>,
+            partition: Partition,
+            address: Address,
+        ) -> Result<StoreGetData, StoreError> {
+            self.inner.clone().get_metadata(partition, address).await
+        }
+
+        async fn query(
+            self: Arc<Self>,
+            partition: Partition,
+            addresses: &[Address],
+            results: &mut [StoreMatchResult],
+        ) -> Result<(), StoreError> {
+            self.inner
+                .clone()
+                .query(partition, addresses, results)
+                .await
+        }
+
+        async fn put(
+            self: Arc<Self>,
+            partition: Partition,
+            address: Address,
+            fragment: Fragment,
+            payload: Option<Bytes>,
+            force: bool,
+        ) -> Result<(), StoreError> {
+            self.puts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner
+                .clone()
+                .put(partition, address, fragment, payload, force)
+                .await
+        }
+
+        async fn copy(
+            self: Arc<Self>,
+            source_partition: Partition,
+            source_address: Address,
+            destination_partition: Partition,
+            destination_context: Context,
+            durable: bool,
+        ) -> Result<(), StoreError> {
+            self.copies
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner
+                .clone()
+                .copy(
+                    source_partition,
+                    source_address,
+                    destination_partition,
+                    destination_context,
+                    durable,
+                )
+                .await
+        }
+
+        async fn obliterate(
+            self: Arc<Self>,
+            partition: Partition,
+            address: Address,
+            stats: Arc<StoreObliterateStats>,
+        ) -> Result<(), StoreError> {
+            self.inner
+                .clone()
+                .obliterate(partition, address, stats)
+                .await
+        }
+
+        async fn evict(
+            self: Arc<Self>,
+            max_capacity: usize,
+            sync_data: bool,
+            sink: Option<lore_storage::gc_event::GcEventSinkRef>,
+        ) -> Result<usize, StoreError> {
+            self.inner
+                .clone()
+                .evict(max_capacity, sync_data, sink)
+                .await
+        }
+
+        async fn compact(
+            self: Arc<Self>,
+            max_size: usize,
+            at: Option<usize>,
+            sync_data: bool,
+            sink: Option<lore_storage::gc_event::GcEventSinkRef>,
+        ) -> Result<Option<usize>, StoreError> {
+            self.inner
+                .clone()
+                .compact(max_size, at, sync_data, sink)
+                .await
+        }
+
+        async fn compact_resume_at(self: Arc<Self>) -> Option<usize> {
+            self.inner.clone().compact_resume_at().await
+        }
+
+        async fn compact_stop(self: Arc<Self>) {
+            self.inner.clone().compact_stop().await;
+        }
+
+        fn max_query_batch(&self) -> Option<usize> {
+            self.inner.max_query_batch()
+        }
+
+        async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), StoreError> {
+            self.inner.clone().flush(sync_data).await
+        }
+
+        async fn verify(self: Arc<Self>, heal: bool) -> Result<(), StoreError> {
+            self.inner.clone().verify(heal).await
+        }
+    }
+
+    /// A composite shaped like a server's: a real in-memory local cache in front of the AWS store,
+    /// which is what lets a second put see the first one's association and duplicate it.
+    async fn initialize_store_with_local_cache() -> Result<
+        (
+            Arc<CompositeStore>,
+            Arc<CountingDurable>,
+            Arc<ExecutionContext>,
+        ),
+        Box<dyn Error>,
+    > {
+        let execution = setup_execution("test".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let (s3, dynamo_immutable, _dynamo_mutable) = setup(vec![
+                    MUTABLE_STORE_TABLE_NAME,
+                    FRAGMENTS_TABLE_NAME,
+                    FRAGMENT_METADATA_TABLE_NAME,
+                ])
+                .await?;
+
+                let aws_immutable_settings = AwsImmutableStoreSettings::new(
+                    S3StoreSettings::new(STORE_BUCKET_NAME.to_string()),
+                    DynamoDbImmutableStoreSettings::new(
+                        FRAGMENTS_TABLE_NAME.to_string(),
+                        FRAGMENT_METADATA_TABLE_NAME.to_string(),
+                    ),
+                    false,
+                );
+
+                let durable = CountingDurable::new(Arc::new(AwsImmutableStore::new(
+                    s3,
+                    dynamo_immutable,
+                    &aws_immutable_settings,
+                )));
+
+                let local = lore_storage::local::immutable_store::create(
+                    None::<&str>,
+                    lore_storage::local::immutable_store::ImmutableStoreCreateOptions::none(),
+                    false,
+                    lore_storage::local::immutable_store::ImmutableStoreSettings {
+                        isolate_partitions: true,
+                        ..Default::default()
+                    },
+                )
+                .await?;
+
+                let immutable_store = Arc::new(
+                    CompositeStoreBuilder::default()
+                        .with_durable("aws".to_string(), durable.clone())
+                        .expect("Failed to assign AWS durable immutable store")
+                        .with_local("local".to_string(), local)
+                        .expect("Failed to assign local immutable store")
+                        .build()
+                        .expect("Failed to build composite store"),
+                );
+
+                Ok((immutable_store, durable, execution_context()))
+            })
+            .await
+    }
+
+    /// A put whose content the durable store already holds under another context is registered with
+    /// a copy, and the target address reads back the deduplicated payload once the put returns.
+    #[tokio::test]
+    async fn put_duplicating_a_durable_association_reads_back_from_the_target() -> TestResult {
+        let partition = random::<RepositoryId>();
+        let (fragment, first, payload) = fragment::generate_random();
+        let second = Address {
+            hash: first.hash,
+            context: random::<Context>(),
+        };
+
+        let (store, durable, execution) = initialize_store_with_local_cache()
+            .await
+            .expect("Failed to create store");
+
+        LORE_CONTEXT
+            .scope(execution.clone(), async move {
+                store
+                    .clone()
+                    .put(partition, first, fragment, Some(payload.clone()), false)
+                    .await
+                    .expect("first put should store the payload");
+                assert_eq!(durable.puts(), 1, "the first put has to upload the payload");
+                assert_eq!(durable.copies(), 0);
+
+                // The composite caches into the local store detached, and it is that cached
+                // association the second put names as its source.
+                for _ in 0..50 {
+                    let cached = query_one(&store.local(), partition, first)
+                        .await
+                        .expect("query the local cache");
+                    if cached.match_made == StoreMatch::MatchFull && cached.stored_durable {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+
+                store
+                    .clone()
+                    .put(partition, second, fragment, Some(payload.clone()), false)
+                    .await
+                    .expect("second put should duplicate the association");
+
+                assert_eq!(
+                    durable.copies(),
+                    1,
+                    "the durable store already holds these bytes, so it must be asked to copy"
+                );
+                assert_eq!(
+                    durable.puts(),
+                    1,
+                    "no second upload: the payload must not reach S3 again"
+                );
+
+                let (read_fragment, read_payload) = store
+                    .clone()
+                    .get(partition, second)
+                    .await
+                    .and_then(StoreGetData::into_payload)
+                    .expect("the target address must read back after the put");
+                assert_eq!(read_payload, payload, "the deduplicated bytes must match");
+                assert_eq!(read_fragment.size_content, fragment.size_content);
+
+                // And it is the durable store that holds it, not merely the cache in front: the
+                // association is in DynamoDB and S3 serves the payload for the target address.
+                let on_durable = query_one(
+                    &(durable.clone() as Arc<dyn ImmutableStore>),
+                    partition,
+                    second,
+                )
+                .await
+                .expect("query the durable store");
+                assert_eq!(
+                    on_durable.match_made,
+                    StoreMatch::MatchFull,
+                    "the durable store must hold the target association"
+                );
+
+                let (_, from_durable) = durable
+                    .clone()
+                    .get(partition, second)
+                    .await
+                    .and_then(StoreGetData::into_payload)
+                    .expect("the durable store must serve the target address");
+                assert_eq!(
+                    from_durable, payload,
+                    "the durable store must serve the deduplicated bytes for the target address"
+                );
+
+                Ok(())
+            })
+            .await
+    }
+
     async fn initialize_store() -> Result<
         (
             Arc<CompositeStore>,

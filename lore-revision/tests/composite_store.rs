@@ -38,6 +38,11 @@ mod tests {
     struct TestStore<'a> {
         succeed: bool,
         match_result: Option<StoreMatch>,
+        /// The context a match reports having found the content under, where it is not the one
+        /// asked about.
+        match_context: Option<Context>,
+        /// Whether a match reports the durable store as holding the association.
+        match_durable: bool,
         invocations: RwLock<HashMap<&'a str, u32>>,
         compare_and_swap_result: Option<Hash>,
         get_immutable_result: Option<StoreGetData>,
@@ -76,6 +81,14 @@ mod tests {
 
         fn with_mock_match(mut self, match_result: StoreMatch) -> Self {
             self.match_result = Some(match_result);
+            self
+        }
+
+        /// Report a match found under `context` and already held by the durable store, which is what
+        /// a put needs before it can duplicate an association instead of storing the payload.
+        fn with_mock_durable_match(mut self, context: Context) -> Self {
+            self.match_context = Some(context);
+            self.match_durable = true;
             self
         }
 
@@ -203,9 +216,9 @@ mod tests {
                 *result = lore_storage::StoreMatchResult {
                     match_made,
                     partition: _repository,
-                    context: address.context,
+                    context: self.match_context.unwrap_or(address.context),
                     stored_local: false,
-                    stored_durable: false,
+                    stored_durable: self.match_durable,
                 };
             }
 
@@ -235,6 +248,23 @@ mod tests {
             _force: bool,
         ) -> Result<(), StoreError> {
             self.track_invocation("put");
+
+            if self.succeed {
+                Ok(())
+            } else {
+                Err(StoreError::internal("Mock store failure"))
+            }
+        }
+
+        async fn copy(
+            self: Arc<Self>,
+            _source_partition: Partition,
+            _source_address: Address,
+            _destination_partition: Partition,
+            _destination_context: Context,
+            _durable: bool,
+        ) -> Result<(), StoreError> {
+            self.track_invocation("copy");
 
             if self.succeed {
                 Ok(())
@@ -1638,6 +1668,469 @@ mod tests {
                 assert_eq!(durable_payload, payload);
             })
             .await;
+    }
+
+    /// A put whose content the durable store already holds, under an association the local store
+    /// can name, is a write the durable store can answer with a copy. The caller supplying the
+    /// payload is what makes naming that source its own to use, since ingress verified the payload
+    /// against this address.
+    mod put_duplicates_a_durable_association {
+        use super::*;
+
+        struct Fixture {
+            store: Arc<lore_revision::store::composite::CompositeStore>,
+            local: Arc<TestStore<'static>>,
+            durable: Arc<TestStore<'static>>,
+            replica: Arc<TestStore<'static>>,
+            partition: Partition,
+            address: Address,
+        }
+
+        /// A composite whose local store answers `match` for the address, and a durable store that
+        /// records whichever verb it is asked for.
+        fn fixture(local: TestStore<'static>) -> Fixture {
+            fixture_with_replica(local, false)
+        }
+
+        fn fixture_with_replica(local: TestStore<'static>, write_replica: bool) -> Fixture {
+            let local_store: Arc<TestStore<'static>> = Arc::new(local);
+            let durable: Arc<TestStore<'static>> = Arc::new(TestStore::succeeding());
+            let replica: Arc<TestStore<'static>> = Arc::new(TestStore::succeeding());
+            let store = CompositeStoreBuilder::default()
+                .with_local("local".to_string(), local_store.clone())
+                .expect("Failed add local")
+                .with_durable("durable".to_string(), durable.clone())
+                .expect("Failed add durable")
+                .with_replica("replica".to_string(), replica.clone(), false, write_replica)
+                .build()
+                .expect("Failed store build");
+            Fixture {
+                store: Arc::new(store),
+                local: local_store,
+                durable,
+                replica,
+                partition: random::<RepositoryId>(),
+                address: Address {
+                    hash: random::<Hash>(),
+                    context: random::<Context>(),
+                },
+            }
+        }
+
+        async fn put(fixture: &Fixture, payload: Option<Bytes>) {
+            fixture
+                .store
+                .clone()
+                .put(
+                    fixture.partition,
+                    fixture.address,
+                    Fragment {
+                        flags: 0,
+                        size_payload: 128,
+                        size_content: 128,
+                    },
+                    payload,
+                    false,
+                )
+                .await
+                .expect("Put failed");
+            // The local mirror of a copy is detached.
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+
+        fn count(store: &Arc<TestStore<'static>>, verb: &str) -> u32 {
+            store
+                .invocations
+                .read()
+                .unwrap()
+                .get(verb)
+                .copied()
+                .unwrap_or_default()
+        }
+
+        #[tokio::test]
+        async fn a_durable_partition_match_is_copied_not_stored() {
+            let execution = setup_test_execution();
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let fixture = fixture(
+                        TestStore::succeeding()
+                            .with_mock_match(StoreMatch::MatchPartition)
+                            .with_mock_durable_match(random::<Context>()),
+                    );
+
+                    put(&fixture, Some(Bytes::from(vec![0u8; 128]))).await;
+
+                    assert_eq!(
+                        count(&fixture.durable, "copy"),
+                        1,
+                        "the durable store holds these bytes already, so it must be asked for the \
+                         association rather than the payload"
+                    );
+                    assert_eq!(
+                        count(&fixture.durable, "put"),
+                        0,
+                        "no payload should reach the durable store"
+                    );
+                    assert_eq!(
+                        count(&fixture.local, "copy"),
+                        1,
+                        "the local cache must be given the association too, or the next read of the \
+                         target address leaves the process for bytes it already holds"
+                    );
+                })
+                .await;
+        }
+
+        /// The same for a hash held in another partition, which only a local store that reads across
+        /// them reports — the ownership the payload proves is what makes it usable as a source.
+        #[tokio::test]
+        async fn a_durable_hash_match_is_copied_not_stored() {
+            let execution = setup_test_execution();
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let fixture = fixture(
+                        TestStore::succeeding()
+                            .with_mock_match(StoreMatch::MatchHash)
+                            .with_mock_durable_match(random::<Context>()),
+                    );
+
+                    put(&fixture, Some(Bytes::from(vec![0u8; 128]))).await;
+
+                    assert_eq!(count(&fixture.durable, "copy"), 1);
+                    assert_eq!(count(&fixture.durable, "put"), 0);
+                })
+                .await;
+        }
+
+        /// Without a payload the caller has proved nothing, so it gets no association it did not
+        /// already have.
+        #[tokio::test]
+        async fn a_match_without_a_payload_is_stored_not_copied() {
+            let execution = setup_test_execution();
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let fixture = fixture(
+                        TestStore::succeeding()
+                            .with_mock_match(StoreMatch::MatchPartition)
+                            .with_mock_durable_match(random::<Context>()),
+                    );
+
+                    put(&fixture, None).await;
+
+                    assert_eq!(count(&fixture.durable, "copy"), 0);
+                    assert_eq!(count(&fixture.durable, "put"), 1);
+                })
+                .await;
+        }
+
+        /// A match the local cache holds but the durable store does not names a source the copy
+        /// would not find, so the payload is stored as before.
+        #[tokio::test]
+        async fn a_match_the_durable_store_lacks_is_stored_not_copied() {
+            let execution = setup_test_execution();
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let fixture = fixture(
+                        TestStore::succeeding().with_mock_match(StoreMatch::MatchPartition),
+                    );
+
+                    put(&fixture, Some(Bytes::from(vec![0u8; 128]))).await;
+
+                    assert_eq!(count(&fixture.durable, "copy"), 0);
+                    assert_eq!(count(&fixture.durable, "put"), 1);
+                })
+                .await;
+        }
+
+        /// Nothing matched, so there is no association to duplicate.
+        #[tokio::test]
+        async fn a_miss_is_stored_not_copied() {
+            let execution = setup_test_execution();
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let fixture =
+                        fixture(TestStore::succeeding().with_mock_match(StoreMatch::MatchNone));
+
+                    put(&fixture, Some(Bytes::from(vec![0u8; 128]))).await;
+
+                    assert_eq!(count(&fixture.durable, "copy"), 0);
+                    assert_eq!(count(&fixture.durable, "put"), 1);
+                })
+                .await;
+        }
+
+        /// A put's contract includes replicating it, and satisfying the durable leg with a copy must
+        /// not drop that. The replica is issued the same copy rather than the payload — one that
+        /// cannot answer it holds no association, which replicas being an acceleration makes
+        /// acceptable, but it must be asked.
+        #[tokio::test]
+        async fn a_copied_put_still_reaches_the_write_replicas() {
+            let execution = setup_test_execution();
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let fixture = fixture_with_replica(
+                        TestStore::succeeding()
+                            .with_mock_match(StoreMatch::MatchPartition)
+                            .with_mock_durable_match(random::<Context>()),
+                        true,
+                    );
+
+                    put(&fixture, Some(Bytes::from(vec![0u8; 128]))).await;
+
+                    assert_eq!(count(&fixture.durable, "copy"), 1);
+                    assert_eq!(count(&fixture.durable, "put"), 0);
+                    assert_eq!(
+                        count(&fixture.replica, "copy"),
+                        1,
+                        "the write replica must be asked to duplicate the association too"
+                    );
+                    assert_eq!(
+                        count(&fixture.replica, "put"),
+                        0,
+                        "no payload should reach a replica either"
+                    );
+                })
+                .await;
+        }
+
+        /// A replica that refuses the copy leaves the put succeeding: the durable store holds the
+        /// association, which is what the put was for.
+        #[tokio::test]
+        async fn a_replica_refusing_the_copy_does_not_fail_the_put() {
+            let execution = setup_test_execution();
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let local: Arc<TestStore<'static>> = Arc::new(
+                        TestStore::succeeding()
+                            .with_mock_match(StoreMatch::MatchPartition)
+                            .with_mock_durable_match(random::<Context>()),
+                    );
+                    let durable: Arc<TestStore<'static>> = Arc::new(TestStore::succeeding());
+                    let replica: Arc<TestStore<'static>> = Arc::new(TestStore::failing());
+                    let store = CompositeStoreBuilder::default()
+                        .with_local("local".to_string(), local)
+                        .expect("Failed add local")
+                        .with_durable("durable".to_string(), durable.clone())
+                        .expect("Failed add durable")
+                        .with_replica("replica".to_string(), replica.clone(), false, true)
+                        .build()
+                        .expect("Failed store build");
+
+                    Arc::new(store)
+                        .put(
+                            random::<RepositoryId>(),
+                            Address {
+                                hash: random::<Hash>(),
+                                context: random::<Context>(),
+                            },
+                            Fragment {
+                                flags: 0,
+                                size_payload: 128,
+                                size_content: 128,
+                            },
+                            Some(Bytes::from(vec![0u8; 128])),
+                            false,
+                        )
+                        .await
+                        .expect("a replica that cannot duplicate must not fail the put");
+
+                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                    assert_eq!(count(&durable, "copy"), 1);
+                    assert_eq!(count(&replica, "copy"), 1);
+                })
+                .await;
+        }
+
+        /// And a replica that was never configured is not a reason to hold the payload.
+        #[tokio::test]
+        async fn a_copied_put_without_replicas_sends_nothing_further() {
+            let execution = setup_test_execution();
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let fixture = fixture(
+                        TestStore::succeeding()
+                            .with_mock_match(StoreMatch::MatchPartition)
+                            .with_mock_durable_match(random::<Context>()),
+                    );
+
+                    put(&fixture, Some(Bytes::from(vec![0u8; 128]))).await;
+
+                    assert_eq!(count(&fixture.durable, "copy"), 1);
+                    assert_eq!(count(&fixture.replica, "put"), 0);
+                })
+                .await;
+        }
+
+        /// The consequence of releasing the payload first: a refused copy has nothing to fall back
+        /// on, so the put fails and nothing is stored. Recovery is the caller's retry.
+        #[tokio::test]
+        async fn a_refused_copy_fails_the_put_without_storing_the_payload() {
+            let execution = setup_test_execution();
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let local: Arc<TestStore<'static>> = Arc::new(
+                        TestStore::succeeding()
+                            .with_mock_match(StoreMatch::MatchPartition)
+                            .with_mock_durable_match(random::<Context>()),
+                    );
+                    let durable: Arc<TestStore<'static>> = Arc::new(TestStore::failing());
+                    let store = CompositeStoreBuilder::default()
+                        .with_local("local".to_string(), local)
+                        .expect("Failed add local")
+                        .with_durable("durable".to_string(), durable.clone())
+                        .expect("Failed add durable")
+                        .build()
+                        .expect("Failed store build");
+
+                    Arc::new(store)
+                        .put(
+                            random::<RepositoryId>(),
+                            Address {
+                                hash: random::<Hash>(),
+                                context: random::<Context>(),
+                            },
+                            Fragment {
+                                flags: 0,
+                                size_payload: 128,
+                                size_content: 128,
+                            },
+                            Some(Bytes::from(vec![0u8; 128])),
+                            false,
+                        )
+                        .await
+                        .expect_err("a refused copy must fail the put");
+
+                    assert_eq!(count(&durable, "copy"), 1);
+                    assert_eq!(
+                        count(&durable, "put"),
+                        0,
+                        "the payload was released, so there is nothing to fall back to and nothing \
+                         may be stored"
+                    );
+                })
+                .await;
+        }
+
+        /// `PayloadDoNotReplicate` governs the copy fan-out as it governs the put one.
+        #[tokio::test]
+        async fn a_copied_put_honours_do_not_replicate() {
+            let execution = setup_test_execution();
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let fixture = fixture_with_replica(
+                        TestStore::succeeding()
+                            .with_mock_match(StoreMatch::MatchPartition)
+                            .with_mock_durable_match(random::<Context>()),
+                        true,
+                    );
+
+                    fixture
+                        .store
+                        .clone()
+                        .put(
+                            fixture.partition,
+                            fixture.address,
+                            Fragment {
+                                flags: FragmentFlags::PayloadDoNotReplicate.into(),
+                                size_payload: 128,
+                                size_content: 128,
+                            },
+                            Some(Bytes::from(vec![0u8; 128])),
+                            false,
+                        )
+                        .await
+                        .expect("Put failed");
+                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+                    assert_eq!(count(&fixture.durable, "copy"), 1);
+                    assert_eq!(
+                        count(&fixture.replica, "copy"),
+                        0,
+                        "do_not_replicate must hold the copy back as it holds the put back"
+                    );
+                })
+                .await;
+        }
+
+        /// A composite with no local store answers its own query from the durable store, so a
+        /// partial match there is duplicated too — and there is no local mirror to spawn.
+        #[tokio::test]
+        async fn a_durable_only_composite_copies_from_its_own_match() {
+            let execution = setup_test_execution();
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let durable: Arc<TestStore<'static>> = Arc::new(
+                        TestStore::succeeding()
+                            .with_mock_match(StoreMatch::MatchPartition)
+                            .with_mock_durable_match(random::<Context>()),
+                    );
+                    let store = CompositeStoreBuilder::default()
+                        .with_durable("durable".to_string(), durable.clone())
+                        .expect("Failed add durable")
+                        .build()
+                        .expect("Failed store build");
+
+                    Arc::new(store)
+                        .put(
+                            random::<RepositoryId>(),
+                            Address {
+                                hash: random::<Hash>(),
+                                context: random::<Context>(),
+                            },
+                            Fragment {
+                                flags: 0,
+                                size_payload: 128,
+                                size_content: 128,
+                            },
+                            Some(Bytes::from(vec![0u8; 128])),
+                            false,
+                        )
+                        .await
+                        .expect("Put failed");
+                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+                    assert_eq!(count(&durable, "copy"), 1);
+                    assert_eq!(count(&durable, "put"), 0);
+                })
+                .await;
+        }
+
+        /// A forced put is a write the caller asked for outright, so it is neither short-circuited
+        /// by a full match nor turned into a copy.
+        #[tokio::test]
+        async fn a_forced_put_is_stored_not_copied() {
+            let execution = setup_test_execution();
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let fixture = fixture(
+                        TestStore::succeeding()
+                            .with_mock_match(StoreMatch::MatchPartition)
+                            .with_mock_durable_match(random::<Context>()),
+                    );
+
+                    fixture
+                        .store
+                        .clone()
+                        .put(
+                            fixture.partition,
+                            fixture.address,
+                            Fragment {
+                                flags: 0,
+                                size_payload: 128,
+                                size_content: 128,
+                            },
+                            Some(Bytes::from(vec![0u8; 128])),
+                            true,
+                        )
+                        .await
+                        .expect("Put failed");
+
+                    assert_eq!(count(&fixture.durable, "copy"), 0);
+                    assert_eq!(count(&fixture.durable, "put"), 1);
+                })
+                .await;
+        }
     }
 
     #[tokio::test]
