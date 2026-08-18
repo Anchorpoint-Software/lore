@@ -56,7 +56,7 @@ use crate::util::inflight::RequestRole;
 
 const METRICS_REPLICA_TYPE_LABEL: &str = "replica_type";
 
-type InfightGetsKey = (Partition, Address);
+type InflightGetsKey = (Partition, Address);
 
 /// A target for a local store
 #[derive(Clone)]
@@ -441,7 +441,7 @@ pub struct CompositeStore {
 
     instruments: CompositeStoreInstruments,
 
-    inflight_gets: InflightOutput<InfightGetsKey, Result<StoreGetData, StoreError>>,
+    inflight_gets: InflightOutput<InflightGetsKey, Result<StoreGetData, StoreError>>,
 }
 
 pub struct ReevaluatePeersSummary {
