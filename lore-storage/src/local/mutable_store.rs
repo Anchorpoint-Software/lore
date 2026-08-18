@@ -1911,6 +1911,22 @@ mod tests {
         assert_eq!(reloaded, value, "bucket must be usable after recovery");
     }
 
+    #[tokio::test]
+    async fn local_mutable_store_satisfies_conformance_battery() {
+        let store = crate::local::mutable_store::create(
+            None::<&std::path::Path>,
+            MutableStoreSettings::default(),
+            make_in_memory_immutable().await,
+        )
+        .await
+        .expect("create store");
+        crate::mutable_conformance::verify_mutable_store(
+            store,
+            crate::mutable_conformance::Capabilities::new("LocalMutableStore"),
+        )
+        .await;
+    }
+
     async fn make_in_memory_immutable() -> Arc<dyn ImmutableStore> {
         crate::local::immutable_store::create(
             None::<&str>,

@@ -1808,4 +1808,40 @@ mod aws_store_tests {
             })
             .await
     }
+
+    #[tokio::test]
+    async fn aws_mutable_store_satisfies_conformance_battery() -> TestResult {
+        let execution = setup_execution("test".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let (_, dynamo, _) = setup(vec![MUTABLE_STORE_TABLE_NAME]).await?;
+
+                let settings = AwsMutableStoreSettings::new(
+                    DynamoDbMutableStoreSettings::new(MUTABLE_STORE_TABLE_NAME.to_string()),
+                    false,
+                );
+
+                let store: Arc<dyn MutableStore> = Arc::new(AwsMutableStore::new(
+                    dynamo,
+                    &settings,
+                    Arc::new(LocalStore::default()),
+                ));
+
+                lore_storage::mutable_conformance::verify_mutable_store(
+                    store,
+                    lore_storage::mutable_conformance::Capabilities::new("AwsMutableStore")
+                        .known_violations(&[
+                            // DynamoDB queries are scoped to a single partition key value.
+                            // Partition::default() converts to a zero Context and queries only
+                            // entries stored under that specific partition — not a cross-partition
+                            // scan.
+                            lore_storage::mutable_conformance::Check::ListNullPartitionMatchesAll,
+                        ]),
+                )
+                .await;
+
+                Ok(())
+            })
+            .await
+    }
 }
