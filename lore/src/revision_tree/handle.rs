@@ -294,6 +294,7 @@ pub(crate) async fn synth_repository_context(
             remote: remote_result,
             filter: Arc::new(Filter::default()),
             format: RepositoryFormat::Lore,
+            filesystem_provider: None,
         })
         .with_write_token(RepositoryWriteToken::in_memory(&IN_MEMORY_MARKER)),
     )
@@ -367,13 +368,12 @@ pub(crate) mod test_support {
     use std::sync::Arc;
 
     use lore_base::types::Partition;
-    use lore_revision::filter::Filter;
-    use lore_revision::instance::InstanceId;
     use lore_revision::repository::RepositoryContext;
     use lore_revision::repository::RepositoryContextCreationArgs;
     use lore_revision::repository::RepositoryFormat;
     use lore_revision::repository::create_client_memory_stores;
     use lore_revision::state::State;
+    use lore_transport::ProtocolError;
 
     use super::RevisionTreeInternal;
     use crate::storage::store::StoreInternal;
@@ -392,12 +392,11 @@ pub(crate) mod test_support {
             immutable_store: immutable,
             mutable_store: mutable,
             id: repository,
-            instance_id: InstanceId::default(),
-            remote: Err(lore_transport::ProtocolError::from(
-                lore_base::error::NoRemote,
-            )),
-            filter: Arc::new(Filter::default()),
+            instance_id: Default::default(),
+            remote: Err(ProtocolError::from(lore_base::error::NoRemote)),
+            filter: Arc::default(),
             format: RepositoryFormat::Lore,
+            filesystem_provider: None,
         }));
         let state = Arc::new(State::new());
         Arc::new(RevisionTreeInternal::new(

@@ -21,6 +21,7 @@ use super::filesystem_provider::FilesystemPath;
 use super::filesystem_provider::FilesystemProvider;
 use super::filesystem_provider::FsError;
 use super::filesystem_provider::InstanceOperation;
+use super::filesystem_provider::InstanceOperationImpl;
 use super::filesystem_provider::StaticDispatchInstanceOperation;
 use crate::change::NodeChange;
 use crate::filter::FilterMode;
@@ -50,14 +51,20 @@ impl OsFilesystem {
             repo_path: repo_path.as_ref().to_path_buf(),
         }
     }
+
+    fn begin_operation(&self) -> Result<Arc<InstanceOperationImpl>, FsError> {
+        Ok(Arc::new(InstanceOperationImpl::new(
+            StaticDispatchInstanceOperation::Os(OsOperation {
+                repo_path: self.repo_path.clone(),
+            }),
+        )))
+    }
 }
 
 #[async_trait]
 impl FilesystemProvider for OsFilesystem {
-    async fn begin_operation(&self) -> Result<Arc<StaticDispatchInstanceOperation>, FsError> {
-        Ok(Arc::new(StaticDispatchInstanceOperation::Os(OsOperation {
-            repo_path: self.repo_path.clone(),
-        })))
+    async fn begin_operation(&self) -> Result<Arc<InstanceOperationImpl>, FsError> {
+        OsFilesystem::begin_operation(self)
     }
 }
 

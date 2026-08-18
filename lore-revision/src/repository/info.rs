@@ -112,6 +112,7 @@ pub async fn info(repository_url: Option<&str>, identity: &str) -> Result<(), Re
         remote: Ok(remote),
         filter: Arc::default(),
         format: super::RepositoryFormat::Lore,
+        filesystem_provider: None,
     }));
 
     let metadata = repository::metadata(repository, data.metadata)

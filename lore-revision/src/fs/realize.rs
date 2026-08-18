@@ -24,6 +24,7 @@ use crate::event;
 use crate::filter::FilterMode;
 use crate::fs::filesystem_provider::FilesystemPath;
 use crate::fs::filesystem_provider::InstanceOperation;
+use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::hash;
 use crate::interface::LoreString;
 use crate::link::LinkFlags;
@@ -68,7 +69,7 @@ use crate::util::path::expand_path_ancestors;
 
 pub async fn realize_state(
     repository: Arc<RepositoryContext>,
-    operation: Arc<impl InstanceOperation + 'static>,
+    operation: Arc<InstanceOperationImpl>,
     state_current: Arc<State>,
     state_target: Arc<State>,
     options: SyncOptions,
@@ -228,7 +229,7 @@ pub async fn realize_state(
     Ok(())
 }
 pub async fn verify_filesystem_for_changes(
-    args: Arc<SyncVerifyArgs<impl InstanceOperation + 'static>>,
+    args: Arc<SyncVerifyArgs>,
 ) -> Result<Arc<Vec<NodeChange>>, SyncError> {
     // Queue up to a given number of parallel tasks to verify filesystem
     let mut failure = None;
@@ -317,7 +318,7 @@ pub async fn verify_filesystem_for_changes(
 pub async fn verify_filesystem(
     change: NodeChange,
     repository: Arc<RepositoryContext>,
-    operation: Arc<impl InstanceOperation + 'static>,
+    operation: Arc<InstanceOperationImpl>,
     state_current: Arc<State>,
     forward_changes: bool,
     force_full_check: bool,
@@ -652,7 +653,7 @@ pub async fn verify_filesystem(
 
 pub async fn realize_changes(
     repository: Arc<RepositoryContext>,
-    operation: Arc<impl InstanceOperation + 'static>,
+    operation: Arc<InstanceOperationImpl>,
     changes: Arc<Vec<NodeChange>>,
     state_stage: Option<Arc<State>>,
     dry_run: bool,
@@ -795,7 +796,7 @@ pub async fn realize_changes(
 #[allow(clippy::too_many_arguments)]
 pub async fn realize_conflicts(
     repository: Arc<RepositoryContext>,
-    operation: Arc<impl InstanceOperation + 'static>,
+    operation: Arc<InstanceOperationImpl>,
     state_base: Arc<State>,
     state_from: Arc<State>,
     state_to: Arc<State>,
@@ -875,7 +876,7 @@ pub async fn realize_conflicts(
 
 pub async fn realize_scratch_file(
     repository: Arc<RepositoryContext>,
-    operation: Arc<impl InstanceOperation + 'static>,
+    operation: Arc<InstanceOperationImpl>,
     path: impl AsRef<Path>,
     node: Node,
     stats: Arc<SyncRealizeStats>,
@@ -930,7 +931,7 @@ pub async fn realize_scratch_file(
 
 pub async fn realize_file(
     repository: Arc<RepositoryContext>,
-    operation: Arc<impl InstanceOperation + 'static>,
+    operation: Arc<InstanceOperationImpl>,
     path: &RepositoryPath,
     node: Node,
     stats: Arc<SyncRealizeStats>,
@@ -1003,7 +1004,7 @@ fn progress_ticker(stats: Arc<SyncRealizeStats>) -> AbortOnDropHandle<()> {
 
 async fn realize_changes_delete(
     repository: Arc<RepositoryContext>,
-    operation: Arc<impl InstanceOperation + 'static>,
+    operation: Arc<InstanceOperationImpl>,
     changes: Arc<Vec<NodeChange>>,
     state_stage: Option<Arc<State>>,
     dry_run: bool,
@@ -1214,7 +1215,7 @@ async fn sync_discover_modify_add(
 
 async fn sync_execute_modify_add(
     mut rx: mpsc::Receiver<SyncWorkItem>,
-    operation: Arc<impl InstanceOperation + 'static>,
+    operation: Arc<InstanceOperationImpl>,
     state_stage: Option<Arc<State>>,
     dry_run: bool,
     is_merge: bool,
@@ -1370,7 +1371,7 @@ async fn remove_link_registry_entry(
 #[allow(clippy::too_many_arguments)]
 async fn realize_change_modify_add(
     tasks: &mut JoinSet<Result<(), SyncError>>,
-    operation: Arc<impl InstanceOperation + 'static>,
+    operation: Arc<InstanceOperationImpl>,
     change: NodeChange,
     node: Node,
     state_stage: Option<Arc<State>>,
@@ -1695,7 +1696,7 @@ async fn realize_change_modify_add(
 #[allow(clippy::too_many_arguments)]
 async fn realize_changes_merge(
     repository: Arc<RepositoryContext>,
-    operation: Arc<impl InstanceOperation + 'static>,
+    operation: Arc<InstanceOperationImpl>,
     state_base: Arc<State>,
     state_from: Arc<State>,
     state_to: Arc<State>,
@@ -1773,7 +1774,7 @@ async fn realize_changes_merge(
 #[allow(clippy::too_many_arguments)]
 async fn realize_file_merge(
     repository: Arc<RepositoryContext>,
-    operation: Arc<impl InstanceOperation + 'static>,
+    operation: Arc<InstanceOperationImpl>,
     state_base: Arc<State>,
     state_from: Arc<State>,
     _state_to: Arc<State>,

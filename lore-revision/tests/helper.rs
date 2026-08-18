@@ -48,6 +48,7 @@ pub fn default_repository_creation_args(
         )),
         filter: std::sync::Arc::default(),
         format: lore_revision::repository::RepositoryFormat::Lore,
+        filesystem_provider: None,
     }
 }
 
@@ -62,6 +63,12 @@ pub trait RepositoryContextCreationArgsExt {
     ) -> Self;
     fn with_filter(self, filter: std::sync::Arc<lore_revision::filter::Filter>) -> Self;
     fn with_format(self, format: lore_revision::repository::RepositoryFormat) -> Self;
+    fn with_filesystem_provider(
+        self,
+        filesystem_provider: std::sync::Arc<
+            dyn lore_revision::fs::filesystem_provider::FilesystemProvider,
+        >,
+    ) -> Self;
 }
 
 impl RepositoryContextCreationArgsExt for lore_revision::repository::RepositoryContextCreationArgs {
@@ -95,6 +102,16 @@ impl RepositoryContextCreationArgsExt for lore_revision::repository::RepositoryC
 
     fn with_format(mut self, format: lore_revision::repository::RepositoryFormat) -> Self {
         self.format = format;
+        self
+    }
+
+    fn with_filesystem_provider(
+        mut self,
+        filesystem_provider: std::sync::Arc<
+            dyn lore_revision::fs::filesystem_provider::FilesystemProvider,
+        >,
+    ) -> Self {
+        self.filesystem_provider = Some(filesystem_provider);
         self
     }
 }

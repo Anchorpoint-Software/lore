@@ -25,7 +25,7 @@ use crate::find;
 use crate::fs::filesystem_provider::FilesystemProvider;
 use crate::fs::filesystem_provider::FsError;
 use crate::fs::filesystem_provider::InstanceOperation;
-use crate::fs::filesystem_provider::StaticDispatchInstanceOperation;
+use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::history;
 use crate::interface::LoreBranchLocation;
 use crate::interface::LoreError;
@@ -857,7 +857,7 @@ async fn sync_layers(
 async fn shim_with_operation<T>(
     filesystem: Arc<dyn FilesystemProvider>,
     changes_made: bool,
-    callback: impl AsyncFnOnce(Arc<StaticDispatchInstanceOperation>) -> T,
+    callback: impl AsyncFnOnce(Arc<InstanceOperationImpl>) -> T,
 ) -> Result<T, FsError> {
     let operation = filesystem.begin_operation().await?;
     let result = callback(operation.clone()).await;
@@ -885,17 +885,17 @@ async fn sync_realize(
 }
 
 #[derive(Clone)]
-pub struct SyncVerifyArgs<Operation: InstanceOperation + 'static> {
+pub struct SyncVerifyArgs {
     pub changes: Arc<Vec<NodeChange>>,
     pub repository_current: Arc<RepositoryContext>,
-    pub operation: Arc<Operation>,
+    pub operation: Arc<InstanceOperationImpl>,
     pub state_current: Arc<State>,
     pub options: Arc<SyncOptions>,
 }
 
 pub async fn sync_verify_filesystem(
     _repository: Arc<RepositoryContext>,
-    args: Arc<SyncVerifyArgs<impl InstanceOperation>>,
+    args: Arc<SyncVerifyArgs>,
 ) -> Result<Arc<Vec<NodeChange>>, SyncError> {
     crate::fs::realize::verify_filesystem_for_changes(args).await
 }

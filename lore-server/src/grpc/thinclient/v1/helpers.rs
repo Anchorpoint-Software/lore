@@ -368,6 +368,7 @@ mod tests {
             remote: Err(ProtocolError::from(lore_base::error::NoRemote)),
             filter: Arc::default(),
             format: RepositoryFormat::Lore,
+            filesystem_provider: None,
         }))
     }
 

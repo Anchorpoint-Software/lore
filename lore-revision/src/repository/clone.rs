@@ -920,6 +920,7 @@ pub async fn clone(
             remote: Ok(remote.clone()),
             filter: Arc::default(),
             format: RepositoryFormat::Lore,
+            filesystem_provider: None,
         }));
 
         repository.set_disable_upload(true);

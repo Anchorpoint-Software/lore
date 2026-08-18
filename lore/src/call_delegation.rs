@@ -146,7 +146,6 @@ mod tests {
 
     use lore_base::error::NotFound;
     use lore_error_set::FfiError;
-    use lore_error_set::prelude::*;
     use lore_revision::event::EventError;
     use lore_revision::event::LoreEvent;
     use lore_revision::interface::LoreEventCallbackConfig;

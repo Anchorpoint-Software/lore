@@ -236,6 +236,7 @@ pub async fn recover_instance_id(
         remote: Err(lore_transport::ProtocolError::from(crate::errors::NoRemote)),
         filter: Arc::default(),
         format: crate::repository::RepositoryFormat::Lore,
+        filesystem_provider: None,
     }));
 
     let normalized_current = crate::util::path::clean(current_path.to_owned());

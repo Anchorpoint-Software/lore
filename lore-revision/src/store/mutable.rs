@@ -417,6 +417,7 @@ async fn migrate_immutable_value_to_typed(
         remote: Ok(remote.clone()),
         filter: Arc::default(),
         format: crate::repository::RepositoryFormat::Lore,
+        filesystem_provider: None,
     }));
     let hash = entry.value;
 

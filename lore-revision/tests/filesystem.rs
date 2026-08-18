@@ -18,7 +18,7 @@ mod tests {
     use lore_revision::branch;
     use lore_revision::fs::filesystem_provider::FilesystemPath;
     use lore_revision::fs::filesystem_provider::InstanceOperation;
-    use lore_revision::fs::filesystem_provider::StaticDispatchInstanceOperation;
+    use lore_revision::fs::filesystem_provider::InstanceOperationImpl;
     use lore_revision::lore::RepositoryId;
     use lore_revision::repository;
     use lore_revision::repository::RepositoryContext;
@@ -48,7 +48,7 @@ mod tests {
     /// Returns `true` from the closure to indicate changes were made (passed to finalize).
     async fn run_fs_test<F, Fut>(test_fn: F)
     where
-        F: FnOnce(Arc<RepositoryContext>, Arc<StaticDispatchInstanceOperation>, PathBuf) -> Fut
+        F: FnOnce(Arc<RepositoryContext>, Arc<InstanceOperationImpl>, PathBuf) -> Fut
             + Send
             + 'static,
         Fut: Future<Output = bool> + Send,

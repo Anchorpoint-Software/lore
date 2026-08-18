@@ -1521,6 +1521,7 @@ mod remote_resolve_tests {
             state,
             Arc::default(),
             RepositoryFormat::Lore,
+            None,
         ))
     }
 

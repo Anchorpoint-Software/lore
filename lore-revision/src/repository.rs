@@ -608,6 +608,7 @@ pub struct RepositoryContextCreationArgs {
     pub remote: Result<Arc<Connection>, ProtocolError>,
     pub filter: Arc<Filter>,
     pub format: RepositoryFormat,
+    pub filesystem_provider: Option<Arc<dyn FilesystemProvider>>,
 }
 
 impl RepositoryContext {
@@ -621,6 +622,7 @@ impl RepositoryContext {
             RemoteState::from_result(create_args.remote),
             create_args.filter,
             create_args.format,
+            create_args.filesystem_provider,
         )
     }
 
@@ -634,8 +636,10 @@ impl RepositoryContext {
         remote: RemoteState,
         filter: Arc<Filter>,
         format: RepositoryFormat,
+        filesystem_provider: Option<Arc<dyn FilesystemProvider>>,
     ) -> Self {
-        let file_system = Self::default_filesystem(path.as_deref().unwrap_or(Path::new("")));
+        let file_system = filesystem_provider
+            .unwrap_or_else(|| Self::default_filesystem(path.as_deref().unwrap_or(Path::new(""))));
         RepositoryContext {
             link_read: allow_all_repositories(),
             path,
@@ -2094,6 +2098,7 @@ pub async fn load_and_connect_with_token(
         remote_state,
         filter,
         format,
+        None,
     );
     let repository = match repo_lock {
         Some(lock) => repository.with_repository_lock(lock),
@@ -2317,6 +2322,7 @@ pub async fn create_local(
             remote: Err(ProtocolError::from(NoRemote)),
             filter: Arc::default(),
             format: RepositoryFormat::Lore,
+            filesystem_provider: None,
         })
         .with_write_token(token.share()),
     );
@@ -3438,6 +3444,9 @@ pub async fn resolve_by_name(
 
 #[cfg(test)]
 pub mod test_helpers {
+    use std::sync::Arc;
+
+    use crate::fs::filesystem_provider::FilesystemProvider;
     use crate::instance::InstanceId;
 
     pub fn default_repository_creation_args(
@@ -3455,6 +3464,7 @@ pub mod test_helpers {
             )),
             filter: std::sync::Arc::default(),
             format: crate::repository::RepositoryFormat::Lore,
+            filesystem_provider: None,
         }
     }
 
@@ -3471,6 +3481,8 @@ pub mod test_helpers {
         ) -> Self;
         fn with_filter(self, filter: std::sync::Arc<crate::filter::Filter>) -> Self;
         fn with_format(self, format: crate::repository::RepositoryFormat) -> Self;
+        fn with_filesystem_provider(self, filesystem_provider: Arc<dyn FilesystemProvider>)
+        -> Self;
     }
 
     impl RepositoryContextCreationArgsExt for crate::repository::RepositoryContextCreationArgs {
@@ -3507,6 +3519,14 @@ pub mod test_helpers {
 
         fn with_format(mut self, format: crate::repository::RepositoryFormat) -> Self {
             self.format = format;
+            self
+        }
+
+        fn with_filesystem_provider(
+            mut self,
+            filesystem_provider: Arc<dyn FilesystemProvider>,
+        ) -> Self {
+            self.filesystem_provider = Some(filesystem_provider);
             self
         }
     }
@@ -3575,6 +3595,7 @@ mod remote_state_tests {
             state,
             Arc::default(),
             crate::repository::RepositoryFormat::Lore,
+            None,
         ))
     }
 
