@@ -862,17 +862,18 @@ mod test {
                        |     |
                        .     .
     */
-    /// Two branch points on the same branch that share no revision leave the
-    /// divergence search with nothing to find. The base must not fall back to the
-    /// zero revision: that is the empty tree, so both branches would report every
-    /// path as an add and conflict on all of them.
+    /// Two branch points on the same branch that share no revision leave both
+    /// searches with nothing to find, so the older branch point is used. It is a
+    /// guess rather than an ancestor, and it is still the answer: the branches
+    /// were created from it, and the alternative - the zero revision - is the
+    /// empty tree, which reports every path in both branches as an add.
     #[tokio::test]
-    async fn disjoint_histories_are_rejected() {
+    async fn disjoint_histories_fall_back_to_the_older_branch_point() {
         let repository = random::<Context>();
         let (immutable_store, mutable_store, execution) =
             test_store_create().await.expect("Failed to create stores");
 
-        let status = Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+        let (base, branch_point) = Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
             let repository_context = Arc::new(RepositoryContext::new_server_context(
                 immutable_store.clone(),
                 mutable_store.clone(),
@@ -956,20 +957,22 @@ mod test {
                 tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
             );
 
-            handler(request, immutable_store, mutable_store).await.err()
+            let response = handler(request, immutable_store, mutable_store)
+                .await
+                .expect("Branch diff must resolve a base for histories that share no revision")
+                .into_inner();
+
+            (Hash::from(response.revision_base), main_latest_revision)
         }))
         .await;
 
-        let status = status.expect("Branch diff must refuse histories that share no revision");
         assert_eq!(
-            status.code(),
-            tonic::Code::InvalidArgument,
-            "Disjoint histories are a repository state the caller has to resolve, got {status:?}"
+            base, branch_point,
+            "The older of the two branch points is the best answer left once both searches come up empty"
         );
         assert!(
-            status.message().contains("divergent"),
-            "The status must report divergent history rather than a zero base, got {:?}",
-            status.message()
+            !base.is_zero(),
+            "A zero base is the empty tree, which conflicts on every path in both branches"
         );
     }
 }
