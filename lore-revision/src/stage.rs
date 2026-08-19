@@ -1699,7 +1699,7 @@ pub(crate) async fn stage_node_from_metadata(
             tracker.on_node_changed(repository.id);
         }
 
-        lore_debug!("Staged new node {node_id} for {name}");
+        lore_trace!("Staged new node {node_id} for {name}");
 
         if metadata.is_dir() {
             stats
@@ -1990,7 +1990,7 @@ pub(crate) async fn stage_node_from_metadata(
             )
             .await?;
 
-            lore_debug!(
+            lore_trace!(
                 "Staged existing node {} as modified for {}",
                 node_link.node,
                 relative_path.join(name.as_str())
