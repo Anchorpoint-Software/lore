@@ -1,6 +1,36 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 #[cfg(all(test, feature = "integration_tests"))]
+pub(crate) mod net_common {
+    /// How many numbers [`bind_matched_pair`] tries before giving up. Each attempt is a fresh port
+    /// from the OS, so this only runs out if UDP is congested across the whole ephemeral range.
+    pub(crate) const PORT_PAIR_ATTEMPTS: usize = 100;
+
+    /// A TCP listener and a UDP socket on the same port, both held exclusively.
+    ///
+    /// A `lore://` server serves gRPC on TCP and QUIC on UDP at one number, and no bind can reserve
+    /// a number for the other protocol. So the port is not chosen and then bound twice — it is
+    /// taken from the OS on TCP, matched on UDP, and both sockets are handed to the servers already
+    /// bound. Nothing can take either between choosing and serving, because there is no such gap.
+    ///
+    /// Neither socket sets a reuse option, so losing the UDP half is an error rather than a silent
+    /// share of somebody else's port; the pair is released and the OS asked for a different number.
+    pub(crate) fn bind_matched_pair() -> (std::net::TcpListener, std::net::UdpSocket) {
+        for _ in 0..PORT_PAIR_ATTEMPTS {
+            let tcp = std::net::TcpListener::bind("127.0.0.1:0").expect("bind tcp");
+            let port = tcp.local_addr().expect("tcp local addr").port();
+            match std::net::UdpSocket::bind(("127.0.0.1", port)) {
+                Ok(udp) => return (tcp, udp),
+                // Free on TCP, taken on UDP. Drop the listener too: keeping it would only make the
+                // OS hand out a different number next time while this one stayed half-held.
+                Err(_) => drop(tcp),
+            }
+        }
+        panic!("no port free on both TCP and UDP after {PORT_PAIR_ATTEMPTS} attempts");
+    }
+}
+
+#[cfg(all(test, feature = "integration_tests"))]
 pub(crate) mod aws_common {
     use std::error::Error;
     use std::sync::Arc;

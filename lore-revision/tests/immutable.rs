@@ -1149,7 +1149,8 @@ mod tests {
                     .expect("Failed writing to store");
 
                 // Read via stream and collect all buffers
-                let (tx, mut rx) = tokio::sync::mpsc::channel::<Bytes>(64);
+                let (tx, mut rx) =
+                    tokio::sync::mpsc::channel::<Result<Bytes, lore_storage::StorageError>>(64);
                 let options = immutable::read_options_from_repository(&repository);
                 let content_length =
                     immutable::read_stream(repository.clone(), address, None, options, tx)
@@ -1160,6 +1161,7 @@ mod tests {
 
                 let mut reassembled = Vec::with_capacity(payload_size);
                 while let Some(chunk) = rx.recv().await {
+                    let chunk = chunk.expect("stream reported a mid-stream failure");
                     reassembled.extend_from_slice(chunk.as_ref());
                 }
 

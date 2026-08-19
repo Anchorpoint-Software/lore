@@ -59,6 +59,7 @@ class LoreGlobalArgs(Structure):
 
     _fields_ = [
         ("repository_path", LoreString),
+        ("working_directory", LoreString),
         ("correlation_id", LoreString),
         ("identity", LoreString),
         ("force", c_uint8),
@@ -79,6 +80,8 @@ class LoreGlobalArgs(Structure):
         ("store_keep_alive_seconds", c_uint64),
         ("sync_data", c_uint8),
         ("cache", c_uint8),
+        ("identity_token", LoreString),
+        ("access_token", LoreString),
     ]
 
 

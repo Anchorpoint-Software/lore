@@ -48,6 +48,7 @@ pub mod flush;
 pub mod get;
 pub mod get_file;
 pub mod get_metadata;
+pub mod get_resolved;
 pub mod handle;
 pub mod mutable_compare_and_swap;
 pub mod mutable_list;
@@ -57,15 +58,18 @@ pub mod obliterate;
 pub mod open;
 pub mod put;
 pub mod put_file;
+pub mod put_resolved;
 pub(crate) mod remote;
 pub(crate) mod store;
 pub mod upload;
 
 use lore_base::error::InvalidArguments;
+use lore_base::types::Address;
 use lore_error_set::internal::SupportsInternalError;
 use lore_revision::event::LoreErrorCode;
 use lore_storage::StorageError;
 use lore_storage::StoreError;
+use lore_storage::StoreResult;
 use lore_transport::ProtocolError;
 
 /// Close every storage handle currently registered with the library.
@@ -93,12 +97,17 @@ pub async fn close_all_handles() {
 /// and running the close sequence on each. Client-mode handles (no connection id recorded)
 /// are unaffected. Per-handle drains run in parallel.
 ///
-/// IPC buffer-bearing args policy: `lore_storage_put`, `lore_storage_get`,
-/// `lore_storage_put_file`, `lore_storage_get_file`, and `lore_storage_upload` all carry
-/// `LoreBytes` views into caller memory that have no natural cross-process representation.
-/// Their args fail to deserialize on the server side; the dispatcher must reject them with
-/// `InvalidArguments` rather than attempt to round-trip the payload bytes through IPC.
-/// Service-mode callers route those ops directly against the local backend.
+/// IPC buffer-bearing args policy: `lore_storage_put` and `lore_storage_put_resolved` carry a
+/// `LoreBytes` view into caller memory in their *args*, which has no natural cross-process
+/// representation. `LoreBytes::deserialize` always errors, so those args cannot be reconstructed
+/// on the server side of the IPC boundary.
+///
+/// Two caveats worth knowing before relying on this. Nothing enforces it: every op goes through
+/// `dispatch_call` and is delegated whenever service mode is active, and the failure surfaces as
+/// a message that fails to read — dropping the connection — rather than as the `InvalidArguments`
+/// a caller would expect. And the read ops (`lore_storage_get`, `lore_storage_get_resolved`) are
+/// *not* in this family despite emitting `LoreBytes`: they carry it only in events, whose
+/// lifetime is the callback, so their args round-trip fine.
 ///
 /// Revision tree handles loaded against a drained storage handle are closed too, and this
 /// is the only path that closes one for its caller: elsewhere a tree outlives its parent by
@@ -152,6 +161,52 @@ pub(crate) fn item_content_range(offset: u64, length: u64) -> Option<std::ops::R
         start.saturating_add(usize::try_from(length).unwrap_or(usize::MAX))
     };
     Some(start..end)
+}
+
+/// What writing one item produced, in the shape `PUT_ITEM_COMPLETE` reports it.
+///
+/// Shared by `put`, `put_file` and `put_resolved`: each resolves an item to exactly this and then
+/// emits one `LoreStoragePutItemCompleteEventData` from it. One type rather than three identical
+/// tuples, so a field cannot be read out of position and a new field lands in every op at once.
+pub(crate) struct PutItemOutcome {
+    /// Address the content is stored under, or `Address::default()` when nothing was stored.
+    pub(crate) address: Address,
+    /// `LoreErrorCode::None` on success, else the failing error's code.
+    pub(crate) error_code: LoreErrorCode,
+    /// Whether the local store holds the content.
+    pub(crate) stored_local: bool,
+    /// Whether the content reached the remote, or was already durable there. Named for the event
+    /// field it feeds; the write path calls the same thing `stored_durable`.
+    pub(crate) stored_remote: bool,
+}
+
+impl PutItemOutcome {
+    /// An item that never reached the store: no address, nothing stored anywhere.
+    pub(crate) fn failed(error_code: LoreErrorCode) -> Self {
+        Self {
+            address: Address::default(),
+            error_code,
+            stored_local: false,
+            stored_remote: false,
+        }
+    }
+
+    /// The outcome of a completed write, whichever write function produced it — `write_content`,
+    /// `write_from_file` and `write_resolved` all report a `StoreResult`.
+    ///
+    /// A remote leg that failed is not an error here: the write returns `Ok` as long as the local
+    /// store took the content, and `stored_remote` is what tells the two apart.
+    pub(crate) fn from_write(result: Result<StoreResult, StorageError>) -> Self {
+        match result {
+            Ok(written) => Self {
+                address: written.address,
+                error_code: LoreErrorCode::None,
+                stored_local: written.stored_local,
+                stored_remote: written.stored_durable,
+            },
+            Err(err) => Self::failed(storage_error_to_code(&err)),
+        }
+    }
 }
 
 /// Map a `StorageError` to the external `LoreErrorCode` surface used by per-item completion

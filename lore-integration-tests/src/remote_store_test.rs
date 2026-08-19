@@ -32,6 +32,7 @@ mod remote_store_tests {
     use lore_storage::local::immutable_store::ImmutableStoreSettings;
     use rand::random;
 
+    use crate::common::net_common::bind_matched_pair;
     use crate::setup_execution;
 
     type TestResult = Result<(), Box<dyn Error>>;
@@ -40,19 +41,6 @@ mod remote_store_tests {
         immutable_store: Arc<RemoteImmutableStore>,
         mutable_store: Arc<RemoteMutableStore>,
         _shutdown: tokio::sync::oneshot::Sender<()>,
-    }
-
-    /// Bind a loopback port that is free for both TCP and UDP, so one address can carry the gRPC
-    /// services and the QUIC storage endpoint at once.
-    fn bind_shared_port() -> (std::net::TcpListener, SocketAddr) {
-        for _ in 0..50 {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let addr: SocketAddr = listener.local_addr().unwrap();
-            if std::net::UdpSocket::bind(addr).is_ok() {
-                return (listener, addr);
-            }
-        }
-        panic!("no loopback port was free for both TCP and UDP");
     }
 
     /// The stores a real server runs, behind its gRPC services. Both harnesses build on this; the
@@ -153,7 +141,9 @@ mod remote_store_tests {
     }
 
     async fn start_test_server() -> TestServer {
-        let (listener, addr) = bind_shared_port();
+        // gRPC only, so no UDP half is needed: bind TCP and hand it straight over.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
         let (_immutable, _mutable, shutdown_tx) = start_backend(listener, addr).await;
 
         let url = format!("grpc://127.0.0.1:{}", addr.port());
@@ -179,7 +169,10 @@ mod remote_store_tests {
     /// the stream and every later read on that session waits forever. QUIC frames each command
     /// separately and has no such coupling, so the contract battery runs here until that is fixed.
     async fn start_test_quic_server() -> QuicTestServer {
-        let (listener, addr) = bind_shared_port();
+        // Both halves of the port are held before either server starts, so neither can lose it to
+        // something else between being told the number and binding it.
+        let (listener, udp) = bind_matched_pair();
+        let addr: SocketAddr = listener.local_addr().unwrap();
         let (backend_immutable, backend_mutable, shutdown_tx) = start_backend(listener, addr).await;
 
         let (cert_file, pkey_file, _ca) =
@@ -187,7 +180,7 @@ mod remote_store_tests {
 
         let server = QuinnServer::start(
             QuinnConfigBuilder::new()
-                .address(addr)
+                .socket(udp)
                 .cert_file(cert_file)
                 .pkey_file(pkey_file)
                 .stream_handler_factory(Box::new(TestHandlerFactory::new(
