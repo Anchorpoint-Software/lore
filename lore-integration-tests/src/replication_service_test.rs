@@ -107,24 +107,6 @@ mod replication_service_tests {
         _shutdown: tokio::sync::oneshot::Sender<()>,
     }
 
-    /// Reserve a port free on both TCP and UDP, as `storage_remote_test` does, so a server that
-    /// binds after the probe is dropped is not racing another test for the number.
-    async fn reserve_port() -> SocketAddr {
-        for _ in 0..64 {
-            let Ok(udp) = tokio::net::UdpSocket::bind("127.0.0.1:0").await else {
-                continue;
-            };
-            let addr = udp.local_addr().expect("udp local addr");
-            let Ok(tcp) = tokio::net::TcpListener::bind(addr).await else {
-                continue;
-            };
-            drop(tcp);
-            drop(udp);
-            return addr;
-        }
-        panic!("no port free on both TCP and UDP after 64 attempts");
-    }
-
     /// Block until `addr` accepts a connection, panicking rather than letting the test discover a
     /// failed bind as a peer that never answers.
     async fn await_listening(addr: SocketAddr) {
@@ -139,7 +121,11 @@ mod replication_service_tests {
 
     async fn start_server() -> Result<TestServer, Box<dyn Error>> {
         let certs = generate_certs()?;
-        let addr = reserve_port().await;
+
+        // Bound here and handed to the server below, so there is no interval in which the number is
+        // spoken for but not held. This service is TCP only, so one socket is the whole port.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
 
         let immutable = lore_storage::local::immutable_store::create(
             None::<&str>,
@@ -180,7 +166,10 @@ mod replication_service_tests {
 
         #[allow(clippy::disallowed_methods)]
         tokio::spawn(async move {
-            server.serve(addr, signal).await.expect("replication serve");
+            server
+                .serve_with_listener(listener, signal)
+                .await
+                .expect("replication serve");
         });
         await_listening(addr).await;
 

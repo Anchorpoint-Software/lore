@@ -68,31 +68,31 @@ mod storage_remote_tests {
         }
     }
 
-    /// Pick a port number that is free on both TCP and UDP.
+    /// How many numbers [`bind_matched_pair`] tries before giving up. Each attempt is a fresh port
+    /// from the OS, so this only runs out if UDP is congested across the whole ephemeral range.
+    const PORT_PAIR_ATTEMPTS: usize = 100;
+
+    /// A TCP listener and a UDP socket on the same port, both held exclusively.
     ///
-    /// A `lore://` server needs gRPC on TCP and QUIC on UDP at the same number, and neither
-    /// server API accepts a pre-bound socket — both bind from the address themselves. Choosing
-    /// the number by binding TCP alone therefore never checks the UDP side, so two servers can
-    /// settle on the same number and one of them loses its bind. Binding UDP first and then
-    /// requiring the same number on TCP proves both are free before either server starts.
+    /// A `lore://` server serves gRPC on TCP and QUIC on UDP at one number, and no bind can reserve
+    /// a number for the other protocol. So the port is not chosen and then bound twice — it is
+    /// taken from the OS on TCP, matched on UDP, and both sockets are handed to the servers already
+    /// bound. Nothing can take either between choosing and serving, because there is no such gap.
     ///
-    /// The window between dropping these probes and the servers binding is unavoidable while the
-    /// APIs bind for themselves; it is a few microseconds against the seconds-long lifetime of a
-    /// real conflict, and [`await_listening`] turns a loss into an immediate failure.
-    async fn reserve_port() -> SocketAddr {
-        for _ in 0..64 {
-            let Ok(udp) = tokio::net::UdpSocket::bind("127.0.0.1:0").await else {
-                continue;
-            };
-            let addr = udp.local_addr().expect("udp local addr");
-            let Ok(tcp) = tokio::net::TcpListener::bind(addr).await else {
-                continue;
-            };
-            drop(tcp);
-            drop(udp);
-            return addr;
+    /// Neither socket sets a reuse option, so losing the UDP half is an error rather than a silent
+    /// share of somebody else's port; the pair is released and the OS asked for a different number.
+    fn bind_matched_pair() -> (std::net::TcpListener, std::net::UdpSocket) {
+        for _ in 0..PORT_PAIR_ATTEMPTS {
+            let tcp = std::net::TcpListener::bind("127.0.0.1:0").expect("bind tcp");
+            let port = tcp.local_addr().expect("tcp local addr").port();
+            match std::net::UdpSocket::bind(("127.0.0.1", port)) {
+                Ok(udp) => return (tcp, udp),
+                // Free on TCP, taken on UDP. Drop the listener too: keeping it would only make the
+                // OS hand out a different number next time while this one stayed half-held.
+                Err(_) => drop(tcp),
+            }
         }
-        panic!("no port free on both TCP and UDP after 64 attempts");
+        panic!("no port free on both TCP and UDP after {PORT_PAIR_ATTEMPTS} attempts");
     }
 
     /// Block until `addr` accepts a TCP connection, panicking if it never does.
@@ -254,12 +254,15 @@ mod storage_remote_tests {
         let backend_for_test = backend_immutable.clone();
         let backend_mutable_for_test: Arc<dyn lore_storage::MutableStore> = backend_mutable.clone();
 
-        let addr = reserve_port().await;
+        // Both legs serve on one number: gRPC on its TCP half, QUIC on its UDP half. Both are bound
+        // before either server starts, so neither has a port to lose.
+        let (listener, udp) = bind_matched_pair();
+        let addr: SocketAddr = listener.local_addr().expect("tcp local addr");
 
         let (cert_path, key_path, _ca) = server_certs().expect("test certs");
         let quic = QuinnServer::start(
             QuinnConfigBuilder::new()
-                .address(addr)
+                .socket(udp)
                 .cert_file(cert_path)
                 .pkey_file(key_path)
                 .stream_handler_factory(Box::new(TestHandlerFactory::new(
@@ -301,7 +304,7 @@ mod storage_remote_tests {
                 )
                 .with_jwt_verifier(None)
                 .unwrap()
-                .serve(addr, signal)
+                .serve_with_listener(listener, signal)
                 .await
                 .unwrap();
         });
