@@ -4037,3 +4037,579 @@ mod interop_tests {
         close_handle(handle).await;
     }
 }
+
+/// Calls racing each other on a multi-threaded runtime, which is how the dispatcher drives
+/// this surface. What each test pins is an outcome the scheduling cannot change: a read never
+/// sees a tree that never existed, two commits on one handle chain rather than interleave, two
+/// handles racing one branch produce exactly one winner, and two repositories on one storage
+/// handle do not touch each other.
+#[cfg(test)]
+mod concurrency_tests {
+    use std::collections::BTreeSet;
+
+    use lore::revision_tree::add::LoreRevisionTreeAddArgs;
+    use lore::revision_tree::add::LoreRevisionTreeAddEntry;
+    use lore::revision_tree::add::add;
+    use lore::revision_tree::commit::LoreRevisionTreeCommitArgs;
+    use lore::revision_tree::commit::LoreRevisionTreeCommitOptions;
+    use lore::revision_tree::commit::commit;
+    use lore::revision_tree::handle::LoreRevisionTree;
+    use lore::revision_tree::metadata_get::LoreRevisionTreeMetadataGetArgs;
+    use lore::revision_tree::metadata_get::LoreRevisionTreeMetadataGetEntry;
+    use lore::revision_tree::metadata_get::metadata_get;
+    use lore::revision_tree::metadata_set::LoreRevisionTreeMetadataSetArgs;
+    use lore::revision_tree::metadata_set::LoreRevisionTreeMetadataSetEntry;
+    use lore::revision_tree::metadata_set::metadata_set;
+    use lore::revision_tree::resolve_path::LoreRevisionTreeResolvePathArgs;
+    use lore::revision_tree::resolve_path::resolve_path;
+    use lore_base::lore_spawn;
+    use lore_base::types::Address;
+    use lore_base::types::Context;
+    use lore_base::types::Hash;
+    use lore_base::types::Partition;
+    use lore_revision::event::LoreErrorCode;
+    use lore_revision::interface::LoreArray;
+    use lore_revision::interface::LoreGlobalArgs;
+    use lore_revision::interface::LoreMetadata;
+    use lore_revision::interface::LoreNodeType;
+    use lore_revision::interface::LoreString;
+    use lore_revision::metadata::BRANCH;
+    use lore_revision::node::NodeID;
+    use lore_revision::node::ROOT_NODE;
+    use tokio::task::JoinSet;
+
+    use super::support::*;
+
+    fn file_entry(entry_id: u64, parent_node_id: NodeID, name: &str) -> LoreRevisionTreeAddEntry {
+        LoreRevisionTreeAddEntry {
+            entry_id,
+            parent_node_id,
+            parent_entry_index: 0,
+            name: LoreString::from_str(name),
+            kind: LoreNodeType::File as u32,
+            mode: 0o644,
+            size: 12,
+            address: Address {
+                hash: Hash::from_u64(0xc0ffee),
+                context: Context::from(uuid::Uuid::now_v7()),
+            },
+        }
+    }
+
+    fn directory_entry(entry_id: u64, name: &str) -> LoreRevisionTreeAddEntry {
+        LoreRevisionTreeAddEntry {
+            entry_id,
+            parent_node_id: ROOT_NODE,
+            parent_entry_index: 0,
+            name: LoreString::from_str(name),
+            kind: LoreNodeType::Directory as u32,
+            mode: 0o755,
+            size: 0,
+            address: Address::default(),
+        }
+    }
+
+    async fn run_add(
+        handle: LoreRevisionTree,
+        entries: Vec<LoreRevisionTreeAddEntry>,
+    ) -> Vec<Captured> {
+        let (sink, callback) = make_sink();
+        let status = add(
+            LoreGlobalArgs::default(),
+            LoreRevisionTreeAddArgs {
+                batch_id: CALL_ID,
+                handle,
+                entries: LoreArray::from_vec(entries),
+            },
+            callback,
+        )
+        .await;
+        let events = sink.lock().unwrap().clone();
+        assert_eq!(status, 0, "the add must succeed, got {events:?}");
+        events
+    }
+
+    fn added_node(events: &[Captured], entry_id: u64) -> NodeID {
+        events
+            .iter()
+            .find_map(|event| match event {
+                Captured::AddComplete(id, node_id, code) if *id == entry_id => {
+                    assert_eq!(*code, LoreErrorCode::None, "entry {entry_id} must succeed");
+                    Some(*node_id)
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("entry {entry_id} must report, got {events:?}"))
+    }
+
+    async fn resolve(handle: LoreRevisionTree, path: &str) -> NodeID {
+        let (sink, callback) = make_sink();
+        let status = resolve_path(
+            LoreGlobalArgs::default(),
+            LoreRevisionTreeResolvePathArgs {
+                id: 1,
+                handle,
+                path: LoreString::from_str(path),
+            },
+            callback,
+        )
+        .await;
+        let events = sink.lock().unwrap().clone();
+        assert_eq!(status, 0, "resolving {path} must succeed, got {events:?}");
+        events
+            .iter()
+            .find_map(|event| match event {
+                Captured::ResolvePath(node_id, LoreErrorCode::None) => Some(*node_id),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("resolving {path} must report a node, got {events:?}"))
+    }
+
+    async fn set_branch(handle: LoreRevisionTree, branch: Context) {
+        let (sink, callback) = make_sink();
+        let status = metadata_set(
+            LoreGlobalArgs::default(),
+            LoreRevisionTreeMetadataSetArgs {
+                batch_id: CALL_ID,
+                handle,
+                entries: LoreArray::from_vec(vec![LoreRevisionTreeMetadataSetEntry {
+                    entry_id: 1,
+                    key: LoreString::from_str(BRANCH),
+                    value: LoreMetadata::Context(branch),
+                }]),
+            },
+            callback,
+        )
+        .await;
+        assert_eq!(
+            status,
+            0,
+            "naming the branch must succeed, got {:?}",
+            sink.lock().unwrap()
+        );
+    }
+
+    /// The commit terminal in full: status, the revision it published, the tip to reload from
+    /// when it did not, and the outcome code.
+    async fn run_commit(handle: LoreRevisionTree) -> (i32, Hash, Hash, LoreErrorCode) {
+        let (sink, callback) = make_sink();
+        let status = commit(
+            LoreGlobalArgs::default(),
+            LoreRevisionTreeCommitArgs {
+                id: CALL_ID,
+                handle,
+                options: LoreRevisionTreeCommitOptions::default(),
+            },
+            callback,
+        )
+        .await;
+        let events = sink.lock().unwrap().clone();
+        let (revision, new_tip, code) = events
+            .iter()
+            .find_map(|event| match event {
+                Captured::CommitComplete(id, revision, new_tip, code) if *id == CALL_ID => {
+                    Some((*revision, *new_tip, *code))
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("the commit terminal must fire, got {events:?}"));
+        (status, revision, new_tip, code)
+    }
+
+    /// Reads and writes overlapping on one handle. A reader may see any number of the
+    /// concurrent adds, but never fewer nodes than were already committed to the tree and
+    /// never a name nobody added — the two ways a torn read would show.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_reads_and_writes_on_one_handle_do_not_race() {
+        const SEEDED: u64 = 4;
+        const WRITERS: u64 = 4;
+        const PER_WRITER: u64 = 8;
+        const READERS: u64 = 4;
+        const READS_EACH: u64 = 12;
+
+        let handle = load_handle(Partition::from([0x20u8; 16])).await;
+        let seeded = run_add(handle, vec![directory_entry(1, "dir")]).await;
+        let directory = added_node(&seeded, 1);
+        run_add(
+            handle,
+            (0..SEEDED)
+                .map(|index| file_entry(index + 1, directory, &format!("seed-{index}")))
+                .collect(),
+        )
+        .await;
+        let anchor = resolve(handle, "dir/seed-0").await;
+
+        let settled: BTreeSet<String> = (0..SEEDED).map(|index| format!("seed-{index}")).collect();
+        let written: BTreeSet<String> = (0..WRITERS)
+            .flat_map(|writer| (0..PER_WRITER).map(move |index| format!("w{writer}-{index}")))
+            .collect();
+
+        let mut writers: JoinSet<()> = JoinSet::new();
+        for writer in 0..WRITERS {
+            lore_spawn!(writers, async move {
+                for index in 0..PER_WRITER {
+                    run_add(
+                        handle,
+                        vec![file_entry(
+                            writer * PER_WRITER + index + 1,
+                            directory,
+                            &format!("w{writer}-{index}"),
+                        )],
+                    )
+                    .await;
+                }
+            });
+        }
+
+        let mut readers: JoinSet<Vec<BTreeSet<String>>> = JoinSet::new();
+        for _ in 0..READERS {
+            lore_spawn!(readers, async move {
+                let mut seen = Vec::new();
+                for _ in 0..READS_EACH {
+                    assert_eq!(
+                        node_info_of(handle, anchor).await.name.as_str(),
+                        "seed-0",
+                        "a settled node must keep reading back while the tree is written to"
+                    );
+                    assert_eq!(
+                        resolve(handle, "dir/seed-0").await,
+                        anchor,
+                        "and must keep resolving to the same node"
+                    );
+                    seen.push(child_names(handle, directory).await.into_iter().collect());
+                }
+                seen
+            });
+        }
+
+        while let Some(result) = writers.join_next().await {
+            result.expect("a writer must not panic");
+        }
+        for result in readers.join_all().await {
+            for observed in result {
+                assert!(
+                    settled.is_subset(&observed),
+                    "a read must never lose a settled node, got {observed:?}"
+                );
+                assert!(
+                    observed
+                        .difference(&settled)
+                        .all(|name| written.contains(name)),
+                    "a read must never invent a node, got {observed:?}"
+                );
+            }
+        }
+
+        assert_eq!(
+            child_names(handle, directory).await,
+            settled.union(&written).cloned().collect::<Vec<String>>(),
+            "every concurrent write must survive the reads"
+        );
+        close_handle(handle).await;
+    }
+
+    /// Two commits racing on one handle. The exclusive claim makes them serialize, so the
+    /// second runs against the state the first published rather than beside it — the branch
+    /// never moves under either, and no edit is dropped between them.
+    ///
+    /// Which of the two publishes what is the scheduler's to decide: one commit can sweep up
+    /// both adds and leave the other with nothing staged, which is a legal outcome and not the
+    /// failure this test is looking for.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_commit_on_one_handle_serializes() {
+        let repository = Partition::from([0x21u8; 16]);
+        let store = open_store().await;
+        let handle = load_on(store, repository, Hash::default()).await;
+        set_branch(handle, Context::from(uuid::Uuid::now_v7())).await;
+
+        let mut commits: JoinSet<(i32, Hash, Hash, LoreErrorCode)> = JoinSet::new();
+        for task in 0..2u64 {
+            lore_spawn!(commits, async move {
+                run_add(
+                    handle,
+                    vec![file_entry(task + 1, ROOT_NODE, &format!("f{task}.bin"))],
+                )
+                .await;
+                run_commit(handle).await
+            });
+        }
+        let outcomes = commits.join_all().await;
+
+        for (_, _, new_tip, _) in &outcomes {
+            assert!(
+                new_tip.is_zero(),
+                "a commit on one handle must never find the branch advanced under it, got \
+                 {outcomes:?}"
+            );
+        }
+        let published: Vec<Hash> = outcomes
+            .iter()
+            .filter(|(status, ..)| *status == 0)
+            .map(|(_, revision, ..)| *revision)
+            .collect();
+        assert!(
+            !published.is_empty(),
+            "one of the two must publish, got {outcomes:?}"
+        );
+
+        let mut carried_both = false;
+        for revision in &published {
+            let reloaded = load_on(store, repository, *revision).await;
+            carried_both |= child_names(reloaded, ROOT_NODE).await
+                == vec!["f0.bin".to_string(), "f1.bin".to_string()];
+            close_handle(reloaded).await;
+        }
+        assert!(
+            carried_both,
+            "a published revision must carry both adds — a lost one means the commits \
+             interleaved, got {outcomes:?}"
+        );
+
+        close_handle(handle).await;
+    }
+
+    /// Two handles racing one branch. There is no shared claim to serialize them, so the CAS in
+    /// the mutable store decides: exactly one tip advance lands, and the loser is handed the
+    /// revision it has to reload from rather than an error it has to interpret.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_commit_on_same_branch_from_two_handles_resolves_via_branch_advanced() {
+        let repository = Partition::from([0x22u8; 16]);
+        let branch = Context::from(uuid::Uuid::now_v7());
+        let store = open_store().await;
+
+        let mut handles = Vec::new();
+        for task in 0..2u64 {
+            let handle = load_on(store, repository, Hash::default()).await;
+            run_add(
+                handle,
+                vec![file_entry(task + 1, ROOT_NODE, &format!("f{task}.bin"))],
+            )
+            .await;
+            set_branch(handle, branch).await;
+            handles.push(handle);
+        }
+
+        let mut commits: JoinSet<(i32, Hash, Hash, LoreErrorCode)> = JoinSet::new();
+        for handle in handles.iter().copied() {
+            lore_spawn!(commits, async move { run_commit(handle).await });
+        }
+        let outcomes = commits.join_all().await;
+
+        let published: Vec<Hash> = outcomes
+            .iter()
+            .filter(|(status, ..)| *status == 0)
+            .map(|(_, revision, ..)| *revision)
+            .collect();
+        assert_eq!(
+            published.len(),
+            1,
+            "exactly one commit may advance the branch, got {outcomes:?}"
+        );
+
+        let (status, revision, new_tip, code) = outcomes
+            .iter()
+            .find(|(status, ..)| *status != 0)
+            .copied()
+            .unwrap_or_else(|| panic!("one commit must lose, got {outcomes:?}"));
+        assert_eq!(status, -1, "got {outcomes:?}");
+        assert_eq!(code, LoreErrorCode::Internal, "got {outcomes:?}");
+        assert!(
+            revision.is_zero(),
+            "a loser publishes nothing, got {outcomes:?}"
+        );
+        assert_eq!(
+            new_tip, published[0],
+            "the loser must be told the tip the winner set, got {outcomes:?}"
+        );
+
+        for handle in handles {
+            close_handle(handle).await;
+        }
+    }
+
+    /// Two repositories committing concurrently through one storage handle. They share the
+    /// backend stores, so the isolation being proved is that a revision lands in the partition
+    /// it belongs to and neither branch tip is written by the other's commit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_commits_on_different_repositories_one_storage_handle_dont_interfere() {
+        let repositories = [Partition::from([0x23u8; 16]), Partition::from([0x24u8; 16])];
+        let store = open_store().await;
+
+        let mut handles = Vec::new();
+        for (task, repository) in repositories.iter().enumerate() {
+            let handle = load_on(store, *repository, Hash::default()).await;
+            run_add(
+                handle,
+                vec![file_entry(
+                    task as u64 + 1,
+                    ROOT_NODE,
+                    &format!("r{task}.bin"),
+                )],
+            )
+            .await;
+            set_branch(handle, Context::from(uuid::Uuid::now_v7())).await;
+            handles.push(handle);
+        }
+
+        // `join_all` yields results as tasks finish, so each carries the repository it
+        // committed for rather than relying on the order they come back in.
+        let mut commits: JoinSet<(usize, i32, Hash, LoreErrorCode)> = JoinSet::new();
+        for (task, handle) in handles.iter().copied().enumerate() {
+            lore_spawn!(commits, async move {
+                let (status, revision, _, code) = run_commit(handle).await;
+                (task, status, revision, code)
+            });
+        }
+        let mut outcomes = commits.join_all().await;
+        outcomes.sort_unstable_by_key(|(task, ..)| *task);
+
+        for (_, status, revision, code) in &outcomes {
+            assert_eq!(
+                *status, 0,
+                "separate repositories must not collide, got {outcomes:?}"
+            );
+            assert_eq!(*code, LoreErrorCode::None, "got {outcomes:?}");
+            assert!(!revision.is_zero(), "got {outcomes:?}");
+        }
+        assert_ne!(
+            outcomes[0].2, outcomes[1].2,
+            "two repositories must not publish one revision, got {outcomes:?}"
+        );
+
+        for (task, repository) in repositories.iter().enumerate() {
+            let reloaded = load_on(store, *repository, outcomes[task].2).await;
+            assert_eq!(
+                child_names(reloaded, ROOT_NODE).await,
+                vec![format!("r{task}.bin")],
+                "each revision must hold only its own repository's tree"
+            );
+            close_handle(reloaded).await;
+        }
+        for handle in handles {
+            close_handle(handle).await;
+        }
+    }
+
+    /// Reads and writes racing on the pending metadata buffer. A key is either not there yet or
+    /// carries the value it was written with; a read that returned some other value would mean
+    /// the buffer was observed mid-write.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_metadata_set_and_metadata_get_do_not_race() {
+        const SETTERS: u64 = 4;
+        const PER_SETTER: u64 = 8;
+        const READERS: u64 = 4;
+        const READS_EACH: u64 = 12;
+        const KEYS: u64 = SETTERS * PER_SETTER;
+
+        let handle = load_handle(Partition::from([0x25u8; 16])).await;
+
+        let mut setters: JoinSet<()> = JoinSet::new();
+        for setter in 0..SETTERS {
+            lore_spawn!(setters, async move {
+                for index in 0..PER_SETTER {
+                    let key = setter * PER_SETTER + index;
+                    let (sink, callback) = make_sink();
+                    let status = metadata_set(
+                        LoreGlobalArgs::default(),
+                        LoreRevisionTreeMetadataSetArgs {
+                            batch_id: CALL_ID,
+                            handle,
+                            entries: LoreArray::from_vec(vec![LoreRevisionTreeMetadataSetEntry {
+                                entry_id: key + 1,
+                                key: LoreString::from_str(&format!("k-{key}")),
+                                value: LoreMetadata::Numeric(key),
+                            }]),
+                        },
+                        callback,
+                    )
+                    .await;
+                    assert_eq!(
+                        status,
+                        0,
+                        "a concurrent set must succeed, got {:?}",
+                        sink.lock().unwrap()
+                    );
+                }
+            });
+        }
+
+        let mut readers: JoinSet<()> = JoinSet::new();
+        for _ in 0..READERS {
+            lore_spawn!(readers, async move {
+                for _ in 0..READS_EACH {
+                    let (sink, callback) = make_sink();
+                    let status = metadata_get(
+                        LoreGlobalArgs::default(),
+                        LoreRevisionTreeMetadataGetArgs {
+                            batch_id: CALL_ID,
+                            handle,
+                            include_revision: 0,
+                            entries: LoreArray::from_vec(
+                                (0..KEYS)
+                                    .map(|key| LoreRevisionTreeMetadataGetEntry {
+                                        entry_id: key + 1,
+                                        key: LoreString::from_str(&format!("k-{key}")),
+                                    })
+                                    .collect(),
+                            ),
+                        },
+                        callback,
+                    )
+                    .await;
+                    let events = sink.lock().unwrap().clone();
+                    assert_eq!(
+                        status, 0,
+                        "a read must tolerate a key not set yet, got {events:?}"
+                    );
+                    for event in &events {
+                        if let Captured::MetadataGetComplete(entry_id, key, value, code) = event {
+                            assert_eq!(*code, LoreErrorCode::None, "got {events:?}");
+                            let expected = entry_id - 1;
+                            assert_eq!(key.as_str(), format!("k-{expected}"), "got {events:?}");
+                            assert_eq!(
+                                *value,
+                                LoreMetadata::Numeric(expected),
+                                "a reported key must carry the value it was written with"
+                            );
+                        }
+                    }
+                }
+            });
+        }
+
+        setters.join_all().await;
+        readers.join_all().await;
+
+        let (sink, callback) = make_sink();
+        let status = metadata_get(
+            LoreGlobalArgs::default(),
+            LoreRevisionTreeMetadataGetArgs {
+                batch_id: CALL_ID,
+                handle,
+                include_revision: 0,
+                entries: LoreArray::from_vec(
+                    (0..KEYS)
+                        .map(|key| LoreRevisionTreeMetadataGetEntry {
+                            entry_id: key + 1,
+                            key: LoreString::from_str(&format!("k-{key}")),
+                        })
+                        .collect(),
+                ),
+            },
+            callback,
+        )
+        .await;
+        let events = sink.lock().unwrap().clone();
+        assert_eq!(status, 0, "got {events:?}");
+        let reported = events
+            .iter()
+            .filter(|event| matches!(event, Captured::MetadataGetComplete(..)))
+            .count();
+        assert_eq!(
+            reported as u64, KEYS,
+            "every concurrently written key must be present once the writers are done"
+        );
+
+        close_handle(handle).await;
+    }
+}
