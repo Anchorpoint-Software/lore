@@ -17,6 +17,7 @@ use crate::link::LinkTracker;
 use crate::lore::Hash;
 use crate::lore::execution_context;
 use crate::lore_debug;
+use crate::lore_limit_drain_tasks;
 use crate::node::Node;
 use crate::node::NodeBlock;
 use crate::node::NodeFlags;
@@ -284,6 +285,14 @@ pub async fn stage(
     let repository_path = repository.require_path()?.to_path_buf();
     let mut failure = None;
     let mut tasks: JoinSet<Result<crate::node::NodeLink, StageError>> = JoinSet::new();
+
+    /// Targets walked at once. Each in-flight target is a walk in progress
+    /// holding around 8 KiB, and a targets file can name a million paths, so
+    /// spawning one per target before any of them runs costs gigabytes of task
+    /// state before any work happens. This still offers the syscall pool the walk
+    /// waits on far more work than it has threads.
+    const MAX_TASKS: usize = 1000;
+
     for target in antichain {
         lore_spawn!(
             tasks,
@@ -300,11 +309,12 @@ pub async fn stage(
                 global_mask.clone(),
             )
         );
-        while let Some(result) = tasks.try_join_next() {
-            failure = failure.or(result
-                .map_err(|e| StageError::internal_with_context(e, "Failed to join task"))
-                .flatten()
-                .err());
+        if let Err(err) = lore_limit_drain_tasks!(
+            tasks,
+            MAX_TASKS,
+            StageError::internal("Failed to join task")
+        ) {
+            failure = failure.or(Some(err));
         }
         if failure.is_some() {
             break;
@@ -329,11 +339,12 @@ pub async fn stage(
                 failure = Some(err);
                 break;
             }
-            while let Some(result) = tasks.try_join_next() {
-                failure = failure.or(result
-                    .map_err(|e| StageError::internal_with_context(e, "Failed to join task"))
-                    .flatten()
-                    .err());
+            if let Err(err) = lore_limit_drain_tasks!(
+                tasks,
+                MAX_TASKS,
+                StageError::internal("Failed to join task")
+            ) {
+                failure = failure.or(Some(err));
             }
             if failure.is_some() {
                 break;
