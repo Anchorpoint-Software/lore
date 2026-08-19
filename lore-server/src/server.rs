@@ -73,6 +73,7 @@ use crate::hooks::HookDispatcher;
 use crate::hooks::HookRegistrationContext;
 use crate::hooks::HookRegistry;
 use crate::http::LoreHttpServer;
+use crate::http::security_headers::ContentTypePolicy;
 use crate::http::server::LoreHttpServerSettings;
 use crate::http::server::PresignSettings;
 use crate::plugins;
@@ -97,6 +98,7 @@ use crate::server_config::ServerConfig;
 use crate::settings::CompositeStoreSettings;
 use crate::settings::CompositeSubStoreSettings;
 use crate::settings::GrpcSettings;
+use crate::settings::HttpSettings;
 use crate::settings::LocalImmutableStoreSettings;
 use crate::settings::LocalMutableStoreSettings;
 use crate::settings::NotificationSettings;
@@ -617,6 +619,33 @@ async fn launch_grpc_internal_server(
             let _ = shutdown_rx.wait_for(|&v| v).await;
         })
         .await
+}
+
+fn build_lore_http_settings(
+    http_settings: &HttpSettings,
+    user_agent_filter: Arc<UserAgentFilter>,
+) -> LoreHttpServerSettings {
+    LoreHttpServerSettings {
+        port: http_settings.port,
+        host: http_settings.host.clone(),
+        max_file_size: http_settings.max_file_size,
+        request_timeout_seconds: http_settings.request_timeout_seconds,
+        request_body_timeout_seconds: http_settings.request_body_timeout_seconds,
+        available_interval_seconds: http_settings.available_interval_seconds,
+        available_timeout_seconds: http_settings.available_timeout_seconds,
+        store_health_check: http_settings.store_health_check,
+        presign: PresignSettings {
+            hmac_key: http_settings.presigned_url_hmac_key.clone(),
+            min_ttl_seconds: http_settings.presigned_url_min_ttl_seconds,
+            default_ttl_seconds: http_settings.presigned_url_default_ttl_seconds,
+            max_ttl_seconds: http_settings.presigned_url_max_ttl_seconds,
+            content_type_policy: ContentTypePolicy {
+                extra: http_settings.presigned_url_extra_content_types.clone(),
+                denied: http_settings.presigned_url_denied_content_types.clone(),
+            },
+        },
+        user_agent_filter,
+    }
 }
 
 async fn launch_http_server(
@@ -2042,23 +2071,8 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
         if let Some(http_settings) = settings.server.http.as_ref()
             && http_settings.enabled
         {
-            let lore_http_settings = LoreHttpServerSettings {
-                port: http_settings.port,
-                host: http_settings.host.clone(),
-                max_file_size: http_settings.max_file_size,
-                request_timeout_seconds: http_settings.request_timeout_seconds,
-                request_body_timeout_seconds: http_settings.request_body_timeout_seconds,
-                available_interval_seconds: http_settings.available_interval_seconds,
-                available_timeout_seconds: http_settings.available_timeout_seconds,
-                store_health_check: http_settings.store_health_check,
-                presign: PresignSettings {
-                    hmac_key: http_settings.presigned_url_hmac_key.clone(),
-                    min_ttl_seconds: http_settings.presigned_url_min_ttl_seconds,
-                    default_ttl_seconds: http_settings.presigned_url_default_ttl_seconds,
-                    max_ttl_seconds: http_settings.presigned_url_max_ttl_seconds,
-                },
-                user_agent_filter: user_agent_filter.clone(),
-            };
+            let lore_http_settings =
+                build_lore_http_settings(http_settings, user_agent_filter.clone());
             let immutable_store = immutable_store.clone();
             let mutable_store = mutable_store.clone();
             let shutdown_rx = _shutdown_rx.clone();
@@ -2146,6 +2160,87 @@ fn server_log_dispatch(level: lore_base::log::LoreLogLevel, location: &str, mess
 
 #[cfg(test)]
 mod tests {
+    /// Covers the `[server.http]` to `LoreHttpServerSettings` mapping, the one seam
+    /// between config deserialization and the HTTP server's own settings.
+    mod http_settings_mapping {
+        use std::sync::Arc;
+
+        use super::super::build_lore_http_settings;
+        use crate::settings::HttpSettings;
+
+        fn http_settings(extra_keys: &str) -> HttpSettings {
+            let config = format!(
+                r#"
+                enabled = true
+                host = "127.0.0.1"
+                max_file_size = 1024
+                port = 8080
+                request_timeout_seconds = 30
+                request_body_timeout_seconds = 30
+                available_interval_seconds = 5
+                available_timeout_seconds = 30
+                store_health_check = false
+                {extra_keys}
+                "#
+            );
+            toml::from_str(&config).expect("[server.http] should deserialize")
+        }
+
+        /// The whole read path: TOML to the policy the allowlist is built from.
+        #[test]
+        fn content_type_policy_is_carried_from_config() {
+            let settings = build_lore_http_settings(
+                &http_settings(
+                    r#"
+                    presigned_url_extra_content_types = ["application/zip"]
+                    presigned_url_denied_content_types = ["application/pdf"]
+                    "#,
+                ),
+                Arc::default(),
+            );
+
+            assert_eq!(
+                settings.presign.content_type_policy.extra,
+                ["application/zip"]
+            );
+            assert_eq!(
+                settings.presign.content_type_policy.denied,
+                ["application/pdf"]
+            );
+        }
+
+        /// Absent keys give an empty policy, which resolves to the built-in set.
+        #[test]
+        fn absent_content_type_keys_give_an_empty_policy() {
+            let settings = build_lore_http_settings(&http_settings(""), Arc::default());
+
+            assert!(settings.presign.content_type_policy.extra.is_empty());
+            assert!(settings.presign.content_type_policy.denied.is_empty());
+        }
+
+        /// Guards against a copy-paste slip putting the wrong source field on a
+        /// neighbouring target field.
+        #[test]
+        fn presign_ttl_and_key_are_carried_from_config() {
+            let settings = build_lore_http_settings(
+                &http_settings(
+                    r#"
+                    presigned_url_hmac_key = "abcdef"
+                    presigned_url_min_ttl_seconds = 5
+                    presigned_url_default_ttl_seconds = 60
+                    presigned_url_max_ttl_seconds = 600
+                    "#,
+                ),
+                Arc::default(),
+            );
+
+            assert_eq!(settings.presign.hmac_key.as_deref(), Some("abcdef"));
+            assert_eq!(settings.presign.min_ttl_seconds, 5);
+            assert_eq!(settings.presign.default_ttl_seconds, 60);
+            assert_eq!(settings.presign.max_ttl_seconds, 600);
+        }
+    }
+
     mod validate_endpoint_security {
         use std::path::PathBuf;
 
