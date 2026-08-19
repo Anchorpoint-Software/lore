@@ -26,6 +26,7 @@ mod support {
     use lore::revision_tree::node_info::node_info;
     use lore::storage::open;
     use lore::storage::open::LoreStorageOpenArgs;
+    use lore_base::types::Address;
     use lore_base::types::Hash;
     use lore_base::types::Partition;
     use lore_revision::event::LoreErrorCode;
@@ -63,7 +64,7 @@ mod support {
         Info(Box<LoreRevisionTreeInfoEventData>),
         ResolvePath(NodeID, LoreErrorCode),
         CommitComplete(u64, Hash, Hash, LoreErrorCode),
-        Child(NodeID, String),
+        Child(NodeID, String, Address),
         Complete(i32),
         Other,
     }
@@ -114,7 +115,7 @@ mod support {
                     data.error_code,
                 ),
                 LoreEvent::RevisionTreeChild(data) => {
-                    Captured::Child(data.node_id, data.name.as_str().to_string())
+                    Captured::Child(data.node_id, data.name.as_str().to_string(), data.address)
                 }
                 LoreEvent::Complete(data) => Captured::Complete(data.status),
                 _ => Captured::Other,
@@ -217,6 +218,20 @@ mod support {
         handle: LoreRevisionTree,
         parent_node_id: NodeID,
     ) -> Vec<String> {
+        let mut names: Vec<String> = child_records(handle, parent_node_id)
+            .await
+            .into_iter()
+            .map(|(_, name, _)| name)
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Every child as `(node_id, name, address)`, in listing order.
+    pub(super) async fn child_records(
+        handle: LoreRevisionTree,
+        parent_node_id: NodeID,
+    ) -> Vec<(NodeID, String, Address)> {
         let (sink, callback) = make_sink();
         let status = list_children(
             LoreGlobalArgs::default(),
@@ -229,17 +244,14 @@ mod support {
         )
         .await;
         assert_eq!(status, 0, "listing children must succeed");
-        let mut names: Vec<String> = sink
-            .lock()
-            .unwrap()
+        let records = sink.lock().unwrap();
+        records
             .iter()
             .filter_map(|event| match event {
-                Captured::Child(_, name) => Some(name.clone()),
+                Captured::Child(node_id, name, address) => Some((*node_id, name.clone(), *address)),
                 _ => None,
             })
-            .collect();
-        names.sort();
-        names
+            .collect()
     }
 
     pub(super) async fn node_info_of(
@@ -3503,6 +3515,523 @@ mod lifecycle_tests {
             node_info_of(handle, added).await.revision,
             second,
             "the node added after the close belongs to the revision the commit published"
+        );
+
+        close_handle(handle).await;
+    }
+}
+
+/// `lore_address_t` crossing between the storage API and this one, over a real store and in
+/// both directions: the address a `lore_storage_put` returns is the address `add` and
+/// `modify` take, and the address `node_info` and `list_children` report is the address
+/// `lore_storage_get` reads. Each test below carries one address across the boundary with no
+/// conversion, which only compiles because a single type spans both surfaces — a bridging
+/// type or wrapper would break the build rather than a test.
+#[cfg(test)]
+mod interop_tests {
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    use lore::revision_tree::add::LoreRevisionTreeAddArgs;
+    use lore::revision_tree::add::LoreRevisionTreeAddEntry;
+    use lore::revision_tree::add::add;
+    use lore::revision_tree::commit::LoreRevisionTreeCommitArgs;
+    use lore::revision_tree::commit::LoreRevisionTreeCommitOptions;
+    use lore::revision_tree::commit::commit;
+    use lore::revision_tree::handle::LoreRevisionTree;
+    use lore::revision_tree::metadata_set::LoreRevisionTreeMetadataSetArgs;
+    use lore::revision_tree::metadata_set::LoreRevisionTreeMetadataSetEntry;
+    use lore::revision_tree::metadata_set::metadata_set;
+    use lore::revision_tree::modify::LoreRevisionTreeModifyArgs;
+    use lore::revision_tree::modify::LoreRevisionTreeModifyEntry;
+    use lore::revision_tree::modify::modify;
+    use lore::storage::handle::LoreStore;
+    use lore_base::types::Address;
+    use lore_base::types::Context;
+    use lore_base::types::Hash;
+    use lore_base::types::Partition;
+    use lore_revision::event::LoreBytes;
+    use lore_revision::event::LoreErrorCode;
+    use lore_revision::event::LoreEvent;
+    use lore_revision::interface::LoreArray;
+    use lore_revision::interface::LoreEventCallback;
+    use lore_revision::interface::LoreGlobalArgs;
+    use lore_revision::interface::LoreMetadata;
+    use lore_revision::interface::LoreNodeType;
+    use lore_revision::interface::LoreString;
+    use lore_revision::metadata::BRANCH;
+    use lore_revision::node::NodeID;
+    use lore_revision::node::ROOT_NODE;
+
+    use super::support::*;
+
+    /// The canonical write path the LEP documents: the caller mints a file id and supplies it
+    /// as the put's context, so one address carries both the content and the file identity.
+    fn file_id() -> Context {
+        Context::from(uuid::Uuid::now_v7())
+    }
+
+    /// Store `payload` and return the address the storage API reports for it.
+    async fn put_bytes(
+        store_handle_id: u64,
+        partition: Partition,
+        context: Context,
+        payload: &[u8],
+    ) -> Address {
+        let stored: Arc<Mutex<Option<Address>>> = Arc::new(Mutex::new(None));
+        let sink = stored.clone();
+        let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
+            if let LoreEvent::StoragePutItemComplete(data) = event {
+                assert_eq!(
+                    data.error_code,
+                    LoreErrorCode::None,
+                    "storing the payload must succeed"
+                );
+                *sink.lock().unwrap() = Some(data.address);
+            }
+        }));
+        let status = lore::storage::put::put(
+            LoreGlobalArgs::default(),
+            lore::storage::put::LoreStoragePutArgs {
+                handle: LoreStore {
+                    handle_id: store_handle_id,
+                },
+                items: LoreArray::from_vec(vec![lore::storage::put::LoreStoragePutItem {
+                    id: 1,
+                    partition,
+                    context,
+                    data: LoreBytes {
+                        ptr: payload.as_ptr().cast(),
+                        len: payload.len(),
+                    },
+                    remote_write: 0,
+                    local_cache: 0,
+                    fixed_size_chunk: 0,
+                }]),
+            },
+            callback,
+        )
+        .await;
+        assert_eq!(status, 0, "the put call must succeed");
+        let address = *stored.lock().unwrap();
+        address.expect("the put must report the address it stored the payload at")
+    }
+
+    /// Read `address` back through the storage API. The `GET_DATA` view is valid only for the
+    /// callback's invocation, so the bytes are copied out inside it.
+    async fn get_bytes(store_handle_id: u64, partition: Partition, address: Address) -> Vec<u8> {
+        let read: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = read.clone();
+        let outcome: Arc<Mutex<Option<LoreErrorCode>>> = Arc::new(Mutex::new(None));
+        let outcome_sink = outcome.clone();
+        let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| match event {
+            LoreEvent::StorageGetData(data) => {
+                if data.bytes.len > 0 {
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts(data.bytes.ptr.cast::<u8>(), data.bytes.len)
+                    };
+                    sink.lock().unwrap().extend_from_slice(bytes);
+                }
+            }
+            LoreEvent::StorageGetItemComplete(data) => {
+                *outcome_sink.lock().unwrap() = Some(data.error_code);
+            }
+            _ => {}
+        }));
+        let status = lore::storage::get::get(
+            LoreGlobalArgs::default(),
+            lore::storage::get::LoreStorageGetArgs {
+                handle: LoreStore {
+                    handle_id: store_handle_id,
+                },
+                items: LoreArray::from_vec(vec![lore::storage::get::LoreStorageGetItem {
+                    id: 1,
+                    partition,
+                    address,
+                    ..Default::default()
+                }]),
+            },
+            callback,
+        )
+        .await;
+        assert_eq!(status, 0, "reading {address:?} back must succeed");
+        assert_eq!(
+            *outcome.lock().unwrap(),
+            Some(LoreErrorCode::None),
+            "the read of {address:?} must report success"
+        );
+        read.lock().unwrap().clone()
+    }
+
+    fn file_entry(
+        entry_id: u64,
+        name: &str,
+        size: u64,
+        address: Address,
+    ) -> LoreRevisionTreeAddEntry {
+        LoreRevisionTreeAddEntry {
+            entry_id,
+            parent_node_id: ROOT_NODE,
+            parent_entry_index: 0,
+            name: LoreString::from_str(name),
+            kind: LoreNodeType::File as u32,
+            mode: 0o644,
+            size,
+            address,
+        }
+    }
+
+    async fn run_add(
+        handle: LoreRevisionTree,
+        entries: Vec<LoreRevisionTreeAddEntry>,
+    ) -> Vec<Captured> {
+        let (sink, callback) = make_sink();
+        let status = add(
+            LoreGlobalArgs::default(),
+            LoreRevisionTreeAddArgs {
+                batch_id: CALL_ID,
+                handle,
+                entries: LoreArray::from_vec(entries),
+            },
+            callback,
+        )
+        .await;
+        let events = sink.lock().unwrap().clone();
+        assert_eq!(status, 0, "placing the file must succeed, got {events:?}");
+        events
+    }
+
+    async fn run_modify(handle: LoreRevisionTree, entries: Vec<LoreRevisionTreeModifyEntry>) {
+        let (sink, callback) = make_sink();
+        let status = modify(
+            LoreGlobalArgs::default(),
+            LoreRevisionTreeModifyArgs {
+                batch_id: CALL_ID,
+                handle,
+                entries: LoreArray::from_vec(entries),
+            },
+            callback,
+        )
+        .await;
+        assert_eq!(
+            status,
+            0,
+            "rewriting the file must succeed, got {:?}",
+            sink.lock().unwrap()
+        );
+    }
+
+    fn added_node(events: &[Captured], entry_id: u64) -> NodeID {
+        events
+            .iter()
+            .find_map(|event| match event {
+                Captured::AddComplete(id, node_id, code) if *id == entry_id => {
+                    assert_eq!(*code, LoreErrorCode::None, "entry {entry_id} must succeed");
+                    Some(*node_id)
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("entry {entry_id} must report, got {events:?}"))
+    }
+
+    async fn commit_on(handle: LoreRevisionTree, branch: Context) -> Hash {
+        let (sink, callback) = make_sink();
+        let status = metadata_set(
+            LoreGlobalArgs::default(),
+            LoreRevisionTreeMetadataSetArgs {
+                batch_id: CALL_ID,
+                handle,
+                entries: LoreArray::from_vec(vec![LoreRevisionTreeMetadataSetEntry {
+                    entry_id: 1,
+                    key: LoreString::from_str(BRANCH),
+                    value: LoreMetadata::Context(branch),
+                }]),
+            },
+            callback,
+        )
+        .await;
+        assert_eq!(
+            status,
+            0,
+            "naming the branch must succeed, got {:?}",
+            sink.lock().unwrap()
+        );
+
+        let (sink, callback) = make_sink();
+        let status = commit(
+            LoreGlobalArgs::default(),
+            LoreRevisionTreeCommitArgs {
+                id: CALL_ID,
+                handle,
+                options: LoreRevisionTreeCommitOptions::default(),
+            },
+            callback,
+        )
+        .await;
+        let events = sink.lock().unwrap().clone();
+        assert_eq!(status, 0, "committing must succeed, got {events:?}");
+        events
+            .iter()
+            .find_map(|event| match event {
+                Captured::CommitComplete(id, revision, _, _) if *id == CALL_ID => Some(*revision),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("the commit terminal must fire, got {events:?}"))
+    }
+
+    /// The write leg: an address produced by `lore_storage_put` reaches the tree with every
+    /// field intact, file id included, and the node reports it back as one value rather than
+    /// as parts a caller has to reassemble.
+    #[tokio::test]
+    async fn address_from_storage_put_crosses_unchanged_to_revision_tree_add() {
+        let repository = Partition::from([0x1au8; 16]);
+        let store = open_store().await;
+        let handle = load_on(store, repository, Hash::default()).await;
+
+        let payload = b"content addressed by a put and placed by an add".to_vec();
+        let put_address = put_bytes(store, repository, file_id(), &payload).await;
+
+        let seeded = run_add(
+            handle,
+            vec![file_entry(
+                1,
+                "payload.bin",
+                payload.len() as u64,
+                put_address,
+            )],
+        )
+        .await;
+
+        let info = node_info_of(handle, added_node(&seeded, 1)).await;
+        assert_eq!(
+            info.address, put_address,
+            "the whole address must cross unchanged, got {info:?}"
+        );
+        assert_eq!(
+            info.file_id, put_address.context,
+            "the file id is the address context the put was given, got {info:?}"
+        );
+
+        close_handle(handle).await;
+    }
+
+    /// The same leg for `modify`. Rewriting a file's content keeps its identity, so the second
+    /// put carries the file id the first one did and the whole address crosses again.
+    #[tokio::test]
+    async fn address_from_storage_put_crosses_unchanged_to_revision_tree_modify() {
+        let repository = Partition::from([0x1bu8; 16]);
+        let store = open_store().await;
+        let handle = load_on(store, repository, Hash::default()).await;
+
+        let identity = file_id();
+        let original = b"the content the file was added with".to_vec();
+        let first = put_bytes(store, repository, identity, &original).await;
+        let seeded = run_add(
+            handle,
+            vec![file_entry(1, "payload.bin", original.len() as u64, first)],
+        )
+        .await;
+        let node = added_node(&seeded, 1);
+
+        let rewritten = b"the content the file was rewritten with, which is longer".to_vec();
+        let second = put_bytes(store, repository, identity, &rewritten).await;
+        assert_ne!(
+            second.hash, first.hash,
+            "the rewrite must produce different content"
+        );
+        run_modify(
+            handle,
+            vec![LoreRevisionTreeModifyEntry {
+                entry_id: 1,
+                node_id: node,
+                mode: 0o644,
+                size: rewritten.len() as u64,
+                address: second,
+            }],
+        )
+        .await;
+
+        let info = node_info_of(handle, node).await;
+        assert_eq!(
+            info.address, second,
+            "the rewritten address must cross unchanged, got {info:?}"
+        );
+        assert_eq!(
+            info.file_id, identity,
+            "and the file survives its own rewrite, got {info:?}"
+        );
+
+        close_handle(handle).await;
+    }
+
+    /// The read leg: the address `node_info` reports is a complete argument for
+    /// `lore_storage_get`, paired with the repository the same event carries. Byte equality
+    /// is the assertion that matters — field equality alone would not show that the store
+    /// accepts what the tree handed back.
+    #[tokio::test]
+    async fn address_from_revision_tree_node_info_crosses_unchanged_to_storage_get() {
+        let repository = Partition::from([0x1cu8; 16]);
+        let store = open_store().await;
+        let handle = load_on(store, repository, Hash::default()).await;
+
+        let payload = b"bytes fetched back through the address the tree reports".to_vec();
+        let put_address = put_bytes(store, repository, file_id(), &payload).await;
+        let seeded = run_add(
+            handle,
+            vec![file_entry(
+                1,
+                "payload.bin",
+                payload.len() as u64,
+                put_address,
+            )],
+        )
+        .await;
+
+        let info = node_info_of(handle, added_node(&seeded, 1)).await;
+        assert_eq!(
+            info.address, put_address,
+            "the reported address must be the one the put returned, got {info:?}"
+        );
+        assert_eq!(
+            info.repository, repository,
+            "the node must name the partition to read from, got {info:?}"
+        );
+        assert_eq!(
+            get_bytes(store, info.repository, info.address).await,
+            payload,
+            "the address the tree reported must read the content back"
+        );
+
+        close_handle(handle).await;
+    }
+
+    /// `list_children` is the other read verb that surfaces an address, and it must be as
+    /// usable as `node_info`'s: the same value, and the same successful read.
+    #[tokio::test]
+    async fn address_from_revision_tree_list_children_crosses_unchanged_to_storage_get() {
+        let repository = Partition::from([0x1du8; 16]);
+        let store = open_store().await;
+        let handle = load_on(store, repository, Hash::default()).await;
+
+        let payload = b"bytes fetched back through the address a listing reports".to_vec();
+        let put_address = put_bytes(store, repository, file_id(), &payload).await;
+        run_add(
+            handle,
+            vec![file_entry(
+                1,
+                "payload.bin",
+                payload.len() as u64,
+                put_address,
+            )],
+        )
+        .await;
+
+        let listed = child_records(handle, ROOT_NODE).await;
+        let (_, name, address) = listed
+            .first()
+            .unwrap_or_else(|| panic!("the child must be listed, got {listed:?}"));
+        assert_eq!(name, "payload.bin");
+        assert_eq!(
+            *address, put_address,
+            "the listing must carry the address unchanged, got {listed:?}"
+        );
+        assert_eq!(
+            get_bytes(store, repository, *address).await,
+            payload,
+            "the address the listing reported must read the content back"
+        );
+
+        close_handle(handle).await;
+    }
+
+    /// The round trip across a commit. The address is written into a node block, serialized,
+    /// and read back through a handle that loaded the committed revision from the store — so
+    /// this is the leg that would catch an address the tree cannot preserve on disk.
+    #[tokio::test]
+    async fn an_address_survives_a_commit_and_reads_back_through_storage_get() {
+        let repository = Partition::from([0x1eu8; 16]);
+        let store = open_store().await;
+        let handle = load_on(store, repository, Hash::default()).await;
+
+        let payload = b"content that outlives the handle that placed it".to_vec();
+        let put_address = put_bytes(store, repository, file_id(), &payload).await;
+        let seeded = run_add(
+            handle,
+            vec![file_entry(
+                1,
+                "payload.bin",
+                payload.len() as u64,
+                put_address,
+            )],
+        )
+        .await;
+        let node = added_node(&seeded, 1);
+        let revision = commit_on(handle, file_id()).await;
+        close_handle(handle).await;
+
+        let reloaded = load_on(store, repository, revision).await;
+        let info = node_info_of(reloaded, node).await;
+        assert_eq!(
+            info.address, put_address,
+            "a committed and reloaded node must carry the address the put returned, got {info:?}"
+        );
+        assert_eq!(
+            get_bytes(store, info.repository, info.address).await,
+            payload,
+            "and it must still read the content back"
+        );
+
+        close_handle(reloaded).await;
+    }
+
+    /// The one case where the address does not cross unchanged. A node carries its file id in
+    /// the context slot of its address, so a file added with a zero context has one generated
+    /// into it and the tree reports an address the caller never held. The content is still
+    /// reachable here only because a store that does not isolate partitions resolves a read on
+    /// the hash alone; one that does serves exact associations only. Minting the file id before
+    /// the put, as the LEP's example does, is what makes the two addresses one value.
+    #[tokio::test]
+    async fn an_add_without_a_file_id_stamps_one_into_the_address_context() {
+        let repository = Partition::from([0x1fu8; 16]);
+        let store = open_store().await;
+        let handle = load_on(store, repository, Hash::default()).await;
+
+        let payload = b"content stored without a file id".to_vec();
+        let put_address = put_bytes(store, repository, Context::default(), &payload).await;
+        assert!(
+            put_address.context.is_zero(),
+            "the put must report the context it was given, got {put_address:?}"
+        );
+
+        let seeded = run_add(
+            handle,
+            vec![file_entry(
+                1,
+                "payload.bin",
+                payload.len() as u64,
+                put_address,
+            )],
+        )
+        .await;
+
+        let info = node_info_of(handle, added_node(&seeded, 1)).await;
+        assert_eq!(
+            info.address.hash, put_address.hash,
+            "the content hash must be untouched, got {info:?}"
+        );
+        assert_ne!(
+            info.address.context, put_address.context,
+            "the zero context must be replaced by a generated file id, got {info:?}"
+        );
+        assert_eq!(
+            info.file_id, info.address.context,
+            "which is where the node keeps its file id, got {info:?}"
+        );
+        assert_eq!(
+            get_bytes(store, repository, info.address).await,
+            payload,
+            "the content is still reachable through the hash on a store that does not isolate \
+             partitions"
         );
 
         close_handle(handle).await;
