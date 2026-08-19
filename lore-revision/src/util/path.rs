@@ -450,25 +450,62 @@ impl RelativePath {
     ///
     /// Comparison is structural on the canonical `/`-separated form
     /// (case-sensitive). The returned paths are in lexicographic order.
+    ///
+    /// Runs in O(n log n): the sort dominates, and the scan that follows tests
+    /// each path against one candidate rather than against everything kept so
+    /// far. That matters at the sizes a `--targets` file reaches — a
+    /// scan-against-all pass over 900,000 paths is ~4×10¹¹ comparisons, each one
+    /// chasing a separate allocation, which does not finish in an hour.
     pub fn dedup_to_supersets(paths: Vec<RelativePath>) -> Vec<RelativePath> {
         if paths.iter().any(|p| p.is_empty()) {
             return Vec::new();
         }
 
         let mut sorted = paths;
-        sorted.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        sorted.sort_unstable_by(|a, b| compare_subtree_order(a.as_str(), b.as_str()));
 
+        // Testing only the last kept path is sufficient, not a bug: a covering
+        // path's subtree is contiguous in this order, so anything kept earlier
+        // that covered this path would also cover the last kept one, and a
+        // covered path is never kept.
         let mut result: Vec<RelativePath> = Vec::with_capacity(sorted.len());
         for path in sorted {
             if !result
-                .iter()
-                .any(|kept| covers_impl(kept.as_str(), path.as_str()))
+                .last()
+                .is_some_and(|kept| covers_impl(kept.as_str(), path.as_str()))
             {
                 result.push(path);
             }
         }
+
+        // Subtree order is not the lexicographic order this returns.
+        result.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
         result
     }
+}
+
+/// Orders paths so that every path is immediately followed by its own subtree.
+///
+/// A byte comparison does not do that. `/` is 0x2F, so any name character below
+/// it interleaves: `a/b` < `a/b.c` < `a/b/c` puts an unrelated sibling between a
+/// directory and its child. Ranking the separator below every other byte makes a
+/// directory's subtree the contiguous run directly after it, because `/` is then
+/// the smallest thing that can follow the directory's name.
+///
+/// The order is total — lexicographic over the ranked bytes, then by length — so
+/// it is a valid sort comparator.
+fn compare_subtree_order(left: &str, right: &str) -> std::cmp::Ordering {
+    fn rank(byte: u8) -> u16 {
+        if byte == b'/' { 0 } else { byte as u16 + 1 }
+    }
+
+    let (left, right) = (left.as_bytes(), right.as_bytes());
+    for (a, b) in left.iter().zip(right.iter()) {
+        if a != b {
+            return rank(*a).cmp(&rank(*b));
+        }
+    }
+    left.len().cmp(&right.len())
 }
 
 #[derive(Clone)]

@@ -340,6 +340,53 @@ mod tests {
         assert_eq!(dedup(&["x/y/z", "a/b/c", "a/b", "x/y"]), vec!["a/b", "x/y"],);
     }
 
+    /// The single-candidate covering scan is only correct because a path's
+    /// subtree is contiguous in the order it scans. These are the inputs that
+    /// break if that ordering regresses to a plain byte comparison: a sibling
+    /// whose name sorts between a directory and its children, because the
+    /// character it differs by is below `/`.
+    #[test]
+    fn dedup_to_supersets_collapses_across_separator_sort_order() {
+        fn dedup(inputs: &[&str]) -> Vec<String> {
+            let paths: Vec<RelativePath> = inputs
+                .iter()
+                .map(|p| RelativePath::new_from_initial_path(p).expect("Path init failed"))
+                .collect();
+            RelativePath::dedup_to_supersets(paths)
+                .into_iter()
+                .map(|p| p.as_str().to_owned())
+                .collect()
+        }
+
+        // '!' 0x21, '-' 0x2D and '.' 0x2E all sort below the separator '/' 0x2F.
+        assert_eq!(dedup(&["a/b", "a/b.c", "a/b/c"]), vec!["a/b", "a/b.c"]);
+        assert_eq!(dedup(&["a/b/c", "a/b.c", "a/b"]), vec!["a/b", "a/b.c"]);
+        assert_eq!(
+            dedup(&["a", "a!x", "a-y", "a.z", "a/c"]),
+            vec!["a", "a!x", "a-y", "a.z"]
+        );
+        assert_eq!(
+            dedup(&["a/b", "a/b.1", "a/b.2", "a/b/c/d/e"]),
+            vec!["a/b", "a/b.1", "a/b.2"]
+        );
+        assert_eq!(
+            dedup(&["a/b", "a/b.x", "a/b/c", "m/n", "m/n.y", "m/n/o"]),
+            vec!["a/b", "a/b.x", "m/n", "m/n.y"]
+        );
+        assert_eq!(
+            dedup(&["a", "a.1", "a/b", "a/b.2", "a/b/c"]),
+            vec!["a", "a.1"]
+        );
+
+        let leaves: Vec<String> = (0..64).map(|i| format!("p/{i:03}")).collect();
+        let refs: Vec<&str> = leaves.iter().map(String::as_str).collect();
+        assert_eq!(dedup(&refs), leaves);
+
+        let mut with_parent = vec!["p"];
+        with_parent.extend(refs.iter().copied());
+        assert_eq!(dedup(&with_parent), vec!["p"]);
+    }
+
     #[test]
     fn new_from_user_path() {
         let repository_path = "my_repo";
