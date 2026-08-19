@@ -1547,6 +1547,65 @@ impl State {
         }))
     }
 
+    /// The file-metadata block for `block_index`, but only when one exists:
+    /// already resident, or recorded in the tree and therefore worth reading.
+    ///
+    /// `None` means no metadata has ever been stored for this block, so every
+    /// slot in it reads as zero. It is the answer to "is there anything here to
+    /// clear", asked without paying for the answer:
+    /// [`Self::block_file_metadata`] would hand back a freshly zeroed block in
+    /// this case, and that block is 65,568 bytes, is zeroed on allocation, and is
+    /// published only as a `Weak` — so nothing keeps it alive and the next caller
+    /// allocates another one.
+    ///
+    /// A resident block is always returned, whatever the tree has stored: it may
+    /// hold metadata from a slot that has since been freed, which a caller
+    /// recycling that slot has to clear.
+    pub async fn try_block_file_metadata_existing(
+        &self,
+        repository: Arc<RepositoryContext>,
+        block_index: usize,
+    ) -> Result<Option<Arc<NodeFileMetadataBlock>>, StateError> {
+        {
+            let lock = self.runtime.read();
+            if lock.block_file_metadata.len() > block_index
+                && let Some(block) = lock.block_file_metadata[block_index].upgrade()
+            {
+                return Ok(Some(block));
+            }
+        }
+
+        let tree = self.tree(repository.clone()).await?;
+        if block_index >= tree.block_count as usize {
+            return Err(StateError::internal(format!(
+                "Invalid block index: {block_index}"
+            )));
+        }
+
+        // Nothing has ever been written for this tree, so no block of it can
+        // hold anything.
+        if tree.hash_file_metadata.is_zero() {
+            return Ok(None);
+        }
+
+        // The address list records which blocks were written. A zero hash at this
+        // index is a block that never was. If the list has not been read yet,
+        // fall through — `block_file_metadata` reads it, and repeats the same
+        // test against it before deserializing.
+        {
+            let block_hash_bytes = self.runtime.read().block_file_metadata_address.clone();
+            if block_index < block_hash_bytes.count::<Hash>()
+                && block_hash_bytes.as_type_slice::<Hash>()[block_index].is_zero()
+            {
+                return Ok(None);
+            }
+        }
+
+        self.block_file_metadata(repository, block_index)
+            .await
+            .map(Some)
+    }
+
     pub async fn block_file_metadata(
         &self,
         repository: Arc<RepositoryContext>,
@@ -2011,25 +2070,29 @@ impl State {
         let metadata_block_index = NodeFileMetadataBlock::index(metadata_node_id);
         let metadata_node_index = NodeFileMetadata::index(metadata_node_id);
 
-        let metadata_block = self
-            .block_file_metadata(repository.clone(), metadata_block_index)
-            .await?;
+        // The slot may be recycled, in which case it still carries the metadata of
+        // whatever used to live there and has to be cleared. Where no metadata
+        // block exists there is nothing to carry, so nothing to clear.
+        if let Some(metadata_block) = self
+            .try_block_file_metadata_existing(repository.clone(), metadata_block_index)
+            .await?
+        {
+            let dirtied = {
+                let mut block_lock = metadata_block.write();
 
-        let dirtied = {
-            let mut block_lock = metadata_block.write();
+                let node_metadata = block_lock.node(metadata_node_index);
+                if !node_metadata.metadata.is_zero() {
+                    node_metadata.metadata.zero();
 
-            let node_metadata = block_lock.node(metadata_node_index);
-            if !node_metadata.metadata.is_zero() {
-                node_metadata.metadata.zero();
+                    block_lock.mark_dirty()
+                } else {
+                    false
+                }
+            };
 
-                block_lock.mark_dirty()
-            } else {
-                false
+            if dirtied {
+                self.block_file_metadata_modified(metadata_block, metadata_block_index);
             }
-        };
-
-        if dirtied {
-            self.block_file_metadata_modified(metadata_block, metadata_block_index);
         }
 
         Ok(node_id)
