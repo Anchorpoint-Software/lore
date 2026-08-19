@@ -700,8 +700,20 @@ class Lore:
             **kwargs,
         )
 
-    def branch_archive(self, branch: str | None = None, **kwargs: Unpack[GlobalOptions]):
-        return self.run(["branch", "archive"] + ([branch] if branch else []), **kwargs)
+    def branch_archive(
+        self,
+        branch: str | None = None,
+        include_layers: bool = False,
+        layer: str | None = None,
+        **kwargs: Unpack[GlobalOptions],
+    ):
+        return self.run(
+            ["branch", "archive"]
+            + ([branch] if branch else [])
+            + (["--include-layers"] if include_layers else [])
+            + (["--layer", layer] if layer else []),
+            **kwargs,
+        )
 
     def branch_reset(
         self,

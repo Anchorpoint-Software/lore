@@ -259,6 +259,279 @@ def test_layer_branch_create(new_lore_repo):
 
 
 @pytest.mark.smoke
+def test_layer_branch_archive_leaves_layers_by_default(new_lore_repo):
+    """`lore branch archive` touches only the repository it ran in.
+
+    A layer is a separate repository owning its own branch lifecycle, so an
+    archive must not reach into it without being asked.
+    """
+    repo, layer_repo = _setup_repo_with_layer(new_lore_repo)
+
+    repo.branch_create("feature")
+    repo.push()
+    assert layer_repo.branch_list().has_remote_branch("feature"), (
+        "Expected branch create to cascade into the layer repository"
+    )
+
+    repo.branch_switch("main")
+    repo.branch_archive("feature")
+
+    assert sorted(repo.branch_list().remote_branches) == ["main"], (
+        f"Expected only 'main' remaining in the parent, got: {repo.branch_list()}"
+    )
+    assert layer_repo.branch_list().has_remote_branch("feature"), (
+        f"Expected the layer branch to be left alone, got: {layer_repo.branch_list()}"
+    )
+
+
+@pytest.mark.smoke
+def test_layer_branch_archive_include_layers(new_lore_repo):
+    """`--include-layers` archives the branch in the layer repository too, so
+    the layer is left with exactly the branches it had before the create.
+    """
+    repo, layer_repo = _setup_repo_with_layer(new_lore_repo)
+
+    branches_before = sorted(layer_repo.branch_list().remote_branches)
+
+    repo.branch_create("feature")
+    repo.push()
+    assert layer_repo.branch_list().has_remote_branch("feature"), (
+        "Expected branch create to cascade into the layer repository"
+    )
+
+    repo.branch_switch("main")
+    repo.branch_archive("feature", include_layers=True)
+
+    assert sorted(repo.branch_list().remote_branches) == ["main"], (
+        f"Expected only 'main' remaining in the parent, got: {repo.branch_list()}"
+    )
+    assert sorted(layer_repo.branch_list().remote_branches) == branches_before, (
+        f"Expected layer branches {branches_before}, got: {layer_repo.branch_list()}"
+    )
+
+
+@pytest.mark.smoke
+def test_layer_branch_archive_multiple_layers(new_lore_repo):
+    """`--include-layers` archives the branch in every configured layer."""
+    repo, second_repo, third_repo = _setup_repo_with_two_layers(new_lore_repo)
+
+    repo.branch_create("feature")
+    repo.push()
+    for layer in (second_repo, third_repo):
+        assert layer.branch_list().has_remote_branch("feature"), (
+            f"Expected branch create to cascade into {layer.name}"
+        )
+
+    repo.branch_switch("main")
+    repo.branch_archive("feature", include_layers=True)
+
+    for layer in (second_repo, third_repo):
+        assert sorted(layer.branch_list().remote_branches) == ["main"], (
+            f"Expected only 'main' remaining in {layer.name}, got: {layer.branch_list()}"
+        )
+
+
+@pytest.mark.smoke
+def test_layer_branch_archive_single_layer(new_lore_repo):
+    """`--layer <path>` archives the branch in that layer and no other."""
+    repo, second_repo, third_repo = _setup_repo_with_two_layers(new_lore_repo)
+
+    repo.branch_create("feature")
+    repo.push()
+    repo.branch_switch("main")
+
+    repo.branch_archive("feature", layer="sec")
+
+    assert not second_repo.branch_list().has_remote_branch("feature"), (
+        f"Expected the scoped layer to be archived, got: {second_repo.branch_list()}"
+    )
+    assert third_repo.branch_list().has_remote_branch("feature"), (
+        f"Expected the other layer to be left alone, got: {third_repo.branch_list()}"
+    )
+
+
+@pytest.mark.smoke
+def test_layer_branch_archive_unknown_layer_errors(new_lore_repo):
+    """`--layer` naming a path that is not a layer is an error, not a silent no-op."""
+    repo, layer_repo = _setup_repo_with_layer(new_lore_repo)
+
+    repo.branch_create("feature")
+    repo.push()
+    repo.branch_switch("main")
+
+    output = repo.branch_archive("feature", layer="not-a-layer", check=False)
+
+    assert "not a layer" in output.lower(), (
+        f"Expected an unknown layer path to be reported, got: {output}"
+    )
+
+
+@pytest.mark.smoke
+def test_layer_branch_archive_layer_flags_conflict(new_lore_repo):
+    """`--include-layers` and `--layer` are mutually exclusive."""
+    repo, layer_repo = _setup_repo_with_layer(new_lore_repo)
+
+    output = repo.branch_archive(
+        "feature", include_layers=True, layer="lay", check=False
+    )
+
+    assert "cannot be used with" in output.lower(), (
+        f"Expected clap to reject the flag combination, got: {output}"
+    )
+
+
+@pytest.mark.smoke
+def test_layer_branch_archive_local_keeps_layer_remote(new_lore_repo):
+    """`--local --include-layers` archives the layer's local cache only,
+    leaving the layer's remote branch in place.
+    """
+    repo, layer_repo = _setup_repo_with_layer(new_lore_repo)
+
+    repo.branch_create("feature")
+    repo.push()
+
+    repo.branch_switch("main")
+    repo.branch_archive("feature", local=True, include_layers=True)
+
+    assert not repo.branch_list().has_local_branch("feature"), (
+        f"Expected the local branch to be archived, got: {repo.branch_list()}"
+    )
+    assert layer_repo.branch_list().has_remote_branch("feature"), (
+        f"Expected the layer remote branch to remain, got: {layer_repo.branch_list()}"
+    )
+
+
+@pytest.mark.smoke
+def test_layer_branch_archive_skips_layer_without_branch(new_lore_repo):
+    """A layer that never had the branch is skipped quietly.
+
+    Creating the branch before the layer is configured is the one flow that
+    leaves a layer with no metadata for it, so the layer answers NOT_FOUND
+    rather than the idempotent already-archived success.
+    """
+    repo: Lore = new_lore_repo()
+    layer_repo: Lore = new_lore_repo(repo.name + "_layer")
+
+    repo.write_commit_push(None, {MAIN_FILE: b"main content"})
+    layer_repo.make_dirs("lay")
+    layer_repo.write_commit_push(None, {LAYER_FILE: b"layer content v1"})
+
+    # No layer configured yet, so the branch is never cascaded anywhere.
+    repo.branch_create("feature")
+    repo.push()
+    repo.branch_switch("main")
+
+    repo.layer_add("lay", layer_repo, "lay/")
+    assert not layer_repo.branch_list().has_remote_branch("feature"), (
+        f"Expected the layer to never have seen the branch, got: {layer_repo.branch_list()}"
+    )
+
+    output = repo.branch_archive("feature", include_layers=True)
+
+    assert "not found" not in output.lower(), (
+        f"Expected the missing layer branch to be skipped quietly, got: {output}"
+    )
+    assert sorted(repo.branch_list().remote_branches) == ["main"], (
+        f"Expected only 'main' remaining in the parent, got: {repo.branch_list()}"
+    )
+
+
+@pytest.mark.smoke
+def test_layer_branch_archive_tolerates_already_archived_layer(new_lore_repo):
+    """Archiving a branch a layer already archived is not an error."""
+    repo, layer_repo = _setup_repo_with_layer(new_lore_repo)
+
+    repo.branch_create("feature")
+    repo.push()
+    repo.branch_switch("main")
+
+    layer_repo.branch_switch("main")
+    layer_repo.branch_archive("feature")
+
+    repo.branch_archive("feature", include_layers=True)
+
+    assert sorted(repo.branch_list().remote_branches) == ["main"], (
+        f"Expected only 'main' remaining in the parent, got: {repo.branch_list()}"
+    )
+
+
+@pytest.mark.smoke
+def test_layer_branch_archive_reports_once(new_lore_repo):
+    """Archiving reports a single branch, not one line per layer."""
+    repo, second_repo, third_repo = _setup_repo_with_two_layers(new_lore_repo)
+
+    repo.branch_create("feature")
+    repo.push()
+    repo.branch_switch("main")
+
+    output = repo.branch_archive("feature", include_layers=True)
+
+    assert output.count("Archived branch") == 1, (
+        f"Expected one archive line for the outer repository, got: {output}"
+    )
+
+
+@pytest.mark.smoke
+def test_layer_branch_archive_continues_past_refusing_layer(new_lore_repo):
+    """One layer refusing the archive does not stop the remaining layers."""
+    repo, second_repo, third_repo = _setup_repo_with_two_layers(new_lore_repo)
+
+    repo.branch_create("feature")
+    repo.push()
+    repo.branch_switch("main")
+
+    second_repo.branch_protect("feature")
+
+    repo.branch_archive("feature", include_layers=True, check=False)
+
+    assert second_repo.branch_list().has_remote_branch("feature"), (
+        f"Expected the protected layer branch to survive, got: {second_repo.branch_list()}"
+    )
+    assert not third_repo.branch_list().has_remote_branch("feature"), (
+        f"Expected the remaining layer to still be archived, got: {third_repo.branch_list()}"
+    )
+
+
+@pytest.mark.smoke
+def test_layer_branch_archive_current_leaves_layers(new_lore_repo):
+    """Refusing to archive the current branch leaves the layers alone."""
+    repo, layer_repo = _setup_repo_with_layer(new_lore_repo)
+
+    repo.branch_create("feature")
+    repo.push()
+
+    repo.branch_archive("feature", include_layers=True, check=False)
+
+    assert layer_repo.branch_list().has_remote_branch("feature"), (
+        f"Expected the layer branch to be untouched, got: {layer_repo.branch_list()}"
+    )
+
+
+@pytest.mark.smoke
+def test_layer_branch_archive_converges_after_partial_archive(new_lore_repo):
+    """A repeat archive still reaches the layers after a partial one.
+
+    `--local` leaves every remote behind, so the second run finds the outer
+    local branch already gone. That must not abort the cascade, or the layer
+    remotes stay orphaned with no way to clean them up.
+    """
+    repo, layer_repo = _setup_repo_with_layer(new_lore_repo)
+
+    repo.branch_create("feature")
+    repo.push()
+    repo.branch_switch("main")
+
+    repo.branch_archive("feature", local=True, include_layers=True)
+    assert layer_repo.branch_list().has_remote_branch("feature")
+
+    repo.branch_archive("feature", include_layers=True, check=False)
+
+    assert not layer_repo.branch_list().has_remote_branch("feature"), (
+        f"Expected the repeat archive to reach the layer, got: {layer_repo.branch_list()}"
+    )
+
+
+@pytest.mark.smoke
 def test_layer_branch_switch_basic(new_lore_repo):
     """
     Switching to a branch that exists in the layer repo syncs layer files

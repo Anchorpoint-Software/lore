@@ -676,15 +676,14 @@ async fn sync_load_layer_list(
         // Detached sync - layers are handled separately by the caller
         return Ok((layer_revisions, nearest_revision));
     }
-    if let Ok(layers) = layer::list(repository.clone()).await {
+    if let Ok(layers) = layer::list_with_context(repository.clone()).await {
         // Check which matching revision to sync to for each layer
         // TODO(mjansson): Task parallelize this for multiple layers
         // TODO(mjansson): Handle multiple nearest matches for main revision
         if !layers.is_empty() {
             lore_info!("Resolving layer revisions");
         }
-        for layer in layers.iter() {
-            let module = Arc::new(repository.to_layer_context(layer.repository).await);
+        for (layer, module) in layers.iter() {
             let Ok(layer_latest) = layer::latest_revision(module.clone(), branch_id).await else {
                 // No revision on this branch yet (e.g. newly created branch),
                 // skip layer sync - files stay at current state

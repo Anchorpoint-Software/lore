@@ -529,12 +529,11 @@ pub async fn commit_impl(
             continue;
         }
 
-        let layer_repository = Arc::new(repository.to_layer_context(layer.repository).await);
-
         let layer_state = layer
-            .deserialize_current_and_staged(layer_repository.clone())
+            .deserialize_current_and_staged(repository.clone())
             .await
             .forward::<CommitError>("Failed to deserialize layer states")?;
+        let layer_repository = layer_state.repository.clone();
 
         lore_debug!(
             "Committing layer revision, current revision {}, staged revision {}",
@@ -676,11 +675,11 @@ async fn commit_layer_only(
             .into()
         })?;
 
-    let layer_repository_ctx = Arc::new(repository.to_layer_context(layer.repository).await);
     let layer_state = layer
-        .deserialize_current_and_staged(layer_repository_ctx.clone())
+        .deserialize_current_and_staged(repository.clone())
         .await
         .forward::<CommitError>("Failed to deserialize layer states")?;
+    let layer_repository_ctx = layer_state.repository.clone();
 
     let context = execution_context();
     let globals = context.globals();

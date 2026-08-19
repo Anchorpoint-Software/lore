@@ -1966,10 +1966,14 @@ pub async fn delete(
 
     delete_name_to_id(repository.clone(), &branch_name).await?;
 
-    event::LoreEvent::BranchArchive(LoreBranchArchiveEventData {
-        name: branch_name.into(),
-    })
-    .send();
+    // A layer archive is a consequence of the outer one, not its own user-facing
+    // event, so reporting it again per layer would read as repeated archives.
+    if !repository.is_layer() {
+        event::LoreEvent::BranchArchive(LoreBranchArchiveEventData {
+            name: branch_name.into(),
+        })
+        .send();
+    }
 
     Ok(())
 }
@@ -1984,12 +1988,18 @@ pub async fn delete_remote(
         .await
         .forward::<BranchError>("Failed to connect to remote revision service")?;
 
-    remote
-        .branch_delete(branch)
-        .await
-        .forward::<BranchError>("Failed to delete branch on remote")?;
-
-    Ok(())
+    // The service answers NOT_FOUND here for one reason only, and callers
+    // distinguish the missing-branch case to decide whether to skip. Left as the
+    // transport's generic NotFound it is indistinguishable from a real failure.
+    match remote.branch_delete(branch).await {
+        Err(err) if err.is_not_found() => Err(BranchError::BranchNotFound(
+            BranchNotFound {
+                branch: branch.to_string(),
+            }
+            .chain_err_from(err, "branch missing on remote"),
+        )),
+        result => result.forward::<BranchError>("Failed to delete branch on remote"),
+    }
 }
 
 pub async fn protect(

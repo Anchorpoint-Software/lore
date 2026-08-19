@@ -2918,7 +2918,7 @@ async fn layer_branch_switch(
     branch_signature: Hash,
     reset: bool,
 ) -> Result<(), RepositoryError> {
-    let layers = layer::list(repository.clone())
+    let layers = layer::list_with_context(repository.clone())
         .await
         .forward::<RepositoryError>("Failed to switch branch in layer")?;
 
@@ -2931,7 +2931,7 @@ async fn layer_branch_switch(
 
     let mut layer_updates: Vec<(RepositoryId, String, Hash)> = Vec::new();
 
-    for layer in layers {
+    for (layer, layer_repository) in layers {
         // Check for uncommitted staged changes in layer
         if !layer.staged.is_zero() && layer.staged != layer.current {
             if !global.force() {
@@ -2950,8 +2950,6 @@ async fn layer_branch_switch(
             .await
             .forward::<RepositoryError>("Failed to switch branch in layer")?;
         }
-
-        let layer_repository = Arc::new(repository.to_layer_context(layer.repository).await);
 
         // Check if branch already exists in layer repo
         let branch_exists = branch::exist_local(layer_repository.clone(), branch_id).await;

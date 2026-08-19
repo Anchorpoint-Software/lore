@@ -337,23 +337,23 @@ pub async fn push(
     )
     .await?;
 
-    if let Ok(layers) = layer::list(repository.clone()).await {
-        for layer in layers {
-            let repository = Arc::new(repository.to_layer_context(layer.repository).await);
-            let state_current = State::deserialize(repository.clone(), layer.current)
-                .await
-                .forward::<PushError>("deserializing layer state")?;
+    for (layer, repository) in layer::list_with_context(repository.clone())
+        .await
+        .unwrap_or_default()
+    {
+        let state_current = State::deserialize(repository.clone(), layer.current)
+            .await
+            .forward::<PushError>("deserializing layer state")?;
 
-            collect_fragments_and_push(
-                repository.clone(),
-                token,
-                options.clone(),
-                state_current,
-                branch,
-                layer.current,
-            )
-            .await?;
-        }
+        collect_fragments_and_push(
+            repository.clone(),
+            token,
+            options.clone(),
+            state_current,
+            branch,
+            layer.current,
+        )
+        .await?;
     }
 
     let state_current = State::deserialize(repository.clone(), local_latest)

@@ -726,6 +726,24 @@ pub async fn list(repository: Arc<RepositoryContext>) -> Result<Vec<Layer>, Laye
     Ok(config.layers)
 }
 
+/// For operations that cascade into every configured layer.
+///
+/// Each context costs its own connection until UCS-19226 lands, so they are
+/// opened concurrently rather than one handshake after another.
+pub async fn list_with_context(
+    repository: Arc<RepositoryContext>,
+) -> Result<Vec<(Layer, Arc<RepositoryContext>)>, LayerError> {
+    let layers = list(repository.clone()).await?;
+    Ok(futures::future::join_all(layers.into_iter().map(|layer| {
+        let repository = repository.clone();
+        async move {
+            let context = Arc::new(repository.to_layer_context(layer.repository).await);
+            (layer, context)
+        }
+    }))
+    .await)
+}
+
 /// Information about a layer with staged changes, including the count of files
 /// modified since the layer's `current` revision.
 #[derive(Clone, Debug)]

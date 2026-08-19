@@ -320,6 +320,14 @@ pub struct BranchArchiveArgs {
     /// Name of the branch to archive
     #[clap(value_name = "branch")]
     branch: String,
+
+    /// Also archive the branch in every configured layer
+    #[clap(long, action, conflicts_with = "layer")]
+    include_layers: bool,
+
+    /// Also archive the branch in the layer at the given mount path
+    #[clap(long, value_name = "path", conflicts_with = "include_layers")]
+    layer: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -1553,6 +1561,8 @@ pub fn handle_branch_unprotect(globals: LoreGlobalArgs, args: &BranchUnprotectAr
 pub fn handle_branch_archive(globals: LoreGlobalArgs, args: &BranchArchiveArgs) -> u8 {
     let archive_args = LoreBranchArchiveArgs {
         branch: LoreString::from(&args.branch),
+        layer: LoreString::from(args.layer.as_deref().unwrap_or("")),
+        include_layers: u8::from(args.include_layers),
     };
 
     let callback = output_formatter().unwrap_or(Some(

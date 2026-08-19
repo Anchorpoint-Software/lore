@@ -233,14 +233,16 @@ async fn layer_branch_create(
     branch_id: BranchId,
     category: String,
 ) -> Result<(), CreateError> {
-    let layers = layer::list(repository.clone())
+    let layers = layer::list_with_context(repository.clone())
         .await
         .forward::<CreateError>("listing layers")?;
 
-    lore_debug!("Creating branch {branch} for layers {layers:?}");
+    lore_debug!(
+        "Creating branch {branch} for layers {:?}",
+        layers.iter().map(|(layer, _)| layer).collect::<Vec<_>>()
+    );
 
-    for layer in layers {
-        let layer_repository = Arc::new(repository.to_layer_context(layer.repository).await);
+    for (layer, layer_repository) in layers {
         let user_id = execution_context().user_id().await;
 
         let current_revision = State::deserialize(layer_repository.clone(), layer.current)

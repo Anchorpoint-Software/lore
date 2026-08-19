@@ -3853,6 +3853,10 @@ typedef struct lore_branch_unprotect_args_t {
 typedef struct lore_branch_archive_args_t {
   // Name of the branch
   struct lore_string_t branch;
+  // If set, archive only in this layer (mount path relative to repo root)
+  struct lore_string_t layer;
+  // Also archive the branch in every configured layer
+  uint8_t include_layers;
 } lore_branch_archive_args_t;
 
 // Arguments for listing all branches in the repository.

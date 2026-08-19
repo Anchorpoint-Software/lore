@@ -17,6 +17,7 @@ use lore_revision::interface::LoreArray;
 use lore_revision::interface::LoreEventCallback;
 use lore_revision::interface::LoreGlobalArgs;
 use lore_revision::interface::LoreMetadataType;
+use lore_revision::layer;
 use lore_revision::lore::BranchId;
 use lore_revision::lore::execution_context;
 use lore_revision::lore_debug;
@@ -1096,6 +1097,12 @@ async fn unprotect_local(
 pub struct LoreBranchArchiveArgs {
     /// Name of the branch
     pub branch: LoreString,
+    /// If set, archive only in this layer (mount path relative to repo root)
+    #[serde(default)]
+    pub layer: LoreString,
+    /// Also archive the branch in every configured layer
+    #[serde(default)]
+    pub include_layers: u8,
 }
 
 /// Archives a branch locally and, unless running in local mode, on the remote.
@@ -1149,6 +1156,13 @@ async fn archive_impl(
 
     let branch = branch::resolve(repository.clone(), args.branch.as_str()).await?;
 
+    let layer_path: Option<&str> = (&args.layer).into();
+    let scope = match layer_path {
+        Some(path) => LayerScope::Single(path.to_string()),
+        None if args.include_layers != 0 => LayerScope::All,
+        None => LayerScope::OuterOnly,
+    };
+
     let mut local_fail = false;
 
     // Make sure branch is not current
@@ -1187,10 +1201,69 @@ async fn archive_impl(
         }
     }
 
+    // Runs even when the outer archive failed, so that a repeat of a partially
+    // applied archive still converges on the layers.
+    if !local_current {
+        archive_layers(repository, branch.id, scope).await?;
+    }
+
     if local_fail {
         return Err(BranchError::from(lore_base::error::BranchNotFound {
             branch: branch.id.to_string(),
         }));
+    }
+
+    Ok(())
+}
+
+/// A layer is a separate repository owning its own branch lifecycle, and
+/// archiving deletes, so the cascade is asked for rather than assumed.
+enum LayerScope {
+    OuterOnly,
+    Single(String),
+    All,
+}
+
+async fn archive_layers(
+    repository: Arc<RepositoryContext>,
+    branch: BranchId,
+    scope: LayerScope,
+) -> Result<(), BranchError> {
+    let execution = execution_context();
+    let archive_remote = !execution.globals().local();
+
+    let layers = match scope {
+        LayerScope::OuterOnly => return Ok(()),
+        LayerScope::All => layer::list_with_context(repository)
+            .await
+            .forward::<BranchError>("Failed to list layers")?,
+        LayerScope::Single(path) => {
+            let layer = layer::list(repository.clone())
+                .await
+                .forward::<BranchError>("Failed to list layers")?
+                .into_iter()
+                .find(|layer| layer.target_path == path)
+                .ok_or_else(|| -> BranchError { lore_base::error::NotALayer { path }.into() })?;
+            let context = Arc::new(repository.to_layer_context(layer.repository).await);
+            vec![(layer, context)]
+        }
+    };
+
+    for (_, layer_repository) in layers {
+        lore_debug!("Attempt archive of branch in layer {}", layer_repository.id);
+        if let Err(err) = branch::delete(layer_repository.clone(), branch).await
+            && !err.is_branch_not_found()
+        {
+            execution.dispatcher.send_error(err);
+        }
+
+        if archive_remote
+            && let Ok(remote) = layer_repository.remote().await
+            && let Err(err) = branch::delete_remote(remote, layer_repository.id, branch).await
+            && !err.is_branch_not_found()
+        {
+            execution.dispatcher.send_error(err);
+        }
     }
 
     Ok(())
@@ -1503,4 +1576,23 @@ async fn metadata_clear_local(
         },
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn archive_args_old_payload_missing_layer_fields_uses_defaults() {
+        // Old IPC client payload with no layer fields. The new fields must be
+        // `#[serde(default)]` so old clients keep working.
+        let payload = r#"{ "branch": "feature" }"#;
+
+        let args: LoreBranchArchiveArgs =
+            serde_json::from_str(payload).expect("old payload must deserialise");
+
+        assert_eq!(args.branch.as_str(), "feature");
+        assert_eq!(args.layer.as_str(), "");
+        assert_eq!(args.include_layers, 0);
+    }
 }
