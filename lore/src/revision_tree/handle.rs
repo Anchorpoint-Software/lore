@@ -70,13 +70,10 @@ lore_base::carries_no_text!(LoreRevisionTree);
 pub(crate) struct RevisionTreeInternal {
     /// Shared store reference cloned from the parent storage handle.
     pub(crate) store_internal: Arc<StoreInternal>,
-    /// Registry key of the parent storage handle this revision tree was
-    /// loaded against. Used by the storage-close warning path and the IPC
-    /// connection-teardown cascade to match revision tree handles to
-    /// their parent storage handle. That cascade has not landed, so outside
-    /// tests the field has no reader yet; the expectation below fires as
-    /// unfulfilled once one exists, which is when to remove it.
-    #[cfg_attr(not(test), expect(dead_code))]
+    /// Registry key of the parent storage handle this revision tree was loaded
+    /// against, and what the connection-teardown cascade matches on. The id
+    /// rather than the store, so two handles sharing one cached backend stay
+    /// distinct.
     pub(crate) parent_storage_handle_id: u64,
     /// Repository identity (a `Partition`) the loaded revision targets.
     pub(crate) repository: Partition,
@@ -255,6 +252,46 @@ pub(crate) fn lookup(handle: LoreRevisionTree) -> Option<Arc<RevisionTreeInterna
     REGISTRY.get(&handle.handle_id).map(|entry| entry.clone())
 }
 
+/// Test-only helper: whether `handle` is still registered. `#[doc(hidden)]` keeps it
+/// out of the public surface, mirroring `storage::handle::immutable_for_test`.
+///
+/// `lore/tests/shutdown.rs` reads the registry directly because no verb can report on
+/// it once `lore::shutdown` has taken the runtimes down.
+#[doc(hidden)]
+pub fn is_registered_for_test(handle: LoreRevisionTree) -> bool {
+    lookup(handle).is_some()
+}
+
+/// Drain the registry, returning every `(handle_id, Arc<RevisionTreeInternal>)` pair it
+/// held. Atomic against a concurrent load, which is why shutdown takes the whole set in
+/// one pass rather than iterating.
+pub(crate) fn drain_all() -> Vec<(u64, Arc<RevisionTreeInternal>)> {
+    let mut drained = Vec::new();
+    REGISTRY.retain(|&id, internal| {
+        drained.push((id, internal.clone()));
+        false
+    });
+    drained
+}
+
+/// Drain every registry entry loaded against the storage handle `storage_handle_id`, for
+/// the connection-teardown cascade: a tree outlives its parent by design, so a connection
+/// that drops without closing it would hold the store for the life of the process.
+pub(crate) fn drain_for_storage_handle(
+    storage_handle_id: u64,
+) -> Vec<(u64, Arc<RevisionTreeInternal>)> {
+    let mut drained = Vec::new();
+    REGISTRY.retain(|&id, internal| {
+        if internal.parent_storage_handle_id == storage_handle_id {
+            drained.push((id, internal.clone()));
+            false
+        } else {
+            true
+        }
+    });
+    drained
+}
+
 /// Remove the handle's entry from the registry, returning the `Arc` the
 /// entry held (for the caller to drive close).
 pub(crate) fn unregister(handle: LoreRevisionTree) -> Option<Arc<RevisionTreeInternal>> {
@@ -382,6 +419,14 @@ pub(crate) mod test_support {
     /// Build a `RevisionTreeInternal` for tests. Uses in-memory stores so
     /// no filesystem touch happens and no cleanup is required.
     pub(crate) async fn new_for_testing() -> Arc<RevisionTreeInternal> {
+        new_for_testing_on_storage_handle(0).await
+    }
+
+    /// The same fixture, claiming to have been loaded against a given storage
+    /// handle — what the connection-teardown close cascade matches on.
+    pub(crate) async fn new_for_testing_on_storage_handle(
+        parent_storage_handle_id: u64,
+    ) -> Arc<RevisionTreeInternal> {
         let store_internal: Arc<StoreInternal> = in_memory_for_tests("revision-tree-test").await;
         let (immutable, mutable) = create_client_memory_stores()
             .await
@@ -401,7 +446,7 @@ pub(crate) mod test_support {
         let state = Arc::new(State::new());
         Arc::new(RevisionTreeInternal::new(
             store_internal,
-            0,
+            parent_storage_handle_id,
             repository,
             repository_context,
             state,

@@ -99,8 +99,17 @@ pub async fn close_all_handles() {
 /// Their args fail to deserialize on the server side; the dispatcher must reject them with
 /// `InvalidArguments` rather than attempt to round-trip the payload bytes through IPC.
 /// Service-mode callers route those ops directly against the local backend.
+///
+/// Revision tree handles loaded against a drained storage handle are closed too, and this
+/// is the only path that closes one for its caller: elsewhere a tree outlives its parent by
+/// design, but a dropped connection leaves nobody to release it. The cascade runs per
+/// storage handle, each draining its own trees in parallel.
 pub async fn close_for_connection(connection_id: u64) {
-    drain_in_parallel(handle::drain_for_connection(connection_id)).await;
+    let entries = handle::drain_for_connection(connection_id);
+    for (storage_handle_id, _) in &entries {
+        crate::revision_tree::close_for_storage_handle(*storage_handle_id).await;
+    }
+    drain_in_parallel(entries).await;
 }
 
 /// Run the close sequence for each entry concurrently: every drain fires its own task so the
@@ -323,6 +332,74 @@ mod tests {
         for h in [h_8, h_client] {
             handle::unregister(h);
         }
+    }
+
+    /// Teardown closes the revision tree handles on the connection's storage handles.
+    /// Handles on another connection, or on none, are left registered.
+    #[tokio::test]
+    async fn close_for_connection_closes_the_revision_handles_loaded_on_it() {
+        use lore_base::types::Hash;
+        use lore_base::types::Partition;
+        use lore_revision::event::LoreEvent;
+        use lore_revision::interface::LoreEventCallback;
+        use lore_revision::interface::LoreGlobalArgs;
+
+        use crate::revision_tree::handle as tree_handle;
+        use crate::revision_tree::handle::LoreRevisionTree;
+        use crate::revision_tree::load::LoreRevisionTreeLoadArgs;
+        use crate::revision_tree::load::load;
+
+        async fn load_tree(store: handle::LoreStore, repository: Partition) -> LoreRevisionTree {
+            let loaded: Arc<std::sync::Mutex<Option<u64>>> = Arc::new(std::sync::Mutex::new(None));
+            let sink = loaded.clone();
+            let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
+                if let LoreEvent::RevisionTreeLoaded(data) = event {
+                    *sink.lock().unwrap() = Some(data.handle_id);
+                }
+            }));
+            let status = load(
+                LoreGlobalArgs::default(),
+                LoreRevisionTreeLoadArgs {
+                    store,
+                    repository,
+                    revision_hash: Hash::default(),
+                },
+                callback,
+            )
+            .await;
+            assert_eq!(status, 0, "loading the revision tree fixture must succeed");
+            LoreRevisionTree {
+                handle_id: loaded
+                    .lock()
+                    .unwrap()
+                    .expect("load must emit RevisionTreeLoaded"),
+            }
+        }
+
+        const CONNECTION: u64 = 0x18A;
+
+        let dropped = handle::register(build_connection_store("teardown", CONNECTION).await);
+        let client = handle::register(in_memory_for_tests("teardown-client").await);
+        let on_dropped = load_tree(dropped, Partition::from([0x1Au8; 16])).await;
+        let on_client = load_tree(client, Partition::from([0x1Bu8; 16])).await;
+
+        close_for_connection(CONNECTION).await;
+
+        assert!(
+            handle::lookup(dropped).is_none(),
+            "the connection's storage handle must be closed",
+        );
+        assert!(
+            tree_handle::lookup(on_dropped).is_none(),
+            "the revision tree loaded on it must be closed with it",
+        );
+        assert!(
+            tree_handle::lookup(on_client).is_some(),
+            "a revision tree on a handle the connection did not own must survive",
+        );
+
+        tree_handle::unregister(on_client);
+        handle::unregister(client);
     }
 
     async fn build_connection_store(identity: &str, connection_id: u64) -> Arc<StoreInternal> {

@@ -3252,3 +3252,259 @@ mod move_tests {
         close_handle(handle).await;
     }
 }
+
+/// A handle outliving its parent storage handle, driven over the capi. The handle borrows
+/// the store rather than looking the parent up per call, so closing the parent leaves it
+/// fully usable — and a freshly loaded handle caches no node block, so every read below
+/// reaches a store whose handle is gone.
+#[cfg(test)]
+mod lifecycle_tests {
+    use lore::revision_tree::add::LoreRevisionTreeAddArgs;
+    use lore::revision_tree::add::LoreRevisionTreeAddEntry;
+    use lore::revision_tree::add::add;
+    use lore::revision_tree::commit::LoreRevisionTreeCommitArgs;
+    use lore::revision_tree::commit::LoreRevisionTreeCommitOptions;
+    use lore::revision_tree::commit::commit;
+    use lore::revision_tree::handle::LoreRevisionTree;
+    use lore::revision_tree::metadata_set::LoreRevisionTreeMetadataSetArgs;
+    use lore::revision_tree::metadata_set::LoreRevisionTreeMetadataSetEntry;
+    use lore::revision_tree::metadata_set::metadata_set;
+    use lore::storage::close::LoreStorageCloseArgs;
+    use lore_base::types::Address;
+    use lore_base::types::Context;
+    use lore_base::types::Hash;
+    use lore_base::types::Partition;
+    use lore_revision::event::LoreErrorCode;
+    use lore_revision::interface::LoreArray;
+    use lore_revision::interface::LoreGlobalArgs;
+    use lore_revision::interface::LoreMetadata;
+    use lore_revision::interface::LoreNodeType;
+    use lore_revision::interface::LoreString;
+    use lore_revision::metadata::BRANCH;
+    use lore_revision::node::BLOCK_NODE_COUNT;
+    use lore_revision::node::INVALID_NODE;
+    use lore_revision::node::NodeID;
+    use lore_revision::node::ROOT_NODE;
+
+    use super::support::*;
+
+    /// One directory plus enough files under it that the tree needs a second node block,
+    /// so a read of the last child cannot be served by whatever the first read pulled in.
+    fn subtree_entries(file_count: u64) -> Vec<LoreRevisionTreeAddEntry> {
+        let directory = LoreRevisionTreeAddEntry {
+            entry_id: 1,
+            parent_node_id: ROOT_NODE,
+            parent_entry_index: 0,
+            name: LoreString::from_str("dir"),
+            kind: LoreNodeType::Directory as u32,
+            mode: 0o755,
+            size: 0,
+            address: Address::default(),
+        };
+        let files = (0..file_count).map(|index| LoreRevisionTreeAddEntry {
+            entry_id: index + 2,
+            parent_node_id: INVALID_NODE,
+            parent_entry_index: 0,
+            name: LoreString::from_str(&format!("f-{index:05}")),
+            kind: LoreNodeType::File as u32,
+            mode: 0o644,
+            size: 12,
+            address: Address {
+                hash: Hash::from_u64(0xc0ffee + index),
+                context: Context::from(uuid::Uuid::now_v7()),
+            },
+        });
+        std::iter::once(directory).chain(files).collect()
+    }
+
+    async fn run_add(
+        handle: LoreRevisionTree,
+        entries: Vec<LoreRevisionTreeAddEntry>,
+    ) -> Vec<Captured> {
+        let (sink, callback) = make_sink();
+        let status = add(
+            LoreGlobalArgs::default(),
+            LoreRevisionTreeAddArgs {
+                batch_id: CALL_ID,
+                handle,
+                entries: LoreArray::from_vec(entries),
+            },
+            callback,
+        )
+        .await;
+        let events = sink.lock().unwrap().clone();
+        assert_eq!(status, 0, "seeding the tree must succeed, got {events:?}");
+        events
+    }
+
+    fn added_node(events: &[Captured], entry_id: u64) -> NodeID {
+        events
+            .iter()
+            .find_map(|event| match event {
+                Captured::AddComplete(id, node_id, code) if *id == entry_id => {
+                    assert_eq!(*code, LoreErrorCode::None, "entry {entry_id} must succeed");
+                    Some(*node_id)
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("entry {entry_id} must report, got {events:?}"))
+    }
+
+    /// A file directly under the root.
+    fn file_entry(entry_id: u64, name: &str) -> LoreRevisionTreeAddEntry {
+        LoreRevisionTreeAddEntry {
+            entry_id,
+            parent_node_id: ROOT_NODE,
+            parent_entry_index: 0,
+            name: LoreString::from_str(name),
+            kind: LoreNodeType::File as u32,
+            mode: 0o644,
+            size: 12,
+            address: Address {
+                hash: Hash::from_u64(0xc0ffee),
+                context: Context::from(uuid::Uuid::now_v7()),
+            },
+        }
+    }
+
+    /// `branch` names the branch an initial commit publishes to. A follow-up commit on a
+    /// handle that already carries a revision passes `None`, continuing that revision's own.
+    async fn commit_on(handle: LoreRevisionTree, branch: Option<Context>) -> Hash {
+        if let Some(branch) = branch {
+            let (sink, callback) = make_sink();
+            let status = metadata_set(
+                LoreGlobalArgs::default(),
+                LoreRevisionTreeMetadataSetArgs {
+                    batch_id: CALL_ID,
+                    handle,
+                    entries: LoreArray::from_vec(vec![LoreRevisionTreeMetadataSetEntry {
+                        entry_id: 1,
+                        key: LoreString::from_str(BRANCH),
+                        value: LoreMetadata::Context(branch),
+                    }]),
+                },
+                callback,
+            )
+            .await;
+            assert_eq!(
+                status,
+                0,
+                "naming the branch must succeed, got {:?}",
+                sink.lock().unwrap()
+            );
+        }
+
+        let (sink, callback) = make_sink();
+        let status = commit(
+            LoreGlobalArgs::default(),
+            LoreRevisionTreeCommitArgs {
+                id: CALL_ID,
+                handle,
+                options: LoreRevisionTreeCommitOptions::default(),
+            },
+            callback,
+        )
+        .await;
+        let events = sink.lock().unwrap().clone();
+        assert_eq!(status, 0, "committing must succeed, got {events:?}");
+        events
+            .iter()
+            .find_map(|event| match event {
+                Captured::CommitComplete(id, revision, _, _) if *id == CALL_ID => Some(*revision),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("the commit terminal must fire, got {events:?}"))
+    }
+
+    async fn close_store(store_handle_id: u64) {
+        let (sink, callback) = make_sink();
+        let status = lore::storage::close::close(
+            LoreGlobalArgs::default(),
+            LoreStorageCloseArgs {
+                handle: lore::storage::handle::LoreStore {
+                    handle_id: store_handle_id,
+                },
+            },
+            callback,
+        )
+        .await;
+        assert_eq!(
+            status,
+            0,
+            "closing the parent storage handle must succeed, got {:?}",
+            sink.lock().unwrap()
+        );
+    }
+
+    /// Reading a committed revision through a handle whose parent has closed. The blocks
+    /// live in the store and the fresh handle holds none of them, so the store it kept has
+    /// to be functionally live rather than merely reference-counted.
+    #[tokio::test]
+    async fn tree_block_reads_continue_after_the_parent_storage_closes() {
+        let repository = Partition::from([0x18u8; 16]);
+        let store = open_store().await;
+        let handle = load_on(store, repository, Hash::default()).await;
+
+        let file_count = BLOCK_NODE_COUNT as u64 + 8;
+        let seeded = run_add(handle, subtree_entries(file_count)).await;
+        let last_leaf = added_node(&seeded, file_count + 1);
+        let revision = commit_on(handle, Some(Context::from(uuid::Uuid::now_v7()))).await;
+        close_handle(handle).await;
+
+        let reloaded = load_on(store, repository, revision).await;
+        close_store(store).await;
+
+        let names = child_names(reloaded, added_node(&seeded, 1)).await;
+        assert_eq!(
+            names.len(),
+            file_count as usize,
+            "every child must come back from a store whose handle is closed"
+        );
+        // The name comes out of the node's own block, unlike the revision, which the state
+        // header carries.
+        let record = node_info_of(reloaded, last_leaf).await;
+        assert_eq!(
+            record.name.as_str(),
+            format!("f-{:05}", file_count - 1),
+            "a node in the last block must read back too, got {record:?}"
+        );
+
+        close_handle(reloaded).await;
+    }
+
+    /// The handle still writes, too. A commit is the whole write path at once: it freezes
+    /// the tree, serializes blocks through the immutable store and advances a branch
+    /// pointer in the mutable one, all through Arcs whose storage handle is gone.
+    #[tokio::test]
+    async fn edits_and_commits_continue_after_the_parent_storage_closes() {
+        let repository = Partition::from([0x19u8; 16]);
+        let store = open_store().await;
+        let handle = load_on(store, repository, Hash::default()).await;
+
+        run_add(handle, vec![file_entry(1, "before.bin")]).await;
+        let first = commit_on(handle, Some(Context::from(uuid::Uuid::now_v7()))).await;
+
+        close_store(store).await;
+
+        let seeded = run_add(handle, vec![file_entry(2, "after.bin")]).await;
+        let added = added_node(&seeded, 2);
+        let second = commit_on(handle, None).await;
+
+        assert!(
+            !second.is_zero() && second != first,
+            "the commit must publish a new revision, got {second} after {first}"
+        );
+        assert_eq!(
+            child_names(handle, ROOT_NODE).await,
+            vec!["after.bin".to_string(), "before.bin".to_string()],
+            "and the tree must hold both what it committed before its parent closed and after"
+        );
+        assert_eq!(
+            node_info_of(handle, added).await.revision,
+            second,
+            "the node added after the close belongs to the revision the commit published"
+        );
+
+        close_handle(handle).await;
+    }
+}
