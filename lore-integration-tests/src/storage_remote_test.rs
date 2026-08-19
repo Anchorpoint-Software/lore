@@ -73,10 +73,37 @@ mod storage_remote_tests {
         url: String,
         backend_immutable: Arc<dyn lore_storage::ImmutableStore>,
         backend_mutable: Arc<dyn lore_storage::MutableStore>,
-        /// Holds whatever keeps the server alive — a shutdown sender for gRPC, the server handle
-        /// for QUIC. Dropping it stops the server.
-        _shutdown: Box<dyn std::any::Any + Send>,
+        /// Signals the gRPC server to stop serving. Dropping it starts the shutdown.
+        grpc_shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+        /// Fires when the gRPC serve task returns, which is when its listener is closed.
+        grpc_stopped: Option<tokio::sync::oneshot::Receiver<String>>,
+        /// The QUIC endpoint, on a `lore://` server.
+        quic: Option<QuinnServer>,
     }
+
+    impl TestServer {
+        /// Stop serving and wait until this server is unreachable.
+        ///
+        /// Dropping a `TestServer` only *signals* the stop: the gRPC listener closes when its
+        /// serve task returns, and QUIC keeps accepting until its endpoint does. A test that
+        /// needs the peer gone rather than going has to wait for both, or the request it expects
+        /// to fail can still be answered.
+        async fn shutdown(mut self) {
+            if let Some(quic) = self.quic.take() {
+                quic.close().await;
+            }
+            drop(self.grpc_shutdown.take());
+            if let Some(stopped) = self.grpc_stopped.take()
+                && tokio::time::timeout(SHUTDOWN_WAIT, stopped).await.is_err()
+            {
+                panic!("test server at {} did not stop serving", self.url);
+            }
+        }
+    }
+
+    /// Bound on a test server's shutdown. Long enough that a loaded runner is not mistaken for a
+    /// server that will not stop.
+    const SHUTDOWN_WAIT: Duration = Duration::from_secs(10);
 
     /// A server-side store that refuses to store exactly one leaf fragment.
     ///
@@ -233,15 +260,75 @@ mod storage_remote_tests {
     ///
     /// The gRPC server binds inside a spawned task, so a failed bind cannot propagate to the
     /// caller. Returning quietly on timeout leaves the test to meet it as a peer that never
-    /// answers — minutes of client retries reported as a hang instead of the bind error it is.
-    async fn await_listening(addr: SocketAddr) {
+    /// answers — minutes of client retries reported as a hang instead of the bind error it is,
+    /// which is why `stopped` is polled alongside: a server that died says why.
+    async fn await_listening(
+        addr: SocketAddr,
+        stopped: &mut tokio::sync::oneshot::Receiver<String>,
+    ) {
         for _ in 0..100 {
+            if let Ok(reason) = stopped.try_recv() {
+                panic!("test server on {addr} {reason}");
+            }
             if tokio::net::TcpStream::connect(addr).await.is_ok() {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         panic!("server at {addr} never started listening");
+    }
+
+    /// Serve gRPC on `listener` until the returned sender is dropped, reporting through the
+    /// returned receiver once the serve task has returned.
+    fn spawn_grpc_server(
+        listener: std::net::TcpListener,
+        backend_immutable: Arc<dyn lore_storage::ImmutableStore>,
+        backend_mutable: Arc<dyn lore_storage::MutableStore>,
+    ) -> (
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<String>,
+    ) {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let (stopped_tx, stopped_rx) = tokio::sync::oneshot::channel::<String>();
+
+        let notification_sender: Arc<dyn lore_revision::notification::NotificationSender> =
+            Arc::new(lore_server::notification::local::NotificationSender::default());
+        let hook_dispatcher = Arc::new(HookDispatcher::empty());
+
+        #[allow(clippy::disallowed_methods)]
+        tokio::spawn(async move {
+            let outcome = GrpcServerBuilder::new()
+                .with_environment(EnvironmentConfig::default())
+                .with_feature(FeatureSettings::default())
+                .with_immutable_store(backend_immutable.clone(), backend_immutable)
+                .with_mutable_store(backend_mutable)
+                .with_lock_store(None)
+                .with_notification(notification_sender, None)
+                .with_hook_dispatcher(hook_dispatcher)
+                .with_tls_config(None, None, None)
+                .unwrap()
+                .with_admin_endpoints(HashMap::new(), vec![])
+                .with_http2_config(
+                    None,
+                    None,
+                    Duration::from_secs(30),
+                    None,
+                    Default::default(),
+                    None,
+                )
+                .with_jwt_verifier(None)
+                .unwrap()
+                .serve_with_listener(listener, async {
+                    shutdown_rx.await.ok();
+                })
+                .await;
+            let _ = stopped_tx.send(match outcome {
+                Ok(()) => "stopped before the test finished".to_string(),
+                Err(error) => format!("failed: {error}"),
+            });
+        });
+
+        (shutdown_tx, stopped_rx)
     }
 
     /// Build a fresh in-memory backend pair for a test server to serve.
@@ -293,67 +380,17 @@ mod storage_remote_tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr: SocketAddr = listener.local_addr().unwrap();
 
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-        let signal = async {
-            shutdown_rx.await.ok();
-        };
-
-        let notification_sender: Arc<dyn lore_revision::notification::NotificationSender> =
-            Arc::new(lore_server::notification::local::NotificationSender::default());
-        let hook_dispatcher = Arc::new(HookDispatcher::empty());
-
-        let (stopped_tx, mut stopped_rx) = tokio::sync::oneshot::channel::<String>();
-        #[allow(clippy::disallowed_methods)]
-        tokio::spawn(async move {
-            let outcome = GrpcServerBuilder::new()
-                .with_environment(EnvironmentConfig::default())
-                .with_feature(FeatureSettings::default())
-                .with_immutable_store(backend_immutable.clone(), backend_immutable)
-                .with_mutable_store(backend_mutable)
-                .with_lock_store(None)
-                .with_notification(notification_sender, None)
-                .with_hook_dispatcher(hook_dispatcher)
-                .with_tls_config(None, None, None)
-                .unwrap()
-                .with_admin_endpoints(HashMap::new(), vec![])
-                .with_http2_config(
-                    None,
-                    None,
-                    Duration::from_secs(30),
-                    None,
-                    Default::default(),
-                    None,
-                )
-                .with_jwt_verifier(None)
-                .unwrap()
-                .serve_with_listener(listener, signal)
-                .await;
-            let _ = stopped_tx.send(match outcome {
-                Ok(()) => "stopped before the test finished".to_string(),
-                Err(error) => format!("failed: {error}"),
-            });
-        });
-
-        // A server that never starts must say so, rather than leaving a client to wait on a socket
-        // nothing is answering.
-        let mut ready = false;
-        for _ in 0..50 {
-            if let Ok(reason) = stopped_rx.try_recv() {
-                panic!("test server on {addr} {reason}");
-            }
-            if tokio::net::TcpStream::connect(addr).await.is_ok() {
-                ready = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        assert!(ready, "test server on {addr} never accepted a connection");
+        let (shutdown_tx, mut stopped_rx) =
+            spawn_grpc_server(listener, backend_immutable, backend_mutable);
+        await_listening(addr, &mut stopped_rx).await;
 
         TestServer {
             url: format!("grpc://127.0.0.1:{}", addr.port()),
             backend_immutable: backend_for_test,
             backend_mutable: backend_mutable_for_test,
-            _shutdown: Box::new(shutdown_tx),
+            grpc_shutdown: Some(shutdown_tx),
+            grpc_stopped: Some(stopped_rx),
+            quic: None,
         }
     }
 
@@ -397,50 +434,17 @@ mod storage_remote_tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr: SocketAddr = listener.local_addr().unwrap();
 
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-        let signal = async {
-            shutdown_rx.await.ok();
-        };
-
-        let notification_sender: Arc<dyn lore_revision::notification::NotificationSender> =
-            Arc::new(lore_server::notification::local::NotificationSender::default());
-        let hook_dispatcher = Arc::new(HookDispatcher::empty());
-
-        #[allow(clippy::disallowed_methods)]
-        tokio::spawn(async move {
-            GrpcServerBuilder::new()
-                .with_environment(EnvironmentConfig::default())
-                .with_feature(FeatureSettings::default())
-                .with_immutable_store(backend_immutable.clone(), backend_immutable)
-                .with_mutable_store(backend_mutable)
-                .with_lock_store(None)
-                .with_notification(notification_sender, None)
-                .with_hook_dispatcher(hook_dispatcher)
-                .with_tls_config(None, None, None)
-                .unwrap()
-                .with_admin_endpoints(HashMap::new(), vec![])
-                .with_http2_config(
-                    None,
-                    None,
-                    Duration::from_secs(30),
-                    None,
-                    Default::default(),
-                    None,
-                )
-                .with_jwt_verifier(None)
-                .unwrap()
-                .serve_with_listener(listener, signal)
-                .await
-                .unwrap();
-        });
-
-        await_listening(addr).await;
+        let (shutdown_tx, mut stopped_rx) =
+            spawn_grpc_server(listener, backend_immutable, backend_mutable);
+        await_listening(addr, &mut stopped_rx).await;
 
         TestServer {
             url: format!("grpc://127.0.0.1:{}", addr.port()),
             backend_immutable: backend_for_test,
             backend_mutable: backend_mutable_for_test,
-            _shutdown: Box::new(shutdown_tx),
+            grpc_shutdown: Some(shutdown_tx),
+            grpc_stopped: Some(stopped_rx),
+            quic: None,
         }
     }
 
@@ -495,49 +499,53 @@ mod storage_remote_tests {
         )
         .expect("quinn server start");
 
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-        let signal = async {
-            shutdown_rx.await.ok();
-        };
-        let notification_sender: Arc<dyn lore_revision::notification::NotificationSender> =
-            Arc::new(lore_server::notification::local::NotificationSender::default());
-        let hook_dispatcher = Arc::new(HookDispatcher::empty());
-        #[allow(clippy::disallowed_methods)]
-        tokio::spawn(async move {
-            GrpcServerBuilder::new()
-                .with_environment(EnvironmentConfig::default())
-                .with_feature(FeatureSettings::default())
-                .with_immutable_store(backend_immutable.clone(), backend_immutable)
-                .with_mutable_store(backend_mutable)
-                .with_lock_store(None)
-                .with_notification(notification_sender, None)
-                .with_hook_dispatcher(hook_dispatcher)
-                .with_tls_config(None, None, None)
-                .unwrap()
-                .with_admin_endpoints(HashMap::new(), vec![])
-                .with_http2_config(
-                    None,
-                    None,
-                    Duration::from_secs(30),
-                    None,
-                    Default::default(),
-                    None,
-                )
-                .with_jwt_verifier(None)
-                .unwrap()
-                .serve_with_listener(listener, signal)
-                .await
-                .unwrap();
-        });
-
-        await_listening(addr).await;
+        let (shutdown_tx, mut stopped_rx) =
+            spawn_grpc_server(listener, backend_immutable, backend_mutable);
+        await_listening(addr, &mut stopped_rx).await;
 
         TestServer {
             url: format!("lore://127.0.0.1:{}", addr.port()),
             backend_immutable: backend_for_test,
             backend_mutable: backend_mutable_for_test,
-            _shutdown: Box::new((quic, shutdown_tx)),
+            grpc_shutdown: Some(shutdown_tx),
+            grpc_stopped: Some(stopped_rx),
+            quic: Some(quic),
         }
+    }
+
+    /// The shutdown barrier itself, because two tests depend on a server actually being gone
+    /// and dropping one does not achieve that: the serve task tears the listener down
+    /// asynchronously, so a dropped server keeps accepting. Measured before this barrier
+    /// existed, a dropped server was still accepting on every attempt.
+    ///
+    /// TCP covers the gRPC leg on both server kinds, `lore://` included, since both serve gRPC
+    /// on the port's TCP half. The QUIC half has no equivalent probe and rests on
+    /// `Endpoint::close` plus `wait_idle`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_awaited_shutdown_leaves_the_port_closed() {
+        let execution = setup_execution("storage-remote-shutdown-barrier".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                for transport in TRANSPORTS {
+                    let server = start_server(transport).await;
+                    let addr: SocketAddr = server
+                        .url
+                        .rsplit_once('/')
+                        .expect("url carries a scheme")
+                        .1
+                        .parse()
+                        .expect("url carries a socket address");
+
+                    server.shutdown().await;
+
+                    assert!(
+                        tokio::net::TcpStream::connect(addr).await.is_err(),
+                        "{transport:?}: the port must refuse a connection once the server has \
+                         stopped, or a test that needs an unreachable peer does not have one"
+                    );
+                }
+            })
+            .await;
     }
 
     #[derive(Debug, Clone, PartialEq)]
@@ -4276,7 +4284,9 @@ mod storage_remote_tests {
                     let handle_id = open_remote_handle(&server).await;
 
                     let backend_mutable = server.backend_mutable.clone();
-                    drop(server);
+                    // Awaited, not dropped: the upload below has to meet a server that is gone,
+                    // and a signalled-but-still-listening one answers it.
+                    server.shutdown().await;
 
                     let outs: Arc<Mutex<Vec<(LoreErrorCode, u8, u8)>>> =
                         Arc::new(Mutex::new(Vec::new()));
