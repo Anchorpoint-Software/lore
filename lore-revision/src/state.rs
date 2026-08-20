@@ -1921,98 +1921,7 @@ impl State {
             ));
         }
 
-        let permit = self.unused.acquire().await.map_err(|error| {
-            StateError::internal(format!("node allocation semaphore is closed: {error}"))
-        })?;
-
-        let mut node_id = INVALID_NODE;
-        let tree = self.tree(repository.clone()).await?;
-        let mut block_index = tree.block_unused_first as usize;
-        let block_count = self.block_count();
-        lore_trace!("node_add block unused {block_index} block count {block_count}");
-        while block_index < block_count && !node_id.is_valid_node_id() {
-            let block = self.block(repository.clone(), block_index).await?;
-            let (dirtied, block_full, next_unused_index) = {
-                let mut block = block.write();
-                let next_unused_index = block.block_unused_next();
-                node_id = block.grab_node_unused(block_index as u32);
-                if node_id.is_valid_node_id() {
-                    (block.mark_dirty(), block.is_full(), next_unused_index)
-                } else {
-                    (false, true, next_unused_index)
-                }
-            };
-            if dirtied {
-                self.block_modified(block.clone(), block_index);
-                self.mark_dirty();
-            }
-            if block_full {
-                let mut popped_dirty = false;
-                {
-                    let mut runtime = self.runtime.write();
-                    if let Some(tree) = runtime.tree.as_mut()
-                        && tree.block_unused_first == block_index as u32
-                    {
-                        tree.block_unused_first = next_unused_index;
-                        tree.flags |= TreeFlags::Dirty;
-                        let mut block_writer = block.write();
-                        block_writer.node_block().block_unused_next = INVALID_BLOCK;
-                        popped_dirty = block_writer.mark_dirty();
-                    }
-                }
-                if popped_dirty {
-                    self.block_modified(block.clone(), block_index);
-                    self.mark_dirty();
-                }
-            }
-            if !node_id.is_valid_node_id() {
-                if block_index != next_unused_index as usize {
-                    block_index = next_unused_index as usize;
-                } else {
-                    block_index = INVALID_BLOCK as usize;
-                }
-            }
-        }
-
-        if !node_id.is_valid_node_id()
-            && let Some((idx, block)) = self.try_recycle_last_block()
-        {
-            let candidate = {
-                let mut block_writer = block.write();
-                let id = block_writer.grab_node_unused(idx as u32);
-                if id.is_valid_node_id() {
-                    block_writer.mark_dirty();
-                }
-                id
-            };
-            if candidate.is_valid_node_id() {
-                node_id = candidate;
-                self.block_modified(block.clone(), idx);
-                self.mark_dirty();
-                self.push_unused_block_list(idx, &block);
-            }
-        }
-
-        if !node_id.is_valid_node_id() {
-            let (idx, block) = self.allocate_fresh_block()?;
-            node_id = {
-                let mut block_writer = block.write();
-                let id = block_writer.grab_node_unused(idx as u32);
-                if id.is_valid_node_id() {
-                    block_writer.mark_dirty();
-                }
-                id
-            };
-            if !node_id.is_valid_node_id() {
-                return Err(StateError::internal(
-                    "grab_node_unused returned INVALID on a freshly-allocated block",
-                ));
-            }
-            self.block_modified(block.clone(), idx);
-            self.mark_dirty();
-        }
-
-        drop(permit);
+        let node_id = self.grab_node_slot(repository.clone()).await?;
 
         let block_index = NodeBlock::index(node_id);
         lore_trace!("Block {} node {} added", block_index, Node::index(node_id));
@@ -2134,6 +2043,120 @@ impl State {
         }
 
         Ok(block)
+    }
+
+    /// Grab a free node slot, extending the tree when nothing is available.
+    ///
+    /// The common path takes no allocator permit. `grab_node_unused` mutates
+    /// only the block it is called on and only under that block's write lock,
+    /// so concurrent grabbers on the same block are already handed distinct
+    /// slots. A block holds [`BLOCK_NODE_COUNT`] of them, so all but one add per
+    /// block full is pure per-block work; the permit is needed only for the
+    /// transitions that mutate the unused chain or the block vector.
+    async fn grab_node_slot(
+        &self,
+        repository: Arc<RepositoryContext>,
+    ) -> Result<NodeID, StateError> {
+        loop {
+            let head = self.unused_head();
+            if (head as usize) < self.block_count() {
+                let block = self.block(repository.clone(), head as usize).await?;
+                if let Some(node_id) = self.try_grab_in(&block, head as usize) {
+                    return Ok(node_id);
+                }
+
+                let _permit = self.acquire_unused().await?;
+                self.retire_full_block(head, &block);
+                continue;
+            }
+
+            let _permit = self.acquire_unused().await?;
+            // Whoever held the permit before may have already published a block
+            // with room, in which case the retry finds it on the fast path.
+            if self.unused_head() != head {
+                continue;
+            }
+
+            if let Some((idx, block)) = self.try_recycle_last_block()
+                && let Some(node_id) = self.try_grab_in(&block, idx)
+            {
+                self.push_unused_block_list(idx, &block);
+                return Ok(node_id);
+            }
+
+            let (idx, block) = self.allocate_fresh_block()?;
+            return self.try_grab_in(&block, idx).ok_or_else(|| {
+                StateError::internal(
+                    "grab_node_unused returned INVALID on a freshly-allocated block",
+                )
+            });
+        }
+    }
+
+    async fn acquire_unused(&self) -> Result<tokio::sync::SemaphorePermit<'_>, StateError> {
+        self.unused.acquire().await.map_err(|error| {
+            StateError::internal(format!("node allocation semaphore is closed: {error}"))
+        })
+    }
+
+    fn unused_head(&self) -> u32 {
+        self.runtime
+            .read()
+            .tree
+            .as_ref()
+            .map_or(INVALID_BLOCK, |tree| tree.block_unused_first)
+    }
+
+    /// Take one slot out of `block`, recording the dirty state a successful grab
+    /// produces. `None` means the block had nothing left.
+    fn try_grab_in(&self, block: &Arc<NodeBlock>, block_index: usize) -> Option<NodeID> {
+        let (node_id, dirtied) = {
+            let mut block_writer = block.write();
+            let node_id = block_writer.grab_node_unused(block_index as u32);
+            if node_id.is_valid_node_id() {
+                (node_id, block_writer.mark_dirty())
+            } else {
+                (node_id, false)
+            }
+        };
+        if !node_id.is_valid_node_id() {
+            return None;
+        }
+        if dirtied {
+            self.block_modified(block.clone(), block_index);
+            self.mark_dirty();
+        }
+        Some(node_id)
+    }
+
+    /// Unlink an exhausted block from the head of the unused chain.
+    ///
+    /// Fullness is re-tested here rather than trusted from the caller's failed
+    /// grab: [`Self::release_node`] can return a slot to this block in between,
+    /// and retiring it then would strand a block that has room. Holding the
+    /// permit keeps that release from landing inside this check.
+    fn retire_full_block(&self, head: u32, block: &Arc<NodeBlock>) {
+        let popped_dirty = {
+            let mut runtime = self.runtime.write();
+            let Some(tree) = runtime.tree.as_mut() else {
+                return;
+            };
+            if tree.block_unused_first != head {
+                return;
+            }
+            let mut block_writer = block.write();
+            if !block_writer.is_full() {
+                return;
+            }
+            tree.block_unused_first = block_writer.block_unused_next();
+            tree.flags |= TreeFlags::Dirty;
+            block_writer.node_block().block_unused_next = INVALID_BLOCK;
+            block_writer.mark_dirty()
+        };
+        if popped_dirty {
+            self.block_modified(block.clone(), head as usize);
+            self.mark_dirty();
+        }
     }
 
     /// Return a grabbed but unpublished node slot to its block's free list.
