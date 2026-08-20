@@ -28,6 +28,7 @@ use lore_transport::MatchedProtocolError;
 use lore_transport::ProtocolError;
 use serde::Deserialize;
 use serde::Serialize;
+use tokio::join;
 use tokio::sync::RwLock;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -3194,17 +3195,21 @@ async fn find_common_ancestor_from_branch_points(
         return Ok(Some(shared.source_point));
     }
 
-    // Equal numbers mean the two points are on lines that already split, so
-    // neither reaches the other and the answer is whichever is taken as older.
-    // That is the target's point, the side being diffed into.
-    let source_number = revision_number_or_zero(repository.clone(), shared.source_point).await;
-    let target_number = revision_number_or_zero(repository.clone(), shared.target_point).await;
+    let (source_number, target_number) = join!(
+        revision_number_or_zero(repository.clone(), shared.source_point),
+        revision_number_or_zero(repository.clone(), shared.target_point)
+    );
     lore_debug!(
         "Found common branch {} in the branch stacks, source branch point {} -> {source_number} and target branch point {} -> {target_number}",
         shared.branch,
         shared.source_point,
         shared.target_point
     );
+    // Only the higher numbered point can reach the other, a revision's number
+    // being one past its parents'. On equal numbers the source is taken as the
+    // newer and so the target as the older, by definition rather than by
+    // measurement: neither reaches the other, and the target is the side being
+    // diffed into.
     let (newer_point, newer_number, older_point, older_number) = if source_number >= target_number {
         (
             shared.source_point,
@@ -3224,15 +3229,23 @@ async fn find_common_ancestor_from_branch_points(
     // TODO(mjansson): By keeping branch epochs and sequentially force push, we can
     //                 avoid trying to detect divergence here if branch points are known
     //                 to be from the same epoch
-    match Box::pin(find_revision_in_history_line(
-        repository.clone(),
-        newer_point,
-        newer_number,
-        older_point,
-        older_number,
-    ))
-    .await?
-    {
+    let line_search = if source_number == target_number {
+        // Two revisions of one number are never one another's ancestor, so the
+        // points are divergent on the numbers alone and following the line would
+        // spend its whole budget establishing that.
+        HistoryLineSearch::Diverged
+    } else {
+        Box::pin(find_revision_in_history_line(
+            repository.clone(),
+            newer_point,
+            newer_number,
+            older_point,
+            older_number,
+        ))
+        .await?
+    };
+
+    match line_search {
         HistoryLineSearch::Reached => return Ok(Some(older_point)),
         HistoryLineSearch::Diverged => {
             if let Some(shared_revision) = Box::pin(find_common_revision_in_history_lines(
@@ -3413,8 +3426,12 @@ async fn find_common_revision_in_history_lines(
 ) -> Result<Option<Hash>, BranchError> {
     lore_debug!("Follow {self_revision} and {other_revision} back until the lines meet");
 
-    let mut self_line = load_history_line(repository.clone(), self_revision).await;
-    let mut other_line = load_history_line(repository.clone(), other_revision).await;
+    // Both lines are fetched at once. Each is a round trip when the history is not
+    // cached, and neither depends on the other.
+    let (mut self_line, mut other_line) = join!(
+        load_history_line(repository.clone(), self_revision),
+        load_history_line(repository.clone(), other_revision)
+    );
 
     // Each line keeps a lookup of itself, extended as the line is, so a round
     // tests the revisions it just loaded against everything the other side holds
@@ -3469,14 +3486,23 @@ async fn find_common_revision_in_history_lines(
             return Ok(None);
         }
 
-        if extend_self {
-            self_ended = load_additional_history(repository.clone(), &mut self_line, 0).await;
-            self_lookup.extend(self_line[self_loaded..].iter().copied());
-        }
-        if extend_other {
-            other_ended = load_additional_history(repository.clone(), &mut other_line, 0).await;
-            other_lookup.extend(other_line[other_loaded..].iter().copied());
-        }
+        // Two round trips that need not wait on each other.
+        join!(
+            async {
+                if extend_self {
+                    self_ended =
+                        load_additional_history(repository.clone(), &mut self_line, 0).await;
+                    self_lookup.extend(self_line[self_loaded..].iter().copied());
+                }
+            },
+            async {
+                if extend_other {
+                    other_ended =
+                        load_additional_history(repository.clone(), &mut other_line, 0).await;
+                    other_lookup.extend(other_line[other_loaded..].iter().copied());
+                }
+            }
+        );
     }
 }
 
@@ -4196,9 +4222,11 @@ mod tests {
             let one = write_revision(&repository, shared[1], 13).await;
             let other = write_revision(&repository, shared[1], 3).await;
 
-            let met = find_common_revision_in_history_lines(repository, one, other)
-                .await
-                .expect("the search must not fail on readable lines");
+            let met = Box::pin(find_common_revision_in_history_lines(
+                repository, one, other,
+            ))
+            .await
+            .expect("the search must not fail on readable lines");
 
             assert_eq!(
                 met,
@@ -4218,9 +4246,11 @@ mod tests {
             let one = write_revision(&repository, shared[2], 13).await;
             let other = write_revision(&repository, shared[2], 4).await;
 
-            let met = find_common_revision_in_history_lines(repository, one, other)
-                .await
-                .expect("the search must not fail on readable lines");
+            let met = Box::pin(find_common_revision_in_history_lines(
+                repository, one, other,
+            ))
+            .await
+            .expect("the search must not fail on readable lines");
 
             assert_eq!(met, Some(shared[2]));
         }))
@@ -4234,11 +4264,11 @@ mod tests {
             let one = write_line(&repository, Hash::default(), 1, 3).await;
             let other = write_line(&repository, Hash::default(), 11, 3).await;
 
-            let met = find_common_revision_in_history_lines(
+            let met = Box::pin(find_common_revision_in_history_lines(
                 repository,
                 *one.last().unwrap(),
                 *other.last().unwrap(),
-            )
+            ))
             .await
             .expect("running out of line is not a failure");
 
@@ -4252,10 +4282,13 @@ mod tests {
         Box::pin(with_execution(async {
             let repository = null_repository().await;
 
-            let met =
-                find_common_revision_in_history_lines(repository, revision(200), revision(201))
-                    .await
-                    .expect("an unreadable line is not a failure of the search");
+            let met = Box::pin(find_common_revision_in_history_lines(
+                repository,
+                revision(200),
+                revision(201),
+            ))
+            .await
+            .expect("an unreadable line is not a failure of the search");
 
             assert_eq!(met, None);
         }))
@@ -4323,6 +4356,46 @@ mod tests {
             .expect("the search must not fail on readable lines");
 
             assert_eq!(found, Some(shared[1]));
+        }))
+        .await;
+    }
+
+    /// Branch points of equal revision number cannot reach one another, whatever
+    /// their hashes. The answer still comes from following both lines to where
+    /// they meet, rather than from taking one of the points.
+    #[tokio::test]
+    async fn common_ancestor_of_equal_numbered_points_is_where_lines_meet() {
+        Box::pin(with_execution(async {
+            let repository = null_repository().await;
+            // Same number, different parents, so the two are distinct revisions
+            // that provably cannot reach one another.
+            let shared = write_line(&repository, Hash::default(), 1, 2).await;
+            let source_point = write_revision(&repository, shared[1], 3).await;
+            let target_point = write_revision(&repository, shared[0], 3).await;
+
+            let found = find_common_ancestor_from_branch_points(
+                repository,
+                branch_id(1),
+                revision(10),
+                &[BranchPoint {
+                    branch: branch_id(9),
+                    revision: source_point,
+                }],
+                branch_id(2),
+                revision(11),
+                &[BranchPoint {
+                    branch: branch_id(9),
+                    revision: target_point,
+                }],
+            )
+            .await
+            .expect("the search must not fail on readable lines");
+
+            assert_eq!(
+                found,
+                Some(shared[0]),
+                "The lines meet at the revision they both descend from"
+            );
         }))
         .await;
     }
