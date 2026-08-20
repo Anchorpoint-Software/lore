@@ -111,6 +111,11 @@ pub struct MetadataMigratorConfig {
     pub api_retry_base_delay: Duration,
 
     pub scan_config: ScanConfig,
+
+    /// When `true`, fragments are analysed but no writes occur:
+    /// `write_payload_and_state` is skipped and a `process_fragment` error
+    /// does not abort the consumer loop.
+    pub is_dry_run: bool,
 }
 
 pub struct MetadataMigrator {
@@ -122,6 +127,7 @@ pub struct MetadataMigrator {
     api_retry_base_delay: Duration,
 
     scan_config: ScanConfig,
+    is_dry_run: bool,
 }
 
 impl MetadataMigrator {
@@ -133,6 +139,7 @@ impl MetadataMigrator {
             api_call_max_retries: config.api_call_max_retries,
             api_retry_base_delay: config.api_retry_base_delay,
             scan_config: config.scan_config,
+            is_dry_run: config.is_dry_run,
         }
     }
 
@@ -259,22 +266,24 @@ impl MetadataMigrator {
                 }
             };
 
-        let mut attempt = 0;
-        loop {
-            match self
-                .store
-                .write_payload_and_state(hash, new_fragment, new_payload.clone())
-                .await
-            {
-                Ok(()) => break,
-                Err(e) => {
-                    if attempt < self.api_call_max_retries {
-                        attempt += 1;
-                        warn!(hash = %hash, error = ?e, attempt, "write_payload_and_state failed; retrying");
-                        rewrite_backoff(self.api_retry_base_delay, attempt).await;
-                        continue;
+        if !self.is_dry_run {
+            let mut attempt = 0;
+            loop {
+                match self
+                    .store
+                    .write_payload_and_state(hash, new_fragment, new_payload.clone())
+                    .await
+                {
+                    Ok(()) => break,
+                    Err(e) => {
+                        if attempt < self.api_call_max_retries {
+                            attempt += 1;
+                            warn!(hash = %hash, error = ?e, attempt, "write_payload_and_state failed; retrying");
+                            rewrite_backoff(self.api_retry_base_delay, attempt).await;
+                            continue;
+                        }
+                        return Err(e);
                     }
-                    return Err(e);
                 }
             }
         }
@@ -299,11 +308,12 @@ impl MetadataMigrator {
             };
             let Some(hash) = hash else { break Ok(()) };
 
-            let process_outcome = {
+            // `None` means a dry-run error: the fragment failed but we continue the loop.
+            let process_outcome: Option<ConvertOutcome> = {
                 let mut attempt = 0;
                 loop {
                     match self.process_fragment(hash, &stats).await {
-                        Ok(outcome) => break outcome,
+                        Ok(outcome) => break Some(outcome),
                         Err(e) => {
                             if attempt < self.api_call_max_retries {
                                 attempt += 1;
@@ -313,10 +323,16 @@ impl MetadataMigrator {
                             }
                             error!(hash = %hash, error = ?e, "fragment conversion failed after retries; giving up on fragment");
                             stats.errored.fetch_add(1, Ordering::Relaxed);
+                            if self.is_dry_run {
+                                break None;
+                            }
                             return Err(e);
                         }
                     }
                 }
+            };
+            let Some(process_outcome) = process_outcome else {
+                continue;
             };
 
             match process_outcome {
@@ -644,6 +660,20 @@ mod tests {
             api_call_max_retries: 0,
             api_retry_base_delay: Duration::ZERO,
             scan_config: ScanConfig::default(),
+            is_dry_run: false,
+        };
+        Arc::new(migrator)
+    }
+
+    async fn make_dry_run_migrator(fake: &Fake) -> Arc<MetadataMigrator> {
+        let migrator = MetadataMigrator {
+            dynamodb: crate::dynamodb::MockDynamoDb::default(),
+            store: store_with_separate_metadata_table(fake).await,
+            metadata_table_name: FRAGMENT_METADATA_TABLE_NAME.into(),
+            api_call_max_retries: 0,
+            api_retry_base_delay: Duration::ZERO,
+            scan_config: ScanConfig::default(),
+            is_dry_run: true,
         };
         Arc::new(migrator)
     }
@@ -955,6 +985,7 @@ mod tests {
                 api_call_max_retries: 0,
                 api_retry_base_delay: Duration::ZERO,
                 scan_config: ScanConfig::default(),
+                is_dry_run: false,
             };
             Arc::new(migrator)
         }
@@ -1195,6 +1226,30 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn dry_run_skips_write_payload_and_state() {
+            let fake = Fake::default();
+            let migrator = make_dry_run_migrator(&fake).await;
+            let content = vec![0x33u8; 150];
+            let hash = lore_storage::hash_slice(&content);
+            fake.put_object_without_metadata(hash, &content);
+            fake.set_legacy_metadata_row(
+                hash,
+                Fragment {
+                    flags: 0,
+                    size_payload: content.len() as u32,
+                    size_content: content.len() as u64,
+                },
+            );
+            let stats = RewriteStats::default();
+            // Outcome is still reported correctly — only the write is suppressed.
+            assert_eq!(
+                migrator.process_fragment(hash, &stats).await.unwrap(),
+                ConvertOutcome::Maintained
+            );
+            assert_eq!(fake.state_of(hash), None, "dry_run must not write state");
+        }
+
+        #[tokio::test]
         async fn mismatch_recompresses_to_zstd_and_writes_state() {
             let fake = Fake::default();
             let migrator = make_migrator(&fake).await;
@@ -1319,6 +1374,51 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn dry_run_error_continues_loop_without_stopping() {
+            // One fragment has no S3 object → load() returns an error.
+            // One fragment is valid and uncompressed.
+            // In dry_run mode the consumer must process both rather than aborting on the error.
+            let fake = Fake::default();
+            let migrator = make_dry_run_migrator(&fake).await;
+
+            // Fragment that will error: metadata row exists but no S3 object.
+            let error_content = vec![0x01u8; 100];
+            let (error_frag, _compressed, error_hash) = make_zstd_payload(&error_content);
+            fake.set_legacy_metadata_row(error_hash, error_frag);
+
+            // Fragment that succeeds: uncompressed, valid.
+            let ok_content = vec![0x02u8; 100];
+            let ok_hash = lore_storage::hash_slice(&ok_content);
+            fake.put_object_without_metadata(ok_hash, &ok_content);
+            fake.set_legacy_metadata_row(
+                ok_hash,
+                Fragment {
+                    flags: 0,
+                    size_payload: ok_content.len() as u32,
+                    size_content: ok_content.len() as u64,
+                },
+            );
+
+            let (tx, rx) = mpsc::channel(10);
+            tx.send(error_hash).await.unwrap();
+            tx.send(ok_hash).await.unwrap();
+            drop(tx);
+
+            let stats = Arc::new(RewriteStats::default());
+            let aborted = Arc::new(AtomicBool::new(false));
+            // Should complete without returning an error despite the first fragment failing.
+            migrator
+                .fragment_stream_consumer(Arc::new(Mutex::new(rx)), stats.clone(), aborted)
+                .await
+                .unwrap();
+
+            assert_eq!(stats.errored.load(Ordering::Relaxed), 1);
+            assert_eq!(stats.maintained.load(Ordering::Relaxed), 1);
+            // dry_run: neither fragment should have been written to state.
+            assert_eq!(fake.state_of(ok_hash), None);
+        }
+
+        #[tokio::test]
         async fn aborted_flag_stops_consumer_without_processing() {
             let fake = Fake::default();
             let migrator = make_migrator(&fake).await;
@@ -1350,6 +1450,7 @@ mod tests {
                 api_call_max_retries: 0,
                 api_retry_base_delay: Duration::ZERO,
                 scan_config: ScanConfig::default(),
+                is_dry_run: false,
             }
         }
 
