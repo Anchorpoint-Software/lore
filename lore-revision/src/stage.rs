@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
@@ -14,6 +15,7 @@ use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
 use serde::Deserialize;
 use serde::Serialize;
+use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use crate::branch;
@@ -44,6 +46,7 @@ use crate::node::NodeLink;
 use crate::node::ROOT_NODE;
 use crate::node::SiblingCycleGuard;
 use crate::path::emit_path_ignore;
+use crate::progress::max_concurrent_stage_directory_tasks;
 use crate::repository::BASE_SUFFIX;
 use crate::repository::DOT_LORE;
 use crate::repository::DOT_URC;
@@ -1135,6 +1138,16 @@ async fn resolve_case_variant_collisions(
     Ok(())
 }
 
+static DIRECTORY_TASK_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+/// Process-wide rather than per-operation: the cap has to hold across all the
+/// targets `file::stage` walks concurrently, so a semaphore owned by one walk
+/// would let N concurrent targets run N times the intended fan-out.
+fn directory_task_semaphore() -> &'static Arc<Semaphore> {
+    DIRECTORY_TASK_SEMAPHORE
+        .get_or_init(|| Arc::new(Semaphore::new(max_concurrent_stage_directory_tasks())))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn stage_directory(
     repository: Arc<RepositoryContext>,
@@ -1268,116 +1281,51 @@ pub(crate) async fn stage_directory(
                 }
             };
 
-            lore_spawn!(directory_tasks, {
-                let repository = repository.clone();
-                let state = state.clone();
-                let stats = stats.clone();
-                let mut relative_path = relative_path.clone();
-                let mut absolute_path = absolute_path.to_path_buf();
-                let link_tracker = link_tracker.clone();
-                let layer_mask = layer_mask.clone();
-                async move {
-                    if !node_link.is_valid() {
-                        return Ok(());
-                    }
-
-                    let from_node =
-                        state
-                            .node(repository.clone(), node_link.node)
-                            .await
-                            .forward::<StageError>("Failed to resolve node path in state")?;
-
-                    if from_node.is_link() {
-                        let link = from_node.linked_node();
-
-                        let linked_repository =
-                            Arc::new(repository.to_link_context(link.repository).await);
-                        let mut linked_state =
-                            State::deserialize(linked_repository.clone(), link.revision)
-                                .await
-                                .forward::<StageError>("Failed to deserialize linked state")?;
-
-                        // Register link with tracker for deferred processing
-                        if let Some(ref tracker) = link_tracker {
-                            // Check for existing context and reuse state if available
-                            linked_state = if let Some(existing_context) =
-                                tracker.find_link_context(link.repository)
-                            {
-                                existing_context.link_state.clone()
-                            } else {
-                                linked_state.clone()
-                            };
-
-                            let link_context = link::LinkContext {
-                                link_repository_id: link.repository,
-                                link_node_id: node_link.node,
-                                parent_repository_id: repository.id,
-                                link_path: relative_path.clone(),
-                                link_state: linked_state.clone(),
-                            };
-
-                            tracker.add_link(link_context);
-                        }
-
-                        let mut link_relative_path = relative_path.clone();
-                        // Scoped so the read lock drops before the recurse below.
-                        {
-                            let node_name = state
-                                .node_name_ref(repository.clone(), node_link.node)
-                                .await
-                                .forward::<StageError>("Failed to resolve node name")?;
-                            absolute_path.push(&node_name);
-                            link_relative_path.push(&node_name);
-                        }
-
-                        let result = stage_directory_recurse(
-                            linked_repository.clone(),
-                            linked_state.clone(),
-                            absolute_path.as_path(),
-                            link_relative_path.clone(),
-                            link.node,
-                            depth,
-                            options,
-                            stats.clone(),
-                            link_tracker.clone(),
-                            layer_mask.clone(),
-                        )
-                        .await;
-
-                        stats.task_count.fetch_sub(1, Ordering::Release);
-
-                        result
-                    } else {
-                        // If the directory node was renamed as part of the stage case variation unification,
-                        // use the updated unified name to recurse into the correct subdirectory on disk
-                        let node_name = state
-                            .node_name_ref(repository.clone(), node_link.node)
-                            .await
-                            .forward::<StageError>("Failed to resolve node name")?;
-                        absolute_path.push(&*node_name);
-                        relative_path.push(node_name);
-                        // Layer mount directories are filtered out by the
-                        // mask check at the top of `stage_directory`'s
-                        // child-iteration loop, so no mask check is needed here.
-                        stats.task_count.fetch_add(1, Ordering::Release);
-                        let result = stage_directory_recurse(
+            // Inline fallback rather than a blocking acquire: a parent awaiting
+            // its children must never block on a permit a descendant needs, or
+            // the bounded fan-out would deadlock.
+            if let Ok(permit) = directory_task_semaphore().clone().try_acquire_owned() {
+                lore_spawn!(directory_tasks, {
+                    let repository = repository.clone();
+                    let state = state.clone();
+                    let stats = stats.clone();
+                    let relative_path = relative_path.clone();
+                    let absolute_path = absolute_path.to_path_buf();
+                    let link_tracker = link_tracker.clone();
+                    let layer_mask = layer_mask.clone();
+                    async move {
+                        let _permit = permit;
+                        stage_child_directory(
                             repository,
                             state,
-                            absolute_path.as_path(),
+                            absolute_path,
                             relative_path,
-                            node_link.node,
-                            depth + 1,
+                            node_link,
+                            depth,
                             options,
-                            stats.clone(),
-                            link_tracker.clone(),
-                            layer_mask.clone(),
+                            stats,
+                            link_tracker,
+                            layer_mask,
                         )
-                        .await;
-                        stats.task_count.fetch_sub(1, Ordering::Release);
-                        result
+                        .await
                     }
-                }
-            });
+                });
+            } else {
+                let result = stage_child_directory(
+                    repository.clone(),
+                    state.clone(),
+                    absolute_path.to_path_buf(),
+                    relative_path.clone(),
+                    node_link,
+                    depth,
+                    options,
+                    stats.clone(),
+                    link_tracker.clone(),
+                    layer_mask.clone(),
+                )
+                .await;
+                failure = failure.or(result.err());
+            }
 
             for (index, child_name) in children_name.iter().enumerate() {
                 if directory.name_hash == *child_name {
@@ -1490,6 +1438,119 @@ pub(crate) async fn stage_directory(
     }
 
     Ok(())
+}
+
+/// Descend into one child directory of `stage_directory`. Split out from the
+/// child loop so the bounded fan-out there can either spawn this or await it
+/// inline without duplicating the body.
+#[allow(clippy::too_many_arguments)]
+async fn stage_child_directory(
+    repository: Arc<RepositoryContext>,
+    state: Arc<State>,
+    mut absolute_path: PathBuf,
+    mut relative_path: RelativePathBuf,
+    node_link: NodeLink,
+    depth: usize,
+    options: StageOptions,
+    stats: Arc<StageStats>,
+    link_tracker: Option<Arc<crate::link::LinkTracker>>,
+    layer_mask: Option<Arc<Vec<String>>>,
+) -> Result<(), StageError> {
+    if !node_link.is_valid() {
+        return Ok(());
+    }
+
+    let from_node = state
+        .node(repository.clone(), node_link.node)
+        .await
+        .forward::<StageError>("Failed to resolve node path in state")?;
+
+    if from_node.is_link() {
+        let link = from_node.linked_node();
+
+        let linked_repository = Arc::new(repository.to_link_context(link.repository).await);
+        let mut linked_state = State::deserialize(linked_repository.clone(), link.revision)
+            .await
+            .forward::<StageError>("Failed to deserialize linked state")?;
+
+        // Register link with tracker for deferred processing
+        if let Some(ref tracker) = link_tracker {
+            // Check for existing context and reuse state if available
+            linked_state =
+                if let Some(existing_context) = tracker.find_link_context(link.repository) {
+                    existing_context.link_state.clone()
+                } else {
+                    linked_state.clone()
+                };
+
+            let link_context = link::LinkContext {
+                link_repository_id: link.repository,
+                link_node_id: node_link.node,
+                parent_repository_id: repository.id,
+                link_path: relative_path.clone(),
+                link_state: linked_state.clone(),
+            };
+
+            tracker.add_link(link_context);
+        }
+
+        let mut link_relative_path = relative_path.clone();
+        // Scoped so the read lock drops before the recurse below.
+        {
+            let node_name = state
+                .node_name_ref(repository.clone(), node_link.node)
+                .await
+                .forward::<StageError>("Failed to resolve node name")?;
+            absolute_path.push(&node_name);
+            link_relative_path.push(&node_name);
+        }
+
+        let result = stage_directory_recurse(
+            linked_repository.clone(),
+            linked_state.clone(),
+            absolute_path.as_path(),
+            link_relative_path.clone(),
+            link.node,
+            depth,
+            options,
+            stats.clone(),
+            link_tracker.clone(),
+            layer_mask.clone(),
+        )
+        .await;
+
+        stats.task_count.fetch_sub(1, Ordering::Release);
+
+        result
+    } else {
+        // If the directory node was renamed as part of the stage case variation unification,
+        // use the updated unified name to recurse into the correct subdirectory on disk
+        let node_name = state
+            .node_name_ref(repository.clone(), node_link.node)
+            .await
+            .forward::<StageError>("Failed to resolve node name")?;
+        absolute_path.push(&*node_name);
+        relative_path.push(node_name);
+        // Layer mount directories are filtered out by the mask check at the top
+        // of `stage_directory`'s child-iteration loop, so no mask check is
+        // needed here.
+        stats.task_count.fetch_add(1, Ordering::Release);
+        let result = stage_directory_recurse(
+            repository,
+            state,
+            absolute_path.as_path(),
+            relative_path,
+            node_link.node,
+            depth + 1,
+            options,
+            stats.clone(),
+            link_tracker.clone(),
+            layer_mask.clone(),
+        )
+        .await;
+        stats.task_count.fetch_sub(1, Ordering::Release);
+        result
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
