@@ -65,6 +65,31 @@ pub struct RewriteStats {
     pub payloads_deduced: AtomicU64,
 }
 
+/// Logs every total the migrator keeps, labelled with the point in the run it was read at.
+///
+/// The counters are read one at a time, so a snapshot taken while consumers are running is
+/// approximate: it is a progress report, not a reconciliation.
+pub fn log_stats(phase: &str, stats: &RewriteStats) {
+    info!(
+        phase,
+        scanned = stats.scanned.load(Ordering::Relaxed),
+        metadata_rows = stats.valid_metadata_entries.load(Ordering::Relaxed),
+        maintained = stats.maintained.load(Ordering::Relaxed),
+        recompressed_oodle = stats.recompressed_oodle.load(Ordering::Relaxed),
+        recompressed_mismatch = stats.recompressed_mismatch.load(Ordering::Relaxed),
+        stored_uncompressed = stats
+            .converted_compressed_to_uncompressed
+            .load(Ordering::Relaxed),
+        payloads_deduced = stats.payloads_deduced.load(Ordering::Relaxed),
+        already_migrated = stats.skipped_migrated.load(Ordering::Relaxed),
+        obliterated = stats.skipped_obliterated.load(Ordering::Relaxed),
+        oversized = stats.skipped_malicious.load(Ordering::Relaxed),
+        unreadable = stats.could_not_deduce_payload.load(Ordering::Relaxed),
+        errored = stats.errored.load(Ordering::Relaxed),
+        "Migration totals"
+    );
+}
+
 /// Outcome of attempting to decompress and identify a fragment's codec.
 #[derive(Debug)]
 enum DecompressOutcome {
