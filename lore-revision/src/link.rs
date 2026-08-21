@@ -50,6 +50,7 @@ use crate::util::path::RepositoryPath;
 use crate::util::serde::u8_as_bool;
 
 pub mod add;
+pub mod info;
 pub mod list;
 pub mod remove;
 pub(crate) mod reset;
@@ -285,31 +286,6 @@ pub struct LoreLinkBranchCreateEventData {
     /// reused rather than created.
     #[serde(with = "u8_as_bool")]
     pub reused: u8,
-}
-
-/// Data for an event describing a single link in a repository.
-#[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LoreLinkEntryEventData {
-    /// Identifier of the repository the link points to.
-    pub link: RepositoryId,
-    /// Identifier of the link node in the parent repository.
-    pub link_node: u32,
-    /// Path of the link within the parent repository.
-    pub link_path: LoreString,
-    /// Identifier of the source node in the linked repository.
-    pub source_node: u32,
-    /// Path of the source within the linked repository.
-    pub source_path: LoreString,
-    /// Identifier of the branch the link is pinned to.
-    pub branch: BranchId,
-    /// Name of the branch the link is pinned to.
-    pub branch_name: LoreString,
-    /// Hash of the revision the link is pinned to.
-    pub revision: Hash,
-    /// Link flags.
-    pub flags: u32,
 }
 
 bitflags! {
@@ -754,6 +730,9 @@ pub struct ResolvedLinkChain {
     pub levels: Vec<LinkChainLevel>,
     pub innermost_repository: Arc<RepositoryContext>,
     pub innermost_state: Arc<State>,
+    /// The innermost repository's committed state. Carries registry entries that
+    /// the staged state has already dropped, such as a link staged for removal.
+    pub innermost_current_state: Arc<State>,
     /// Node the `remainder_path` is rooted at in the innermost repository.
     pub innermost_base_node: NodeID,
     /// `link_path` minus `remainder_path`; empty for the top level.
@@ -879,6 +858,7 @@ pub async fn resolve_link_chain(
         levels,
         innermost_repository: cur_repository,
         innermost_state: cur_state,
+        innermost_current_state: cur_current_state,
         innermost_base_node: base_node,
         innermost_mount_path: mount_prefix,
         remainder_path: remainder,
@@ -1469,18 +1449,61 @@ pub struct ResolvedLink {
     pub local_node: NodeID,
 }
 
-/// Resolves a link by path to its full context.
+/// The fields of a link that must be read out of the linked repository, shared
+/// by `link list` and `link info`. The caller supplies what it already holds —
+/// the link context, the link node and the pin.
+pub struct DescribedLink {
+    pub link_state: Arc<State>,
+    pub source_path: String,
+}
+
+/// Reads the pinned state of a linked repository and the path the link exposes
+/// from it, normalising a root mount to `/`.
+pub async fn describe_link(
+    link_context: Arc<RepositoryContext>,
+    signature: Hash,
+    link_node: &Node,
+) -> Result<DescribedLink, LinkError> {
+    let link_state = State::deserialize(link_context.clone(), signature)
+        .await
+        .forward::<LinkError>("Failed deserializing state node block")?;
+
+    let source_path = link_state
+        .node_path(link_context.clone(), link_node.child)
+        .await
+        .forward::<LinkError>("Failed resolving link node")?;
+
+    let source_path = if source_path.is_empty() {
+        String::from("/")
+    } else {
+        source_path
+    };
+
+    Ok(DescribedLink {
+        link_state,
+        source_path,
+    })
+}
+
+/// A link's node and the repository that owns the mount, without consulting the
+/// link registry.
+struct LinkNodeAtPath {
+    parent_repository: Arc<RepositoryContext>,
+    parent_state: Arc<State>,
+    local_node: NodeID,
+    link_node: Node,
+    link_context: Arc<RepositoryContext>,
+}
+
+/// Everything about a link that the tree alone answers.
 ///
-/// Finds the node via `find_node_link` (which descends through any parent
-/// links), then looks up the node and its `LinkReference` in the OWNING
-/// repository — the innermost containing repo for a nested link, not the
-/// top-level one. `parent_repository`/`parent_state`/`local_node` identify
-/// where the link's registry entry lives so callers repin the right registry.
-pub async fn resolve_link_at_path(
+/// Kept separate from [`resolve_link_at_path`] because the registry lookup is
+/// the one part a link staged for removal can no longer satisfy.
+async fn resolve_link_node_at_path(
     state: &Arc<State>,
     repository: Arc<RepositoryContext>,
     link_path: &str,
-) -> Result<ResolvedLink, LinkError> {
+) -> Result<LinkNodeAtPath, LinkError> {
     let node_link = state
         .find_node_link(repository.clone(), link_path)
         .await
@@ -1523,8 +1546,59 @@ pub async fn resolve_link_at_path(
             .await,
     );
 
+    Ok(LinkNodeAtPath {
+        parent_repository,
+        parent_state,
+        local_node: node_link.node,
+        link_node,
+        link_context,
+    })
+}
+
+/// The linked repository's context for the link mounted at `link_path`.
+///
+/// A link's branch belongs to the repository it points at, so anything that
+/// reads branch state for a link has to ask that repository rather than the one
+/// holding the mount. Answers for a link staged for removal too, since the node
+/// names the repository without the registry entry that staging the removal
+/// dropped.
+pub async fn link_context_at_path(
+    repository: Arc<RepositoryContext>,
+    link_path: &str,
+) -> Result<Arc<RepositoryContext>, LinkError> {
+    let (state_current, state_staged, _parent_branch) =
+        State::deserialize_current_and_staged(repository.clone())
+            .await
+            .forward::<LinkError>("Failed deserializing state")?;
+    let state = state_staged.unwrap_or(state_current);
+
+    Ok(resolve_link_node_at_path(&state, repository, link_path)
+        .await?
+        .link_context)
+}
+
+/// Resolves a link by path to its full context.
+///
+/// Finds the node via `find_node_link` (which descends through any parent
+/// links), then looks up the node and its `LinkReference` in the OWNING
+/// repository — the innermost containing repo for a nested link, not the
+/// top-level one. `parent_repository`/`parent_state`/`local_node` identify
+/// where the link's registry entry lives so callers repin the right registry.
+pub async fn resolve_link_at_path(
+    state: &Arc<State>,
+    repository: Arc<RepositoryContext>,
+    link_path: &str,
+) -> Result<ResolvedLink, LinkError> {
+    let LinkNodeAtPath {
+        parent_repository,
+        parent_state,
+        local_node,
+        link_node,
+        link_context,
+    } = resolve_link_node_at_path(state, repository, link_path).await?;
+
     let link_reference = parent_state
-        .link_find(parent_repository.clone(), link_context.id, node_link.node)
+        .link_find(parent_repository.clone(), link_context.id, local_node)
         .await
         .forward::<LinkError>("Failed to find link")?;
 
@@ -1534,7 +1608,7 @@ pub async fn resolve_link_at_path(
         link_reference,
         parent_repository,
         parent_state,
-        local_node: node_link.node,
+        local_node,
     })
 }
 

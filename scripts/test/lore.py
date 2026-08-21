@@ -1737,6 +1737,16 @@ class Lore:
             **kwargs,
         )
 
+    def link_info(
+        self,
+        link_path: str,
+        **kwargs: Unpack[GlobalOptions],
+    ):
+        return self.run(
+            ["link", "info", self._fix_path(link_path)],
+            **kwargs,
+        )
+
     def link_update(
         self,
         link_path: str,

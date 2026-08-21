@@ -121,6 +121,8 @@ async fn create_local(
 pub struct LoreBranchInfoArgs {
     /// Name of the branch
     pub branch: LoreString,
+    /// Optional path of a link whose repository the branch belongs to
+    pub link: LoreString,
 }
 
 /// Retrieves metadata for a branch including its name, id, category, and protection status.
@@ -158,8 +160,19 @@ async fn info_local(
 ) -> i32 {
     repository_call_read(globals, callback, args, info, move |repository, args| {
         let branch_name = args.branch.to_string();
+        let link_path = args.link.to_string();
 
-        lore_revision::branch::info::info(repository, branch_name)
+        async move {
+            let repository = if link_path.is_empty() {
+                repository
+            } else {
+                lore_revision::link::link_context_at_path(repository, link_path.as_str())
+                    .await
+                    .forward::<lore_revision::branch::info::InfoError>("resolving link path")?
+            };
+
+            lore_revision::branch::info::info(repository, branch_name).await
+        }
     })
     .await
 }

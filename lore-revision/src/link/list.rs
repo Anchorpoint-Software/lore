@@ -7,10 +7,9 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use super::LinkError;
-use crate::branch;
 use crate::event;
+use crate::event::LoreLinkEntryEventData;
 use crate::interface::LoreString;
-use crate::link::LoreLinkEntryEventData;
 use crate::lore::BranchId;
 use crate::lore::RepositoryId;
 use crate::lore_debug;
@@ -58,51 +57,33 @@ async fn list_recursive(
             .await
             .forward::<LinkError>("Failed resolving link node")?;
 
-        let full_path = if path_prefix.is_empty() {
-            local_path.clone()
-        } else {
-            format!("{path_prefix}/{local_path}")
-        };
-
-        let link = Arc::new(repository.to_link_context(link_reference.repository).await);
-
         let local_node = state
             .node(repository.clone(), link_reference.local_node)
             .await
             .forward::<LinkError>("Specified node is not a link node")?;
 
-        let link_state = State::deserialize(link.clone(), link_reference.signature)
-            .await
-            .forward::<LinkError>("Failed deserializing state node block")?;
-
-        let source_path = link_state
-            .node_path(link.clone(), local_node.child)
-            .await
-            .forward::<LinkError>("Failed resolving link node")?;
-
-        let source_path = if source_path.is_empty() {
-            String::from("/")
-        } else {
-            source_path
-        };
+        let link_context = Arc::new(repository.to_link_context(link_reference.repository).await);
 
         let resolved_branch = link_reference.resolve_branch(parent_branch);
 
-        let branch_name =
-            if let Ok(metadata) = branch::metadata(link.clone(), resolved_branch).await {
-                branch::name(&metadata).unwrap_or_default().to_string()
-            } else {
-                String::new()
-            };
+        let described =
+            super::describe_link(link_context.clone(), link_reference.signature, &local_node)
+                .await?;
+
+        let full_path = if path_prefix.is_empty() {
+            local_path
+        } else {
+            format!("{path_prefix}/{local_path}")
+        };
 
         event::LoreEvent::LinkEntry(LoreLinkEntryEventData {
             link: link_reference.repository,
             link_node: link_reference.local_node,
             link_path: full_path.clone().into(),
             source_node: local_node.child,
-            source_path: source_path.into(),
+            source_path: described.source_path.into(),
             branch: resolved_branch,
-            branch_name: LoreString::from(branch_name.as_str()),
+            tracking: link_reference.is_tracking() as u8,
             revision: link_reference.signature,
             flags: link_reference.flags,
         })
@@ -110,8 +91,8 @@ async fn list_recursive(
 
         if link_depth + 1 < crate::state::MAX_LINK_DEPTH && seen.insert(link_reference.repository) {
             Box::pin(list_recursive(
-                link.clone(),
-                link_state,
+                link_context,
+                described.link_state,
                 full_path,
                 resolved_branch,
                 link_depth + 1,

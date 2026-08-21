@@ -130,7 +130,6 @@ use crate::layer::LoreLayerRemoveEventData;
 use crate::layer::LoreLayerStagedEntryEventData;
 use crate::link::LoreLinkBranchCreateEventData;
 use crate::link::LoreLinkChangeEventData;
-use crate::link::LoreLinkEntryEventData;
 use crate::link::list::LoreLinkStagedEntryEventData;
 use crate::lock::file::acquire::LoreLockFileAcquireBeginEventData;
 use crate::lock::file::acquire::LoreLockFileAcquireEventData;
@@ -140,6 +139,9 @@ use crate::lock::file::release::LoreLockFileReleaseBeginEventData;
 use crate::lock::file::release::LoreLockFileReleaseEventData;
 use crate::lock::file::status::LoreLockFileStatusBeginEventData;
 use crate::lock::file::status::LoreLockFileStatusEventData;
+use crate::lore::BranchId;
+use crate::lore::Hash;
+use crate::lore::RepositoryId;
 use crate::lore::execution_context;
 use crate::metadata::Metadata;
 use crate::metadata::MetadataError;
@@ -270,6 +272,69 @@ pub trait EventError: std::fmt::Display {
 pub struct LoreProgressEventData {
     /// Placeholder field; carries no meaningful value.
     pub _unused: u32,
+}
+
+/// cbindgen:prefix-with-name
+/// cbindgen:rename-all=ScreamingSnakeCase
+#[repr(C)]
+/// Staged change to a link itself, as opposed to content inside it.
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LoreLinkStagedState {
+    /// The link carries no staged change.
+    None = 0,
+    /// The link was added and is not committed yet.
+    Added = 1,
+    /// The link was removed and the removal is not committed yet.
+    Removed = 2,
+    /// The link's pin was changed and is not committed yet.
+    Modified = 3,
+}
+
+/// Data for an event describing a single link in a repository. Carries the
+/// branch identifier rather than its name; a consumer that wants the name
+/// resolves it, so listing links costs no branch metadata reads.
+#[repr(C)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoreLinkEntryEventData {
+    /// Identifier of the repository the link points to.
+    pub link: RepositoryId,
+    /// Identifier of the link node in the parent repository.
+    pub link_node: u32,
+    /// Path of the link within the parent repository.
+    pub link_path: LoreString,
+    /// Identifier of the source node in the linked repository.
+    pub source_node: u32,
+    /// Path of the source within the linked repository.
+    pub source_path: LoreString,
+    /// Identifier of the branch the link is pinned to.
+    pub branch: BranchId,
+    /// Set when the link follows its parent's branch instead of being pinned to
+    /// an explicit one, in which case `branch` is the branch it resolved to.
+    #[serde(with = "crate::util::serde::u8_as_bool")]
+    pub tracking: u8,
+    /// Hash of the revision the link is pinned to.
+    pub revision: Hash,
+    /// Link flags.
+    pub flags: u32,
+}
+
+/// Data for an event describing a single link in detail: everything `LinkEntry`
+/// reports, plus the state only `link info` gathers.
+#[repr(C)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoreLinkInfoEventData {
+    /// The link as `LinkEntry` reports it.
+    pub entry: LoreLinkEntryEventData,
+    /// Hash of the remote latest revision of the pinned branch, zero when the
+    /// remote was not consulted.
+    pub remote_revision: Hash,
+    /// Staged change to the link itself.
+    pub staged_state: LoreLinkStagedState,
+    /// Number of staged files inside the linked repository.
+    pub staged_file_count: u64,
 }
 
 /// Borrowed byte slice handed to callbacks.
@@ -923,6 +988,8 @@ pub enum LoreEvent {
     LinkChange(LoreLinkChangeEventData),
     /// One entry in a link listing.
     LinkEntry(LoreLinkEntryEventData),
+    /// Detailed information about a single link.
+    LinkInfo(LoreLinkInfoEventData),
     /// The start of a file lock acquire report.
     LockFileAcquireBegin(LoreLockFileAcquireBeginEventData),
     /// A file concerning the lock acquire report.

@@ -115,6 +115,18 @@ typedef enum lore_file_action_t {
   LORE_FILE_ACTION_COPY = 4,
 } lore_file_action_t;
 
+// Staged change to a link itself, as opposed to content inside it.
+typedef enum lore_link_staged_state_t {
+  // The link carries no staged change.
+  LORE_LINK_STAGED_STATE_NONE = 0,
+  // The link was added and is not committed yet.
+  LORE_LINK_STAGED_STATE_ADDED = 1,
+  // The link was removed and the removal is not committed yet.
+  LORE_LINK_STAGED_STATE_REMOVED = 2,
+  // The link's pin was changed and is not committed yet.
+  LORE_LINK_STAGED_STATE_MODIFIED = 3,
+} lore_link_staged_state_t;
+
 // The kind of a tracked node.
 typedef enum lore_node_type_t {
   // A directory.
@@ -1602,7 +1614,9 @@ typedef struct lore_link_change_event_data_t {
   enum lore_file_action_t action;
 } lore_link_change_event_data_t;
 
-// Data for an event describing a single link in a repository.
+// Data for an event describing a single link in a repository. Carries the
+// branch identifier rather than its name; a consumer that wants the name
+// resolves it, so listing links costs no branch metadata reads.
 typedef struct lore_link_entry_event_data_t {
   // Identifier of the repository the link points to.
   lore_repository_id_t link;
@@ -1616,13 +1630,28 @@ typedef struct lore_link_entry_event_data_t {
   struct lore_string_t source_path;
   // Identifier of the branch the link is pinned to.
   lore_branch_id_t branch;
-  // Name of the branch the link is pinned to.
-  struct lore_string_t branch_name;
+  // Set when the link follows its parent's branch instead of being pinned to
+  // an explicit one, in which case `branch` is the branch it resolved to.
+  uint8_t tracking;
   // Hash of the revision the link is pinned to.
   struct lore_hash_t revision;
   // Link flags.
   uint32_t flags;
 } lore_link_entry_event_data_t;
+
+// Data for an event describing a single link in detail: everything `LinkEntry`
+// reports, plus the state only `link info` gathers.
+typedef struct lore_link_info_event_data_t {
+  // The link as `LinkEntry` reports it.
+  struct lore_link_entry_event_data_t entry;
+  // Hash of the remote latest revision of the pinned branch, zero when the
+  // remote was not consulted.
+  struct lore_hash_t remote_revision;
+  // Staged change to the link itself.
+  enum lore_link_staged_state_t staged_state;
+  // Number of staged files inside the linked repository.
+  uint64_t staged_file_count;
+} lore_link_info_event_data_t;
 
 // Data for an event that marks the start of a lock acquire report.
 typedef struct lore_lock_file_acquire_begin_event_data_t {
@@ -3218,6 +3247,8 @@ enum lore_event_id_t {
   LORE_EVENT_LINK_CHANGE,
   // One entry in a link listing.
   LORE_EVENT_LINK_ENTRY,
+  // Detailed information about a single link.
+  LORE_EVENT_LINK_INFO,
   // The start of a file lock acquire report.
   LORE_EVENT_LOCK_FILE_ACQUIRE_BEGIN,
   // A file concerning the lock acquire report.
@@ -3561,6 +3592,7 @@ typedef struct lore_event_t {
     struct lore_link_branch_create_event_data_t link_branch_create;
     struct lore_link_change_event_data_t link_change;
     struct lore_link_entry_event_data_t link_entry;
+    struct lore_link_info_event_data_t link_info;
     struct lore_lock_file_acquire_begin_event_data_t lock_file_acquire_begin;
     struct lore_lock_file_acquire_event_data_t lock_file_acquire;
     struct lore_lock_file_status_begin_event_data_t lock_file_status_begin;
@@ -3837,6 +3869,8 @@ typedef struct lore_branch_create_args_t {
 typedef struct lore_branch_info_args_t {
   // Name of the branch
   struct lore_string_t branch;
+  // Optional path of a link whose repository the branch belongs to
+  struct lore_string_t link;
 } lore_branch_info_args_t;
 
 // Arguments for diffing two branches, reporting changed and conflicting files.
@@ -4314,6 +4348,12 @@ typedef struct lore_link_remove_args_t {
   // Path within this repository where the link is removed
   struct lore_string_t link_path;
 } lore_link_remove_args_t;
+
+// Arguments for reading detailed information about a single link.
+typedef struct lore_link_info_args_t {
+  // Path within this repository of the link to describe
+  struct lore_string_t link_path;
+} lore_link_info_args_t;
 
 // Arguments for listing all linked repositories in the current repository.
 typedef struct lore_link_list_args_t {
@@ -8481,6 +8521,58 @@ int32_t lore_link_remove(const struct lore_global_args_t *globals,
 void lore_link_remove_async(const struct lore_global_args_t *globals,
                             const struct lore_link_remove_args_t *args,
                             struct lore_event_callback_config_t callback);
+
+// Report detailed information about a single repository link.
+//
+// # Events
+//
+// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+//
+// ## Standard Events
+//
+// These events are emitted by all interface functions:
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
+// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+//
+// ## Link Events
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_LINK_INFO` | `lore_link_info_event_data_t` | Emitted once for the described link |
+int32_t lore_link_info(const struct lore_global_args_t *globals,
+                       const struct lore_link_info_args_t *args,
+                       struct lore_event_callback_config_t callback);
+
+// Asynchronous version of `lore_link_info`.
+//
+// # Events
+//
+// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+//
+// ## Standard Events
+//
+// These events are emitted by all interface functions:
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
+// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+//
+// ## Link Events
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_LINK_INFO` | `lore_link_info_event_data_t` | Emitted once for the described link |
+void lore_link_info_async(const struct lore_global_args_t *globals,
+                          const struct lore_link_info_args_t *args,
+                          struct lore_event_callback_config_t callback);
 
 // List all repository links configured in the current repository.
 //

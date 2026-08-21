@@ -605,7 +605,10 @@ fn handle_branch_create(globals: LoreGlobalArgs, args: &BranchCreateArgs) -> u8 
 fn handle_branch_info(globals: LoreGlobalArgs, args: &BranchInfoArgs) -> u8 {
     let branch = LoreString::from(&args.name);
 
-    let info_args = LoreBranchInfoArgs { branch };
+    let info_args = LoreBranchInfoArgs {
+        branch,
+        link: LoreString::default(),
+    };
 
     let description = Arc::new(Mutex::new(None));
     let description_cb = description.clone();
@@ -655,8 +658,9 @@ fn handle_branch_info(globals: LoreGlobalArgs, args: &BranchInfoArgs) -> u8 {
             data.latest_remote
         );
         if !data.stack.is_empty() {
+            let mut branches = util::BranchNameResolver::new(globals.clone());
             for (index, entry) in data.stack.as_slice().iter().enumerate() {
-                let name = resolve_branch_name(&globals, entry.branch);
+                let name = branches.name(entry.branch, "");
                 println!(
                     "  {}{}{}{}{} at {}",
                     CommonStyles::HEADERS,
@@ -702,24 +706,6 @@ fn handle_branch_info(globals: LoreGlobalArgs, args: &BranchInfoArgs) -> u8 {
     }
 
     return status;
-}
-
-fn resolve_branch_name(globals: &LoreGlobalArgs, id: Context) -> String {
-    let info_args = LoreBranchInfoArgs {
-        branch: LoreString::from(id.to_string().as_str()),
-    };
-    let name = Arc::new(Mutex::new(None));
-    let name_cb = name.clone();
-    let callback: lore::interface::LoreEventCallback = Some(
-        (Box::new(move |event: &LoreEvent| {
-            if let LoreEvent::BranchInfo(data) = event {
-                *name_cb.lock() = Some(data.name.to_string());
-            }
-        }) as EventCallbackFn)
-            .with_defaults(),
-    );
-    runtime().block_on(branch::info(globals.clone(), info_args, callback));
-    name.lock().take().unwrap_or(id.to_string())
 }
 
 fn handle_branch_switch(globals: LoreGlobalArgs, args: &BranchSwitchArgs) -> u8 {

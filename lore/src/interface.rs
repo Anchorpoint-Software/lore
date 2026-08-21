@@ -67,6 +67,7 @@ pub type LoreRevisionSyncRevisionEventData =
     lore_revision::revision::sync::LoreRevisionSyncRevisionEventData;
 pub type LoreRevisionBisectEventData = lore_revision::revision::bisect::LoreRevisionBisectEventData;
 pub type LoreLinkChangeEventData = lore_revision::link::LoreLinkChangeEventData;
+pub type LoreLinkEntryEventData = lore_revision::event::LoreLinkEntryEventData;
 pub type LoreLinkBranchCreateEventData = lore_revision::link::LoreLinkBranchCreateEventData;
 pub type LoreFragmentWriteEventData = lore_revision::immutable::LoreFragmentWriteEventData;
 pub type LoreCompleteEventData = lore_revision::event::LoreCompleteEventData;
@@ -3650,6 +3651,70 @@ pub extern "C" fn lore_link_remove_async(
     callback: LoreEventCallbackConfig,
 ) {
     run_asynchronously(globals, args, callback, crate::link::remove);
+}
+
+pub type LoreLinkInfoArgs = crate::link::LoreLinkInfoArgs;
+
+/// Report detailed information about a single repository link.
+///
+/// # Events
+///
+/// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+///
+/// ## Standard Events
+///
+/// These events are emitted by all interface functions:
+///
+/// | Tag | Data Type | Description |
+/// |-----|-----------|-------------|
+/// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+/// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
+/// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+///
+/// ## Link Events
+///
+/// | Tag | Data Type | Description |
+/// |-----|-----------|-------------|
+/// | `LORE_EVENT_LINK_INFO` | `lore_link_info_event_data_t` | Emitted once for the described link |
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_link_info(
+    globals: &LoreGlobalArgs,
+    args: &LoreLinkInfoArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(globals, args, callback, crate::link::info)
+}
+
+/// Asynchronous version of `lore_link_info`.
+///
+/// # Events
+///
+/// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+///
+/// ## Standard Events
+///
+/// These events are emitted by all interface functions:
+///
+/// | Tag | Data Type | Description |
+/// |-----|-----------|-------------|
+/// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+/// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
+/// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+///
+/// ## Link Events
+///
+/// | Tag | Data Type | Description |
+/// |-----|-----------|-------------|
+/// | `LORE_EVENT_LINK_INFO` | `lore_link_info_event_data_t` | Emitted once for the described link |
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_link_info_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreLinkInfoArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(globals, args, callback, crate::link::info);
 }
 
 pub type LoreLinkListArgs = crate::link::LoreLinkListArgs;
