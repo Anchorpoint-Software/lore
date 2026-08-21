@@ -98,6 +98,7 @@ async fn stage_into_single_layer(
             options,
             None, // No link tracking in layer staging
             None, // Layers don't have nested layer mounts (no overlap)
+            None, // Prefixes are resolved against the repository root, not a layer
         )
     );
 
@@ -260,6 +261,24 @@ pub async fn stage(
     shared_ancestors.sort_unstable_by_key(String::len);
     let precreate_count = shared_ancestors.len();
 
+    // Resolve the case of those directories once, so no target under them
+    // resolves them again. Not under `Keep`, which stages by renaming the file
+    // system to match the tree - the first such rename would leave the map
+    // naming a directory that is no longer there.
+    let prefixes = if matches!(options.case_change, stage::StageCaseChange::Keep) {
+        None
+    } else {
+        let prefixes = Arc::new(
+            crate::util::fs::resolve_prefixes(repository.require_path()?, &shared_ancestors).await,
+        );
+        lore_debug!(
+            "Resolved {} of {} shared ancestor prefixes",
+            prefixes.len(),
+            precreate_count
+        );
+        Some(prefixes)
+    };
+
     let mut precreate_options = options;
     precreate_options.no_children = true;
     for ancestor in shared_ancestors {
@@ -275,6 +294,7 @@ pub async fn stage(
             precreate_options,
             Some(link_tracker.clone()),
             global_mask.clone(),
+            prefixes.clone(),
         ))
         .await?;
     }
@@ -307,6 +327,7 @@ pub async fn stage(
                 options,
                 Some(link_tracker.clone()),
                 global_mask.clone(),
+                prefixes.clone(),
             )
         );
         if let Err(err) = lore_limit_drain_tasks!(
@@ -837,6 +858,7 @@ pub async fn stage_move(
         parent_options,
         None, // TODO(vri): UCS-18009 - Implement stage move for linked changes
         None,
+        None, // No prefix map for a path resolved on its own
     ))
     .await?;
 

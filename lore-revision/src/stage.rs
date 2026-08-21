@@ -314,6 +314,7 @@ pub(crate) async fn stage_filesystem_path(
     options: StageOptions,
     link_tracker: Option<Arc<crate::link::LinkTracker>>,
     layer_mask: Option<Arc<Vec<String>>>,
+    prefixes: Option<Arc<util::fs::ResolvedPrefixes>>,
 ) -> Result<NodeLink, StageError> {
     lore_debug!(
         "Staging path: {}/{}",
@@ -324,9 +325,13 @@ pub(crate) async fn stage_filesystem_path(
     let full_absolute_path = if !relative_path.is_empty() {
         // Find the file system case variation that corresponds to the user given path
         // If no path found, assume it's a delete and use the user given path
-        let fs_path = util::fs::filesystem_path(base_absolute_path.as_path(), &relative_path)
-            .await
-            .unwrap_or(relative_path.as_str().to_string());
+        let fs_path = util::fs::filesystem_path(
+            base_absolute_path.as_path(),
+            &relative_path,
+            prefixes.as_deref(),
+        )
+        .await
+        .unwrap_or(relative_path.as_str().to_string());
         base_absolute_path.join(fs_path.as_str())
     } else {
         base_absolute_path.clone()
@@ -2518,6 +2523,7 @@ pub(crate) async fn stage_from_parent_revision(
                     options,
                     None, // TODO(vri): UCS-17955 - Merging and conflict resolution for links
                     None, // No layer mask
+                    None, // No prefix map for a path resolved on its own
                 ))
                 .await?;
 
@@ -2674,6 +2680,7 @@ pub(crate) async fn stage_from_parent_revision(
                     options,
                     None, // TODO(vri): UCS-17955 - Merging and conflict resolution for links
                     None, // No layer mask
+                    None, // No prefix map for a path resolved on its own
                 ))
                 .await?;
 
@@ -3023,6 +3030,7 @@ pub(crate) async fn stage_link_paths_from_parent_revision(
                     options,
                     None,
                     None,
+                    None, // No prefix map for a path resolved on its own
                 ))
                 .await?;
                 sync::unlink_merge_mine_theirs_base(absolute.as_path()).await;
@@ -3063,6 +3071,7 @@ pub(crate) async fn stage_link_paths_from_parent_revision(
                     options,
                     None,
                     None,
+                    None, // No prefix map for a path resolved on its own
                 ))
                 .await?;
 

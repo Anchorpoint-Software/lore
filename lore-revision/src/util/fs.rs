@@ -251,9 +251,106 @@ pub async fn filesystem_names(
     ))
 }
 
+/// The on-disk spelling of directory prefixes, resolved once for the paths that
+/// share them.
+///
+/// A set of targets under one tree is mostly the same directories over and over:
+/// 200,000 paths of nine components each are 1.8 million lookups against 29,000
+/// distinct directories. Resolving each of those once and handing the answers to
+/// [`filesystem_path`] leaves each path with only its own leaf to resolve.
+///
+/// Keys are relative to the base path they were resolved against, and only that
+/// one - a map built for the repository root says nothing about a path under a
+/// layer or a link mount. A prefix whose spelling is ambiguous or that is not
+/// there is left out, so paths under it resolve as they would have without this.
+#[derive(Default)]
+pub struct ResolvedPrefixes {
+    prefixes: std::collections::HashMap<String, String>,
+}
+
+impl ResolvedPrefixes {
+    pub fn is_empty(&self) -> bool {
+        self.prefixes.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.prefixes.len()
+    }
+
+    /// The longest resolved prefix covering `path`, as the number of components
+    /// it accounts for and the spelling to use for them.
+    ///
+    /// Starts from `path` itself so a prefix asked about directly answers for
+    /// itself, then walks up. The parent hits on the first or second try for any
+    /// path in a set that shares its directories, which is the case this is for.
+    pub fn longest_prefix_of(&self, path: &str) -> Option<(usize, &str)> {
+        let mut end = path.len();
+        loop {
+            let candidate = &path[..end];
+            if let Some(resolved) = self.prefixes.get(candidate) {
+                return Some((candidate.matches('/').count() + 1, resolved.as_str()));
+            }
+            end = candidate.rfind('/')?;
+        }
+    }
+
+    fn insert(&mut self, path: String, resolved: String) {
+        self.prefixes.insert(path, resolved);
+    }
+}
+
+/// Resolve the on-disk spelling of each of `paths`, each against the spelling
+/// already established for its parent.
+///
+/// `paths` must be shallowest first, so a parent is always resolved before the
+/// children that are resolved against it - which the caller has anyway, since
+/// that is the order shared ancestors have to be created in.
+pub async fn resolve_prefixes(base_path: impl AsRef<Path>, paths: &[String]) -> ResolvedPrefixes {
+    let base_path = base_path.as_ref();
+    let mut resolved = ResolvedPrefixes::default();
+    for path in paths {
+        let (parent, name) = match path.rfind('/') {
+            Some(separator) => (&path[..separator], &path[separator + 1..]),
+            None => ("", path.as_str()),
+        };
+        // A parent left out of the map resolves to itself: either it is the
+        // root, or it could not be resolved and this will not resolve either.
+        let parent = resolved
+            .longest_prefix_of(parent)
+            .map_or(parent, |(_, it)| it);
+        let mut directory = base_path.to_path_buf();
+        if !parent.is_empty() {
+            directory.push(parent);
+        }
+
+        if filesystem_name_matches(directory.as_path(), name).await == Some(true) {
+            resolved.insert(path.clone(), join_relative(parent, name));
+            continue;
+        }
+        // One spelling is an answer; several are the ambiguity `filesystem_path`
+        // forks on, and are left for it to find as it always did. A platform that
+        // would not say arrives here too, and the read settles it.
+        if let Ok(names) = filesystem_names(directory.as_path(), name).await
+            && let [single] = names.as_slice()
+        {
+            resolved.insert(path.clone(), join_relative(parent, single));
+        }
+    }
+    resolved
+}
+
+fn join_relative(parent: &str, name: &str) -> String {
+    if parent.is_empty() {
+        name.to_string()
+    } else {
+        format!("{parent}/{name}")
+    }
+}
+
 pub async fn filesystem_path(
     base_path: impl AsRef<Path>,
     find_path: &RelativePath,
+    prefixes: Option<&ResolvedPrefixes>,
 ) -> tokio::io::Result<String> {
     let base_path = base_path.as_ref();
 
@@ -274,6 +371,18 @@ pub async fn filesystem_path(
     let mut full_path = base_path.to_path_buf();
     let mut remain_path = find_path.clone();
     let mut found_path = RelativePathBuf::new();
+
+    // Whatever an earlier path already established is not established again.
+    if let Some((components, resolved)) =
+        prefixes.and_then(|prefixes| prefixes.longest_prefix_of(find_path.as_str()))
+    {
+        full_path.push(resolved);
+        found_path.push(resolved);
+        for _ in 0..components {
+            let _ = remain_path.pop_root();
+        }
+    }
+
     while !remain_path.is_empty() {
         let name = remain_path.pop_root();
         // Nearly every component is already spelled the way the filesystem holds
@@ -361,7 +470,9 @@ pub fn filesystem_path_fork(
 ) -> Pin<Box<dyn Future<Output = tokio::io::Result<String>> + Send>> {
     let base_path = base_path.as_ref().to_path_buf();
     let find_path = find_path.clone();
-    Box::pin(async move { filesystem_path(base_path, &find_path).await })
+    // The fork resolves a path under one of several spellings of a directory,
+    // which is not a prefix any map here was built against.
+    Box::pin(async move { filesystem_path(base_path, &find_path, None).await })
 }
 
 /// Represents a single filesystem item.
@@ -986,7 +1097,7 @@ mod tests {
         let asked: RelativePath =
             std::str::FromStr::from_str("Assets/Meshes/Rock.mesh").expect("relative path");
         assert_eq!(
-            filesystem_path(dir.path(), &asked)
+            filesystem_path(dir.path(), &asked, None)
                 .await
                 .expect("the path must resolve"),
             "Assets/Meshes/Rock.mesh"
@@ -1094,11 +1205,165 @@ mod tests {
         let asked = std::str::FromStr::from_str("assets/MESHES/rock.MESH")
             .expect("relative path is infallible");
         assert_eq!(
-            filesystem_path(dir.path(), &asked)
+            filesystem_path(dir.path(), &asked, None)
                 .await
                 .expect("the path must resolve"),
             "Assets/Meshes/Rock.mesh"
         );
+    }
+
+    /// Shared directories are resolved once, and every path under them then uses
+    /// what was established rather than looking again — including when the
+    /// spelling the caller has differs from the one on disk, which is the part
+    /// that would go wrong if the answer were not carried over.
+    ///
+    /// Spellings are matched over a directory listing rather than by asking the
+    /// filesystem to look the name up, so this holds on a case-sensitive one as
+    /// much as on a case-insensitive one and is not conditioned on which it is.
+    #[tokio::test]
+    async fn resolved_prefixes_answer_for_the_paths_under_them() {
+        let dir = temp_dir();
+        let nested = dir.path().join("Assets").join("Meshes");
+        std::fs::create_dir_all(&nested).expect("create dirs");
+        std::fs::write(nested.join("Rock.mesh"), b"").expect("write file");
+
+        // Shallowest first, as the caller has them.
+        let shared = vec!["assets".to_string(), "assets/meshes".to_string()];
+        let prefixes = resolve_prefixes(dir.path(), &shared).await;
+
+        assert_eq!(prefixes.len(), 2);
+        assert_eq!(prefixes.longest_prefix_of("assets"), Some((1, "Assets")));
+        assert_eq!(
+            prefixes.longest_prefix_of("assets/meshes"),
+            Some((2, "Assets/Meshes"))
+        );
+        assert_eq!(
+            prefixes.longest_prefix_of("assets/meshes/rock.MESH"),
+            Some((2, "Assets/Meshes")),
+            "a path is covered by the longest prefix above it, not by itself"
+        );
+        assert_eq!(prefixes.longest_prefix_of("elsewhere/file"), None);
+
+        let asked: RelativePath =
+            std::str::FromStr::from_str("assets/meshes/rock.MESH").expect("relative path");
+        assert_eq!(
+            filesystem_path(dir.path(), &asked, Some(&prefixes))
+                .await
+                .expect("the path must resolve"),
+            "Assets/Meshes/Rock.mesh"
+        );
+    }
+
+    /// A prefix that is not there, or that several spellings answer for, is left
+    /// out — so a path under it resolves as it would have with no map at all,
+    /// rather than being resolved against a directory that was guessed.
+    #[tokio::test]
+    async fn resolved_prefixes_leave_out_what_they_cannot_settle() {
+        let dir = temp_dir();
+        std::fs::create_dir(dir.path().join("Assets")).expect("create dir");
+
+        let shared = vec!["absent".to_string(), "absent/deeper".to_string()];
+        let prefixes = resolve_prefixes(dir.path(), &shared).await;
+        assert!(prefixes.is_empty(), "nothing there resolves");
+
+        // The path still resolves through the walk, which reports it as missing
+        // in the same way it would without a map.
+        let asked: RelativePath =
+            std::str::FromStr::from_str("absent/file").expect("relative path");
+        assert!(
+            filesystem_path(dir.path(), &asked, Some(&prefixes))
+                .await
+                .is_err()
+        );
+
+        if case_insensitive(dir.path()) {
+            return;
+        }
+        std::fs::create_dir(dir.path().join("assets")).expect("create second spelling");
+        let shared = vec!["ASSETS".to_string()];
+        assert!(
+            resolve_prefixes(dir.path(), &shared).await.is_empty(),
+            "two spellings answer for it, so the caller has to fork and decide"
+        );
+    }
+
+    /// The map is an answer about the filesystem as it was when it was built. A
+    /// caller that renames while it stages - which `StageCaseChange::Keep` does,
+    /// including to the directories these prefixes name - must not be given one,
+    /// and this is what that would look like: the path still resolves, to the
+    /// spelling that is no longer there.
+    #[tokio::test]
+    async fn a_resolved_prefix_does_not_survive_the_directory_being_renamed() {
+        let dir = temp_dir();
+        std::fs::create_dir(dir.path().join("Assets")).expect("create dir");
+        std::fs::write(dir.path().join("Assets").join("rock.mesh"), b"").expect("write file");
+
+        let prefixes = resolve_prefixes(dir.path(), &["Assets".to_string()]).await;
+        assert_eq!(prefixes.longest_prefix_of("Assets"), Some((1, "Assets")));
+
+        std::fs::rename(dir.path().join("Assets"), dir.path().join("ASSETS")).expect("rename");
+
+        let asked: RelativePath =
+            std::str::FromStr::from_str("Assets/rock.mesh").expect("relative path");
+        assert_eq!(
+            filesystem_path(dir.path(), &asked, None).await.ok(),
+            Some("ASSETS/rock.mesh".to_string()),
+            "resolving afresh finds the directory under the name it now has"
+        );
+        assert_ne!(
+            filesystem_path(dir.path(), &asked, Some(&prefixes))
+                .await
+                .ok(),
+            Some("ASSETS/rock.mesh".to_string()),
+            "the map still answers with the name the directory had"
+        );
+    }
+
+    /// What the map is allowed to change is how long resolving takes, never what
+    /// it resolves to. Every shape that reaches it has to come back the same
+    /// either way, because everything downstream - the tree node the path is
+    /// compared against, and what a case change means for it - reads the result
+    /// and nothing else.
+    #[tokio::test]
+    async fn a_resolved_prefix_answers_exactly_as_the_walk_would() {
+        let dir = temp_dir();
+        let nested = dir.path().join("Assets").join("Meshes");
+        std::fs::create_dir_all(&nested).expect("create dirs");
+        std::fs::write(nested.join("Rock.mesh"), b"").expect("write file");
+        std::fs::create_dir(dir.path().join("Assets").join("Empty")).expect("create dir");
+
+        let shared = vec![
+            "Assets".to_string(),
+            "assets".to_string(),
+            "Assets/Meshes".to_string(),
+            "assets/meshes".to_string(),
+            "absent".to_string(),
+        ];
+        let prefixes = resolve_prefixes(dir.path(), &shared).await;
+
+        for asked in [
+            // Given exactly as the filesystem holds it.
+            "Assets/Meshes/Rock.mesh",
+            // Given in another case, at the leaf, at an ancestor, and at both.
+            "Assets/Meshes/rock.MESH",
+            "assets/meshes/Rock.mesh",
+            "ASSETS/MESHES/ROCK.MESH",
+            // Not there at all, below a prefix that is and one that is not.
+            "Assets/Meshes/absent.mesh",
+            "absent/deeper/absent.mesh",
+            // A directory rather than a file, and a single component.
+            "Assets/Empty",
+            "Assets",
+        ] {
+            let asked: RelativePath = std::str::FromStr::from_str(asked).expect("relative path");
+            assert_eq!(
+                filesystem_path(dir.path(), &asked, Some(&prefixes))
+                    .await
+                    .ok(),
+                filesystem_path(dir.path(), &asked, None).await.ok(),
+                "{asked} must resolve the same with the map as without it"
+            );
+        }
     }
 
     #[tokio::test]
