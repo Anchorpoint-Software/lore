@@ -7,7 +7,9 @@ use std::sync::atomic::Ordering;
 
 use bitflags::bitflags;
 use bytes::Bytes;
-use bytes::BytesMut;
+use lore_base::allocator::HeapBox;
+use lore_base::allocator::HeapBuf;
+use lore_base::allocator::node_block_allocator;
 use lore_error_set::prelude::*;
 use parking_lot::RwLock;
 use parking_lot::RwLockReadGuard;
@@ -798,6 +800,19 @@ pub enum NodeBlockFormat {
     NoTimestamp = 2,
 }
 
+/// Route a block payload's heap allocations to the revision tree's own heap
+/// rather than the general one, for the reasons in
+/// [`lore_base::allocator::node_block_allocator`].
+macro_rules! block_payload_on_tree_heap {
+    ($type:ty $(, $trait:ident)+) => {
+        $(impl $trait for $type {
+            fn heap_allocator() -> Option<&'static (dyn std::alloc::GlobalAlloc + Sync)> {
+                lore_base::allocator::node_block_allocator()
+            }
+        })+
+    };
+}
+
 /// A block of nodes, 49280 bytes - 128 byte metadata, 512 nodes (96 bytes each)
 #[repr(C)]
 #[derive(Clone, IntoBytes, FromBytes, Immutable)]
@@ -825,8 +840,7 @@ pub struct NodeBlockData {
 }
 
 impl ReadBoxFromImmutable for NodeBlockData {}
-impl ZeroHeapAlloc for NodeBlockData {}
-impl CloneHeapAlloc for NodeBlockData {}
+block_payload_on_tree_heap!(NodeBlockData, ZeroHeapAlloc, CloneHeapAlloc);
 
 /// A block of nodes, 45184 bytes - 128 byte metadata, 512 nodes (96 bytes each)
 #[repr(C)]
@@ -855,8 +869,7 @@ pub struct NodeBlockDataV2 {
 }
 
 impl ReadBoxFromImmutable for NodeBlockDataV2 {}
-impl ZeroHeapAlloc for NodeBlockDataV2 {}
-impl CloneHeapAlloc for NodeBlockDataV2 {}
+block_payload_on_tree_heap!(NodeBlockDataV2, ZeroHeapAlloc, CloneHeapAlloc);
 
 /// Limit of inline name string in data format version 0
 pub const NODE_NAME_LIMIT: usize = 43;
@@ -883,8 +896,7 @@ pub struct NodeBlockDataV0 {
 }
 
 impl ReadBoxFromImmutable for NodeBlockDataV0 {}
-impl ZeroHeapAlloc for NodeBlockDataV0 {}
-impl CloneHeapAlloc for NodeBlockDataV0 {}
+block_payload_on_tree_heap!(NodeBlockDataV0, ZeroHeapAlloc, CloneHeapAlloc);
 
 /// A node in the revision tree, 128 bytes (32 bit index, max 4G nodes)
 #[repr(C)]
@@ -1055,8 +1067,8 @@ impl NodeV0 {
 }
 
 struct NodeBlockRuntimeData {
-    data: Box<NodeBlockData>,
-    name: BytesMut,
+    data: HeapBox<NodeBlockData>,
+    name: HeapBuf,
 }
 
 /// Internally mutable wrapper around a block of nodes
@@ -1162,22 +1174,22 @@ impl std::fmt::Display for NodeNameLock {
 // name table buffer. The guard keeps the data alive and prevents writers. The raw
 // pointer is !Send by default, but moving NodeNameLock between threads is safe because
 // the ArcRwLockReadGuard owns an Arc reference to the block, ensuring the pointed-to
-// data remains valid. The !Sync BytesMut is only read through the pointer, never
+// data remains valid. The name table is only read through the pointer, never
 // modified, dropped, or cloned.
 unsafe impl Send for NodeNameLock {}
 
 impl NodeBlock {
-    pub fn new(data: Box<NodeBlockData>) -> Self {
+    pub fn new(data: HeapBox<NodeBlockData>) -> Self {
         NodeBlock {
             data: Arc::new(RwLock::new(NodeBlockRuntimeData {
                 data,
-                name: BytesMut::new(),
+                name: HeapBuf::new_in(node_block_allocator()),
             })),
             name_deserialized: AtomicBool::new(false),
         }
     }
 
-    pub fn new_with_name(data: Box<NodeBlockData>, name: BytesMut) -> Self {
+    pub fn new_with_name(data: HeapBox<NodeBlockData>, name: HeapBuf) -> Self {
         NodeBlock {
             data: Arc::new(RwLock::new(NodeBlockRuntimeData { data, name })),
             name_deserialized: AtomicBool::new(true),
@@ -1188,7 +1200,7 @@ impl NodeBlock {
         let mut data = NodeBlockData::new_from_heap_zeroed();
         data.block_unused_next = INVALID_BLOCK;
         data.version = NodeBlockFormat::Nametable as u32;
-        Self::new_with_name(data, BytesMut::new())
+        Self::new_with_name(data, HeapBuf::new_in(node_block_allocator()))
     }
 
     /// Get the block index from a full node ID
@@ -1294,9 +1306,7 @@ impl NodeBlock {
         .await
         .internal("Deserialize deprecated name table failed")?;
 
-        let nametable = bytes
-            .try_into_mut()
-            .unwrap_or_else(|bytes| BytesMut::from(&bytes[..]));
+        let nametable = HeapBuf::from_slice_in(&bytes, node_block_allocator());
 
         let mut writer = self.write();
         if !self.is_nametable_deserialized() {
@@ -1379,12 +1389,14 @@ impl NodeBlock {
     pub async fn convert_block_v0(
         repository: Arc<RepositoryContext>,
         state: &State,
-        block_data_old: Box<NodeBlockDataV0>,
-    ) -> Result<(Box<NodeBlockData>, BytesMut), StateError> {
+        block_data_old: HeapBox<NodeBlockDataV0>,
+    ) -> Result<(HeapBox<NodeBlockData>, HeapBuf), StateError> {
         const EXPECTED_NAME_LENGTH: usize = 16;
         let mut block_data = NodeBlockData::new_from_heap_zeroed();
-        let mut name_buffer =
-            BytesMut::with_capacity(EXPECTED_NAME_LENGTH * node::BLOCK_V0_NODE_COUNT);
+        let mut name_buffer = HeapBuf::with_capacity_in(
+            EXPECTED_NAME_LENGTH * node::BLOCK_V0_NODE_COUNT,
+            node_block_allocator(),
+        );
 
         block_data.flags = block_data_old.flags | NodeBlockFlags::UpgradeGeneratedNametable;
         block_data.node_count = block_data_old.node_count;
@@ -1439,8 +1451,8 @@ impl NodeBlock {
 
     pub fn convert_block_v2(
         _repository: Arc<RepositoryContext>,
-        block_data_v2: Box<NodeBlockDataV2>,
-    ) -> Result<Box<NodeBlockData>, StateError> {
+        block_data_v2: HeapBox<NodeBlockDataV2>,
+    ) -> Result<HeapBox<NodeBlockData>, StateError> {
         let mut block_data = NodeBlockData::new_from_heap_zeroed();
 
         block_data.flags = block_data_v2.flags;
@@ -1509,7 +1521,7 @@ impl NodeBlockReader<'_> {
     }
 
     pub fn clone_name_table(&self) -> Bytes {
-        self.lock.name.clone().freeze()
+        Bytes::copy_from_slice(&self.lock.name)
     }
 
     /// Access the full node block
@@ -1574,7 +1586,7 @@ impl NodeBlockWriter<'_> {
     }
 
     pub fn discard_node(&mut self, block_index: usize, node_index: usize) {
-        let block = &mut self.lock.data;
+        let block: &mut NodeBlockData = &mut self.lock.data;
         if block.node_unused_count == 0 && block.node_count == BLOCK_NODE_COUNT as u32 {
             block.flags |= NodeBlockFlags::FirstUnusedNode;
         }
@@ -1702,7 +1714,7 @@ impl NodeBlockWriter<'_> {
         if lock.name.is_empty() {
             return;
         }
-        let mut new_name = BytesMut::with_capacity(lock.name.capacity());
+        let mut new_name = HeapBuf::with_capacity_in(lock.name.capacity(), lock.name.allocator());
 
         let node_count = lock.data.node_count as usize;
         for node_index in 0..node_count {
@@ -1898,7 +1910,7 @@ pub struct NodeFileMetadataBlockData {
 }
 
 impl ReadBoxFromImmutable for NodeFileMetadataBlockData {}
-impl ZeroHeapAlloc for NodeFileMetadataBlockData {}
+block_payload_on_tree_heap!(NodeFileMetadataBlockData, ZeroHeapAlloc, CloneHeapAlloc);
 
 /// Legacy block of file metadata with 511 elements (old format before extension to 512)
 #[repr(C)]
@@ -1911,12 +1923,12 @@ struct NodeFileMetadataBlockDataV0 {
 }
 
 impl ReadBoxFromImmutable for NodeFileMetadataBlockDataV0 {}
-impl ZeroHeapAlloc for NodeFileMetadataBlockDataV0 {}
+block_payload_on_tree_heap!(NodeFileMetadataBlockDataV0, ZeroHeapAlloc);
 
 impl NodeFileMetadataBlockDataV0 {
     /// Convert the old 511-element block into the current 512-element format.
     /// The last element is zero-initialized.
-    fn into_current(self) -> Box<NodeFileMetadataBlockData> {
+    fn into_current(self) -> HeapBox<NodeFileMetadataBlockData> {
         let mut block = NodeFileMetadataBlockData::new_from_heap_zeroed();
         block.flags = self.flags;
         block.version = self.version;
@@ -1931,7 +1943,7 @@ impl NodeFileMetadataBlockData {
         repository: Arc<RepositoryContext>,
         address: Address,
         cache: bool,
-    ) -> Result<Box<NodeFileMetadataBlockData>, ImmutableError> {
+    ) -> Result<HeapBox<NodeFileMetadataBlockData>, ImmutableError> {
         match NodeFileMetadataBlockData::read_box_from_immutable(repository.clone(), address, cache)
             .await
         {
@@ -1954,17 +1966,17 @@ impl NodeFileMetadataBlockData {
 /// Internally mutable wrapper around a block of nodes
 pub struct NodeFileMetadataBlock {
     /// Node block data containing all the nodes
-    data: parking_lot::RwLock<Box<NodeFileMetadataBlockData>>,
+    data: parking_lot::RwLock<HeapBox<NodeFileMetadataBlockData>>,
 }
 
 /// Read accessor for a node block
 pub struct NodeFileMetadataBlockReader<'a> {
-    lock: RwLockReadGuard<'a, Box<NodeFileMetadataBlockData>>,
+    lock: RwLockReadGuard<'a, HeapBox<NodeFileMetadataBlockData>>,
 }
 
 /// Write accessor for a node block
 pub struct NodeFileMetadataBlockWriter<'a> {
-    lock: RwLockWriteGuard<'a, Box<NodeFileMetadataBlockData>>,
+    lock: RwLockWriteGuard<'a, HeapBox<NodeFileMetadataBlockData>>,
 }
 
 impl Default for NodeFileMetadataBlock {
@@ -1974,7 +1986,7 @@ impl Default for NodeFileMetadataBlock {
 }
 
 impl NodeFileMetadataBlock {
-    pub fn new(data: Box<NodeFileMetadataBlockData>) -> Self {
+    pub fn new(data: HeapBox<NodeFileMetadataBlockData>) -> Self {
         NodeFileMetadataBlock {
             data: RwLock::new(data),
         }

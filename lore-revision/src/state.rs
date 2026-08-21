@@ -888,7 +888,7 @@ impl State {
                     // TODO(mjansson): Figure out a way to write the node block without having to copy
                     // it out of the lock first. Writing from the locked ref will not work as the immutable
                     // write makes the lock held of an await point
-                    let mut node_block = { *block.read().node_block() };
+                    let mut node_block = { block.read().node_block().clone_on_heap() };
                     node_block.flags &= !NodeBlockFlags::Dirty;
                     let address = node_block
                         .write_to_immutable(

@@ -717,7 +717,7 @@ where
         repository: Arc<RepositoryContext>,
         address: Address,
         cache: bool,
-    ) -> Result<Box<SelfType>, ImmutableError> {
+    ) -> Result<lore_base::allocator::HeapBox<SelfType>, ImmutableError> {
         let mut elem = SelfType::new_from_heap_zeroed();
         let slice = unsafe {
             std::slice::from_raw_parts_mut(
