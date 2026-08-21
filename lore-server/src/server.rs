@@ -1028,10 +1028,15 @@ fn resolve_local_store_path(configured: &str, store_label: &str) -> PathBuf {
 /// endpoint that has no certificate configured by generating an ephemeral
 /// self-signed certificate and writing it under the system temporary directory.
 ///
-/// Used for the user-facing QUIC endpoint so a stand alone server binary with
-/// no external config can serve TLS out of the box. A prominent warning is
-/// logged because these certificates are untrusted and regenerated on every
-/// startup.
+/// Used for QUIC endpoints that carry no mTLS requirement, so a stand alone
+/// server binary with no external config can serve TLS out of the box. A
+/// prominent warning is logged because these certificates are untrusted and
+/// regenerated on every startup.
+///
+/// The file names carry the process id: several servers routinely share one
+/// machine (and therefore one temporary directory), and a fixed name would let
+/// them overwrite each other's certificate between the write here and the read
+/// in the endpoint setup, pairing one server's certificate with another's key.
 fn generate_ephemeral_certificate(endpoint: &str) -> Result<crate::tls::CertificateSettings> {
     let dir = local_data_dir();
     std::fs::create_dir_all(&dir).map_err(|e| {
@@ -1041,8 +1046,9 @@ fn generate_ephemeral_certificate(endpoint: &str) -> Result<crate::tls::Certific
         )
     })?;
 
-    let cert_file = dir.join(format!("{endpoint}-cert.pem"));
-    let pkey_file = dir.join(format!("{endpoint}-key.pem"));
+    let process_id = std::process::id();
+    let cert_file = dir.join(format!("{endpoint}-{process_id}-cert.pem"));
+    let pkey_file = dir.join(format!("{endpoint}-{process_id}-key.pem"));
 
     let generated = lore_transport::tls::generate_self_signed(vec![
         "localhost".to_string(),
@@ -2029,6 +2035,12 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                  clients"
             );
         }
+        // Without mTLS the certificate is only there to satisfy the TLS
+        // handshake — peers connect over `quic://` and do not validate it — so
+        // an ephemeral one keeps the endpoint zero-config. Under mTLS the
+        // certificate is the authentication, and a generated one would be
+        // worthless, so that path keeps demanding a configured triple.
+        let generate_ephemeral_cert = security == EndpointSecurity::Untrusted;
         lore_spawn!(endpoints, {
             let immutable_store = immutable_store.clone();
             let settings = settings.clone();
@@ -2059,9 +2071,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 )),
                 frequency,
                 quic_settings,
-                // Internal QUIC endpoint requires a real (mTLS) certificate;
-                // never fall back to an ephemeral one.
-                false,
+                generate_ephemeral_cert,
                 shutdown_rx,
             )
         });

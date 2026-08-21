@@ -68,12 +68,12 @@ Environment-variable overrides apply last, after every file layer, so they win o
 
 With no config files loaded, the server runs as a self-contained, single-node instance, substituting ephemeral local artifacts for what a production deployment would configure. It logs each substitution so the choice is visible.
 
-- **TLS certificate.** When the public-facing QUIC endpoint has no certificate, the server writes a self-signed certificate for `localhost`, `127.0.0.1`, and `::1` to `<temp>/lore-server/<endpoint>-cert.pem` (and `-key.pem`). It's untrusted, regenerated on every restart, and for local development only.
+- **TLS certificate.** When a QUIC endpoint that does not require mutual TLS has no certificate, the server writes a self-signed certificate for `localhost`, `127.0.0.1`, and `::1` to `<temp>/lore-server/<endpoint>-<pid>-cert.pem` (and `-key.pem`), where `<pid>` is the server's process id. It's untrusted, regenerated on every restart, and for local development only.
 - **Local store path.** When a local store has no `path`, it uses `<temp>/lore-server`. Because that path is fixed, a later run reopens the same directory and reuses whatever the previous run left.
 - **Presigned URL feature.** When `presigned_url_hmac_key` is absent, the feature starts disabled.
 
 > [!NOTE]
-> `<temp>` is the OS temporary directory (`$TMPDIR` or `/tmp` on Linux; a per-user `/var/folders/…` path on macOS). The server always uses the same fixed subdirectory, `<temp>/lore-server`, so the paths above are stable across runs.
+> `<temp>` is the OS temporary directory (`$TMPDIR` or `/tmp` on Linux; a per-user `/var/folders/…` path on macOS). The server always uses the same fixed subdirectory, `<temp>/lore-server`, so the store path above is stable across runs. Certificate file names carry the process id so that servers sharing a machine cannot overwrite each other's certificate; they are not stable across runs, and old pairs are left behind rather than cleaned up.
 
 <!-- -->
 
@@ -110,7 +110,7 @@ The `[server]` table and its sub-tables configure the network endpoints and grac
 
 #### Certificate block
 
-Each QUIC endpoint takes an optional `[server.quic.certificate]` (or `[server.quic_internal.certificate]`) block. When omitted on the public endpoint, the server generates an ephemeral certificate (see [Zero-config defaults](#zero-config-defaults)). The block as a whole is optional, but when it is present `cert_file` and `pkey_file` are both required — only `cert_chain` is individually optional.
+Each QUIC endpoint takes an optional `[server.quic.certificate]` (or `[server.quic_internal.certificate]`) block. A configured block is always used as given. When it is omitted, the server generates an ephemeral certificate (see [Zero-config defaults](#zero-config-defaults)) on the public endpoint, and on the internal endpoint when `verify_client_certs = false` — there the certificate only has to satisfy the handshake, since no client is being verified. The internal endpoint with `verify_client_certs = true` has no such fallback: mutual TLS is the authentication, so a missing certificate fails startup. The block as a whole is optional, but when it is present `cert_file` and `pkey_file` are both required — only `cert_chain` is individually optional.
 
 | Field | Default | Description |
 | --- | --- | --- |

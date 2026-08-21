@@ -58,18 +58,6 @@ def pytest_addoption(parser):
         help="The host name Lore Server has",
     )
     parser.addoption(
-        "--lore-server-creds-key-path",
-        action="store",
-        default="key.pem",
-        help="The path to key.pem in the test directory",
-    )
-    parser.addoption(
-        "--lore-server-creds-cert-path",
-        action="store",
-        default="cert.pem",
-        help="The path to cert.pem in the test directory",
-    )
-    parser.addoption(
         "--lore-remote-url",
         action="store",
         default=None,
