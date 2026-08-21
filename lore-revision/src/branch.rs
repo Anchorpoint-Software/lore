@@ -56,7 +56,6 @@ use crate::interface::LoreError;
 use crate::interface::LoreFileAction;
 use crate::interface::LoreString;
 use crate::link;
-use crate::link::LinkFlags;
 use crate::lore::*;
 use crate::lore_debug;
 use crate::lore_drain_tasks;
@@ -82,7 +81,6 @@ use crate::revision::DiffItem;
 use crate::revision::DiffResult;
 use crate::revision::sync;
 use crate::state;
-use crate::state::LinkReference;
 use crate::state::State;
 use crate::state::StateData;
 use crate::state::StateError;
@@ -1737,30 +1735,10 @@ async fn create_linked_branches(
         return Ok(current_latest);
     }
 
-    // A repository can be linked at more than one mount path, and the branch has
-    // a single identity within it. Group the mounts by repository so the cascade
-    // creates that branch once instead of racing itself: concurrent creates with
-    // the same branch ID resolve to one winner, and the loser is rejected with
+    // Grouping keeps the cascade from racing itself: concurrent creates with the
+    // same branch ID resolve to one winner, and the loser is rejected with
     // "branch has been advanced by another instance", failing the whole create.
-    let mut link_groups: Vec<(RepositoryId, Vec<LinkReference>)> = Vec::new();
-
-    for link_reference in link_list.iter() {
-        if link_reference.flags & LinkFlags::DisableAutoFollow != 0 {
-            lore_debug!(
-                "Auto follow disabled for link {}",
-                link_reference.repository
-            );
-            continue;
-        }
-
-        match link_groups
-            .iter_mut()
-            .find(|(link_id, _mounts)| *link_id == link_reference.repository)
-        {
-            Some((_link_id, mounts)) => mounts.push(*link_reference),
-            None => link_groups.push((link_reference.repository, vec![*link_reference])),
-        }
-    }
+    let link_groups = link::auto_following_mounts(&link_list);
 
     let mut link_tasks = JoinSet::new();
 
@@ -1967,9 +1945,9 @@ pub async fn delete(
 
     delete_name_to_id(repository.clone(), &branch_name).await?;
 
-    // A layer archive is a consequence of the outer one, not its own user-facing
-    // event, so reporting it again per layer would read as repeated archives.
-    if !repository.is_layer() {
+    // A layer or link archive is a consequence of the outer one, not its own
+    // user-facing event, so reporting each one would read as repeated archives.
+    if !repository.is_layer() && !repository.is_link() {
         event::LoreEvent::BranchArchive(LoreBranchArchiveEventData {
             name: branch_name.into(),
         })

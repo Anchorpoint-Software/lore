@@ -705,13 +705,17 @@ class Lore:
         branch: str | None = None,
         include_layers: bool = False,
         layer: str | None = None,
+        include_links: bool = False,
+        link: str | None = None,
         **kwargs: Unpack[GlobalOptions],
     ):
         return self.run(
             ["branch", "archive"]
             + ([branch] if branch else [])
             + (["--include-layers"] if include_layers else [])
-            + (["--layer", layer] if layer else []),
+            + (["--layer", layer] if layer else [])
+            + (["--include-links"] if include_links else [])
+            + (["--link", link] if link else []),
             **kwargs,
         )
 

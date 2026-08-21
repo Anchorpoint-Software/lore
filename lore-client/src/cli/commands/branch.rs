@@ -328,6 +328,14 @@ pub struct BranchArchiveArgs {
     /// Also archive the branch in the layer at the given mount path
     #[clap(long, value_name = "path", conflicts_with = "include_layers")]
     layer: Option<String>,
+
+    /// Also archive the branch in every configured link
+    #[clap(long, action, conflicts_with = "link")]
+    include_links: bool,
+
+    /// Also archive the branch in the link at the given mount path
+    #[clap(long, value_name = "path", conflicts_with = "include_links")]
+    link: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -1563,6 +1571,8 @@ pub fn handle_branch_archive(globals: LoreGlobalArgs, args: &BranchArchiveArgs) 
         branch: LoreString::from(&args.branch),
         layer: LoreString::from(args.layer.as_deref().unwrap_or("")),
         include_layers: u8::from(args.include_layers),
+        link: LoreString::from(args.link.as_deref().unwrap_or("")),
+        include_links: u8::from(args.include_links),
     };
 
     let callback = output_formatter().unwrap_or(Some(

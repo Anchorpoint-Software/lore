@@ -417,6 +417,180 @@ pub(crate) fn report_branch_outcome(
     .send();
 }
 
+/// A linked repository a branch cascade acts on, with a mount path for
+/// reporting.
+pub struct LinkTarget {
+    pub path: String,
+    pub repository: RepositoryId,
+    pub context: Arc<RepositoryContext>,
+}
+
+/// Groups the mounts in `link_list` by linked repository, skipping links that
+/// opted out of following the parent's branches.
+///
+/// A repository can be linked at more than one mount path while the branch has a
+/// single identity within it, so a cascade acts once per repository rather than
+/// once per mount.
+pub fn auto_following_mounts(
+    link_list: &[LinkReference],
+) -> Vec<(RepositoryId, Vec<LinkReference>)> {
+    let mut groups: Vec<(RepositoryId, Vec<LinkReference>)> = Vec::new();
+
+    for link_reference in link_list.iter() {
+        if link_reference.flags & LinkFlags::DisableAutoFollow != 0 {
+            lore_debug!(
+                "Auto follow disabled for link {}",
+                link_reference.repository
+            );
+            continue;
+        }
+
+        match groups
+            .iter_mut()
+            .find(|(link_id, _mounts)| *link_id == link_reference.repository)
+        {
+            Some((_link_id, mounts)) => mounts.push(*link_reference),
+            None => groups.push((link_reference.repository, vec![*link_reference])),
+        }
+    }
+
+    groups
+}
+
+/// For operations that cascade into every linked repository, including the
+/// links nested inside them.
+///
+/// `branch create` only seeds the top level, so the deeper repositories are
+/// reached here for the sake of converging on whatever a branch has been left
+/// in, however it got there.
+pub async fn list_with_context(
+    repository: Arc<RepositoryContext>,
+) -> Result<Vec<LinkTarget>, LinkError> {
+    let (state, _parent_branch) = current_or_staged_state(repository.clone()).await?;
+
+    let mut seen = std::collections::HashSet::from([repository.id]);
+    Box::pin(collect_with_context(
+        repository,
+        state,
+        String::new(),
+        0,
+        &mut seen,
+    ))
+    .await
+}
+
+/// Bounded by `MAX_LINK_DEPTH` and a visited-repository set, so a link cycle
+/// terminates and a repository reachable by several paths is acted on once.
+///
+/// Each context costs its own connection, so the links at one level are opened
+/// concurrently rather than one handshake after another.
+async fn collect_with_context(
+    repository: Arc<RepositoryContext>,
+    state: Arc<State>,
+    path_prefix: String,
+    link_depth: usize,
+    seen: &mut std::collections::HashSet<RepositoryId>,
+) -> Result<Vec<LinkTarget>, LinkError> {
+    let link_list = state
+        .link_list(repository.clone())
+        .await
+        .forward::<LinkError>("Failed to list links")?;
+
+    let mounts: Vec<(RepositoryId, Vec<LinkReference>)> = auto_following_mounts(&link_list)
+        .into_iter()
+        .filter(|(link_id, _mounts)| seen.insert(*link_id))
+        .collect();
+
+    let level = futures::future::join_all(mounts.into_iter().map(|(link_id, mounts)| {
+        let repository = repository.clone();
+        let state = state.clone();
+        let path_prefix = path_prefix.clone();
+        async move {
+            let local_path = state
+                .node_path(repository.clone(), mounts[0].local_node)
+                .await
+                .unwrap_or_default();
+
+            let target = LinkTarget {
+                path: if path_prefix.is_empty() {
+                    local_path
+                } else {
+                    format!("{path_prefix}/{local_path}")
+                },
+                repository: link_id,
+                context: Arc::new(repository.to_link_context(link_id).await),
+            };
+
+            (target, mounts[0].signature)
+        }
+    }))
+    .await;
+
+    let mut targets = Vec::new();
+    for (target, signature) in level {
+        let nested = if link_depth + 1 < crate::state::MAX_LINK_DEPTH {
+            let context = target.context.clone();
+            let nested_state = State::deserialize(context.clone(), signature)
+                .await
+                .forward::<LinkError>("Failed deserializing state")?;
+
+            Box::pin(collect_with_context(
+                context,
+                nested_state,
+                target.path.clone(),
+                link_depth + 1,
+                seen,
+            ))
+            .await?
+        } else {
+            Vec::new()
+        };
+
+        targets.push(target);
+        targets.extend(nested);
+    }
+
+    Ok(targets)
+}
+
+/// Resolves the link mounted at `path` for a cascade scoped to one link.
+///
+/// Naming a link that opted out of following the parent's branches is refused
+/// rather than honoured: the cascade that would have put the branch there never
+/// ran, so acting on it would delete a branch this repository never created.
+pub async fn find_with_context(
+    repository: Arc<RepositoryContext>,
+    path: &str,
+) -> Result<LinkTarget, LinkError> {
+    let (state, _parent_branch) = current_or_staged_state(repository.clone()).await?;
+    let resolved = resolve_link_at_path(&state, repository, path).await?;
+
+    if resolved.link_reference.flags & LinkFlags::DisableAutoFollow != 0 {
+        return Err(InvalidArguments {
+            reason: format!("link at {path} does not follow the parent's branches"),
+        }
+        .into());
+    }
+
+    Ok(LinkTarget {
+        path: path.to_string(),
+        repository: resolved.link_context.id,
+        context: resolved.link_context,
+    })
+}
+
+/// The staged state when there is one, otherwise the current state, together
+/// with the branch they belong to.
+pub(crate) async fn current_or_staged_state(
+    repository: Arc<RepositoryContext>,
+) -> Result<(Arc<State>, BranchId), LinkError> {
+    let (current, staged, branch) = State::deserialize_current_and_staged(repository)
+        .await
+        .forward::<LinkError>("Failed deserializing state")?;
+
+    Ok((staged.unwrap_or(current), branch))
+}
+
 pub async fn resolve_pin(
     link: Arc<RepositoryContext>,
     pin: String,

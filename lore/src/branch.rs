@@ -18,6 +18,7 @@ use lore_revision::interface::LoreEventCallback;
 use lore_revision::interface::LoreGlobalArgs;
 use lore_revision::interface::LoreMetadataType;
 use lore_revision::layer;
+use lore_revision::link;
 use lore_revision::lore::BranchId;
 use lore_revision::lore::execution_context;
 use lore_revision::lore_debug;
@@ -1103,6 +1104,12 @@ pub struct LoreBranchArchiveArgs {
     /// Also archive the branch in every configured layer
     #[serde(default)]
     pub include_layers: u8,
+    /// If set, archive only in this link (mount path relative to repo root)
+    #[serde(default)]
+    pub link: LoreString,
+    /// Also archive the branch in every configured link
+    #[serde(default)]
+    pub include_links: u8,
 }
 
 /// Archives a branch locally and, unless running in local mode, on the remote.
@@ -1156,12 +1163,9 @@ async fn archive_impl(
 
     let branch = branch::resolve(repository.clone(), args.branch.as_str()).await?;
 
-    let layer_path: Option<&str> = (&args.layer).into();
-    let scope = match layer_path {
-        Some(path) => LayerScope::Single(path.to_string()),
-        None if args.include_layers != 0 => LayerScope::All,
-        None => LayerScope::OuterOnly,
-    };
+    let layer_scope =
+        CascadeScope::new(&args.layer, args.include_layers, "layer", "include_layers")?;
+    let link_scope = CascadeScope::new(&args.link, args.include_links, "link", "include_links")?;
 
     let mut local_fail = false;
 
@@ -1202,9 +1206,10 @@ async fn archive_impl(
     }
 
     // Runs even when the outer archive failed, so that a repeat of a partially
-    // applied archive still converges on the layers.
+    // applied archive still converges on the layers and links.
     if !local_current {
-        archive_layers(repository, branch.id, scope).await?;
+        archive_layers(repository.clone(), branch.id, layer_scope).await?;
+        archive_links(repository, branch.id, link_scope).await?;
     }
 
     if local_fail {
@@ -1216,50 +1221,111 @@ async fn archive_impl(
     Ok(())
 }
 
-/// A layer is a separate repository owning its own branch lifecycle, and
+/// A layer or link is a separate repository owning its own branch lifecycle, and
 /// archiving deletes, so the cascade is asked for rather than assumed.
-enum LayerScope {
+#[derive(Debug)]
+enum CascadeScope {
     OuterOnly,
     Single(String),
     All,
 }
 
+impl CascadeScope {
+    /// The CLI rejects the pair at the parser, but the IPC and C ABI callers
+    /// reach these fields directly, where silently preferring one would archive
+    /// somewhere the caller did not ask for.
+    fn new(
+        path: &LoreString,
+        include_all: u8,
+        path_field: &str,
+        include_field: &str,
+    ) -> Result<Self, BranchError> {
+        let path: Option<&str> = path.into();
+        match (path, include_all) {
+            (Some(_), 1..) => Err(lore_base::error::InvalidArguments {
+                reason: format!("{path_field} and {include_field} cannot both be set"),
+            }
+            .into()),
+            (Some(path), _) => Ok(Self::Single(path.to_string())),
+            (None, 1..) => Ok(Self::All),
+            (None, 0) => Ok(Self::OuterOnly),
+        }
+    }
+}
+
 async fn archive_layers(
     repository: Arc<RepositoryContext>,
     branch: BranchId,
-    scope: LayerScope,
+    scope: CascadeScope,
 ) -> Result<(), BranchError> {
-    let execution = execution_context();
-    let archive_remote = !execution.globals().local();
-
     let layers = match scope {
-        LayerScope::OuterOnly => return Ok(()),
-        LayerScope::All => layer::list_with_context(repository)
+        CascadeScope::OuterOnly => return Ok(()),
+        CascadeScope::All => layer::list_with_context(repository)
             .await
-            .forward::<BranchError>("Failed to list layers")?,
-        LayerScope::Single(path) => {
+            .forward::<BranchError>("Failed to list layers")?
+            .into_iter()
+            .map(|(_layer, context)| context)
+            .collect(),
+        CascadeScope::Single(path) => {
             let layer = layer::list(repository.clone())
                 .await
                 .forward::<BranchError>("Failed to list layers")?
                 .into_iter()
                 .find(|layer| layer.target_path == path)
                 .ok_or_else(|| -> BranchError { lore_base::error::NotALayer { path }.into() })?;
-            let context = Arc::new(repository.to_layer_context(layer.repository).await);
-            vec![(layer, context)]
+            vec![Arc::new(
+                repository.to_layer_context(layer.repository).await,
+            )]
         }
     };
 
-    for (_, layer_repository) in layers {
-        lore_debug!("Attempt archive of branch in layer {}", layer_repository.id);
-        if let Err(err) = branch::delete(layer_repository.clone(), branch).await
+    archive_in_repositories(layers, branch).await
+}
+
+async fn archive_links(
+    repository: Arc<RepositoryContext>,
+    branch: BranchId,
+    scope: CascadeScope,
+) -> Result<(), BranchError> {
+    let links = match scope {
+        CascadeScope::OuterOnly => return Ok(()),
+        CascadeScope::All => link::list_with_context(repository)
+            .await
+            .forward::<BranchError>("Failed to list links")?
+            .into_iter()
+            .map(|target| target.context)
+            .collect(),
+        CascadeScope::Single(path) => vec![
+            link::find_with_context(repository, &path)
+                .await
+                .forward::<BranchError>("Failed to resolve link")?
+                .context,
+        ],
+    };
+
+    archive_in_repositories(links, branch).await
+}
+
+/// A repository that never had the branch answers `NOT_FOUND`, which is the
+/// cascade converging rather than a failure, so it is not reported.
+async fn archive_in_repositories(
+    repositories: Vec<Arc<RepositoryContext>>,
+    branch: BranchId,
+) -> Result<(), BranchError> {
+    let execution = execution_context();
+    let archive_remote = !execution.globals().local();
+
+    for repository in repositories {
+        lore_debug!("Attempt archive of branch in {}", repository.id);
+        if let Err(err) = branch::delete(repository.clone(), branch).await
             && !err.is_branch_not_found()
         {
             execution.dispatcher.send_error(err);
         }
 
         if archive_remote
-            && let Ok(remote) = layer_repository.remote().await
-            && let Err(err) = branch::delete_remote(remote, layer_repository.id, branch).await
+            && let Ok(remote) = repository.remote().await
+            && let Err(err) = branch::delete_remote(remote, repository.id, branch).await
             && !err.is_branch_not_found()
         {
             execution.dispatcher.send_error(err);
@@ -1583,9 +1649,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn archive_args_old_payload_missing_layer_fields_uses_defaults() {
-        // Old IPC client payload with no layer fields. The new fields must be
-        // `#[serde(default)]` so old clients keep working.
+    fn archive_args_old_payload_missing_cascade_fields_uses_defaults() {
+        // Old IPC client payload with no layer or link fields. The new fields
+        // must be `#[serde(default)]` so old clients keep working.
         let payload = r#"{ "branch": "feature" }"#;
 
         let args: LoreBranchArchiveArgs =
@@ -1594,5 +1660,48 @@ mod tests {
         assert_eq!(args.branch.as_str(), "feature");
         assert_eq!(args.layer.as_str(), "");
         assert_eq!(args.include_layers, 0);
+        assert_eq!(args.link.as_str(), "");
+        assert_eq!(args.include_links, 0);
+    }
+
+    #[test]
+    fn archive_args_layer_payload_missing_link_fields_uses_defaults() {
+        // A client that knows the layer fields but not the link ones.
+        let payload = r#"{ "branch": "feature", "layer": "lay", "include_layers": 1 }"#;
+
+        let args: LoreBranchArchiveArgs =
+            serde_json::from_str(payload).expect("layer payload must deserialise");
+
+        assert_eq!(args.layer.as_str(), "lay");
+        assert_eq!(args.include_layers, 1);
+        assert_eq!(args.link.as_str(), "");
+        assert_eq!(args.include_links, 0);
+    }
+
+    #[test]
+    fn cascade_scope_maps_each_field_combination() {
+        assert!(matches!(
+            CascadeScope::new(&LoreString::from(""), 0, "link", "include_links"),
+            Ok(CascadeScope::OuterOnly)
+        ));
+        assert!(matches!(
+            CascadeScope::new(&LoreString::from(""), 1, "link", "include_links"),
+            Ok(CascadeScope::All)
+        ));
+        assert!(matches!(
+            CascadeScope::new(&LoreString::from("lnk"), 0, "link", "include_links"),
+            Ok(CascadeScope::Single(path)) if path == "lnk"
+        ));
+    }
+
+    #[test]
+    fn cascade_scope_rejects_a_path_together_with_include_all() {
+        let scope = CascadeScope::new(&LoreString::from("lnk"), 1, "link", "include_links");
+
+        let err = scope.expect_err("a path with include_all must be refused");
+        assert!(
+            err.to_string().contains("link and include_links"),
+            "expected the conflicting fields to be named, got: {err}"
+        );
     }
 }

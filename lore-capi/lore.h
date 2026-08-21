@@ -3871,6 +3871,10 @@ typedef struct lore_branch_archive_args_t {
   struct lore_string_t layer;
   // Also archive the branch in every configured layer
   uint8_t include_layers;
+  // If set, archive only in this link (mount path relative to repo root)
+  struct lore_string_t link;
+  // Also archive the branch in every configured link
+  uint8_t include_links;
 } lore_branch_archive_args_t;
 
 // Arguments for listing all branches in the repository.

@@ -8618,3 +8618,360 @@ def test_push_names_parent_branch_for_parent_revision(new_lore_repo):
         f"'{disambiguated_child_branch}' is the child's branch, which exists only "
         f"in the linked repository.\nPush output:\n{push_output}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Branch archive cascading into links.
+# ---------------------------------------------------------------------------
+
+
+def _setup_repo_with_link(new_lore_repo, link_path: str = "lnk"):
+    """Create a main repo with one link and initial content in both."""
+    repo: Lore = new_lore_repo()
+    link_repo: Lore = new_lore_repo(repo.name + "_link")
+
+    repo.write_commit_push(None, {"main.txt": b"main content"})
+    link_repo.write_commit_push(None, {"link.txt": b"link content"})
+
+    repo.link_add(link_path, link_repo.get_id(), "/")
+    repo.commit("add link")
+    repo.push()
+    return repo, link_repo
+
+
+def _setup_repo_with_two_links(new_lore_repo):
+    """Set up a parent repo with two links (sec, thr) and content in each.
+
+    Returns (parent_repo, second_repo, third_repo).
+    """
+    repo: Lore = new_lore_repo()
+    second_repo: Lore = new_lore_repo(repo.name + "_second")
+    third_repo: Lore = new_lore_repo(repo.name + "_third")
+
+    repo.write_commit_push(None, {"main.txt": b"main content"})
+    second_repo.write_commit_push(None, {"second.txt": b"second content"})
+    third_repo.write_commit_push(None, {"third.txt": b"third content"})
+
+    repo.link_add("sec", second_repo.get_id(), "/")
+    repo.link_add("thr", third_repo.get_id(), "/")
+    repo.commit("add links")
+    repo.push()
+    return repo, second_repo, third_repo
+
+
+@pytest.mark.smoke
+def test_link_branch_archive_leaves_link_by_default(new_lore_repo):
+    """`branch archive` touches only the repository it ran in."""
+    repo, link_repo = _setup_repo_with_link(new_lore_repo)
+
+    repo.branch_create("feature")
+    repo.push()
+    assert link_repo.branch_list().has_remote_branch("feature"), (
+        "Expected branch create to cascade into the linked repository"
+    )
+
+    repo.branch_switch("main")
+    repo.branch_archive("feature")
+
+    assert sorted(repo.branch_list().remote_branches) == ["main"], (
+        f"Expected only 'main' remaining in the parent, got: {repo.branch_list()}"
+    )
+    assert link_repo.branch_list().has_remote_branch("feature"), (
+        f"Expected the link branch to be left alone, got: {link_repo.branch_list()}"
+    )
+
+
+@pytest.mark.smoke
+def test_link_branch_archive_include_links(new_lore_repo):
+    """`--include-links` archives the branch in the linked repository too, so
+    the link is left with exactly the branches it had before the create.
+    """
+    repo, link_repo = _setup_repo_with_link(new_lore_repo)
+
+    branches_before = sorted(link_repo.branch_list().remote_branches)
+
+    repo.branch_create("feature")
+    repo.push()
+    assert link_repo.branch_list().has_remote_branch("feature"), (
+        "Expected branch create to cascade into the linked repository"
+    )
+
+    repo.branch_switch("main")
+    repo.branch_archive("feature", include_links=True)
+
+    assert sorted(repo.branch_list().remote_branches) == ["main"], (
+        f"Expected only 'main' remaining in the parent, got: {repo.branch_list()}"
+    )
+    assert sorted(link_repo.branch_list().remote_branches) == branches_before, (
+        f"Expected link branches {branches_before}, got: {link_repo.branch_list()}"
+    )
+
+
+@pytest.mark.smoke
+def test_link_branch_archive_multiple_links(new_lore_repo):
+    """`--include-links` archives the branch in every configured link."""
+    repo, second_repo, third_repo = _setup_repo_with_two_links(new_lore_repo)
+
+    repo.branch_create("feature")
+    repo.push()
+    for link in (second_repo, third_repo):
+        assert link.branch_list().has_remote_branch("feature"), (
+            f"Expected branch create to cascade into {link.name}"
+        )
+
+    repo.branch_switch("main")
+    repo.branch_archive("feature", include_links=True)
+
+    for link in (second_repo, third_repo):
+        assert sorted(link.branch_list().remote_branches) == ["main"], (
+            f"Expected only 'main' remaining in {link.name}, got: {link.branch_list()}"
+        )
+
+
+@pytest.mark.smoke
+def test_link_branch_archive_single_link(new_lore_repo):
+    """`--link <path>` archives the branch in that link and no other."""
+    repo, second_repo, third_repo = _setup_repo_with_two_links(new_lore_repo)
+
+    repo.branch_create("feature")
+    repo.push()
+    repo.branch_switch("main")
+
+    repo.branch_archive("feature", link="sec")
+
+    assert sorted(second_repo.branch_list().remote_branches) == ["main"], (
+        f"Expected the scoped link to be archived, got: {second_repo.branch_list()}"
+    )
+    assert third_repo.branch_list().has_remote_branch("feature"), (
+        f"Expected the other link to be left alone, got: {third_repo.branch_list()}"
+    )
+
+
+@pytest.mark.smoke
+def test_link_branch_archive_unknown_link_errors(new_lore_repo):
+    """`--link` naming a path that is not a link is an error, not a silent no-op."""
+    repo, link_repo = _setup_repo_with_link(new_lore_repo)
+
+    repo.branch_create("feature")
+    repo.push()
+    repo.branch_switch("main")
+
+    output = repo.branch_archive("feature", link="main.txt", check=False)
+
+    assert "not a link" in output.lower(), (
+        f"Expected a non-link path to be reported, got: {output}"
+    )
+    assert link_repo.branch_list().has_remote_branch("feature"), (
+        f"Expected the link to be left alone, got: {link_repo.branch_list()}"
+    )
+
+
+@pytest.mark.smoke
+def test_link_branch_archive_link_flags_conflict(new_lore_repo):
+    """`--include-links` and `--link` are mutually exclusive."""
+    repo, link_repo = _setup_repo_with_link(new_lore_repo)
+
+    output = repo.branch_archive("feature", include_links=True, link="lnk", check=False)
+
+    assert "cannot be used with" in output.lower(), (
+        f"Expected clap to reject the flag combination, got: {output}"
+    )
+
+
+@pytest.mark.smoke
+def test_link_branch_archive_local_keeps_link_remote(new_lore_repo):
+    """`--local --include-links` archives the link's local cache only, leaving
+    the link's remote branch in place.
+    """
+    repo, link_repo = _setup_repo_with_link(new_lore_repo)
+
+    repo.branch_create("feature")
+    repo.push()
+
+    repo.branch_switch("main")
+    repo.branch_archive("feature", local=True, include_links=True)
+
+    assert sorted(repo.branch_list().local_branches) == ["main"], (
+        f"Expected only 'main' remaining locally, got: {repo.branch_list()}"
+    )
+    assert link_repo.branch_list().has_remote_branch("feature"), (
+        f"Expected the link remote branch to remain, got: {link_repo.branch_list()}"
+    )
+
+
+@pytest.mark.smoke
+def test_link_branch_archive_tolerates_already_archived_link(new_lore_repo):
+    """Archiving a branch a link already archived is not an error."""
+    repo, link_repo = _setup_repo_with_link(new_lore_repo)
+
+    repo.branch_create("feature")
+    repo.push()
+    repo.branch_switch("main")
+
+    link_repo.branch_switch("main")
+    link_repo.branch_archive("feature")
+
+    repo.branch_archive("feature", include_links=True)
+
+    assert sorted(repo.branch_list().remote_branches) == ["main"], (
+        f"Expected only 'main' remaining in the parent, got: {repo.branch_list()}"
+    )
+    assert sorted(link_repo.branch_list().remote_branches) == ["main"], (
+        f"Expected only 'main' remaining in the link, got: {link_repo.branch_list()}"
+    )
+
+
+@pytest.mark.smoke
+def test_link_branch_archive_reports_once(new_lore_repo):
+    """Archiving reports a single branch, not one line per link."""
+    repo, second_repo, third_repo = _setup_repo_with_two_links(new_lore_repo)
+
+    repo.branch_create("feature")
+    repo.push()
+    repo.branch_switch("main")
+
+    output = repo.branch_archive("feature", include_links=True)
+
+    assert output.count("Archived branch") == 1, (
+        f"Expected one archive line for the outer repository, got: {output}"
+    )
+
+
+@pytest.mark.smoke
+def test_link_branch_archive_current_leaves_links(new_lore_repo):
+    """Refusing to archive the current branch leaves the links alone."""
+    repo, link_repo = _setup_repo_with_link(new_lore_repo)
+
+    repo.branch_create("feature")
+    repo.push()
+
+    repo.branch_archive("feature", include_links=True, check=False)
+
+    assert link_repo.branch_list().has_remote_branch("feature"), (
+        f"Expected the link branch to be untouched, got: {link_repo.branch_list()}"
+    )
+
+
+@pytest.mark.smoke
+def test_link_branch_archive_skips_auto_follow_disabled_link(new_lore_repo):
+    """A link with auto-follow disabled never received the branch from the
+    create cascade, so `--include-links` leaves its branches as they were.
+    """
+    repo: Lore = new_lore_repo()
+    link_repo: Lore = new_lore_repo(repo.name + "_link")
+
+    repo.write_commit_push(None, {"main.txt": b"main content"})
+    link_repo.write_commit_push(None, {"link.txt": b"link content"})
+
+    repo.link_add("lnk", link_repo.get_id(), "/", disable_branching=True)
+    repo.commit("add link")
+    repo.push()
+
+    branches_before = sorted(link_repo.branch_list().remote_branches)
+
+    repo.branch_create("feature")
+    repo.push()
+    repo.branch_switch("main")
+
+    repo.branch_archive("feature", include_links=True)
+
+    assert sorted(repo.branch_list().remote_branches) == ["main"], (
+        f"Expected only 'main' remaining in the parent, got: {repo.branch_list()}"
+    )
+    assert sorted(link_repo.branch_list().remote_branches) == branches_before, (
+        f"Expected link branches {branches_before}, got: {link_repo.branch_list()}"
+    )
+
+
+@pytest.mark.smoke
+def test_link_branch_archive_single_auto_follow_disabled_link_errors(new_lore_repo):
+    """Naming an auto-follow-disabled link with `--link` is refused, rather than
+    deleting a branch the create cascade never put there.
+    """
+    repo: Lore = new_lore_repo()
+    link_repo: Lore = new_lore_repo(repo.name + "_link")
+
+    repo.write_commit_push(None, {"main.txt": b"main content"})
+    link_repo.write_commit_push(None, {"link.txt": b"link content"})
+
+    repo.link_add("lnk", link_repo.get_id(), "/", disable_branching=True)
+    repo.commit("add link")
+    repo.push()
+
+    branches_before = sorted(link_repo.branch_list().remote_branches)
+
+    repo.branch_create("feature")
+    repo.push()
+    repo.branch_switch("main")
+
+    output = repo.branch_archive("feature", link="lnk", check=False)
+
+    assert "does not follow the parent's branches" in output.lower(), (
+        f"Expected the opted-out link to be reported, got: {output}"
+    )
+    assert sorted(link_repo.branch_list().remote_branches) == branches_before, (
+        f"Expected link branches {branches_before}, got: {link_repo.branch_list()}"
+    )
+
+
+@pytest.mark.smoke
+def test_link_branch_archive_include_links_reaches_nested_link(new_lore_repo):
+    """`--include-links` descends into a link nested inside another link.
+
+    `branch create` only seeds the top level, so the nested repository holds no
+    branch to remove; the cascade is observed reaching it through the debug log
+    rather than through a branch that disappears.
+    """
+    repo_a, repo_b, repo_c, _b_mount, _nested_mount = _build_nested_link_repos(
+        new_lore_repo
+    )
+
+    nested_before = sorted(repo_c.branch_list().remote_branches)
+
+    repo_a.branch_create("feature")
+    repo_a.push()
+    assert repo_b.branch_list().has_remote_branch("feature"), (
+        f"Expected create to cascade into the top-level link, got: {repo_b.branch_list()}"
+    )
+
+    repo_a.branch_switch("main")
+    output = repo_a.branch_archive("feature", include_links=True, level="debug")
+
+    assert repo_c.get_id() in output, (
+        f"Expected the cascade to reach nested link {repo_c.get_id()}, got: {output}"
+    )
+    assert sorted(repo_c.branch_list().remote_branches) == nested_before, (
+        f"Expected nested link branches {nested_before}, got: {repo_c.branch_list()}"
+    )
+
+
+@pytest.mark.smoke
+def test_link_branch_archive_repository_linked_twice(new_lore_repo):
+    """A repository mounted at two paths is archived once and reaches the
+    branches it had before the create.
+    """
+    repo: Lore = new_lore_repo()
+    link_repo: Lore = new_lore_repo(repo.name + "_link")
+
+    repo.write_commit_push(None, {"main.txt": b"main content"})
+    link_repo.write_commit_push(None, {"link.txt": b"link content"})
+
+    repo.link_add("first", link_repo.get_id(), "/")
+    repo.link_add("second", link_repo.get_id(), "/")
+    repo.commit("add links")
+    repo.push()
+
+    branches_before = sorted(link_repo.branch_list().remote_branches)
+
+    repo.branch_create("feature")
+    repo.push()
+    repo.branch_switch("main")
+
+    output = repo.branch_archive("feature", include_links=True)
+
+    assert output.count("Archived branch") == 1, (
+        f"Expected one archive line for the outer repository, got: {output}"
+    )
+    assert sorted(link_repo.branch_list().remote_branches) == branches_before, (
+        f"Expected link branches {branches_before}, got: {link_repo.branch_list()}"
+    )

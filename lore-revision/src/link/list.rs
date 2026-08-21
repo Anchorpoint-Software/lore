@@ -18,11 +18,7 @@ use crate::repository::RepositoryContext;
 use crate::state::State;
 
 pub async fn list(repository: Arc<RepositoryContext>) -> Result<(), LinkError> {
-    let (_state_current, state_staged, parent_branch) =
-        State::deserialize_current_and_staged(repository.clone())
-            .await
-            .forward::<LinkError>("Failed deserializing state")?;
-    let state_staged = state_staged.unwrap_or_else(|| _state_current.clone());
+    let (state_staged, parent_branch) = super::current_or_staged_state(repository.clone()).await?;
 
     lore_debug!("Listing links in repository");
 
