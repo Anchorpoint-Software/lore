@@ -499,9 +499,9 @@ pub async fn update_link_pin_by_node(
     }
 
     // Always re-mark the state as dirty here, even when `mark_dirty()` reports
-    // the block was already dirty. `State::serialize` clears
-    // `NodeBlockFlags::Dirty` only on the on-disk clone it writes; the
-    // in-memory block keeps the flag set across serialize calls. So a sequence
+    // the block was already dirty. `NodeBlockFlags::Dirty` is runtime state that
+    // is never written, and `State::serialize` leaves it set on the in-memory
+    // block until it has written everything. So a sequence
     // of `update_link_pin_by_node` -> `serialize` -> `update_link_pin_by_node`
     // -> `serialize` would leave the state-level dirty flag clear on the
     // second pass and `State::serialize` would early-return the previous

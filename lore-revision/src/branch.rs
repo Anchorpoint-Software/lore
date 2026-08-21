@@ -2934,8 +2934,7 @@ pub async fn resolve_diff3_base(
         "Resolve diff base between source branch {source_branch} revision {source_revision} and target branch {target_branch} revision {target_revision}"
     );
 
-    let base_revision;
-    if source_branch != target_branch {
+    let common_ancestor = if source_branch != target_branch {
         let source_stack = if let Ok(branch_metadata) =
             metadata(repository.clone(), source_branch).await
         {
@@ -3009,16 +3008,7 @@ pub async fn resolve_diff3_base(
 
         lore_debug!("Branch points give common ancestor {common_ancestor}");
 
-        base_revision = find_common_ancestor_from_merges(
-            repository.clone(),
-            source_branch,
-            source_revision,
-            target_branch,
-            target_revision,
-            common_ancestor,
-        )
-        .await?
-        .unwrap_or(common_ancestor);
+        common_ancestor
     } else {
         let branch_point = metadata(repository.clone(), source_branch)
             .await
@@ -3041,17 +3031,19 @@ pub async fn resolve_diff3_base(
 
         lore_debug!("History lines give common ancestor {common_ancestor}");
 
-        base_revision = find_common_ancestor_from_merges(
-            repository.clone(),
-            source_branch,
-            source_revision,
-            target_branch,
-            target_revision,
-            common_ancestor,
-        )
-        .await?
-        .unwrap_or(common_ancestor);
-    }
+        common_ancestor
+    };
+
+    let base_revision = find_common_ancestor_from_merges(
+        repository.clone(),
+        source_branch,
+        source_revision,
+        target_branch,
+        target_revision,
+        common_ancestor,
+    )
+    .await?
+    .unwrap_or(common_ancestor);
 
     lore_debug!(
         "Resolved diff base {base_revision} for source branch {source_branch} revision {source_revision} and target branch {target_branch} revision {target_revision}"

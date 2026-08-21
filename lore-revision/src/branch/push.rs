@@ -863,7 +863,6 @@ async fn collect_fragments_and_push(
 
         // Push new latest to remote
         let current_remote = remote_latest;
-        let current_number;
         let mut response_message = None;
 
         if !dry_run && remote_latest != current_revision {
@@ -931,7 +930,6 @@ async fn collect_fragments_and_push(
 
                 remote_latest = response.revision;
                 current_latest = response.revision;
-                current_number = response.revision_number;
 
                 event::LoreEvent::BranchPushRevisionPushEnd(
                     LoreBranchPushRevisionPushEndEventData {
@@ -939,7 +937,7 @@ async fn collect_fragments_and_push(
                         branch,
                         old_remote_revision: current_remote,
                         new_remote_revision: current_latest,
-                        new_remote_revision_number: current_number,
+                        new_remote_revision_number: response.revision_number,
                         message: response.message.unwrap_or_default().into(),
                         fast_forward_merged: 1,
                     },
@@ -976,17 +974,14 @@ async fn collect_fragments_and_push(
 
             remote_latest = response.revision;
             current_latest = response.revision;
-            current_number = State::deserialize(repository.clone(), current_latest)
-                .await
-                .forward::<PushError>("deserializing current latest state")?
-                .revision_number();
         } else {
             current_latest = current_revision;
-            current_number = State::deserialize(repository.clone(), current_latest)
-                .await
-                .forward::<PushError>("deserializing current latest state")?
-                .revision_number();
         }
+
+        let current_number = State::deserialize(repository.clone(), current_latest)
+            .await
+            .forward::<PushError>("deserializing current latest state")?
+            .revision_number();
 
         event::LoreEvent::BranchPushRevisionPushEnd(LoreBranchPushRevisionPushEndEventData {
             repository: repository.id,

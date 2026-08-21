@@ -144,6 +144,94 @@ mod tests {
             .expect("Task failed");
     }
 
+    /// The block that goes into the store has to be the block that is in
+    /// memory, byte for byte: `State::serialize` writes it straight from its
+    /// lock, so anything the runtime keeps in the block - the dirty flag above
+    /// all - would otherwise be written out with it.
+    #[tokio::test]
+    async fn a_serialized_block_is_the_block_in_memory() {
+        let (_immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let tempdir = generate_tempdir();
+                let path = tempdir.to_path_buf();
+                let immutable_store = LocalImmutableStore::new(
+                    None,
+                    lore_storage::local::immutable_store::ImmutableStoreSettings::default(),
+                )
+                .await
+                .expect("Failed to create store");
+                let write_token =
+                    lore_revision::repository::RepositoryWriteToken::acquire(path.as_path()).await;
+                let repository = Arc::new(
+                    RepositoryContext::new(
+                        default_repository_creation_args(
+                            immutable_store.clone(),
+                            mutable_store.clone(),
+                        )
+                        .with_path(&path),
+                    )
+                    .with_write_token(write_token.share()),
+                );
+
+                let state = Arc::new(State::new());
+                state
+                    .node_add(
+                        repository.clone(),
+                        ROOT_NODE,
+                        Node {
+                            name_hash: hash_string("only"),
+                            ..Default::default()
+                        },
+                        "only",
+                    )
+                    .await
+                    .expect("Failed to add the node");
+                let signature = state
+                    .serialize(repository.clone(), &write_token)
+                    .await
+                    .expect("Failed to serialize");
+
+                let live = state
+                    .block(repository.clone(), 0)
+                    .await
+                    .expect("Failed to read the block back in memory");
+                assert!(
+                    !live.read().is_dirty(),
+                    "serialize must release the blocks it wrote"
+                );
+                assert_eq!(
+                    live.read().node_block().flags & NODE_BLOCK_RUNTIME_FLAGS,
+                    0,
+                    "the runtime flags must be held outside the block data"
+                );
+
+                let restored = State::deserialize(repository.clone(), signature)
+                    .await
+                    .expect("Failed to deserialize");
+                let stored = restored
+                    .block(repository.clone(), 0)
+                    .await
+                    .expect("Failed to read the block back from the store");
+
+                assert_eq!(
+                    stored.read().node_block().flags & NODE_BLOCK_RUNTIME_FLAGS,
+                    0,
+                    "the runtime flags must not reach the store"
+                );
+                assert_eq!(
+                    live.read().node_block().as_bytes(),
+                    stored.read().node_block().as_bytes(),
+                    "the stored block must be the in-memory block byte for byte"
+                );
+            }))
+            .await
+            .expect("Task failed");
+    }
+
     #[tokio::test]
     async fn collect_new_name_fragments() {
         let (_immutable_store, mutable_store, execution) =

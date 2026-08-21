@@ -753,7 +753,7 @@ impl State {
             for (block, block_index) in block_dirty.iter() {
                 let block = block.clone();
                 let block_index = *block_index;
-                if block.read().raw().flags & NodeBlockFlags::FirstUnusedNode != 0 {
+                if block.read().has_first_unused_node() {
                     let block_unused_next = tree.block_unused_first;
                     tree.block_unused_first = block_index as u32;
                     block.write().node_block().block_unused_next = block_unused_next;
@@ -761,11 +761,8 @@ impl State {
                 lore_trace!("Queue serialization of dirty node block {}", block_index);
                 let repository = repository.clone();
                 lore_spawn!(tasks, async move {
-                    // TODO(mjansson): Figure out a way to write the node block without having to copy
-                    // it out of the lock first. Writing from the locked ref will not work as the immutable
-                    // write makes the lock held over an await point
                     lore_trace!("Serializing dirty node block {}", block_index);
-                    let mut node_block = {
+                    let node_block = {
                         block.deserialize_nametable(repository.clone()).await?;
                         block.node_name_repack();
                         if block.is_nametable_deserialized() {
@@ -790,12 +787,10 @@ impl State {
                                 writer.node_block().name_table = name_table.hash;
                             }
                         }
-                        block.read().node_block().clone_on_heap()
+                        block.read_owned()
                     };
-                    node_block.flags &= !NodeBlockFlags::Dirty;
-                    node_block.flags &= !NodeBlockFlags::UpgradeGeneratedNametable;
-                    node_block.flags &= !NodeBlockFlags::FirstUnusedNode;
                     let address = node_block
+                        .node_block()
                         .write_to_immutable(
                             repository.clone(),
                             Context::default(),
@@ -885,12 +880,9 @@ impl State {
 
                 lore_spawn!(tasks, async move {
                     lore_trace!("Serializing dirty file metadata node block {}", block_index);
-                    // TODO(mjansson): Figure out a way to write the node block without having to copy
-                    // it out of the lock first. Writing from the locked ref will not work as the immutable
-                    // write makes the lock held of an await point
-                    let mut node_block = { block.read().node_block().clone_on_heap() };
-                    node_block.flags &= !NodeBlockFlags::Dirty;
+                    let node_block = block.read_owned();
                     let address = node_block
+                        .node_block()
                         .write_to_immutable(
                             repository.clone(),
                             Context::default(),
@@ -1086,10 +1078,10 @@ impl State {
         let mut runtime = self.runtime.write();
         runtime
             .block_dirty
-            .retain(|(block, _)| block.read().raw().flags & NodeBlockFlags::Dirty != 0);
-        runtime.block_file_metadata_dirty.retain(|(block, _)| {
-            block.read().node_block().flags & NodeFileMetadataBlockFlags::Dirty != 0
-        });
+            .retain(|(block, _)| block.read().is_dirty());
+        runtime
+            .block_file_metadata_dirty
+            .retain(|(block, _)| block.read().is_dirty());
     }
 
     pub fn format(&self) -> u32 {
@@ -1706,14 +1698,13 @@ impl State {
 
         let address = Address::zero_context_hash(block_hash[block_index]);
         let block = Arc::new({
-            let mut block_data = NodeFileMetadataBlockData::read_box_from_immutable_compat(
+            let block_data = NodeFileMetadataBlockData::read_box_from_immutable_compat(
                 repository.clone(),
                 address,
                 true,
             )
             .await
             .internal("Failed to deserialize file metadata block")?;
-            block_data.flags &= !NodeBlockFlags::Dirty;
             NodeFileMetadataBlock::new(block_data)
         });
 
@@ -3831,7 +3822,9 @@ impl State {
         let mut entries = Vec::with_capacity(header.count as usize);
         let entry_bytes = &raw[header_size..];
         for chunk in entry_bytes
-            .chunks_exact(size_of::<LinkMergeEntry>())
+            .as_chunks::<{ size_of::<LinkMergeEntry>() }>()
+            .0
+            .iter()
             .take(header.count as usize)
         {
             let Ok(entry) = LinkMergeEntry::read_from_bytes(chunk) else {

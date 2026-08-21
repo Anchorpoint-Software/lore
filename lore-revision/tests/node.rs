@@ -400,6 +400,22 @@ mod tests {
                     reader.node_block().flags & NodeBlockFlags::Dirty.as_u32(),
                     0
                 );
+                // The conversion leaves the names in memory with nothing stored
+                // to load them from, which is what `State::serialize` relies on:
+                // it sees a deserialized name table, writes it out as its own
+                // object and records the hash here. That is where a v0 block's
+                // inline names move to the current model - and only if the block
+                // is edited, since serialize walks the dirty blocks. An
+                // untouched v0 block stays v0 in the store and is converted
+                // again on every load.
+                assert!(
+                    deserialized.is_nametable_deserialized(),
+                    "the converted block must carry its name table in memory"
+                );
+                assert!(
+                    reader.node_block().name_table.is_zero(),
+                    "a converted block has no stored name table until it is serialized"
+                );
             }))
             .await
             .expect("Test task failed");
