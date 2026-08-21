@@ -175,25 +175,35 @@ pub async fn filesystem_names_all_exist(parent: &Path, names: &[&str]) -> bool {
 // TODO(mjansson): We could pass around a hashmap cache of directory to file list mappings
 // while executing an operation, to reduce the number of iterations on the file system to
 // find files and their existing names - used by filesystem_name, filesystem_path and list_files
+/// Whether the directory `path` holds a child spelled exactly `name`.
+///
+/// The question nearly every caller actually has, and the filesystem answers it
+/// directly: one lookup, no directory read, and no string to hold the answer.
+/// [`filesystem_names`] is for the case this rules out, where the name is on
+/// disk under some other spelling and the caller needs to be told which.
+///
+/// `Some(false)` does not mean the name is absent - it means not under this
+/// spelling. `None` is the platform declining to say, as macOS does for every
+/// name and Windows does past `MAX_PATH`; only reading the directory answers
+/// those, which is what [`filesystem_names`] is for.
+pub async fn filesystem_name_matches(path: impl AsRef<Path>, name: &str) -> Option<bool> {
+    lore_io::IoDriver::global()
+        .holds_name_exactly(path.as_ref().join(name))
+        .await
+}
+
+/// Every spelling of `name` the directory `path` holds, the exact one alone if
+/// it is there, and `NotFound` if no spelling is.
+///
+/// Reads the directory and compares every child, which is what answering for
+/// spellings other than the one asked about takes. A caller that only needs to
+/// know whether the spelling it has is the one on disk should ask
+/// [`filesystem_name_matches`] instead.
 pub async fn filesystem_names(
     path: impl AsRef<Path>,
     name: &str,
 ) -> tokio::io::Result<Vec<String>> {
     let path = path.as_ref();
-
-    // TODO(mjansson): This should be a test for file system case sensitivity, in the sense that the file system
-    //                 support multiple concurrent case variations of the same file name
-    #[cfg(target_os = "linux")]
-    {
-        let initial_path = path.join(name);
-        if lore_io::IoDriver::global()
-            .metadata(initial_path.as_path())
-            .await
-            .is_ok()
-        {
-            return Ok(vec![name.to_string()]);
-        }
-    }
 
     let mut matches = vec![];
     let match_name = name.to_lowercase();
@@ -266,6 +276,15 @@ pub async fn filesystem_path(
     let mut found_path = RelativePathBuf::new();
     while !remain_path.is_empty() {
         let name = remain_path.pop_root();
+        // Nearly every component is already spelled the way the filesystem holds
+        // it, and that costs one lookup to establish. Only where it is not, or
+        // where the platform will not say, does the directory get read, and a
+        // name allocated for what it says.
+        if filesystem_name_matches(full_path.as_path(), name).await == Some(true) {
+            full_path.push(name);
+            found_path.push(name);
+            continue;
+        }
         let fs_names = filesystem_names(full_path.as_path(), name).await?;
         if fs_names.len() > 1 {
             if remain_path.is_empty() {
@@ -886,6 +905,200 @@ mod tests {
 
         assert!(filesystem_names_all_exist(dir.path(), &["Assets"]).await);
         assert!(!filesystem_names_all_exist(dir.path(), &["assets"]).await);
+    }
+
+    /// Whether the filesystem under the temporary directory holds one spelling of a name and
+    /// answers lookups in any other. Windows and macOS do by default and Linux does not, but a
+    /// mount can be either on any of them, so the tests below ask rather than assume — and the
+    /// two behaviours are different enough that a test written for one is not a test of the
+    /// other.
+    fn case_insensitive(dir: &Path) -> bool {
+        let probe = dir.join("CaseProbe");
+        std::fs::write(&probe, b"").expect("write probe");
+        let insensitive = std::fs::metadata(dir.join("caseprobe")).is_ok();
+        std::fs::remove_file(&probe).expect("remove probe");
+        insensitive
+    }
+
+    /// What the lookup answers where the platform has one, and `None` where it
+    /// has not — macOS can say nothing about a spelling short of the directory
+    /// read this exists to avoid, so every expectation collapses to that there.
+    fn verdict(held: bool) -> Option<bool> {
+        cfg!(any(target_os = "linux", target_family = "windows")).then_some(held)
+    }
+
+    /// The distinction the whole thing rests on: this answers for the spelling
+    /// asked about, where `Path::exists` answers for the file whatever it is
+    /// called. A case-insensitive filesystem finds the file under either name,
+    /// and must still say no to the one it does not hold.
+    #[tokio::test]
+    async fn name_matches_only_the_spelling_on_disk() {
+        let dir = temp_dir();
+        std::fs::write(dir.path().join("Test.file"), b"").expect("write file");
+
+        assert_eq!(
+            filesystem_name_matches(dir.path(), "Test.file").await,
+            verdict(true)
+        );
+        assert_eq!(
+            filesystem_name_matches(dir.path(), "test.FILE").await,
+            verdict(false),
+            "a spelling the filesystem does not hold is not a match, whether or              not it would find the file"
+        );
+        assert_eq!(
+            filesystem_name_matches(dir.path(), "other.file").await,
+            verdict(false)
+        );
+        assert_eq!(
+            filesystem_name_matches(dir.path(), "Test.file.").await,
+            verdict(false),
+            "a trailing dot names a file that is not there"
+        );
+        assert_eq!(
+            filesystem_name_matches(&dir.path().join("absent"), "Test.file").await,
+            verdict(false),
+            "a missing directory holds nothing"
+        );
+    }
+
+    /// A directory is what most components resolve to, and the lookup has to
+    /// answer for one as readily as for a file.
+    #[tokio::test]
+    async fn name_matches_a_directory() {
+        let dir = temp_dir();
+        std::fs::create_dir(dir.path().join("Assets")).expect("create dir");
+
+        assert_eq!(
+            filesystem_name_matches(dir.path(), "Assets").await,
+            verdict(true)
+        );
+    }
+
+    /// The path already spelled the way the filesystem holds it - the case
+    /// [`filesystem_path`] is built around - comes back unchanged.
+    #[tokio::test]
+    async fn path_resolves_a_path_already_spelled_correctly() {
+        let dir = temp_dir();
+        let nested = dir.path().join("Assets").join("Meshes");
+        std::fs::create_dir_all(&nested).expect("create dirs");
+        std::fs::write(nested.join("Rock.mesh"), b"").expect("write file");
+
+        let asked: RelativePath =
+            std::str::FromStr::from_str("Assets/Meshes/Rock.mesh").expect("relative path");
+        assert_eq!(
+            filesystem_path(dir.path(), &asked)
+                .await
+                .expect("the path must resolve"),
+            "Assets/Meshes/Rock.mesh"
+        );
+    }
+
+    #[tokio::test]
+    async fn names_answers_with_the_spelling_it_was_given() {
+        let dir = temp_dir();
+        std::fs::write(dir.path().join("Test.file"), b"").expect("write file");
+
+        assert_eq!(
+            filesystem_names(dir.path(), "Test.file")
+                .await
+                .expect("a name the filesystem holds must resolve"),
+            vec!["Test.file".to_string()]
+        );
+    }
+
+    /// The reason the helper exists: a caller holding a name in one case needs the one the
+    /// filesystem kept. The directory is read and the names compared here rather than looked up,
+    /// so the spelling on disk is reported whether or not the filesystem would itself have found
+    /// the file under the spelling asked about.
+    #[tokio::test]
+    async fn names_answers_with_the_stored_spelling() {
+        let dir = temp_dir();
+        std::fs::write(dir.path().join("Test.file"), b"").expect("write file");
+
+        assert_eq!(
+            filesystem_names(dir.path(), "test.FILE")
+                .await
+                .expect("a case variation must resolve"),
+            vec!["Test.file".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn names_reports_a_name_that_is_not_there_in_any_case() {
+        let dir = temp_dir();
+        std::fs::write(dir.path().join("Test.file"), b"").expect("write file");
+
+        assert!(
+            filesystem_names(dir.path(), "other.file").await.is_err(),
+            "a name no spelling of which is there must not resolve"
+        );
+    }
+
+    /// Win32 trims trailing dots and spaces from a path before it looks it up, so asking about a
+    /// name with one can be answered about the neighbouring name. That is a different file, and
+    /// must not be reported as a spelling of the name asked about.
+    #[tokio::test]
+    async fn names_does_not_answer_with_a_neighbouring_name() {
+        let dir = temp_dir();
+        std::fs::write(dir.path().join("Test.file"), b"").expect("write file");
+
+        assert!(
+            filesystem_names(dir.path(), "Test.file.").await.is_err(),
+            "a trailing dot names a file that is not there"
+        );
+    }
+
+    /// Where spellings can coexist, every one of them comes back — resolving that ambiguity is the
+    /// caller's to do — while an exact spelling answers for itself alone. Only a case-sensitive
+    /// filesystem can hold the two files this needs.
+    #[tokio::test]
+    async fn names_reports_every_spelling_that_coexists() {
+        let dir = temp_dir();
+        if case_insensitive(dir.path()) {
+            return;
+        }
+        std::fs::write(dir.path().join("Test.file"), b"").expect("write Test.file");
+        std::fs::write(dir.path().join("test.file"), b"").expect("write test.file");
+
+        let mut found = filesystem_names(dir.path(), "TEST.FILE")
+            .await
+            .expect("the variations must resolve");
+        found.sort();
+        assert_eq!(
+            found,
+            vec!["Test.file".to_string(), "test.file".to_string()],
+            "an ambiguous name must report every spelling, not pick one"
+        );
+
+        assert_eq!(
+            filesystem_names(dir.path(), "test.file")
+                .await
+                .expect("an exact name must resolve"),
+            vec!["test.file".to_string()],
+            "a spelling the filesystem holds answers for itself, ambiguity or not"
+        );
+    }
+
+    /// A path is resolved a component at a time, so an ancestor in the wrong case has to be
+    /// corrected as well as the leaf.
+    #[tokio::test]
+    async fn path_resolves_every_component_to_its_stored_spelling() {
+        let dir = temp_dir();
+        if !case_insensitive(dir.path()) {
+            return;
+        }
+        let nested = dir.path().join("Assets").join("Meshes");
+        std::fs::create_dir_all(&nested).expect("create dirs");
+        std::fs::write(nested.join("Rock.mesh"), b"").expect("write file");
+
+        let asked = std::str::FromStr::from_str("assets/MESHES/rock.MESH")
+            .expect("relative path is infallible");
+        assert_eq!(
+            filesystem_path(dir.path(), &asked)
+                .await
+                .expect("the path must resolve"),
+            "Assets/Meshes/Rock.mesh"
+        );
     }
 
     #[tokio::test]
