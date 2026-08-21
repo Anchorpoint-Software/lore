@@ -41,7 +41,6 @@ use crate::dynamodb::ConditionParts;
 use crate::dynamodb::DynamoDb;
 use crate::dynamodb::DynamoDbPutCondition;
 use crate::dynamodb::DynamoDbQuery;
-use crate::dynamodb::error::SdkError as DynamoDbSdkError;
 
 pub const MUTABLE_STORE_DYNAMO_PARTITION_KEY_ATTRIBUTE: &str = "repository_id";
 pub const MUTABLE_STORE_DYNAMO_SORT_KEY_ATTRIBUTE: &str = "key";
@@ -382,10 +381,14 @@ impl AwsMutableStore {
 
         match result {
             Ok(_) => Ok(expected),
-            Err(AwsError::AwsSdkError(DynamoDbSdkError::ServiceError(err)))
-                if err.err().is_conditional_check_failed_exception() =>
+            Err(AwsError::AwsSdkError(sdk_error))
+                if sdk_error
+                    .as_service_error()
+                    .is_some_and(|e| e.is_conditional_check_failed_exception()) =>
             {
-                if let PutItemError::ConditionalCheckFailedException(e) = err.err() {
+                if let Some(PutItemError::ConditionalCheckFailedException(e)) =
+                    sdk_error.as_service_error()
+                {
                     match e.item() {
                         Some(item) => {
                             let entry: MutableStoreEntry =
@@ -870,7 +873,7 @@ mod test {
                     .expect("failed to create CompareAndSwap condition")),
             )
             .return_once(move |_, _, _| {
-                Err(AwsError::AwsSdkError(SdkError::ServiceError(
+                Err(AwsError::sdk_error(SdkError::ServiceError(
                     aws_smithy_runtime_api::client::result::ServiceError::builder()
                         .source(PutItemError::ConditionalCheckFailedException(
                             ConditionalCheckFailedException::builder()
@@ -923,7 +926,7 @@ mod test {
                     .expect("failed to create CompareAndSwap condition")),
             )
             .return_once(move |_, _, _| {
-                Err(AwsError::AwsSdkError(SdkError::ServiceError(
+                Err(AwsError::sdk_error(SdkError::ServiceError(
                     aws_smithy_runtime_api::client::result::ServiceError::builder()
                         .source(PutItemError::ConditionalCheckFailedException(
                             ConditionalCheckFailedException::builder()

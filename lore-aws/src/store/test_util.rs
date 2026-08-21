@@ -364,7 +364,7 @@ pub(crate) fn wire(fake: &Fake) -> (MockS3Impl, MockDynamoDb) {
     dynamodb.expect_get_item().returning(move |table, item, _| {
         if &**table == FRAGMENT_STATE_TABLE_NAME {
             if f.failing(Fault::StateReadTimeout) {
-                return Err(AwsError::AwsSdkError(SdkError::timeout_error(Box::new(
+                return Err(AwsError::sdk_error(SdkError::timeout_error(Box::new(
                     std::io::Error::other("injected timeout"),
                 ))));
             }
@@ -641,7 +641,7 @@ pub(crate) async fn store_with_separate_metadata_table(fake: &Fake) -> Arc<AwsIm
 }
 
 pub(crate) fn aws_error<E>(error: E, status: u16) -> AwsError<SdkError<E, HttpResponse>> {
-    AwsError::AwsSdkError(SdkError::ServiceError(
+    AwsError::sdk_error(SdkError::ServiceError(
         ServiceError::builder()
             .source(error)
             .raw(HttpResponse::new(

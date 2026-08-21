@@ -484,7 +484,7 @@ where
         return false;
     };
 
-    match sdk_error {
+    match &**sdk_error {
         DynamoDbSdkError::TimeoutError(_) | DynamoDbSdkError::DispatchFailure(_) => true,
         DynamoDbSdkError::ServiceError(err) => {
             let status = err.raw().status().as_u16();
@@ -853,10 +853,14 @@ impl AwsImmutableStore {
             .await
         {
             Ok(_) => Ok(FragmentState::Stored),
-            Err(AwsError::AwsSdkError(DynamoDbSdkError::ServiceError(err)))
-                if err.err().is_conditional_check_failed_exception() =>
+            Err(AwsError::AwsSdkError(sdk_error))
+                if sdk_error
+                    .as_service_error()
+                    .is_some_and(|e| e.is_conditional_check_failed_exception()) =>
             {
-                let PutItemError::ConditionalCheckFailedException(failure) = err.err() else {
+                let Some(PutItemError::ConditionalCheckFailedException(failure)) =
+                    sdk_error.as_service_error()
+                else {
                     unreachable!()
                 };
 
@@ -1005,8 +1009,10 @@ impl AwsImmutableStore {
             .await
         {
             Ok(_) => Ok(()),
-            Err(AwsError::AwsSdkError(DynamoDbSdkError::ServiceError(err)))
-                if err.err().is_conditional_check_failed_exception() =>
+            Err(AwsError::AwsSdkError(sdk_error))
+                if sdk_error
+                    .as_service_error()
+                    .is_some_and(|e| e.is_conditional_check_failed_exception()) =>
             {
                 warn!("Fragment state for {hash} was not {expected:?} when moving to {updated:?}");
                 Err(StoreError::internal(
