@@ -1646,10 +1646,13 @@ async fn maybe_fan_out_mutable_group(
             bucket.sorted_index.insert(insert_slot, entry_index as u32);
             bucket.entry.push(entry);
         }
+        // The redistribute leaves every `[0..target]` bucket holding exactly the entries it
+        // should, while the layout on disk is still the pre-fan-out one until the flush commits.
+        // A lazy deserialize of any of them would therefore replace live entries with a stale
+        // file, or with nothing for a slot the old layout never wrote.
+        bucket.deserialized = true;
         if count > 0 {
             group.dirty[new_idx].store(true, atomic::Ordering::Relaxed);
-            // Mark deserialized so subsequent operations don't try to re-read from disk.
-            bucket.deserialized = true;
         }
     }
 

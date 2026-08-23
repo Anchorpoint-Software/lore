@@ -1671,4 +1671,177 @@ mod tests {
 
         cleanup(&store_path);
     }
+
+    /// A fan-out redistributes entries in memory while the layout on disk is still the
+    /// pre-fan-out one, so a reader that lazily deserializes a redistributed bucket in that
+    /// window must not replace its entries with the stale file. Reads run against the group
+    /// throughout the flush that takes it from level 1 to level 32.
+    #[tokio::test]
+    async fn mutable_reads_during_a_fan_out_flush_lose_no_entries() {
+        let store_path = temp_dir();
+        let immutable: Arc<dyn lore_storage::ImmutableStore> =
+            lore_storage::local::immutable_store::create(
+                None::<&str>,
+                ImmutableStoreCreateOptions::none(),
+                false,
+                ImmutableStoreSettings::default(),
+            )
+            .await
+            .expect("Failed to create in-memory immutable store");
+        let mutable = Arc::new(
+            lore_storage::LocalMutableStore::new(
+                Some(&store_path),
+                MutableStoreSettings {
+                    initial_fan_out_level: 1,
+                    fan_out_threshold: FAN_OUT_THRESHOLD_DEFAULT,
+                    ..Default::default()
+                },
+                immutable,
+            )
+            .await
+            .expect("Failed to create mutable store"),
+        );
+        let store: Arc<dyn lore_storage::MutableStore> = mutable.clone();
+        let partition = lore_storage::Partition::default();
+
+        let mut rng = StdRng::seed_from_u64(0xFA0_0002);
+        let mut keys = Vec::with_capacity(5000);
+        for _ in 0..5000 {
+            let mut key = make_hash(&mut rng);
+            key.data_mut()[0] = 0x42;
+            let value = make_hash(&mut rng);
+            keys.push((key, value));
+            store
+                .clone()
+                .store(partition, key, value, lore_storage::KeyType::BranchMetadata)
+                .await
+                .expect("Failed to store");
+        }
+
+        let reader_store = store.clone();
+        let reader_keys = keys.clone();
+        let reader = lore_base::lore_spawn!(async move {
+            for _ in 0..40 {
+                for (key, _) in &reader_keys {
+                    let _ = reader_store
+                        .clone()
+                        .load(partition, *key, lore_storage::KeyType::BranchMetadata)
+                        .await;
+                }
+            }
+        });
+
+        store.clone().flush(true).await.expect("Failed to flush");
+        reader.await.expect("Reader task panicked");
+
+        assert_eq!(
+            mutable.group[0x42].bucket_count.load(Ordering::Relaxed),
+            32,
+            "Group 0x42 must have fanned out to level 32"
+        );
+        store.clone().flush(true).await.expect("Failed to flush");
+
+        let mut missing = 0usize;
+        for (key, value) in &keys {
+            match store
+                .clone()
+                .load(partition, *key, lore_storage::KeyType::BranchMetadata)
+                .await
+            {
+                Ok(loaded) if loaded == *value => {}
+                _ => missing += 1,
+            }
+        }
+
+        cleanup(&store_path);
+        assert_eq!(
+            missing,
+            0,
+            "{missing} of {} entries were lost across the fan-out flush",
+            keys.len()
+        );
+    }
+
+    /// The immutable store makes the same guarantee the same way; see
+    /// `mutable_reads_during_a_fan_out_flush_lose_no_entries`.
+    #[tokio::test]
+    async fn immutable_reads_during_a_fan_out_flush_lose_no_fragments() {
+        let store_path = temp_dir();
+        let store = lore_storage::LocalImmutableStore::new(
+            Some(store_path.clone()),
+            ImmutableStoreSettings {
+                initial_fan_out_level: 1,
+                fan_out_threshold: FAN_OUT_THRESHOLD_DEFAULT,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("Failed to create immutable store");
+
+        let partition = lore_storage::Partition::default();
+        let payload = bytes::Bytes::from_static(b"test fragment payload data 30!");
+        let fragment = lore_storage::Fragment {
+            flags: 0,
+            size_payload: payload.len() as u32,
+            size_content: payload.len() as u64,
+        };
+        let mut rng = StdRng::seed_from_u64(0xFA0_0001);
+        let mut addresses = Vec::with_capacity(5000);
+        for _ in 0..5000 {
+            let mut hash = make_hash(&mut rng);
+            hash.data_mut()[0] = 0x42;
+            let address = lore_storage::Address {
+                hash,
+                context: lore_storage::Context::default(),
+            };
+            addresses.push(address);
+            store
+                .clone()
+                .store(partition, address, fragment, Some(payload.clone()), false)
+                .await
+                .expect("Failed to store fragment");
+        }
+
+        let reader_store = store.clone();
+        let reader_addresses = addresses.clone();
+        let reader = lore_base::lore_spawn!(async move {
+            for _ in 0..40 {
+                for address in &reader_addresses {
+                    let _ = reader_store.find(partition, *address).await;
+                }
+            }
+        });
+
+        let store_dyn: Arc<dyn lore_storage::ImmutableStore> = store.clone();
+        store_dyn.flush(true).await.expect("Failed to flush");
+        reader.await.expect("Reader task panicked");
+
+        assert_eq!(
+            store.group[0x42].bucket_count.load(Ordering::Relaxed),
+            32,
+            "Group 0x42 must have fanned out to level 32"
+        );
+
+        let store_dyn: Arc<dyn lore_storage::ImmutableStore> = store.clone();
+        store_dyn.flush(true).await.expect("Failed to flush");
+
+        let mut missing = 0usize;
+        for address in &addresses {
+            let result = store
+                .find(partition, *address)
+                .await
+                .expect("find returned an error");
+            if result.matching != lore_storage::StoreMatch::MatchFull {
+                missing += 1;
+            }
+        }
+
+        cleanup(&store_path);
+        assert_eq!(
+            missing,
+            0,
+            "{missing} of {} fragments were lost across the fan-out flush",
+            addresses.len()
+        );
+    }
 }
