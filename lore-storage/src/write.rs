@@ -2201,6 +2201,26 @@ mod tests {
         async fn verify(self: Arc<Self>, heal: bool) -> Result<(), StoreError> {
             self.inner.clone().verify(heal).await
         }
+
+        async fn copy(
+            self: Arc<Self>,
+            source_partition: Partition,
+            source_address: Address,
+            destination_partition: Partition,
+            destination_context: Context,
+            durable: bool,
+        ) -> Result<(), StoreError> {
+            self.inner
+                .clone()
+                .copy(
+                    source_partition,
+                    source_address,
+                    destination_partition,
+                    destination_context,
+                    durable,
+                )
+                .await
+        }
     }
 
     #[tokio::test]
@@ -2475,6 +2495,26 @@ mod tests {
         async fn verify(self: Arc<Self>, heal: bool) -> Result<(), StoreError> {
             self.inner.clone().verify(heal).await
         }
+
+        async fn copy(
+            self: Arc<Self>,
+            source_partition: Partition,
+            source_address: Address,
+            destination_partition: Partition,
+            destination_context: Context,
+            durable: bool,
+        ) -> Result<(), StoreError> {
+            self.inner
+                .clone()
+                .copy(
+                    source_partition,
+                    source_address,
+                    destination_partition,
+                    destination_context,
+                    durable,
+                )
+                .await
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2707,6 +2747,26 @@ mod tests {
 
         async fn verify(self: Arc<Self>, heal: bool) -> Result<(), StoreError> {
             self.inner.clone().verify(heal).await
+        }
+
+        async fn copy(
+            self: Arc<Self>,
+            source_partition: Partition,
+            source_address: Address,
+            destination_partition: Partition,
+            destination_context: Context,
+            durable: bool,
+        ) -> Result<(), StoreError> {
+            self.inner
+                .clone()
+                .copy(
+                    source_partition,
+                    source_address,
+                    destination_partition,
+                    destination_context,
+                    durable,
+                )
+                .await
         }
     }
 

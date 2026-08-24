@@ -515,14 +515,12 @@ pub trait ImmutableStore: Any + Send + Sync {
     /// already-durable source does not make the new destination tuple durable.
     async fn copy(
         self: Arc<Self>,
-        _source_partition: Partition,
-        _source_address: Address,
-        _destination_partition: Partition,
-        _destination_context: Context,
-        _durable: bool,
-    ) -> Result<(), StoreError> {
-        Err(StoreError::internal("Copy not supported by this store"))
-    }
+        source_partition: Partition,
+        source_address: Address,
+        destination_partition: Partition,
+        destination_context: Context,
+        durable: bool,
+    ) -> Result<(), StoreError>;
 
     fn as_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync>
     where

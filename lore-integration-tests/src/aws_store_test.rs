@@ -169,6 +169,17 @@ mod aws_store_tests {
             Ok(())
         }
 
+        async fn copy(
+            self: Arc<Self>,
+            _source_partition: Partition,
+            _source_address: Address,
+            _destination_partition: Partition,
+            _destination_context: Context,
+            _durable: bool,
+        ) -> Result<(), StoreError> {
+            Err(StoreError::internal("Copy not supported by this store"))
+        }
+
         fn max_query_batch(&self) -> Option<usize> {
             Some(100)
         }

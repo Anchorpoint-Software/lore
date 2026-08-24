@@ -87,6 +87,7 @@ pub enum Command {
     ImmutableLocalGetMetadata = 16,
     ImmutableQuery = 17,
     ImmutableLocalQuery = 18,
+    ImmutableCopy = 19,
 }
 
 impl From<Command> for QuicOpCode {
@@ -109,6 +110,7 @@ impl TryFrom<QuicOpCode> for Command {
             v if v == Command::ImmutableLocalPut as u8 => Ok(Command::ImmutableLocalPut),
             v if v == Command::ImmutableQuery as u8 => Ok(Command::ImmutableQuery),
             v if v == Command::ImmutableLocalQuery as u8 => Ok(Command::ImmutableLocalQuery),
+            v if v == Command::ImmutableCopy as u8 => Ok(Command::ImmutableCopy),
             _ => Err(UnknownCommand(value)),
         }
     }

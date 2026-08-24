@@ -246,6 +246,26 @@ mod storage_remote_tests {
         async fn verify(self: Arc<Self>, heal: bool) -> Result<(), lore_storage::StoreError> {
             self.inner.clone().verify(heal).await
         }
+
+        async fn copy(
+            self: Arc<Self>,
+            source_partition: lore_base::types::Partition,
+            source_address: lore_base::types::Address,
+            destination_partition: lore_base::types::Partition,
+            destination_context: lore_base::types::Context,
+            durable: bool,
+        ) -> Result<(), lore_storage::StoreError> {
+            self.inner
+                .clone()
+                .copy(
+                    source_partition,
+                    source_address,
+                    destination_partition,
+                    destination_context,
+                    durable,
+                )
+                .await
+        }
     }
 
     /// Start a server speaking `transport`, backed by fresh in-memory stores.
@@ -5312,6 +5332,26 @@ mod storage_remote_tests {
 
         async fn verify(self: Arc<Self>, heal: bool) -> Result<(), lore_storage::StoreError> {
             self.inner.clone().verify(heal).await
+        }
+
+        async fn copy(
+            self: Arc<Self>,
+            source_partition: lore_base::types::Partition,
+            source_address: lore_base::types::Address,
+            destination_partition: lore_base::types::Partition,
+            destination_context: lore_base::types::Context,
+            durable: bool,
+        ) -> Result<(), lore_storage::StoreError> {
+            self.inner
+                .clone()
+                .copy(
+                    source_partition,
+                    source_address,
+                    destination_partition,
+                    destination_context,
+                    durable,
+                )
+                .await
         }
     }
 
