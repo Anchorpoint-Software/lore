@@ -1698,6 +1698,7 @@ mod block_single_flight {
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::runtime::runtime;
     use lore_base::types::Address;
+    use lore_base::types::Context;
     use lore_base::types::Fragment;
     use lore_base::types::Hash;
     use lore_base::types::Partition;
@@ -1861,6 +1862,26 @@ mod block_single_flight {
 
         async fn verify(self: Arc<Self>, heal: bool) -> Result<(), StoreError> {
             self.inner.clone().verify(heal).await
+        }
+
+        async fn copy(
+            self: Arc<Self>,
+            source_partition: Partition,
+            source_address: Address,
+            destination_partition: Partition,
+            destination_context: Context,
+            durable: bool,
+        ) -> Result<(), StoreError> {
+            self.inner
+                .clone()
+                .copy(
+                    source_partition,
+                    source_address,
+                    destination_partition,
+                    destination_context,
+                    durable,
+                )
+                .await
         }
     }
 
