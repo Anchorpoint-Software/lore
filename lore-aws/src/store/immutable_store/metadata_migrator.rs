@@ -1293,6 +1293,28 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn skips_malicious_when_size_content_exceeds_threshold() {
+            let fake = Fake::default();
+            let migrator = make_migrator(&fake).await;
+            let content = vec![0x42u8; 64];
+            let hash: Hash = lore_storage::hash_slice(&content);
+            fake.put_object_without_metadata(hash, &content);
+            fake.set_legacy_metadata_row(
+                hash,
+                Fragment {
+                    flags: FragmentFlags::PayloadCompressedZstd.bits(),
+                    size_payload: content.len() as u32,
+                    size_content: lore_storage::FRAGMENT_SIZE_THRESHOLD as u64 + 1,
+                },
+            );
+            let stats = RewriteStats::default();
+            assert_eq!(
+                migrator.process_fragment(hash, &stats).await.unwrap(),
+                ConvertOutcome::SkippedMaliciousFragment
+            );
+        }
+
+        #[tokio::test]
         async fn deduced_codec_increments_payloads_deduced_stat() {
             let fake = Fake::default();
             let migrator = make_migrator(&fake).await;

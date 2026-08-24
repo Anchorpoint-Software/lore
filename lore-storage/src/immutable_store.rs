@@ -47,11 +47,10 @@ pub enum StoreError {
     NotSupported,
 }
 
-/// Validate that a fragment's declared payload size does not exceed the
-/// protocol-level [`FRAGMENT_SIZE_THRESHOLD`]. Use before allocating or
+/// Validate that a fragment's sizes appear valid. Use before allocating or
 /// streaming a payload buffer based on attacker-influenced metadata.
-///
-/// [`FRAGMENT_SIZE_THRESHOLD`]: crate::FRAGMENT_SIZE_THRESHOLD
+/// These checks are necessary for data that may exist before hardening at the point of ingress
+/// was corrected
 pub fn validate_fragment_size(fragment: &Fragment) -> Result<(), StoreError> {
     let size_payload = fragment.size_payload as usize;
     if size_payload > crate::FRAGMENT_SIZE_THRESHOLD {
@@ -62,6 +61,19 @@ pub fn validate_fragment_size(fragment: &Fragment) -> Result<(), StoreError> {
             ),
         }));
     }
+
+    if (fragment.flags & FragmentFlags::PayloadFragmented) == 0 {
+        let size_content = fragment.size_content as usize;
+        if size_content > crate::FRAGMENT_SIZE_THRESHOLD {
+            return Err(StoreError::from(Oversized {
+                context: format!(
+                    "unfragmented size_content {size_content} exceeds FRAGMENT_SIZE_THRESHOLD {}",
+                    crate::FRAGMENT_SIZE_THRESHOLD
+                ),
+            }));
+        }
+    }
+
     Ok(())
 }
 
@@ -571,6 +583,19 @@ mod tests {
     }
 
     #[test]
+    fn validate_size_rejects_oversized_unfragmented_content() {
+        // size_payload within bounds but size_content over threshold: must be caught to
+        // prevent downstream callers (e.g. decompress) from pre-allocating a huge buffer.
+        let fragment = Fragment {
+            flags: 0,
+            size_payload: 128,
+            size_content: crate::FRAGMENT_SIZE_THRESHOLD as u64 + 1,
+        };
+        let err = validate_fragment_size(&fragment).expect_err("should reject oversize content");
+        assert!(matches!(err, StoreError::Oversized(_)));
+    }
+
+    #[test]
     fn validate_payload_accepts_matching() {
         let fragment = make_fragment(128);
         assert!(validate_fragment_payload(&fragment, 128).is_ok());
@@ -752,7 +777,9 @@ mod tests {
 
         #[test]
         fn accepts_fragmented_with_large_content() {
-            // Fragmented fragments can address any amount of content
+            // Fragmented fragments address total file content that can far exceed
+            // FRAGMENT_SIZE_THRESHOLD; size_content is only bounded for non-fragmented
+            // fragments (where it drives the decompress allocation).
             let fragment = Fragment {
                 flags: FragmentFlags::PayloadFragmented.into(),
                 size_payload: 80,
