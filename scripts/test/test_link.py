@@ -17,6 +17,14 @@ from error_types import (
     PathExistLinkError,
 )
 from lore_parsers import parse_jsonl, parse_status_json
+from thin_client import (
+    ACTION_ADD,
+    ACTION_DELETE,
+    NODE_TYPE_FILE,
+    NODE_TYPE_LINK,
+    revision_diff,
+    revision_tree,
+)
 
 from lore import Lore
 
@@ -8891,6 +8899,190 @@ def test_push_names_parent_branch_for_parent_revision(new_lore_repo):
         f"the parent's branch 'test', but it named '{end_match.group(1)}'. "
         f"'{disambiguated_child_branch}' is the child's branch, which exists only "
         f"in the linked repository.\nPush output:\n{push_output}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Link tracking on the thin-client wire.
+# ---------------------------------------------------------------------------
+
+
+def _wire_identity(repo: Lore) -> tuple[bytes, bytes]:
+    """The repository id and latest revision signature as the raw bytes the
+    thin-client wire expects."""
+    latest = repo.branch_info().local_latest
+    assert len(latest) == 64, f"Expected a full revision signature, got {latest!r}"
+    return bytes.fromhex(repo.get_id()), bytes.fromhex(latest)
+
+
+@pytest.mark.smoke
+def test_thin_client_tree_discriminates_tracking_from_pinned(
+    new_lore_repo, lore_grpc_target
+):
+    """One tree holding both link kinds and a plain file: only the link left on
+    its parent's branch reports tracking. Asserting all three off a single
+    response is what proves the field is populated rather than left at its
+    default."""
+    tracking_source = _commit_initial_main(new_lore_repo, "inner.txt")
+    pinned_source = _commit_initial_main(new_lore_repo, "inner.txt")
+    repo = _commit_initial_main(new_lore_repo, "own.txt")
+
+    repo.link_add("tracked", tracking_source.get_id(), "/")
+    repo.link_add("pinned", pinned_source.get_id(), "/", disable_branching=True)
+    repo.commit()
+    repo.push()
+
+    repository_id, signature = _wire_identity(repo)
+    nodes = {
+        node.path: node
+        for node in revision_tree(lore_grpc_target, repository_id, signature)
+    }
+    for path in ("tracked", "pinned", "own.txt"):
+        assert path in nodes, f"{path} missing from tree: {sorted(nodes)}"
+
+    assert nodes["tracked"].node_type == NODE_TYPE_LINK, (
+        f"Mount path must be reported as a link, got {nodes['tracked']}"
+    )
+    assert nodes["tracked"].tracking, (
+        f"A link following its parent's branch must report tracking, "
+        f"got {nodes['tracked']}"
+    )
+
+    assert nodes["pinned"].node_type == NODE_TYPE_LINK, (
+        f"Mount path must be reported as a link, got {nodes['pinned']}"
+    )
+    assert nodes["pinned"].tracking is False, (
+        f"A link pinned to its own branch must report tracking False, "
+        f"got {nodes['pinned']}"
+    )
+
+    assert nodes["own.txt"].node_type == NODE_TYPE_FILE, (
+        f"Parent's own file must be reported as a file, got {nodes['own.txt']}"
+    )
+    assert nodes["own.txt"].tracking is False, (
+        f"Tracking is a link property, so a file must report False, "
+        f"got {nodes['own.txt']}"
+    )
+
+
+@pytest.mark.smoke
+def test_thin_client_diff_reports_tracking_on_added_link(
+    new_lore_repo, lore_grpc_target
+):
+    """Adding a tracking link is reported as a tracking link entry on the
+    thin-client revision diff."""
+    link_repo = _commit_initial_main(new_lore_repo, "inner.txt")
+    repo = _commit_initial_main(new_lore_repo, "own.txt")
+
+    repository_id, before = _wire_identity(repo)
+
+    link_path = "linked"
+    repo.link_add(link_path, link_repo.get_id(), "/")
+    repo.commit()
+    repo.push()
+
+    _, after = _wire_identity(repo)
+    changes = revision_diff(lore_grpc_target, repository_id, before, after)
+
+    mount_changes = [
+        change
+        for change in changes
+        if change.path == link_path and change.node_type == NODE_TYPE_LINK
+    ]
+    assert mount_changes, f"Mount path must be reported as a link entry, got {changes}"
+    assert all(change.action == ACTION_ADD for change in mount_changes), (
+        f"A newly mounted link must be reported as an add, got {mount_changes}"
+    )
+    assert all(change.tracking for change in mount_changes), (
+        f"A link following its parent's branch must report tracking, "
+        f"got {mount_changes}"
+    )
+
+
+@pytest.mark.smoke
+def test_thin_client_diff_reports_tracking_on_removed_link(
+    new_lore_repo, lore_grpc_target
+):
+    """Removing a tracking link reports tracking on the delete entry. A delete
+    resolves against the "from" side, the only action that does."""
+    link_repo = _commit_initial_main(new_lore_repo, "inner.txt")
+    repo = _commit_initial_main(new_lore_repo, "own.txt")
+
+    link_path = "linked"
+    repo.link_add(link_path, link_repo.get_id(), "/")
+    repo.commit()
+    repo.push()
+
+    repository_id, before = _wire_identity(repo)
+
+    repo.link_remove(link_path)
+    repo.commit()
+    repo.push()
+
+    _, after = _wire_identity(repo)
+    changes = revision_diff(lore_grpc_target, repository_id, before, after)
+
+    mount_changes = [
+        change
+        for change in changes
+        if change.path == link_path and change.node_type == NODE_TYPE_LINK
+    ]
+    assert mount_changes, f"Mount path must be reported as a link entry, got {changes}"
+    assert all(change.action == ACTION_DELETE for change in mount_changes), (
+        f"A removed link must be reported as a delete, got {mount_changes}"
+    )
+    assert all(change.tracking for change in mount_changes), (
+        f"A link following its parent's branch must report tracking, "
+        f"got {mount_changes}"
+    )
+
+
+@pytest.mark.smoke
+def test_thin_client_diff_reports_tracking_on_moved_pin(
+    new_lore_repo, lore_grpc_target
+):
+    """Committing content through a tracking link moves its pin, and the pin
+    move is reported as a tracking link entry on the thin-client revision
+    diff, while the parent's own file change is not."""
+    link_repo = _commit_initial_main(new_lore_repo, "inner.txt")
+    repo = _commit_initial_main(new_lore_repo, "own.txt")
+
+    link_path = "linked"
+    repo.link_add(link_path, link_repo.get_id(), "/")
+    repo.commit()
+    repo.push()
+
+    repository_id, before = _wire_identity(repo)
+
+    with repo.open_file(os.path.join(link_path, "inner.txt"), "w+") as output_file:
+        output_file.writelines(["linked content, revised\n"])
+    with repo.open_file("own.txt", "w+") as output_file:
+        output_file.writelines(["parent content, revised\n"])
+    repo.stage(scan=True)
+    repo.commit()
+    repo.push()
+
+    _, after = _wire_identity(repo)
+    changes = revision_diff(lore_grpc_target, repository_id, before, after)
+
+    mount_changes = [
+        change
+        for change in changes
+        if change.path == link_path and change.node_type == NODE_TYPE_LINK
+    ]
+    assert mount_changes, (
+        f"Moved pin must be reported as a link entry for the mount path, got {changes}"
+    )
+    assert all(change.tracking for change in mount_changes), (
+        f"A link following its parent's branch must report tracking, "
+        f"got {mount_changes}"
+    )
+
+    own_changes = [change for change in changes if change.path == "own.txt"]
+    assert own_changes, f"Parent's own file change missing from diff: {changes}"
+    assert all(change.tracking is False for change in own_changes), (
+        f"Tracking is a link property, so a file change must report False, "
+        f"got {own_changes}"
     )
 
 

@@ -15,7 +15,6 @@ use lore_proto::lore::thin_client::v1::RevisionDiffResponse;
 use lore_proto::lore::thin_client::v1::revision_diff_response::Payload;
 use lore_revision::branch;
 use lore_revision::branch::BranchError;
-use lore_revision::change::FileAction;
 use lore_revision::change::NodeChange;
 use lore_revision::diff::diff_revision_paths;
 use lore_revision::link;
@@ -390,7 +389,7 @@ async fn run_two_way(
             Err(SendOutcome::ReceiverDropped) => return Ok(()),
             Err(SendOutcome::Sent) => unreachable!("resolve_or_announce returns Sent only via Ok"),
         };
-        let payload = Payload::Change(node_change_to_diff_change(&change, index));
+        let payload = Payload::Change(node_change_to_diff_change(&change, index).await);
         match send_payload(tx, payload).await {
             SendOutcome::Sent => {}
             SendOutcome::ReceiverDropped => return Ok(()),
@@ -535,7 +534,7 @@ async fn run_three_way(
                         unreachable!("resolve_or_announce returns Sent only via Ok")
                     }
                 };
-                Payload::Change(node_change_to_diff_change(&change, index))
+                Payload::Change(node_change_to_diff_change(&change, index).await)
             }
             DiffItem::Conflict(pair) => {
                 let index_from = match partitions
@@ -558,7 +557,7 @@ async fn run_three_way(
                         unreachable!("resolve_or_announce returns Sent only via Ok")
                     }
                 };
-                Payload::Conflict(diff_conflict_from_pair(&pair, index_from, index_to))
+                Payload::Conflict(diff_conflict_from_pair(&pair, index_from, index_to).await)
             }
         };
         match send_payload(tx, payload).await {
@@ -743,10 +742,7 @@ impl PartitionTable {
 /// Repository of the side that survives the change: `from` for a
 /// delete, `to` otherwise. This is the partition its content lives in.
 fn surviving_repository_id(change: &NodeChange) -> RepositoryId {
-    match change.action {
-        FileAction::Delete => change.from.repository.id,
-        _ => change.to.repository.id,
-    }
+    change.resolved_side().repository.id
 }
 
 #[cfg(test)]

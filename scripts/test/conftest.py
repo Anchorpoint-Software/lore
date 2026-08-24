@@ -366,6 +366,14 @@ def lore_remote_url(request, lore_main_server_ports):
 
 
 @pytest.fixture(scope="session")
+def lore_grpc_target(request, lore_main_server_ports):
+    """`host:port` of the main loreserver's public gRPC endpoint, for tests that
+    call an RPC the CLI does not expose."""
+    host = request.config.getoption("--lore-server-hostname")
+    return f"{host}:{lore_main_server_ports['grpc']}"
+
+
+@pytest.fixture(scope="session")
 def lore_main_server_ports(request, tmp_path_factory):
     """Resolve the main loreserver's {quic, grpc, http, internal} ports.
 

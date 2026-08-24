@@ -11,7 +11,6 @@ use lore_proto::PathDiff;
 use lore_proto::PathType;
 use lore_revision::change::FileAction;
 use lore_revision::change::NodeChange;
-use lore_revision::change::NodeChangeState;
 use lore_revision::link;
 use lore_revision::link::LinkPinChange;
 use lore_revision::lore::RepositoryId;
@@ -34,40 +33,19 @@ pub fn node_flags_to_type(flags: NodeFlags) -> i32 {
     }
 }
 
-/// The side the change resolves to: `from` for a delete, `to` otherwise.
-fn resolved_side(change: &NodeChange) -> &NodeChangeState {
-    match change.action {
-        FileAction::Delete => &change.from,
-        _ => &change.to,
-    }
-}
-
 /// The partition is empty when the change resolves under the request's own
-/// repository. `tracking` is meaningful only on a link node; a node inside a
-/// linked repository has no link reference of its own.
+/// repository, so a consumer can default to the request's repository id.
 async fn link_partition_and_tracking(
     change: &NodeChange,
     parent_repository_id: RepositoryId,
 ) -> (Bytes, bool) {
-    let side = resolved_side(change);
-    let is_link = side.flags.contains(NodeFlags::Link);
-    let target: RepositoryId = if is_link {
-        side.address.context.into()
-    } else {
-        side.repository.id
-    };
+    let target = change.content_repository_id();
     let link_partition = if target == parent_repository_id {
         Bytes::new()
     } else {
         Bytes::from(target)
     };
-    let tracking = is_link
-        && side
-            .state
-            .link_find(side.repository.clone(), target, side.node)
-            .await
-            .is_ok_and(|link_ref| link_ref.is_tracking());
-    (link_partition, tracking)
+    (link_partition, change.is_tracking_link().await)
 }
 
 pub async fn map_to_path_diff(
