@@ -26,6 +26,7 @@ use crate::dynamodb::ScanConfig;
 use crate::dynamodb::ScanPage;
 use crate::store::immutable_store::AwsImmutableStore;
 use crate::store::immutable_store::FragmentMetadataEntry;
+use crate::store::object_metadata::from_object_metadata;
 
 const REWRITE_RETRY_DELAY_CAP: Duration = Duration::from_secs(5);
 
@@ -241,7 +242,9 @@ impl MetadataMigrator {
         stats: &RewriteStats,
     ) -> Result<ConvertOutcome, StoreError> {
         if self.store.load_state(hash).await?.is_some() {
-            if self.store.metadata_from_s3_head(hash).await.is_ok() {
+            if let Ok(s3_head) = self.store.s3_head_object(hash).await
+                && from_object_metadata(s3_head.metadata()).is_ok()
+            {
                 return Ok(ConvertOutcome::SkippedMigrated);
             }
             stats.state_with_no_head.fetch_add(1, Ordering::Relaxed);
