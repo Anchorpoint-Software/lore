@@ -15,6 +15,7 @@ use aws_sdk_dynamodb::primitives::Blob;
 use aws_sdk_dynamodb::types::AttributeValue;
 use aws_sdk_s3::operation::get_object::GetObjectError;
 use aws_sdk_s3::operation::head_object::HeadObjectError;
+use aws_sdk_s3::operation::head_object::HeadObjectOutput;
 use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 use bytes::Bytes;
 use bytes::BytesMut;
@@ -1368,12 +1369,7 @@ impl AwsImmutableStore {
         Ok(())
     }
 
-    /// Read a fragment without its payload, from the object's object metadata.
-    ///
-    /// This is the one path that spends an S3 request purely on metadata, and it spends the
-    /// cheapest one: `HeadObject` transfers no body. Reads that want the payload get the fragment
-    /// for free on the `GetObject` response instead.
-    async fn head_fragment(&self, hash: Hash) -> Result<Fragment, StoreError> {
+    async fn metadata_from_s3_head(&self, hash: Hash) -> Result<HeadObjectOutput, StoreError> {
         let mut dst = [0u8; 64];
         let output = self
             .s3
@@ -1396,6 +1392,16 @@ impl AwsImmutableStore {
                     StoreError::internal_with_context(e, "S3 head object failed")
                 }
             })?;
+        Ok(output)
+    }
+
+    /// Read a fragment without its payload, from the object's object metadata.
+    ///
+    /// This is the one path that spends an S3 request purely on metadata, and it spends the
+    /// cheapest one: `HeadObject` transfers no body. Reads that want the payload get the fragment
+    /// for free on the `GetObject` response instead.
+    async fn head_fragment(&self, hash: Hash) -> Result<Fragment, StoreError> {
+        let output = self.metadata_from_s3_head(hash).await?;
 
         let fragment = match from_object_metadata(output.metadata()) {
             Ok(fragment) => fragment,

@@ -63,6 +63,9 @@ pub struct RewriteStats {
 
     // num payloads whose compression codec was not accurate and needed to be deduced
     pub payloads_deduced: AtomicU64,
+    // num fragments that have a State item but no S3 head - implying a race in writing the same
+    // fragment between an old legacy deployment and a new deployment writing to S3 at the same time
+    pub state_with_no_head: AtomicU64,
 }
 
 /// Logs every total the migrator keeps, labelled with the point in the run it was read at.
@@ -81,6 +84,7 @@ pub fn log_stats(phase: &str, stats: &RewriteStats) {
             .converted_compressed_to_uncompressed
             .load(Ordering::Relaxed),
         payloads_deduced = stats.payloads_deduced.load(Ordering::Relaxed),
+        state_with_no_head = stats.state_with_no_head.load(Ordering::Relaxed),
         already_migrated = stats.skipped_migrated.load(Ordering::Relaxed),
         obliterated = stats.skipped_obliterated.load(Ordering::Relaxed),
         oversized = stats.skipped_malicious.load(Ordering::Relaxed),
@@ -237,7 +241,10 @@ impl MetadataMigrator {
         stats: &RewriteStats,
     ) -> Result<ConvertOutcome, StoreError> {
         if self.store.load_state(hash).await?.is_some() {
-            return Ok(ConvertOutcome::SkippedMigrated);
+            if self.store.metadata_from_s3_head(hash).await.is_ok() {
+                return Ok(ConvertOutcome::SkippedMigrated);
+            }
+            stats.state_with_no_head.fetch_add(1, Ordering::Relaxed);
         }
 
         // since the state retrieval failed above, this load will be reading from the metadata table
@@ -1124,15 +1131,63 @@ mod tests {
 
         #[tokio::test]
         async fn skips_already_migrated() {
+            // A fully migrated fragment has both a state entry and a properly-headered S3 object.
+            // Migrate a legacy fragment first so both are set up correctly, then verify the
+            // second call skips cleanly without touching state_with_no_head.
             let fake = Fake::default();
             let migrator = make_migrator(&fake).await;
-            let hash: Hash = rand::random();
-            fake.set_state(hash, FragmentState::Stored);
+            let content = vec![0x11u8; 100];
+            let hash = lore_storage::hash_slice(&content);
+            fake.put_object_without_metadata(hash, &content);
+            fake.set_legacy_metadata_row(
+                hash,
+                Fragment {
+                    flags: 0,
+                    size_payload: content.len() as u32,
+                    size_content: content.len() as u64,
+                },
+            );
+            migrator
+                .process_fragment(hash, &RewriteStats::default())
+                .await
+                .unwrap();
+
             let stats = RewriteStats::default();
             assert_eq!(
                 migrator.process_fragment(hash, &stats).await.unwrap(),
                 ConvertOutcome::SkippedMigrated
             );
+            assert_eq!(stats.state_with_no_head.load(Ordering::Relaxed), 0);
+        }
+
+        #[tokio::test]
+        async fn state_with_no_head_is_counted_and_fragment_is_reprocessed() {
+            // State entry exists but head_fragment returns 404 — a race between deployments.
+            // The stat is incremented and processing falls through to load the fragment from
+            // the legacy path and re-migrate it. publish_state handles the pre-existing Stored
+            // row via its RowAbsent conditional write, so the write succeeds without error.
+            let fake = Fake::default();
+            let migrator = make_migrator(&fake).await;
+            let content = vec![0x42u8; 150];
+            let hash = lore_storage::hash_slice(&content);
+            fake.set_state(hash, FragmentState::Stored);
+            // put_object_once: visible to get_object (load) but not head_object (head_fragment)
+            fake.put_object_once(hash, &content);
+            fake.set_legacy_metadata_row(
+                hash,
+                Fragment {
+                    flags: 0,
+                    size_payload: content.len() as u32,
+                    size_content: content.len() as u64,
+                },
+            );
+            let stats = RewriteStats::default();
+            assert_eq!(
+                migrator.process_fragment(hash, &stats).await.unwrap(),
+                ConvertOutcome::Maintained
+            );
+            assert_eq!(stats.state_with_no_head.load(Ordering::Relaxed), 1);
+            assert_eq!(fake.state_of(hash), Some(FragmentState::Stored));
         }
 
         #[tokio::test]
@@ -1337,9 +1392,23 @@ mod tests {
             let fake = Fake::default();
             let migrator = make_migrator(&fake).await;
 
-            // already migrated
-            let migrated: Hash = rand::random();
-            fake.set_state(migrated, FragmentState::Stored);
+            // already migrated: run process_fragment once so both state and a
+            // properly-headered S3 object exist, making head_fragment succeed on the second pass.
+            let migrated_content = vec![0x10u8; 100];
+            let migrated = lore_storage::hash_slice(&migrated_content);
+            fake.put_object_without_metadata(migrated, &migrated_content);
+            fake.set_legacy_metadata_row(
+                migrated,
+                Fragment {
+                    flags: 0,
+                    size_payload: migrated_content.len() as u32,
+                    size_content: migrated_content.len() as u64,
+                },
+            );
+            migrator
+                .process_fragment(migrated, &RewriteStats::default())
+                .await
+                .unwrap();
 
             // obliterated
             let obl_content = vec![0x20u8; 100];

@@ -97,6 +97,9 @@ pub(crate) struct Storage {
     pub(crate) association_deleted: Option<oneshot::Sender<()>>,
     pub(crate) object_reads: usize,
     pub(crate) objects: HashMap<Vec<u8>, StoredObject>,
+    /// Objects returned by `get_object` exactly once before being removed. Not visible to
+    /// `head_object`, so a test can make `head_fragment` fail while `load` still succeeds.
+    pub(crate) objects_once: HashMap<Vec<u8>, StoredObject>,
     pub(crate) associations: HashMap<(Vec<u8>, Vec<u8>), HashMap<String, AttributeValue>>,
     pub(crate) state: HashMap<Vec<u8>, HashMap<String, AttributeValue>>,
     /// Rows in the legacy fragment metadata table (separate from the state table). Only
@@ -240,6 +243,15 @@ impl Fake {
         );
     }
 
+    /// Store an object that `get_object` will return exactly once before removing it.
+    /// Not visible to `head_object`, so `head_fragment` returns 404 while `load` still succeeds.
+    pub(crate) fn put_object_once(&self, hash: Hash, body: &[u8]) {
+        self.lock().objects_once.insert(
+            hash.to_string().into_bytes(),
+            (body.to_vec(), HashMap::new()),
+        );
+    }
+
     /// Store an object whose metadata is present but unreadable.
     pub(crate) fn put_object_with_damaged_metadata(&self, hash: Hash, body: &[u8]) {
         let mut metadata = HashMap::new();
@@ -308,6 +320,12 @@ pub(crate) fn wire(fake: &Fake) -> (MockS3Impl, MockDynamoDb) {
     s3.expect_get_object().returning(move |_, key, _| {
         let mut storage = f.lock();
         storage.object_reads += 1;
+        if let Some((body, metadata)) = storage.objects_once.remove(key.as_bytes()) {
+            return Ok(GetObjectOutput::builder()
+                .set_body(Some(body.into()))
+                .set_metadata(Some(metadata))
+                .build());
+        }
         match storage.objects.get(key.as_bytes()) {
             Some((body, metadata)) => Ok(GetObjectOutput::builder()
                 .set_body(Some(body.clone().into()))
