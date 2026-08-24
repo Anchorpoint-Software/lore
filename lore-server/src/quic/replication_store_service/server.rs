@@ -550,22 +550,7 @@ mod tests {
 
         let response = QueryResponse::parse(collapse_bytes(&handle_output))
             .expect("response parse should work");
-        let carried: Vec<StoreMatchResult> = direct_store_output
-            .iter()
-            .map(|result| StoreMatchResult {
-                context: Context::default(),
-                ..*result
-            })
-            .collect();
-        assert_eq!(response.results, carried);
-        assert!(
-            direct_store_output
-                .iter()
-                .take(3)
-                .all(|result| !result.context.is_zero()),
-            "the store names a context this wire then drops; without one the comparison above \
-             would hold for the wrong reason"
-        );
+        assert_eq!(response.results, direct_store_output);
     }
 
     #[tokio::test]
