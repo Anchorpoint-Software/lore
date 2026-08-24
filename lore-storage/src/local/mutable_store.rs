@@ -34,6 +34,7 @@ use crate::Partition;
 use crate::errors::AddressNotFound;
 use crate::immutable_store::ImmutableStore;
 use crate::immutable_store::StoreError;
+use crate::local::fan_out::GroupLevel;
 use crate::local::immutable_store::SerializeFailureGuard;
 use crate::local::immutable_store::format_bucket_path;
 use crate::store_types::KeyType;
@@ -774,11 +775,8 @@ impl LocalMutableStore {
             None
         };
 
-        // Per-group level marker detection. For each group dir (if present on disk), first run
-        // T10 recovery to roll forward any interrupted fan-out commit, then read the marker; if
-        // the marker is missing, fall back to `settings.initial_fan_out_level` for fresh stores
-        // or 256 for existing legacy stores (the pre-fan-out 256-bucket layout). `committed_level`
-        // tracks the on-disk marker value (0 if absent) for the flush path's two-phase decision.
+        // Groups are surveyed before their levels are decided: the decision needs the store's
+        // serialize version, which is only known once every marker has been read.
         let index_existed_on_disk = mutable_path
             .as_ref()
             .is_some_and(|p| p.join("index").exists());
@@ -786,19 +784,19 @@ impl LocalMutableStore {
         // awaiting the groups in turn puts a store open behind `GROUP_COUNT` round trips to the
         // I/O engine, and each task carries the group it answers for because completions arrive
         // in whatever order the reads finish.
-        let initial_fan_out_level = settings.initial_fan_out_level;
-        let mut levels = vec![(initial_fan_out_level, 0usize, false); GROUP_COUNT];
+        let mut group_levels = vec![GroupLevel::Unwritten; GROUP_COUNT];
         if let Some(path) = mutable_path.as_ref() {
             let index_path = path.join("index");
             let mut tasks = JoinSet::new();
             for group_index in 0..GROUP_COUNT {
-                let group_path = index_path.join(format!("{:02x}", group_index as u8));
+                let group_path = crate::local::fan_out::group_dir_path(&index_path, group_index);
                 lore_base::lore_spawn!(tasks, async move {
+                    if !group_path.exists() {
+                        return (group_index, Ok(GroupLevel::Unwritten));
+                    }
                     // Roll forward any pending fan-out commit before reading the marker. After this returns the marker reflects the post-recovery state.
-                    if group_path.exists()
-                        && let Err(err) =
-                            crate::local::fan_out::recover_level_transition(&group_path, false)
-                                .await
+                    if let Err(err) =
+                        crate::local::fan_out::recover_level_transition(&group_path, false).await
                     {
                         return (
                             group_index,
@@ -809,15 +807,14 @@ impl LocalMutableStore {
                         );
                     }
 
-                    let level = match crate::local::fan_out::read_level_marker(&group_path).await {
-                        Ok(Some(level)) => Ok((level, level, true)),
-                        Ok(None) if index_existed_on_disk => Ok((BUCKET_COUNT, 0, false)),
-                        Ok(None) => Ok((initial_fan_out_level, 0, false)),
-                        Err(err) => Err(LocalMutableStoreError::internal_with_context(
-                            err,
-                            "Failed to read level marker for group",
-                        )),
-                    };
+                    let level = crate::local::fan_out::read_group_level(&group_path)
+                        .await
+                        .map_err(|err| {
+                            LocalMutableStoreError::internal_with_context(
+                                err,
+                                "Failed to read level marker for group",
+                            )
+                        });
                     (group_index, level)
                 });
             }
@@ -826,18 +823,13 @@ impl LocalMutableStore {
                 let (group_index, level) = joined.map_err(|err| {
                     LocalMutableStoreError::internal_with_context(err, "level marker task")
                 })?;
-                levels[group_index] = level?;
+                group_levels[group_index] = level?;
             }
         }
 
-        let mut bucket_counts: Vec<usize> = Vec::with_capacity(GROUP_COUNT);
-        let mut committed_levels: Vec<usize> = Vec::with_capacity(GROUP_COUNT);
-        let mut any_marker_seen = false;
-        for (initial, committed, marker_seen) in levels {
-            bucket_counts.push(initial);
-            committed_levels.push(committed);
-            any_marker_seen |= marker_seen;
-        }
+        let any_marker_seen = group_levels
+            .iter()
+            .any(|level| matches!(level, GroupLevel::Marked(_)));
 
         // Determine serialize_version per Decision 8. Fresh stores and stores with markers / older
         // versions becoming fan-out-aware all go to LazyFanOut. Existing TypedItems stores with no
@@ -851,6 +843,11 @@ impl LocalMutableStore {
             MutableStoreVersion::TypedItems as u32
         };
 
+        let unwritten_level = crate::local::fan_out::unwritten_group_level(
+            serialize_version == MutableStoreVersion::LazyFanOut as u32,
+            settings.initial_fan_out_level,
+        );
+
         let mut store = LocalMutableStore {
             path: mutable_path,
             lock,
@@ -860,14 +857,19 @@ impl LocalMutableStore {
             authoritative,
         };
 
-        for (group_index, &count) in bucket_counts.iter().enumerate() {
+        for level in group_levels {
+            let (count, committed) = match level {
+                GroupLevel::Marked(level) => (level, level),
+                GroupLevel::PreFanOut => (BUCKET_COUNT, 0),
+                GroupLevel::Unwritten => (unwritten_level, 0),
+            };
             store.group.push(Arc::new(MutableStoreGroup {
                 bucket: [const { OnceLock::new() }; BUCKET_COUNT],
                 dirty: std::array::from_fn(|_| AtomicBool::new(false)),
                 bucket_count: std::sync::atomic::AtomicUsize::new(count),
                 serialize_version: std::sync::atomic::AtomicU32::new(serialize_version),
                 fan_out_threshold: settings.fan_out_threshold,
-                committed_level: std::sync::atomic::AtomicUsize::new(committed_levels[group_index]),
+                committed_level: std::sync::atomic::AtomicUsize::new(committed),
             }));
         }
 
@@ -981,7 +983,7 @@ impl LocalMutableStore {
                 let group_path = {
                     let mut p = path.as_path().to_path_buf();
                     p.push("index");
-                    p.push(format!("{:02x}", group_index as u8));
+                    crate::local::fan_out::push_group_dir(&mut p, group_index);
                     p
                 };
                 let fan_out_aware = group.serialize_version.load(atomic::Ordering::Relaxed)

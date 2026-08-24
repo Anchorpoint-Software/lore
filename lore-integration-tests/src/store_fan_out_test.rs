@@ -215,6 +215,180 @@ mod tests {
         cleanup(&store_path);
     }
 
+    /// Open a `LocalMutableStore` at `store_path` over a throwaway in-memory immutable store.
+    async fn open_mutable(
+        store_path: &Path,
+        settings: MutableStoreSettings,
+    ) -> Arc<lore_storage::LocalMutableStore> {
+        let immutable: Arc<dyn lore_storage::ImmutableStore> =
+            lore_storage::local::immutable_store::create(
+                None::<&str>,
+                ImmutableStoreCreateOptions::none(),
+                false,
+                ImmutableStoreSettings::default(),
+            )
+            .await
+            .expect("Failed to create in-memory immutable store");
+        Arc::new(
+            lore_storage::LocalMutableStore::new(Some(store_path), settings, immutable)
+                .await
+                .expect("Failed to open mutable store"),
+        )
+    }
+
+    /// A key in group `group`, landing in bucket `bucket` once the group reaches level 256.
+    fn key_in_group(rng: &mut StdRng, group: u8, bucket: u8) -> lore_storage::Hash {
+        let mut key = make_hash(rng);
+        key.data_mut()[0] = group;
+        key.data_mut()[1] = bucket;
+        key
+    }
+
+    /// A fan-out-aware store reopens its untouched groups at the initial level, and an entry
+    /// written to one of them afterwards is still found after the next open.
+    #[tokio::test]
+    async fn reopened_mutable_store_keeps_untouched_groups_at_the_initial_level() {
+        let store_path = temp_dir();
+        let settings = MutableStoreSettings {
+            initial_fan_out_level: 1,
+            fan_out_threshold: FAN_OUT_THRESHOLD_DEFAULT,
+            ..Default::default()
+        };
+        let partition = lore_storage::Partition::default();
+        let mut rng = StdRng::seed_from_u64(0x5EED_0FFA_1105_0BAD);
+        let written = key_in_group(&mut rng, 0x00, 0x11);
+        let written_value = make_hash(&mut rng);
+        let untouched = key_in_group(&mut rng, 0x42, 0x37);
+        let untouched_value = make_hash(&mut rng);
+
+        let store: Arc<dyn lore_storage::MutableStore> = open_mutable(&store_path, settings).await;
+        store
+            .clone()
+            .store(
+                partition,
+                written,
+                written_value,
+                lore_storage::KeyType::BranchMetadata,
+            )
+            .await
+            .expect("Failed to store");
+        store.flush(true).await.expect("Failed to flush");
+
+        let mutable = open_mutable(&store_path, settings).await;
+        for (idx, group) in mutable.group.iter().enumerate() {
+            let count = group.bucket_count.load(Ordering::Relaxed);
+            assert_eq!(count, 1, "Group {idx} must reopen at the initial level 1");
+        }
+        let store: Arc<dyn lore_storage::MutableStore> = mutable;
+        store
+            .clone()
+            .store(
+                partition,
+                untouched,
+                untouched_value,
+                lore_storage::KeyType::BranchMetadata,
+            )
+            .await
+            .expect("Failed to store");
+        store.flush(true).await.expect("Failed to flush");
+
+        let mutable = open_mutable(&store_path, settings).await;
+        assert_eq!(
+            mutable.group[0x42].bucket_count.load(Ordering::Relaxed),
+            1,
+            "Group 0x42 must stay at level 1 after being written"
+        );
+        let store: Arc<dyn lore_storage::MutableStore> = mutable;
+        for (key, value) in [(written, written_value), (untouched, untouched_value)] {
+            let loaded = store
+                .clone()
+                .load(partition, key, lore_storage::KeyType::BranchMetadata)
+                .await
+                .expect("Lookup failed for written key");
+            assert_eq!(loaded, value, "Loaded value did not match stored value");
+        }
+
+        cleanup(&store_path);
+    }
+
+    /// The immutable store makes the same decision the same way; see
+    /// `reopened_mutable_store_keeps_untouched_groups_at_the_initial_level`.
+    #[tokio::test]
+    async fn reopened_immutable_store_keeps_untouched_groups_at_the_initial_level() {
+        let store_path = temp_dir();
+        // Rebuilt per open: `ImmutableStoreSettings` is neither `Copy` nor `Clone`.
+        let settings = || ImmutableStoreSettings {
+            initial_fan_out_level: 1,
+            fan_out_threshold: FAN_OUT_THRESHOLD_DEFAULT,
+            ..Default::default()
+        };
+        let partition = lore_storage::Partition::default();
+        let payload = bytes::Bytes::from_static(b"test fragment payload data 30!");
+        let fragment = lore_storage::Fragment {
+            flags: 0,
+            size_payload: payload.len() as u32,
+            size_content: payload.len() as u64,
+        };
+        let mut rng = StdRng::seed_from_u64(0x0FFA_1105_1EED_5EED);
+        let written = lore_storage::Address {
+            hash: key_in_group(&mut rng, 0x00, 0x11),
+            context: lore_storage::Context::default(),
+        };
+        let untouched = lore_storage::Address {
+            hash: key_in_group(&mut rng, 0x42, 0x37),
+            context: lore_storage::Context::default(),
+        };
+
+        let store = lore_storage::LocalImmutableStore::new(Some(store_path.clone()), settings())
+            .await
+            .expect("Failed to create immutable store");
+        store
+            .clone()
+            .store(partition, written, fragment, Some(payload.clone()), false)
+            .await
+            .expect("Failed to store fragment");
+        let store: Arc<dyn lore_storage::ImmutableStore> = store;
+        store.flush(true).await.expect("Failed to flush");
+
+        let store = lore_storage::LocalImmutableStore::new(Some(store_path.clone()), settings())
+            .await
+            .expect("Failed to reopen immutable store");
+        for (idx, group) in store.group.iter().enumerate() {
+            let count = group.bucket_count.load(Ordering::Relaxed);
+            assert_eq!(count, 1, "Group {idx} must reopen at the initial level 1");
+        }
+        store
+            .clone()
+            .store(partition, untouched, fragment, Some(payload.clone()), false)
+            .await
+            .expect("Failed to store fragment");
+        let store: Arc<dyn lore_storage::ImmutableStore> = store;
+        store.flush(true).await.expect("Failed to flush");
+
+        let store = lore_storage::LocalImmutableStore::new(Some(store_path.clone()), settings())
+            .await
+            .expect("Failed to reopen immutable store");
+        assert_eq!(
+            store.group[0x42].bucket_count.load(Ordering::Relaxed),
+            1,
+            "Group 0x42 must stay at level 1 after being written"
+        );
+        for address in [written, untouched] {
+            let result = store
+                .find(partition, address)
+                .await
+                .expect("find returned an error");
+            assert_eq!(
+                result.matching,
+                lore_storage::StoreMatch::MatchFull,
+                "Lookup failed for written address (expected MatchFull, got {:?})",
+                result.matching
+            );
+        }
+
+        cleanup(&store_path);
+    }
+
     /// Per-group `bucket_count` must remain at the configured initial level when the workload
     /// stays below threshold. This is observable via the on-disk marker file content.
     #[tokio::test]
@@ -1679,31 +1853,17 @@ mod tests {
     #[tokio::test]
     async fn mutable_reads_during_a_fan_out_flush_lose_no_entries() {
         let store_path = temp_dir();
-        let immutable: Arc<dyn lore_storage::ImmutableStore> =
-            lore_storage::local::immutable_store::create(
-                None::<&str>,
-                ImmutableStoreCreateOptions::none(),
-                false,
-                ImmutableStoreSettings::default(),
-            )
-            .await
-            .expect("Failed to create in-memory immutable store");
-        let mutable = Arc::new(
-            lore_storage::LocalMutableStore::new(
-                Some(&store_path),
-                MutableStoreSettings {
-                    initial_fan_out_level: 1,
-                    fan_out_threshold: FAN_OUT_THRESHOLD_DEFAULT,
-                    ..Default::default()
-                },
-                immutable,
-            )
-            .await
-            .expect("Failed to create mutable store"),
-        );
+        let mutable = open_mutable(
+            &store_path,
+            MutableStoreSettings {
+                initial_fan_out_level: 1,
+                fan_out_threshold: FAN_OUT_THRESHOLD_DEFAULT,
+                ..Default::default()
+            },
+        )
+        .await;
         let store: Arc<dyn lore_storage::MutableStore> = mutable.clone();
         let partition = lore_storage::Partition::default();
-
         let mut rng = StdRng::seed_from_u64(0xFA0_0002);
         let mut keys = Vec::with_capacity(5000);
         for _ in 0..5000 {
@@ -1752,7 +1912,6 @@ mod tests {
                 _ => missing += 1,
             }
         }
-
         cleanup(&store_path);
         assert_eq!(
             missing,
@@ -1802,6 +1961,7 @@ mod tests {
                 .expect("Failed to store fragment");
         }
 
+        // Readers run while the flush fans the group out from level 1 to level 32.
         let reader_store = store.clone();
         let reader_addresses = addresses.clone();
         let reader = lore_base::lore_spawn!(async move {
@@ -1835,7 +1995,6 @@ mod tests {
                 missing += 1;
             }
         }
-
         cleanup(&store_path);
         assert_eq!(
             missing,
@@ -1843,5 +2002,132 @@ mod tests {
             "{missing} of {} fragments were lost across the fan-out flush",
             addresses.len()
         );
+    }
+
+    /// A legacy-version store writes no level markers, so its untouched groups open at the
+    /// pre-fan-out 256-bucket layout and fragments written to them survive a reopen.
+    #[tokio::test]
+    async fn legacy_v4_immutable_store_keeps_untouched_groups_at_the_legacy_level() {
+        let store_path = temp_dir();
+        let group_dir = store_path.join("immutable").join("index").join("00");
+        std::fs::create_dir_all(&group_dir).unwrap();
+        // Synthetic v4 (LastAccessInEntry) bucket file: 16-byte header, count = 0.
+        let mut bucket_bytes = Vec::new();
+        bucket_bytes.extend_from_slice(&4u32.to_le_bytes()); // version = LastAccessInEntry
+        bucket_bytes.extend_from_slice(&0u32.to_le_bytes()); // _unused
+        bucket_bytes.extend_from_slice(&0u32.to_le_bytes()); // count
+        bucket_bytes.extend_from_slice(&0u32.to_le_bytes()); // _unused_two
+        std::fs::write(group_dir.join("index_00"), &bucket_bytes).unwrap();
+
+        let partition = lore_storage::Partition::default();
+        let payload = bytes::Bytes::from_static(b"test fragment payload data 30!");
+        let fragment = lore_storage::Fragment {
+            flags: 0,
+            size_payload: payload.len() as u32,
+            size_content: payload.len() as u64,
+        };
+        let mut rng = StdRng::seed_from_u64(0x1337);
+        let address = lore_storage::Address {
+            hash: key_in_group(&mut rng, 0x42, 0x37),
+            context: lore_storage::Context::default(),
+        };
+
+        let store = lore_storage::LocalImmutableStore::new(
+            Some(store_path.clone()),
+            ImmutableStoreSettings::default(),
+        )
+        .await
+        .expect("Failed to open immutable store");
+        assert_eq!(
+            store.group[0x42].bucket_count.load(Ordering::Relaxed),
+            lore_storage::local::fan_out::FAN_OUT_LEVEL_MAX,
+            "Untouched group of a legacy store must open at the legacy level"
+        );
+        store
+            .clone()
+            .store(partition, address, fragment, Some(payload.clone()), false)
+            .await
+            .expect("Failed to store fragment");
+        let store: Arc<dyn lore_storage::ImmutableStore> = store;
+        store.flush(true).await.expect("Failed to flush");
+
+        assert!(
+            !store_path
+                .join("immutable")
+                .join("index")
+                .join("42")
+                .join(lore_storage::local::fan_out::MARKER_FILENAME)
+                .exists(),
+            "A legacy store must not write a level marker"
+        );
+
+        let store = lore_storage::LocalImmutableStore::new(
+            Some(store_path.clone()),
+            ImmutableStoreSettings::default(),
+        )
+        .await
+        .expect("Failed to reopen immutable store");
+        let result = store
+            .find(partition, address)
+            .await
+            .expect("find returned an error");
+        assert_eq!(
+            result.matching,
+            lore_storage::StoreMatch::MatchFull,
+            "Fragment written to an untouched group of a legacy store must survive a reopen"
+        );
+
+        cleanup(&store_path);
+    }
+
+    /// The mutable store makes the same decision the same way; see
+    /// `legacy_v4_immutable_store_keeps_untouched_groups_at_the_legacy_level`.
+    #[tokio::test]
+    async fn legacy_v2_mutable_store_keeps_untouched_groups_at_the_legacy_level() {
+        let store_path = temp_dir();
+        let mutable_dir = store_path.join("mutable");
+        let group_dir = mutable_dir.join("index").join("00");
+        std::fs::create_dir_all(&group_dir).unwrap();
+        std::fs::write(mutable_dir.join("version"), 2u32.to_le_bytes()).unwrap();
+
+        // Synthetic v2 (TypedItems) bucket file: 16-byte header, count = 0.
+        let mut bucket_bytes = Vec::new();
+        bucket_bytes.extend_from_slice(&2u32.to_le_bytes()); // version = TypedItems
+        bucket_bytes.extend_from_slice(&0u32.to_le_bytes()); // _unused
+        bucket_bytes.extend_from_slice(&0u32.to_le_bytes()); // count
+        bucket_bytes.extend_from_slice(&0u32.to_le_bytes()); // _unused_two
+        std::fs::write(group_dir.join("index_00"), &bucket_bytes).unwrap();
+
+        let partition = lore_storage::Partition::default();
+        let mut rng = StdRng::seed_from_u64(0x1337);
+        let key = key_in_group(&mut rng, 0x42, 0x37);
+        let value = make_hash(&mut rng);
+
+        let mutable = open_mutable(&store_path, MutableStoreSettings::default()).await;
+        assert_eq!(
+            mutable.group[0x42].bucket_count.load(Ordering::Relaxed),
+            lore_storage::local::fan_out::FAN_OUT_LEVEL_MAX,
+            "Untouched group of a legacy store must open at the legacy level"
+        );
+        let store: Arc<dyn lore_storage::MutableStore> = mutable;
+        store
+            .clone()
+            .store(partition, key, value, lore_storage::KeyType::BranchMetadata)
+            .await
+            .expect("Failed to store");
+        store.flush(true).await.expect("Failed to flush");
+
+        let mutable = open_mutable(&store_path, MutableStoreSettings::default()).await;
+        let store: Arc<dyn lore_storage::MutableStore> = mutable;
+        let loaded = store
+            .load(partition, key, lore_storage::KeyType::BranchMetadata)
+            .await
+            .expect("Lookup failed for written key");
+        assert_eq!(
+            loaded, value,
+            "Entry written to an untouched group of a legacy store must survive a reopen"
+        );
+
+        cleanup(&store_path);
     }
 }

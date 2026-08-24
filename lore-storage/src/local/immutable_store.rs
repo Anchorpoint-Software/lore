@@ -66,6 +66,7 @@ use crate::fs_util;
 use crate::hash;
 use crate::immutable_store::StoreError;
 use crate::immutable_store::sanitise_fragment_behavior_flags;
+use crate::local::fan_out::GroupLevel;
 use crate::store_types::StoreGetData;
 use crate::store_types::StoreMatch;
 use crate::store_types::StoreMatchResult;
@@ -368,22 +369,17 @@ struct ImmutableStoreHeader {
 }
 
 pub fn format_bucket_path(path: &Path, group_index: usize, bucket_index: usize) -> PathBuf {
-    use std::io;
-    use std::io::Write;
+    use crate::local::fan_out::BUCKET_FILENAME_PREFIX as PREFIX;
+    use crate::local::fan_out::write_hex_byte;
     let mut path = path.to_path_buf();
     path.reserve(20);
     path.push("index");
-    let mut hexstring: [u8; 8] = Default::default();
-    {
-        let mut cursor = io::Cursor::new(&mut hexstring[..]);
-        let _ = write!(&mut cursor, "{:02x}", group_index as u8);
-        path.push(std::str::from_utf8(&hexstring[..2]).unwrap_or_default());
-    }
-    {
-        let mut cursor = io::Cursor::new(&mut hexstring[..]);
-        let _ = write!(&mut cursor, "index_{:02x}", bucket_index as u8);
-        path.push(std::str::from_utf8(&hexstring).unwrap_or_default());
-    }
+    let mut name = [0u8; PREFIX.len() + 2];
+    write_hex_byte(&mut name, group_index as u8);
+    path.push(std::str::from_utf8(&name[..2]).unwrap_or_default());
+    name[..PREFIX.len()].copy_from_slice(PREFIX.as_bytes());
+    write_hex_byte(&mut name[PREFIX.len()..], bucket_index as u8);
+    path.push(std::str::from_utf8(&name).unwrap_or_default());
     path
 }
 
@@ -408,7 +404,9 @@ fn detect_any_older_immutable_bucket(index_path: &Path) -> bool {
         for file in files.flatten() {
             let name = file.file_name();
             let name_str = name.to_str().unwrap_or("");
-            if !name_str.starts_with("index_") || name_str.ends_with(".new") {
+            if !name_str.starts_with(crate::local::fan_out::BUCKET_FILENAME_PREFIX)
+                || name_str.ends_with(crate::local::fan_out::BUCKET_NEW_SUFFIX)
+            {
                 continue;
             }
             if let Ok(mut f) = std::fs::File::open(file.path()) {
@@ -1032,11 +1030,8 @@ impl LocalImmutableStore {
         // can be set to 1 - and will then grow dynamically as needed
         const MIN_PACKFILE_COUNT: usize = 1;
 
-        // Per-group level marker detection. For each group dir (if present on disk), first run
-        // T10 recovery to roll forward any interrupted fan-out commit, then read the marker; if
-        // the marker is missing, fall back to `settings.initial_fan_out_level` for fresh stores
-        // or 256 for existing legacy stores (the pre-fan-out 256-bucket layout). `committed_level`
-        // tracks the on-disk marker value (0 if absent) for the flush path's two-phase decision.
+        // Groups are surveyed before their levels are decided: the decision needs the store's
+        // serialize version, which is only known once every marker has been read.
         let index_existed_on_disk = immutable_path
             .as_ref()
             .is_some_and(|p| p.join("index").exists());
@@ -1046,19 +1041,19 @@ impl LocalImmutableStore {
         // groups are independent directories, so the reads overlap and the engine's thread budget
         // is what paces them. Completions arrive in whatever order the reads finish, so each task
         // carries the group it answers for.
-        let initial_fan_out_level = store.settings.initial_fan_out_level;
-        let mut levels = vec![(initial_fan_out_level, 0usize, false); GROUP_COUNT];
+        let mut group_levels = vec![GroupLevel::Unwritten; GROUP_COUNT];
         if let Some(path) = immutable_path.as_deref() {
             let index_path = path.as_path().join("index");
             let mut tasks = JoinSet::new();
             for group_index in 0..GROUP_COUNT {
-                let group_path = index_path.join(format!("{:02x}", group_index as u8));
+                let group_path = crate::local::fan_out::group_dir_path(&index_path, group_index);
                 lore_base::lore_spawn!(tasks, async move {
+                    if !group_path.exists() {
+                        return (group_index, Ok(GroupLevel::Unwritten));
+                    }
                     // Roll forward any pending fan-out commit before reading the marker. After this returns the marker reflects the post-recovery state.
-                    if group_path.exists()
-                        && let Err(err) =
-                            crate::local::fan_out::recover_level_transition(&group_path, false)
-                                .await
+                    if let Err(err) =
+                        crate::local::fan_out::recover_level_transition(&group_path, false).await
                     {
                         return (
                             group_index,
@@ -1069,15 +1064,14 @@ impl LocalImmutableStore {
                         );
                     }
 
-                    let level = match crate::local::fan_out::read_level_marker(&group_path).await {
-                        Ok(Some(level)) => Ok((level, level, true)),
-                        Ok(None) if index_existed_on_disk => Ok((BUCKET_COUNT, 0, false)),
-                        Ok(None) => Ok((initial_fan_out_level, 0, false)),
-                        Err(err) => Err(LocalImmutableStoreError::internal_with_context(
-                            err,
-                            "Failed to read level marker for group",
-                        )),
-                    };
+                    let level = crate::local::fan_out::read_group_level(&group_path)
+                        .await
+                        .map_err(|err| {
+                            LocalImmutableStoreError::internal_with_context(
+                                err,
+                                "Failed to read level marker for group",
+                            )
+                        });
                     (group_index, level)
                 });
             }
@@ -1086,18 +1080,13 @@ impl LocalImmutableStore {
                 let (group_index, level) = joined.map_err(|err| {
                     LocalImmutableStoreError::internal_with_context(err, "level marker task")
                 })?;
-                levels[group_index] = level?;
+                group_levels[group_index] = level?;
             }
         }
 
-        let mut bucket_counts: Vec<usize> = Vec::with_capacity(GROUP_COUNT);
-        let mut committed_levels: Vec<usize> = Vec::with_capacity(GROUP_COUNT);
-        let mut any_marker_seen = false;
-        for (initial, committed, marker_seen) in levels {
-            bucket_counts.push(initial);
-            committed_levels.push(committed);
-            any_marker_seen |= marker_seen;
-        }
+        let any_marker_seen = group_levels
+            .iter()
+            .any(|level| matches!(level, GroupLevel::Marked(_)));
 
         // Determine serialize_version per Decision 8. Fresh stores, stores with markers, and
         // existing stores with bucket files at any older version (v1-v3) all go to LazyFanOut.
@@ -1120,18 +1109,22 @@ impl LocalImmutableStore {
                 ImmutableStoreVersion::LastAccessInEntry as u32
             };
 
-        for (group_index, &count) in bucket_counts.iter().enumerate() {
+        let unwritten_level = crate::local::fan_out::unwritten_group_level(
+            serialize_version == ImmutableStoreVersion::LazyFanOut as u32,
+            store.settings.initial_fan_out_level,
+        );
+
+        for (group_index, level) in group_levels.into_iter().enumerate() {
+            let (count, committed) = match level {
+                GroupLevel::Marked(level) => (level, level),
+                GroupLevel::PreFanOut => (BUCKET_COUNT, 0),
+                GroupLevel::Unwritten => (unwritten_level, 0),
+            };
             let packpath = immutable_path.as_deref().map(|path| {
                 let mut path = path.clone();
                 path.reserve(16);
                 path.push("index");
-                {
-                    use std::io::Write;
-                    let mut hexstring: [u8; 2] = Default::default();
-                    let mut cursor = io::Cursor::new(&mut hexstring[..]);
-                    let _ = write!(&mut cursor, "{:02x}", group_index as u8);
-                    path.push(std::str::from_utf8(&hexstring).unwrap_or_default());
-                }
+                crate::local::fan_out::push_group_dir(&mut path, group_index);
                 path
             });
             store.group.push(Arc::new(ImmutableStoreGroup {
@@ -1140,7 +1133,7 @@ impl LocalImmutableStore {
                 bucket_count: std::sync::atomic::AtomicUsize::new(count),
                 serialize_version: std::sync::atomic::AtomicU32::new(serialize_version),
                 fan_out_threshold: store.settings.fan_out_threshold,
-                committed_level: std::sync::atomic::AtomicUsize::new(committed_levels[group_index]),
+                committed_level: std::sync::atomic::AtomicUsize::new(committed),
                 packstore: crate::PackStore::new(
                     packpath,
                     MIN_PACKFILE_COUNT,
@@ -3087,7 +3080,7 @@ impl LocalImmutableStore {
                 let group_path = {
                     let mut p = path.as_path().to_path_buf();
                     p.push("index");
-                    p.push(format!("{:02x}", group_index as u8));
+                    crate::local::fan_out::push_group_dir(&mut p, group_index);
                     p
                 };
                 let fan_out_aware = group.serialize_version.load(atomic::Ordering::Relaxed)
@@ -4726,6 +4719,25 @@ mod tests {
     #[test]
     fn lazy_fan_out_version_is_five() {
         assert_eq!(ImmutableStoreVersion::LazyFanOut as u32, 5);
+    }
+
+    #[test]
+    fn format_bucket_path_is_index_group_bucket() {
+        let root = Path::new("/store");
+        for index in [0usize, 0xab, 255] {
+            let byte = index as u8;
+            assert_eq!(
+                format_bucket_path(root, index, index),
+                root.join("index").join(format!("{byte:02x}")).join(format!(
+                    "{}{byte:02x}",
+                    crate::local::fan_out::BUCKET_FILENAME_PREFIX
+                ))
+            );
+        }
+        assert_eq!(
+            format_bucket_path(root, 0x0f, 0xf0),
+            Path::new("/store/index/0f/index_f0")
+        );
     }
 
     #[tokio::test]
