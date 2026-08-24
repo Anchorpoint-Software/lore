@@ -183,23 +183,33 @@ pub struct LoreBranchDiffNodeData {
     /// Set when the change was merged automatically.
     #[serde(with = "u8_as_bool")]
     pub automerged: u8,
+    /// Previous path of the node when it was moved or copied. Empty otherwise.
+    pub from_path: LoreString,
 }
 
 impl LoreBranchDiffNodeData {
     fn new(node_change: &NodeChange) -> Self {
-        let is_directory_or_module = if node_change.action == FileAction::Delete {
+        let is_directory_or_link = if node_change.action == FileAction::Delete {
             !node_change.from.flags.contains(NodeFlags::File)
         } else {
             !node_change.to.flags.contains(NodeFlags::File)
         };
+        let display_path = |path: &str| -> LoreString {
+            if is_directory_or_link {
+                format!("{path}/").into()
+            } else {
+                path.into()
+            }
+        };
         Self {
             action: LoreFileAction::from(node_change.action),
-            path: if is_directory_or_module {
-                format!("{}/", node_change.path.as_str()).into()
-            } else {
-                node_change.path.as_str().into()
-            },
+            path: display_path(node_change.path.as_str()),
             automerged: node_change.flags.is_conflict_automerged().into(),
+            from_path: node_change
+                .from_path
+                .as_ref()
+                .map(|path| display_path(path.as_str()))
+                .unwrap_or_default(),
         }
     }
 }
@@ -3872,6 +3882,7 @@ pub fn dispatch_diff_events(diff: &DiffResult) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::path::RelativePathBuf;
 
     fn branch_id(byte: u8) -> BranchId {
         BranchId::from([byte; 16])
@@ -4524,6 +4535,105 @@ mod tests {
                 "There is nothing to extend an empty line from"
             );
             assert!(empty.is_empty());
+        }))
+        .await;
+    }
+
+    /// A change between two nodes of one kind, carrying the path a move or copy
+    /// came from.
+    fn node_change(
+        repository: &Arc<RepositoryContext>,
+        state: &Arc<State>,
+        action: FileAction,
+        flags: NodeFlags,
+        path: &str,
+        from_path: Option<&str>,
+    ) -> NodeChange {
+        let side = |node| change::NodeChangeState {
+            repository: repository.clone(),
+            state: state.clone(),
+            node,
+            flags,
+            address: Address::default(),
+        };
+        NodeChange {
+            action,
+            flags: change::Flags::None,
+            from: side(1),
+            to: side(2),
+            path: RelativePathBuf::new().push_and_freeze(path),
+            from_path: from_path.map(|path| RelativePathBuf::new().push_and_freeze(path)),
+        }
+    }
+
+    /// Without the source path a receiver reads a move as an add at the new path
+    /// and cannot tell where the content came from.
+    #[tokio::test]
+    async fn diff_change_carries_the_move_source_path() {
+        Box::pin(with_execution(async {
+            let repository = null_repository().await;
+            let state = Arc::new(State::new());
+            let change = node_change(
+                &repository,
+                &state,
+                FileAction::Move,
+                NodeFlags::File,
+                "new.txt",
+                Some("old.txt"),
+            );
+
+            let data = LoreBranchDiffNodeData::new(&change);
+
+            assert_eq!(data.path.as_str(), "new.txt");
+            assert_eq!(data.from_path.as_str(), "old.txt");
+        }))
+        .await;
+    }
+
+    /// A change that moved nothing maps to the empty string the C API documents,
+    /// not to a dangling pointer a receiver would read past.
+    #[tokio::test]
+    async fn diff_change_without_a_move_reports_no_source_path() {
+        Box::pin(with_execution(async {
+            let repository = null_repository().await;
+            let state = Arc::new(State::new());
+            let change = node_change(
+                &repository,
+                &state,
+                FileAction::Add,
+                NodeFlags::File,
+                "new.txt",
+                None,
+            );
+
+            let data = LoreBranchDiffNodeData::new(&change);
+
+            assert!(data.from_path.is_empty());
+            assert_eq!(data.from_path.as_str(), "");
+        }))
+        .await;
+    }
+
+    /// Both paths of a moved directory get the trailing separator that tells a
+    /// directory from a file, so the two can be compared as they are reported.
+    #[tokio::test]
+    async fn diff_change_marks_a_moved_directory_on_both_paths() {
+        Box::pin(with_execution(async {
+            let repository = null_repository().await;
+            let state = Arc::new(State::new());
+            let change = node_change(
+                &repository,
+                &state,
+                FileAction::Move,
+                NodeFlags::NoFlags,
+                "new",
+                Some("old"),
+            );
+
+            let data = LoreBranchDiffNodeData::new(&change);
+
+            assert_eq!(data.path.as_str(), "new/");
+            assert_eq!(data.from_path.as_str(), "old/");
         }))
         .await;
     }

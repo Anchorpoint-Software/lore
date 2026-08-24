@@ -633,6 +633,8 @@ typedef struct lore_branch_diff_node_data_t {
   struct lore_string_t path;
   // Set when the change was merged automatically.
   uint8_t automerged;
+  // Previous path of the node when it was moved or copied. Empty otherwise.
+  struct lore_string_t from_path;
 } lore_branch_diff_node_data_t;
 
 // Event data reporting a single change in a branch diff.
