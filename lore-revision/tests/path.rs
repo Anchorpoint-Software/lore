@@ -387,6 +387,58 @@ mod tests {
         assert_eq!(dedup(&with_parent), vec!["p"]);
     }
 
+    /// A file system that distinguishes case holds `Assets` and `assets` side by
+    /// side, while one parent in the tree holds a single entry of a name. Paths
+    /// that differ only in the case of a shared component are brought onto one
+    /// variation, so what follows is never asked to create one entry twice.
+    #[test]
+    fn dedup_to_supersets_unifies_the_case_of_a_shared_component() {
+        fn dedup(inputs: &[&str]) -> Vec<String> {
+            let paths: Vec<RelativePath> = inputs
+                .iter()
+                .map(|p| RelativePath::new_from_initial_path(p).expect("Path init failed"))
+                .collect();
+            RelativePath::dedup_to_supersets(paths)
+                .into_iter()
+                .map(|p| p.as_str().to_owned())
+                .collect()
+        }
+
+        // A shared directory in two case variations: both targets keep their own
+        // leaf, under the one variation of the directory.
+        assert_eq!(
+            dedup(&["assets/second.file", "Assets/first.file"]),
+            vec!["Assets/first.file", "Assets/second.file"]
+        );
+
+        // The same entry in two case variations is one target.
+        assert_eq!(
+            dedup(&["Assets/Rock.mesh", "assets/rock.mesh"]),
+            vec!["Assets/Rock.mesh"]
+        );
+
+        // Each component is settled on its own, at whatever depth it disagrees.
+        assert_eq!(
+            dedup(&["a/B/x", "a/b/y", "A/b/z"]),
+            vec!["a/B/x", "a/B/y", "a/B/z"]
+        );
+
+        // A directory that a target covers takes the covering variation with it.
+        assert_eq!(dedup(&["Assets", "assets/first.file"]), vec!["Assets"]);
+
+        // Collapse and unification interleaved: `a/B/c/x` is brought onto
+        // `A/b/c` and then dropped as covered, and `A/B/d` onto the same case.
+        assert_eq!(
+            dedup(&["A/b/c", "a/B/c/x", "A/B/d"]),
+            vec!["A/b/c", "A/b/d"]
+        );
+
+        // Names that differ by more than case are different entries and keep what
+        // they were given.
+        assert_eq!(dedup(&["a/B", "a/b2"]), vec!["a/B", "a/b2"]);
+        assert_eq!(dedup(&["Foo/x", "bar/Y"]), vec!["Foo/x", "bar/Y"]);
+    }
+
     #[test]
     fn new_from_user_path() {
         let repository_path = "my_repo";

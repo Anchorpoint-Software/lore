@@ -79,6 +79,49 @@ pub fn is_path_inside_repository(repository_path: &Path, candidate: &str) -> boo
     )
 }
 
+/// Number of path components in a repository-relative path.
+pub(crate) fn path_depth(path: &str) -> usize {
+    path.matches('/').count() + 1
+}
+
+/// Number of leading components `left` and `right` share.
+pub(crate) fn shared_component_depth(left: &str, right: &str) -> usize {
+    left.split('/')
+        .zip(right.split('/'))
+        .take_while(|(left, right)| left == right)
+        .count()
+}
+
+/// A repository-relative path carrying its own depth.
+///
+/// Ordering is by depth and then by path, which the field order gives the
+/// derive. Carrying the depth counts the components once per path rather than
+/// once per comparison, and leaves a sorted set grouped into depth levels.
+///
+/// The fields are private so the depth is always the one the path has.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct DepthPath {
+    depth: usize,
+    path: String,
+}
+
+impl DepthPath {
+    pub(crate) fn new(path: String) -> Self {
+        Self {
+            depth: path_depth(&path),
+            path,
+        }
+    }
+
+    pub(crate) fn depth(&self) -> usize {
+        self.depth
+    }
+
+    pub(crate) fn path(&self) -> &str {
+        &self.path
+    }
+}
+
 pub fn clean(path: String) -> String {
     // Remove verbatim path and device path prefixes
     let mut path = path.replace("\\\\?\\", "").replace("\\\\.\\", "");
@@ -448,8 +491,12 @@ impl RelativePath {
     /// `Vec` — the root covers everything, and callers should treat the empty
     /// result as "no path filter / scan the entire repository".
     ///
-    /// Comparison is structural on the canonical `/`-separated form
-    /// (case-sensitive). The returned paths are in lexicographic order.
+    /// One parent cannot hold two entries whose names differ only in case, so
+    /// paths that differ only in the case of a shared component are brought onto
+    /// one variation and collapse together.
+    ///
+    /// Comparison is structural on the canonical `/`-separated form. The
+    /// returned paths are in lexicographic order.
     ///
     /// Runs in O(n log n): the sort dominates, and the scan that follows tests
     /// each path against one candidate rather than against everything kept so
@@ -461,15 +508,25 @@ impl RelativePath {
             return Vec::new();
         }
 
+        // Ordered by the lowercase form, so the case variations of one entry sort
+        // together and the first of them is the one the rest are brought onto.
         let mut sorted = paths;
-        sorted.sort_unstable_by(|a, b| compare_subtree_order(a.as_str(), b.as_str()));
+        sorted.sort_unstable_by(|a, b| {
+            compare_subtree_order(a.as_lowercase_str(), b.as_lowercase_str())
+                .then_with(|| compare_subtree_order(a.as_str(), b.as_str()))
+        });
 
         // Testing only the last kept path is sufficient, not a bug: a covering
         // path's subtree is contiguous in this order, so anything kept earlier
         // that covered this path would also cover the last kept one, and a
-        // covered path is never kept.
+        // covered path is never kept. Unification runs before that test, so the
+        // kept path already carries the case every later path is brought onto.
         let mut result: Vec<RelativePath> = Vec::with_capacity(sorted.len());
         for path in sorted {
+            let path = match result.last() {
+                Some(kept) => unify_case_with(kept, &path).unwrap_or(path),
+                None => path,
+            };
             if !result
                 .last()
                 .is_some_and(|kept| covers_impl(kept.as_str(), path.as_str()))
@@ -482,6 +539,52 @@ impl RelativePath {
         result.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
         result
     }
+}
+
+/// Byte length of the first `count` components of `path`.
+fn component_prefix_len(path: &str, count: usize) -> usize {
+    path.split('/')
+        .take(count)
+        .map(|name| name.len() + 1)
+        .sum::<usize>()
+        .saturating_sub(1)
+}
+
+/// `path` with the components it shares with `established` taking that path's
+/// case, or `None` when the two already agree.
+///
+/// Components are shared as far as their lowercase forms run together: below the
+/// first component the two genuinely disagree on they are in different
+/// directories and neither says anything about the other.
+fn unify_case_with(established: &RelativePath, path: &RelativePath) -> Option<RelativePath> {
+    let mut established_names = established.as_str().split('/');
+    let mut established_lower = established.as_lowercase_str().split('/');
+    let mut path_lower = path.as_lowercase_str().split('/');
+
+    let mut shared = 0;
+    let mut differs = false;
+    for name in path.as_str().split('/') {
+        let (Some(established_name), Some(established_name_lower), Some(name_lower)) = (
+            established_names.next(),
+            established_lower.next(),
+            path_lower.next(),
+        ) else {
+            break;
+        };
+        if established_name_lower != name_lower {
+            break;
+        }
+        differs |= established_name != name;
+        shared += 1;
+    }
+    if !differs {
+        return None;
+    }
+
+    let established = established.as_str();
+    let head = &established[..component_prefix_len(established, shared)];
+    let tail = &path.as_str()[component_prefix_len(path.as_str(), shared)..];
+    Some(RelativePath::new_from_clean_parts(head, tail))
 }
 
 /// Orders paths so that every path is immediately followed by its own subtree.
@@ -939,6 +1042,22 @@ impl AsRef<str> for RelativePathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_component_depth_counts_whole_components() {
+        assert_eq!(shared_component_depth("a/b/c", "a/b/d"), 2);
+        assert_eq!(shared_component_depth("a/b/c", "a/x/c"), 1);
+        assert_eq!(shared_component_depth("a/b/c", "x/b/c"), 0);
+        assert_eq!(shared_component_depth("a/b/c", "a/b/c"), 3);
+        // A shared string prefix that stops inside a component shares neither it
+        // nor anything below it.
+        assert_eq!(shared_component_depth("a/b/x", "a/bc/y"), 1);
+        assert_eq!(shared_component_depth("ab/x", "a/x"), 0);
+        // A path that runs out is shared as far as it goes.
+        assert_eq!(shared_component_depth("a/b", "a/b/c"), 2);
+        assert_eq!(shared_component_depth("", "a"), 0);
+        assert_eq!(shared_component_depth("a", "a"), 1);
+    }
 
     #[test]
     fn test_clean_path_with_leading_parent() {

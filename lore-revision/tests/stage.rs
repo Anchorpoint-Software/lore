@@ -844,7 +844,7 @@ mod tests {
     ///
     /// Under `Keep` the staging renames that very directory as it goes, so
     /// anything resolved for it beforehand describes a directory that is no
-    /// longer there. Both files have to arrive under the tree's spelling, and
+    /// longer there. Both files have to arrive under the tree's case, and
     /// neither may be taken for a delete because the path it was resolved under
     /// stopped existing.
     #[tokio::test]
@@ -924,7 +924,7 @@ mod tests {
 
                 // The file system now disagrees with the tree about the
                 // directory, and the targets are given in the file system's
-                // spelling - so the given path, the file system and the node all
+                // case - so the given path, the file system and the node all
                 // have to be reconciled, for a directory two targets share.
                 let renamed = path.as_path().join("assets_renamed");
                 std::fs::rename(directory.as_path(), renamed.as_path()).expect("rename away");
@@ -979,7 +979,7 @@ mod tests {
                     "both files must still be there, under the directory the tree names"
                 );
 
-                // And the tree holds one directory, not one per spelling that
+                // And the tree holds one directory, not one per case variation that
                 // was resolved along the way.
                 let state = state::State::deserialize(repository.clone(), signature)
                     .await
@@ -1251,7 +1251,7 @@ mod tests {
     /// system holds, and the name the node holds - and staging has to reconcile
     /// them however they disagree. `Error` refuses when the file system and the
     /// tree disagree, and is untroubled by the caller having typed a third
-    /// spelling, since resolving the given path against the file system settles
+    /// case variation, since resolving the given path against the file system settles
     /// that before the node is ever consulted.
     #[tokio::test]
     #[allow(clippy::large_futures)]
@@ -1277,7 +1277,7 @@ mod tests {
                 "Assets/rock.MESH",
                 "Assets/Rock.mesh",
             ),
-            // Given is a third spelling of its own.
+            // Given is a third case variation of its own.
             ("all three differ", "Assets/rock.MESH", "Assets/ROCK.mesh"),
         ] {
             let outcome = stage_case_scenario(LEAF_TREE, &[on_disk], &[given], mode).await;
@@ -1394,7 +1394,7 @@ mod tests {
         assert_eq!(outcome.tree, shared("Assets"));
 
         // The file system disagrees with the node about the directory, and the
-        // targets are given in each of the three spellings in turn.
+        // targets are given in each of the three case variations in turn.
         let lowered = shared("assets");
         let lowered: Vec<&str> = lowered.iter().map(String::as_str).collect();
         for given in [&lowered, &vec!["Assets/first.file", "Assets/second.file"]] {

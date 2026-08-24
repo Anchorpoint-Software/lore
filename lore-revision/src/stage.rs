@@ -341,15 +341,23 @@ pub(crate) async fn stage_filesystem_path(
         base_absolute_path.as_path(),
         full_absolute_path.to_string_lossy().as_ref(),
     )
-    .forward::<StageError>(&format!("Invalid path {relative_path}"))?;
+    .forward_with::<StageError, _>(|| format!("Invalid path {relative_path}"))?;
+
+    // The filter and the delete lookup below are repository-relative, while
+    // `relative_path` is relative to the base the walk starts from.
+    let full_relative_path = if base_relative_path.is_empty() {
+        relative_path.clone()
+    } else {
+        RelativePath::new_from_clean_parts(base_relative_path.as_str(), relative_path.as_str())
+    };
 
     let force = execution_context().globals().force();
     if !force
         && repository
             .filter
-            .emit_excludes(&relative_path, true, FilterMode::Full)
+            .emit_excludes(&full_relative_path, true, FilterMode::Full)
     {
-        lore_trace!("Path excluded by filter: {}", relative_path.as_str());
+        lore_trace!("Path excluded by filter: {}", full_relative_path.as_str());
         return Ok(NodeLink::invalid());
     }
 
@@ -517,11 +525,11 @@ pub(crate) async fn stage_filesystem_path(
     lore_debug!(
         "Path not found, staging delete: {}/{}",
         repository.path_for_display(),
-        relative_path.as_str(),
+        full_relative_path.as_str(),
     );
     // TODO(mjansson): Find node link could return the found case aware path of the node
     if let Ok(node_link) = state
-        .find_node_link(repository.clone(), relative_path.as_str())
+        .find_node_link(repository.clone(), full_relative_path.as_str())
         .await
     {
         // Check if case of repository path matches the given path
@@ -545,14 +553,14 @@ pub(crate) async fn stage_filesystem_path(
                 repository.clone(),
                 state.clone(),
                 state.clone(),
-                relative_path.clone(),
+                full_relative_path.clone(),
                 BranchId::default(),
             )
             .await
             .forward::<StageError>("Failed to resolve link chain")?;
 
             chain
-                .record_tracker_contexts(tracker, &node_state, relative_path.as_str())
+                .record_tracker_contexts(tracker, &node_state, full_relative_path.as_str())
                 .await;
         }
 
@@ -560,10 +568,10 @@ pub(crate) async fn stage_filesystem_path(
             .node_path(current_repository.clone(), node_link.node)
             .await
             .forward::<StageError>("Failed to resolve node path in state")?;
-        if node_path == relative_path.as_str() {
+        if node_path == full_relative_path.as_str() {
             lore_debug!(
                 "Path {} exist in repository with matching case, stage deletion",
-                relative_path
+                full_relative_path
             );
             stage_delete(
                 current_repository.clone(),
@@ -577,7 +585,7 @@ pub(crate) async fn stage_filesystem_path(
         } else {
             lore_debug!(
                 "Path {} exist in repository with different case {}",
-                relative_path,
+                full_relative_path,
                 node_path
             );
             stage_delete(
@@ -591,10 +599,10 @@ pub(crate) async fn stage_filesystem_path(
             .await?;
         }
     } else {
-        lore_debug!("Path {} does not exist in repository", relative_path);
+        lore_debug!("Path {} does not exist in repository", full_relative_path);
         if !force {
             return Err(StageError::internal(format!(
-                "Invalid path {relative_path}"
+                "Invalid path {full_relative_path}"
             )));
         } else {
             lore_debug!("Non-existing path ignored by force flag");
@@ -642,7 +650,7 @@ pub(crate) async fn stage_single_node(
     let base_node = state
         .find_node_link(repository.clone(), parent_path.as_str())
         .await
-        .forward::<StageError>(&format!("Invalid path {parent_path}"))?;
+        .forward_with::<StageError, _>(|| format!("Invalid path {parent_path}"))?;
     if !base_node.is_valid_or_root() {
         return Err(StageError::internal(format!("Invalid path {parent_path}")));
     }

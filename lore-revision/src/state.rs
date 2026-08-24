@@ -1889,7 +1889,8 @@ impl State {
     /// always-create, not get-or-add, so they produce duplicate siblings. The
     /// find-then-add is a check-then-act at the call site that this cannot close;
     /// callers fanning out across paths must ensure at most one add per
-    /// `(parent, name)` (e.g. pre-create shared ancestors sequentially).
+    /// `(parent, name)` (e.g. pre-create the ancestors two paths share, from a
+    /// path set holding one case variation of each entry).
     ///
     /// Slot allocation is serialized per tree by a single permit, so concurrent
     /// adds overlap only in the initialize and publish that follow it.

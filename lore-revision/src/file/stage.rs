@@ -37,8 +37,140 @@ use crate::stage::StageOptions;
 use crate::stage::StageStats;
 use crate::state;
 use crate::state::State;
+use crate::util::path::DepthPath;
 use crate::util::path::RelativePath;
 use crate::util::path::RelativePathBuf;
+use crate::util::path::path_depth;
+use crate::util::path::shared_component_depth;
+
+/// Shared ancestors created at once within one depth level. Each is a path
+/// resolution and a node lookup, so this only has to be deep enough to keep the
+/// syscall pool fed; a level can hold a hundred thousand directories and their
+/// task state is not free.
+const MAX_PRECREATE_TASKS: usize = 1000;
+
+/// The node of each shared ancestor already created, borrowed from the list they
+/// are created from.
+type AncestorNodes<'a> = std::collections::HashMap<&'a str, crate::node::NodeID>;
+
+/// The deepest strict ancestor of `path` that has a node, and that node.
+///
+/// Starts at the parent, never at `path` itself: the caller is about to stage
+/// `path`, and starting its walk on top of it would skip it.
+fn longest_ancestor<'a>(
+    path: &'a str,
+    nodes: &AncestorNodes<'_>,
+) -> Option<(&'a str, crate::node::NodeID)> {
+    let mut end = path.rfind('/')?;
+    loop {
+        let candidate = &path[..end];
+        if let Some(node) = nodes.get(candidate) {
+            return Some((candidate, *node));
+        }
+        end = candidate.rfind('/')?;
+    }
+}
+
+/// Where the walk for `target` should start: the deepest ancestor that already
+/// has a node, or `None` for a target with no such ancestor, which has to start
+/// at the repository root.
+///
+/// Returns what [`stage::stage_filesystem_path`] takes as its base - absolute
+/// path, repository-relative path and node - plus what is left of the target
+/// below it.
+fn walk_base(
+    target: &str,
+    repository_path: &std::path::Path,
+    ancestor_nodes: &AncestorNodes<'_>,
+    prefixes: Option<&Arc<crate::util::fs::ResolvedPrefixes>>,
+) -> Option<(
+    std::path::PathBuf,
+    RelativePathBuf,
+    crate::node::NodeID,
+    RelativePath,
+)> {
+    let (prefix, node) = longest_ancestor(target, ancestor_nodes)?;
+    // The case the prefix resolved to, and only when it resolved as a whole: a
+    // shorter match answers for a shorter path and would drop components.
+    let variation = prefixes
+        .and_then(|resolved| resolved.longest_prefix_of(prefix))
+        .filter(|(depth, _)| *depth == path_depth(prefix))
+        .map_or(prefix, |(_, variation)| variation);
+    // Both sides are already clean: one is a slice of `target`, the other a map
+    // value built from cleaned parts, so neither needs validating or rewriting.
+    let remainder = RelativePath::new_from_clean_parts(&target[prefix.len() + 1..], "");
+    let base_relative = RelativePathBuf::new_from_clean_parts(variation, "");
+    Some((
+        repository_path.join(variation),
+        base_relative,
+        node,
+        remainder,
+    ))
+}
+
+/// Fold one finished pre-create into the ancestor node map, keeping the first
+/// error rather than returning it: the caller drains the level either way.
+fn collect_precreate<'a>(
+    joined: Result<(usize, Result<crate::node::NodeLink, StageError>), tokio::task::JoinError>,
+    ancestors: &'a [DepthPath],
+    nodes: &mut AncestorNodes<'a>,
+    failure: &mut Option<StageError>,
+) {
+    match joined {
+        Ok((index, Ok(node_link))) => {
+            if node_link.is_valid() {
+                nodes.insert(ancestors[index].path(), node_link.node);
+            }
+        }
+        Ok((_, Err(err))) => {
+            if failure.is_none() {
+                *failure = Some(err);
+            }
+        }
+        Err(err) => {
+            if failure.is_none() {
+                *failure = Some(StageError::internal_with_context(
+                    err,
+                    "Failed to join pre-create task",
+                ));
+            }
+        }
+    }
+}
+
+/// The directories two or more of `targets` share, shallowest first and
+/// contiguous per depth. Only such a directory is a place where parallel walks
+/// would race to create the same node.
+///
+/// `targets` must be an antichain in lexicographic order, which puts the targets
+/// under a directory in one run: a directory is shared exactly when two
+/// neighbours agree that far, and emitting it at the first target of its run
+/// yields the set once over.
+///
+/// The result is prefix-closed and holds one case variation of each entry, so a
+/// depth is a set of distinct nodes whose parents the depth above holds.
+fn shared_ancestors(targets: &[RelativePath]) -> Vec<DepthPath> {
+    let mut shared: Vec<DepthPath> = Vec::new();
+    let mut preceding = 0;
+    for (index, target) in targets.iter().enumerate() {
+        let following = targets.get(index + 1).map_or(0, |next| {
+            shared_component_depth(target.as_str(), next.as_str())
+        });
+        let target = target.as_str();
+        for (depth, (end, _)) in target.match_indices('/').enumerate() {
+            let depth = depth + 1;
+            if depth > following {
+                break;
+            }
+            if depth > preceding {
+                shared.push(DepthPath::new(target[..end].to_string()));
+            }
+        }
+        preceding = following;
+    }
+    shared.sort_unstable();
+    shared
+}
 
 /// Spawn a stage task into the given layer's repository covering `remain` (the
 /// path-suffix relative to the layer's mount). An empty `remain` stages the
@@ -63,7 +195,10 @@ async fn stage_into_single_layer(
     };
 
     // TODO(mjansson): If this has gone past a link into a subrepository, we
-    // need to stage the link node and upwards in the layer repository.
+    // need to stage the link node and upwards in the layer repository. The base
+    // below also stays relative to this repository while the walk runs against
+    // the linked one, so the filter and the delete lookup are handed a path the
+    // linked repository does not hold.
     let layer_staged_node = layer_state
         .state_staged
         .find_node_link(layer_state.repository.clone(), layer_relative_path.as_str())
@@ -236,29 +371,7 @@ pub async fn stage(
     };
     let antichain_len = antichain.len();
 
-    // Only a directory shared as an ancestor by two or more targets is a place
-    // where parallel walks would race to create the same node. Pre-create
-    // exactly those, in sequence, so no shared ancestor is ever created twice.
-    // A single target — or targets sharing only the root — needs none, leaving
-    // its walk identical to the non-parallel path.
-    let mut ancestor_counts: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
-    for target in &antichain {
-        let mut ancestor = target.clone();
-        ancestor.pop();
-        while !ancestor.is_empty() {
-            *ancestor_counts
-                .entry(ancestor.as_str().to_string())
-                .or_insert(0) += 1;
-            ancestor.pop();
-        }
-    }
-    let mut shared_ancestors: Vec<String> = ancestor_counts
-        .into_iter()
-        .filter_map(|(path, count)| (count >= 2).then_some(path))
-        .collect();
-    // Shallowest first, so each walk only has to create its own final component.
-    shared_ancestors.sort_unstable_by_key(String::len);
+    let shared_ancestors = shared_ancestors(&antichain);
     let precreate_count = shared_ancestors.len();
 
     // Resolve the case of those directories once, so no target under them
@@ -281,28 +394,89 @@ pub async fn stage(
 
     let mut precreate_options = options;
     precreate_options.no_children = true;
-    for ancestor in shared_ancestors {
-        let ancestor_path = RelativePath::new_from_initial_path(&ancestor).unwrap_or_default();
-        Box::pin(stage::stage_filesystem_path(
-            repository.clone(),
-            state.clone(),
-            repository.require_path()?.to_path_buf(),
-            RelativePathBuf::new(),
-            ROOT_NODE,
-            ancestor_path,
-            stats.clone(),
-            precreate_options,
-            Some(link_tracker.clone()),
-            global_mask.clone(),
-            prefixes.clone(),
-        ))
-        .await?;
+    let repository_root = repository.require_path()?.to_path_buf();
+    // Node of each shared ancestor as it is created, so the next level starts
+    // from its parent instead of resolving the chain above it again.
+    let mut ancestor_nodes = AncestorNodes::with_capacity(shared_ancestors.len());
+    let mut precreate_failure: Option<StageError> = None;
+
+    for level in shared_ancestors.chunk_by(|left, right| left.depth() == right.depth()) {
+        if precreate_failure.is_some() {
+            break;
+        }
+
+        let mut level_tasks: JoinSet<(usize, Result<crate::node::NodeLink, StageError>)> =
+            JoinSet::new();
+        for (index, ancestor) in level.iter().enumerate() {
+            if precreate_failure.is_some() {
+                break;
+            }
+            let ancestor = ancestor.path();
+            let (base_absolute, base_relative, base_node, ancestor_path, base_prefixes) =
+                match walk_base(
+                    ancestor,
+                    repository_root.as_path(),
+                    &ancestor_nodes,
+                    prefixes.as_ref(),
+                ) {
+                    // The prefix map is keyed by repository-relative paths, which a
+                    // path relative to the prefix is not.
+                    Some((absolute, relative, node, remainder)) => {
+                        (absolute, relative, node, remainder, None)
+                    }
+                    None => (
+                        repository_root.clone(),
+                        RelativePathBuf::new(),
+                        ROOT_NODE,
+                        RelativePath::new_from_clean_parts(ancestor, ""),
+                        prefixes.clone(),
+                    ),
+                };
+            let repository = repository.clone();
+            let state = state.clone();
+            let stats = stats.clone();
+            let link_tracker = link_tracker.clone();
+            let global_mask = global_mask.clone();
+            lore_spawn!(level_tasks, async move {
+                let result = stage::stage_filesystem_path(
+                    repository,
+                    state,
+                    base_absolute,
+                    base_relative,
+                    base_node,
+                    ancestor_path,
+                    stats,
+                    precreate_options,
+                    Some(link_tracker),
+                    global_mask,
+                    base_prefixes,
+                )
+                .await;
+                (index, result)
+            });
+
+            while let Some(joined) = level_tasks.try_join_next() {
+                collect_precreate(joined, level, &mut ancestor_nodes, &mut precreate_failure);
+            }
+            while level_tasks.len() >= MAX_PRECREATE_TASKS
+                && let Some(joined) = level_tasks.join_next().await
+            {
+                collect_precreate(joined, level, &mut ancestor_nodes, &mut precreate_failure);
+            }
+        }
+        // Drained even on failure: a pre-create in flight is allocating nodes and
+        // must not be cancelled part way through.
+        while let Some(joined) = level_tasks.join_next().await {
+            collect_precreate(joined, level, &mut ancestor_nodes, &mut precreate_failure);
+        }
+    }
+    if let Some(err) = precreate_failure {
+        return Err(err);
     }
 
-    // Shared ancestors now exist and the targets are disjoint, so every
-    // remaining creation is single-writer or a distinct sibling — race-free via
-    // the node_add fix. Layer jobs run against their own separate states.
-    let repository_path = repository.require_path()?.to_path_buf();
+    // Shared ancestors now exist and the targets are disjoint, so every remaining
+    // creation is single-writer or a distinct sibling, which `node_add` publishes
+    // with an atomic CAS prepend. Layer jobs run against their own separate states.
     let mut failure = None;
     let mut tasks: JoinSet<Result<crate::node::NodeLink, StageError>> = JoinSet::new();
 
@@ -319,7 +493,7 @@ pub async fn stage(
             stage::stage_filesystem_path(
                 repository.clone(),
                 state.clone(),
-                repository_path.clone(),
+                repository_root.clone(),
                 RelativePathBuf::new(),
                 ROOT_NODE,
                 target,
@@ -1258,6 +1432,201 @@ mod mask_tests {
         assert!(is_path_under_layer_mask("vendor/foo/x.rs", &mask));
         assert!(is_path_under_layer_mask("external/lib", &mask));
         assert!(!is_path_under_layer_mask("src/main.rs", &mask));
+    }
+}
+
+#[cfg(test)]
+mod shared_ancestor_tests {
+    use super::*;
+
+    fn antichain(targets: &[&str]) -> Vec<RelativePath> {
+        RelativePath::dedup_to_supersets(
+            targets
+                .iter()
+                .map(|path| RelativePath::new_from_initial_path(path).expect("Path init failed"))
+                .collect(),
+        )
+    }
+
+    fn derived(targets: &[&str]) -> Vec<String> {
+        shared_ancestors(&antichain(targets))
+            .iter()
+            .map(|ancestor| ancestor.path().to_string())
+            .collect()
+    }
+
+    /// Every ancestor of every target, counted. What the scan over neighbours
+    /// arrives at without the counting.
+    fn counted(targets: &[RelativePath]) -> Vec<String> {
+        let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for target in targets {
+            let mut ancestor = target.clone();
+            ancestor.pop();
+            while !ancestor.is_empty() {
+                *counts.entry(ancestor.as_str().to_string()).or_insert(0) += 1;
+                ancestor.pop();
+            }
+        }
+        let mut shared: Vec<String> = counts
+            .into_iter()
+            .filter_map(|(path, count)| (count >= 2).then_some(path))
+            .collect();
+        shared.sort_unstable_by(|a, b| path_depth(a).cmp(&path_depth(b)).then_with(|| a.cmp(b)));
+        shared
+    }
+
+    #[test]
+    fn only_a_directory_two_targets_share_is_returned() {
+        assert!(derived(&[]).is_empty());
+        assert!(derived(&["a/b/c"]).is_empty());
+        assert!(derived(&["a/x", "b/y"]).is_empty());
+        assert_eq!(derived(&["a/x", "a/y"]), vec!["a"]);
+    }
+
+    #[test]
+    fn the_result_is_prefix_closed() {
+        assert_eq!(derived(&["a/b/c/x", "a/b/c/y"]), vec!["a", "a/b", "a/b/c"]);
+    }
+
+    #[test]
+    fn one_depth_is_a_contiguous_range_shallowest_first() {
+        let shared = shared_ancestors(&antichain(&[
+            "a/p/x", "a/p/y", "a/q/x", "a/q/y", "b/p/x", "b/p/y",
+        ]));
+        let paths: Vec<&str> = shared.iter().map(DepthPath::path).collect();
+        assert_eq!(paths, vec!["a", "b", "a/p", "a/q", "b/p"]);
+        let depths: Vec<usize> = shared.iter().map(DepthPath::depth).collect();
+        assert!(depths.windows(2).all(|pair| pair[0] <= pair[1]));
+    }
+
+    /// Two spellings of one directory would be two ancestors naming one node,
+    /// and the depth holding both would add it twice. The target set they are
+    /// taken from settles on one, and that is what carries into here.
+    #[test]
+    fn targets_on_one_case_variation_give_ancestors_on_one() {
+        assert_eq!(
+            derived(&["Assets/Meshes/a", "assets/meshes/b", "ASSETS/Meshes/c"]),
+            vec!["Assets", "Assets/Meshes"]
+        );
+    }
+
+    /// The scan reads neighbours, so the shapes that matter are the ones where
+    /// lexicographic order puts something unrelated between two targets, or
+    /// where a shared string prefix stops inside a component.
+    #[test]
+    fn it_agrees_with_counting_every_ancestor() {
+        for targets in [
+            &[][..],
+            &["a/b/c"],
+            &["a/x", "a/y"],
+            &["a/x", "b/y"],
+            &["a/b/c/d/x", "a/b/c/d/y"],
+            &["a/p/x", "a/p/y", "a/q/x", "a/q/y", "b/p/x", "b/p/y"],
+            // '-' sorts below '/', so this lands between "a" and its subtree.
+            &["a/x", "a-foo/y", "a/z"],
+            // '0' sorts above '/', so this lands after the subtree.
+            &["a/x", "a0/y", "a/z"],
+            // A shared string prefix that stops inside a component.
+            &["a/b/x", "a/bc/y", "a/b/z"],
+            // A directory target covering the files beneath it.
+            &["a/b", "a/b/x", "a/b/y", "a/c/x", "a/c/y"],
+            // Three levels, and a lone target beside them.
+            &["t/m/l/f", "t/m/l/g", "t/m/n/f", "t/m/n/g", "u/v/w/x"],
+        ] {
+            let antichain = antichain(targets);
+            let derived: Vec<String> = shared_ancestors(&antichain)
+                .iter()
+                .map(|ancestor| ancestor.path().to_string())
+                .collect();
+            assert_eq!(derived, counted(&antichain), "{targets:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod walk_base_tests {
+    use super::*;
+
+    const NODE_A: crate::node::NodeID = 11;
+    const NODE_AB: crate::node::NodeID = 22;
+
+    fn created<'a>(entries: &[(&'a str, crate::node::NodeID)]) -> AncestorNodes<'a> {
+        entries.iter().copied().collect()
+    }
+
+    fn resolved(entries: &[(&str, &str)]) -> Arc<crate::util::fs::ResolvedPrefixes> {
+        let mut prefixes = crate::util::fs::ResolvedPrefixes::default();
+        for (path, variation) in entries {
+            prefixes.insert((*path).to_string(), (*variation).to_string());
+        }
+        Arc::new(prefixes)
+    }
+
+    #[test]
+    fn longest_ancestor_takes_the_deepest_one_created() {
+        let nodes = created(&[("a", NODE_A), ("a/b", NODE_AB)]);
+        assert_eq!(longest_ancestor("a/b/c/d", &nodes), Some(("a/b", NODE_AB)));
+        // In the map, but a walk about to stage it has to start above it.
+        assert_eq!(longest_ancestor("a/b", &nodes), Some(("a", NODE_A)));
+        assert_eq!(longest_ancestor("a", &nodes), None);
+        assert_eq!(longest_ancestor("x/y", &nodes), None);
+    }
+
+    #[test]
+    fn walk_base_starts_at_that_ancestor_with_the_rest_below_it() {
+        let root = std::path::Path::new("/repo");
+        let nodes = created(&[("a", NODE_A), ("a/b", NODE_AB)]);
+
+        let (absolute, relative, node, remainder) =
+            walk_base("a/b/c", root, &nodes, None).expect("an ancestor was created");
+        assert_eq!(absolute, root.join("a/b"));
+        assert_eq!(relative.as_str(), "a/b");
+        assert_eq!(node, NODE_AB);
+        assert_eq!(remainder.as_str(), "c");
+
+        let (_, relative, node, remainder) =
+            walk_base("a/x/y/z", root, &nodes, None).expect("an ancestor was created");
+        assert_eq!(relative.as_str(), "a");
+        assert_eq!(node, NODE_A);
+        assert_eq!(remainder.as_str(), "x/y/z");
+    }
+
+    #[test]
+    fn walk_base_is_none_when_no_ancestor_was_created() {
+        let root = std::path::Path::new("/repo");
+        let nodes = created(&[("x", NODE_A)]);
+        assert!(walk_base("a/b", root, &nodes, None).is_none());
+        assert!(walk_base("a", root, &nodes, None).is_none());
+        assert!(walk_base("a", root, &created(&[]), None).is_none());
+    }
+
+    #[test]
+    fn walk_base_takes_the_case_the_prefix_resolved_to() {
+        let root = std::path::Path::new("/repo");
+        let nodes = created(&[("a", NODE_A), ("a/b", NODE_AB)]);
+        let prefixes = resolved(&[("a", "A"), ("a/b", "A/B")]);
+
+        let (absolute, relative, node, remainder) =
+            walk_base("a/b/c", root, &nodes, Some(&prefixes)).expect("an ancestor was created");
+        assert_eq!(absolute, root.join("A/B"));
+        assert_eq!(relative.as_str(), "A/B");
+        assert_eq!(node, NODE_AB);
+        assert_eq!(remainder.as_str(), "c", "the remainder is not recased");
+    }
+
+    /// A prefix resolves as a whole or not at all: the map answers for the
+    /// longest prefix it holds, and a shorter one answers for a shorter path.
+    #[test]
+    fn walk_base_ignores_a_resolution_covering_only_part_of_the_prefix() {
+        let root = std::path::Path::new("/repo");
+        let nodes = created(&[("a", NODE_A), ("a/b", NODE_AB)]);
+        let prefixes = resolved(&[("a", "A")]);
+
+        let (absolute, relative, node, _) =
+            walk_base("a/b/c", root, &nodes, Some(&prefixes)).expect("an ancestor was created");
+        assert_eq!(absolute, root.join("a/b"));
+        assert_eq!(relative.as_str(), "a/b");
+        assert_eq!(node, NODE_AB);
     }
 }
 
