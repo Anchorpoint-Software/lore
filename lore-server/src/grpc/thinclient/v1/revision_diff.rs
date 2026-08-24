@@ -808,7 +808,7 @@ mod test {
             .serialize(repository.clone())
             .await
             .expect("serialize metadata");
-        let state = state::State::new();
+        let state = Arc::new(state::State::new());
         state.set_parent_self(parent);
         state.set_revision_number(revision_number);
         state.set_metadata_hash(metadata_hash);

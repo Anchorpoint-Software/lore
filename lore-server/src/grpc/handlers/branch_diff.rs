@@ -216,7 +216,7 @@ mod test {
         revision_number: u64,
     ) -> Hash {
         let write_token = get_write_token();
-        let state = state::State::new();
+        let state = Arc::new(state::State::new());
         state.set_parent_self(parent);
         state.set_revision_number(revision_number);
 
@@ -241,7 +241,7 @@ mod test {
         revision_number: u64,
     ) -> Hash {
         let write_token = get_write_token();
-        let state = state::State::new();
+        let state = Arc::new(state::State::new());
         state.set_parent_self(parent);
         state.set_revision_number(revision_number);
 

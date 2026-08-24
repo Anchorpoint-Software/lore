@@ -131,7 +131,7 @@ mod tests {
         contents: &[u8],
     ) -> Hash {
         let write_token = get_write_token();
-        let state = state::State::new();
+        let state = Arc::new(state::State::new());
         state.set_revision_number(1);
         let address = lore_revision::immutable::write(
             repository.clone(),
@@ -166,7 +166,7 @@ mod tests {
         link_revision: Hash,
     ) -> Hash {
         let write_token = get_write_token();
-        let state = state::State::new();
+        let state = Arc::new(state::State::new());
         state.set_revision_number(1);
         let link_node = Node {
             flags: NodeFlags::Link.bits(),

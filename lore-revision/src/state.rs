@@ -357,6 +357,21 @@ impl StateNodeChildrenIterator {
     }
 }
 
+/// Number of permits gating block deserialization, taken modulo the block
+/// index.
+///
+/// A fixed set rather than one permit per block: the permits then cost no
+/// allocation, no lookup and no growth as a tree gets bigger, against two
+/// blocks whose indices collide deserializing one after the other instead of
+/// together.
+///
+/// The count trades that collision rate against the size of the array every
+/// state carries. A walk fans out to one task per processor, so a count below
+/// that collides on machines that wide; 256 covers the largest and costs ten
+/// kilobytes. A collision is never a correctness matter - the permits gate
+/// duplicate work, and the publish path re-checks residency whatever they do.
+const BLOCK_LOADING_PERMITS: usize = 256;
+
 /// Revision state control structure, internally mutable through r/w locks
 pub struct State {
     /// Serialized data
@@ -371,6 +386,9 @@ pub struct State {
     block_deserialize: tokio::sync::Semaphore,
     /// File metadata block deserialization semaphore
     metadata_deserialize: tokio::sync::Semaphore,
+    /// Permits held while a block is deserialized, shared by a node block and
+    /// its file metadata block
+    block_loading: [tokio::sync::Semaphore; BLOCK_LOADING_PERMITS],
 }
 
 impl std::fmt::Debug for State {
@@ -573,6 +591,7 @@ impl State {
             deserialize: tokio::sync::Semaphore::new(1),
             block_deserialize: tokio::sync::Semaphore::new(1),
             metadata_deserialize: tokio::sync::Semaphore::new(1),
+            block_loading: std::array::from_fn(|_| tokio::sync::Semaphore::new(1)),
         }
     }
 
@@ -671,6 +690,7 @@ impl State {
                 deserialize: tokio::sync::Semaphore::new(1),
                 block_deserialize: tokio::sync::Semaphore::new(1),
                 metadata_deserialize: tokio::sync::Semaphore::new(1),
+                block_loading: std::array::from_fn(|_| tokio::sync::Semaphore::new(1)),
             }))
         }
     }
@@ -1304,6 +1324,21 @@ impl State {
             )));
         }
 
+        let loading_permit = self.block_loading[block_index % BLOCK_LOADING_PERMITS]
+            .acquire()
+            .await
+            .internal("Failed to deserialize node block")?;
+        // One permit covers many blocks, so the task that held it before this
+        // one may have published this block, or a different one.
+        {
+            let lock = self.runtime.read();
+            if lock.block.len() > block_index
+                && let Some(block) = lock.block[block_index].upgrade()
+            {
+                return Ok(block);
+            }
+        }
+
         let (mut block_hash_bytes, rehash_node_names) = {
             let lock = self.runtime.read();
             (lock.block_address.clone(), lock.rehash_node_names)
@@ -1450,6 +1485,10 @@ impl State {
             Err(err) => Err(err),
         };
 
+        // Waiters have what they came for; the prefetch below is not theirs to
+        // wait on.
+        drop(loading_permit);
+
         if let Some(cache_task) = metadata_block_cache {
             let _ = cache_task.await;
         }
@@ -1489,29 +1528,42 @@ impl State {
                 return None;
             }
 
-            // TODO(mjansson): To support huge trees we might want to selectively
-            // read the block addresses instead of all in one big buffer
-            let address = Address::zero_context_hash(tree.hash_file_metadata);
-            let Ok(hash_bytes) = immutable::read(
-                repository.clone(),
-                address,
-                None, /* Read the full array of block hashes */
-                immutable::read_options_from_repository(&repository)
-                    .with_cache()
-                    .with_priority(),
-            )
-            .await
-            else {
+            // One list covers every block, so the tasks prefetching for all the
+            // other blocks want it at the same moment and would each read it.
+            let Ok(_guard) = self.metadata_deserialize.acquire().await else {
                 return None;
             };
-            block_hash_bytes = hash_bytes;
-            if block_hash_bytes.count::<Hash>() < tree.block_count as usize {
-                block_hash_bytes = block_hash_bytes
-                    .clone_and_resize_zeroed::<Hash>(tree.block_count as usize)
-                    .freeze();
-            }
-            {
-                self.runtime.write().block_file_metadata_address = block_hash_bytes.clone();
+
+            block_hash_bytes = {
+                let lock = self.runtime.read();
+                lock.block_file_metadata_address.clone()
+            };
+
+            if block_index >= block_hash_bytes.count::<Hash>() {
+                // TODO(mjansson): To support huge trees we might want to selectively
+                // read the block addresses instead of all in one big buffer
+                let address = Address::zero_context_hash(tree.hash_file_metadata);
+                let Ok(hash_bytes) = immutable::read(
+                    repository.clone(),
+                    address,
+                    None, /* Read the full array of block hashes */
+                    immutable::read_options_from_repository(&repository)
+                        .with_cache()
+                        .with_priority(),
+                )
+                .await
+                else {
+                    return None;
+                };
+                block_hash_bytes = hash_bytes;
+                if block_hash_bytes.count::<Hash>() < tree.block_count as usize {
+                    block_hash_bytes = block_hash_bytes
+                        .clone_and_resize_zeroed::<Hash>(tree.block_count as usize)
+                        .freeze();
+                }
+                {
+                    self.runtime.write().block_file_metadata_address = block_hash_bytes.clone();
+                }
             }
         }
 
@@ -1613,20 +1665,29 @@ impl State {
         }
 
         let tree = self.tree(repository.clone()).await?;
+        if block_index >= tree.block_count as usize {
+            return Err(StateError::internal(format!(
+                "Invalid block index: {block_index}"
+            )));
+        }
 
-        let mut block_hash_bytes = {
-            let mut lock = self.runtime.write();
+        let _loading_permit = self.block_loading[block_index % BLOCK_LOADING_PERMITS]
+            .acquire()
+            .await
+            .internal("Failed to deserialize metadata")?;
+        // One permit covers many blocks, so the task that held it before this
+        // one may have published this block, or a different one.
+        {
+            let lock = self.runtime.read();
             if lock.block_file_metadata.len() > block_index
                 && let Some(block) = lock.block_file_metadata[block_index].upgrade()
             {
                 return Ok(block);
             }
+        }
 
-            if block_index >= tree.block_count as usize {
-                return Err(StateError::internal(format!(
-                    "Invalid block index: {block_index}"
-                )));
-            }
+        let mut block_hash_bytes = {
+            let mut lock = self.runtime.write();
             if block_index >= lock.block_file_metadata.len() {
                 lock.block_file_metadata
                     .resize(tree.block_count as usize, Weak::default());

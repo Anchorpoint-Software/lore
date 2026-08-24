@@ -1686,3 +1686,419 @@ mod is_file_modified_chunking_compat {
             .await;
     }
 }
+
+mod block_single_flight {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use lore_base::runtime::LORE_CONTEXT;
+    use lore_base::runtime::runtime;
+    use lore_base::types::Address;
+    use lore_base::types::Fragment;
+    use lore_base::types::Hash;
+    use lore_base::types::Partition;
+    use lore_base::types::TypedBytes;
+    use lore_revision::immutable;
+    use lore_revision::interface::ExecutionContext;
+    use lore_revision::node::Node;
+    use lore_revision::node::NodeFileMetadata;
+    use lore_revision::node::NodeFileMetadataBlock;
+    use lore_revision::node::ROOT_NODE;
+    use lore_revision::node::node_to_file_metadata;
+    use lore_revision::repository::RepositoryContext;
+    use lore_revision::repository::RepositoryWriteToken;
+    use lore_revision::state::State;
+    use lore_storage::ImmutableStore;
+    use lore_storage::MutableStore;
+    use lore_storage::StoreError;
+    use lore_storage::StoreGetData;
+    use lore_storage::StoreMatchResult;
+    use lore_storage::StoreObliterateStats;
+    use lore_storage::hash::hash_string;
+    use lore_storage::local::immutable_store::LocalImmutableStore;
+
+    use crate::tests::RepositoryContextCreationArgsExt;
+    use crate::tests::TempDir;
+    use crate::tests::default_repository_creation_args;
+    use crate::tests::generate_tempdir;
+    use crate::tests::test_store_create;
+
+    /// Tasks per burst. Large enough that a store read per task is unmistakable
+    /// next to the handful the state needs whatever the concurrency.
+    const BURST: usize = 32;
+
+    /// How long each payload read is held open. Every task in a burst arrives
+    /// inside this window, so a state that does not gate its block reads does
+    /// them all, rather than losing a race it would usually win by accident.
+    const READ_DELAY: Duration = Duration::from_millis(50);
+
+    /// Counts the payload reads reaching the store underneath, per address, and
+    /// paces them.
+    struct CountingStore {
+        inner: Arc<dyn ImmutableStore>,
+        reads: Mutex<BTreeMap<Address, u32>>,
+    }
+
+    impl CountingStore {
+        fn take_reads(&self) -> BTreeMap<Address, u32> {
+            std::mem::take(&mut *self.reads.lock().expect("Read counter poisoned"))
+        }
+    }
+
+    impl std::fmt::Debug for CountingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "CountingStore")
+        }
+    }
+
+    #[async_trait]
+    impl ImmutableStore for CountingStore {
+        async fn get(
+            self: Arc<Self>,
+            partition: Partition,
+            address: Address,
+        ) -> Result<StoreGetData, StoreError> {
+            *self
+                .reads
+                .lock()
+                .expect("Read counter poisoned")
+                .entry(address)
+                .or_default() += 1;
+            tokio::time::sleep(READ_DELAY).await;
+            self.inner.clone().get(partition, address).await
+        }
+
+        async fn get_metadata(
+            self: Arc<Self>,
+            partition: Partition,
+            address: Address,
+        ) -> Result<StoreGetData, StoreError> {
+            self.inner.clone().get_metadata(partition, address).await
+        }
+
+        async fn query(
+            self: Arc<Self>,
+            partition: Partition,
+            addresses: &[Address],
+            results: &mut [StoreMatchResult],
+        ) -> Result<(), StoreError> {
+            self.inner
+                .clone()
+                .query(partition, addresses, results)
+                .await
+        }
+
+        async fn put(
+            self: Arc<Self>,
+            partition: Partition,
+            address: Address,
+            fragment: Fragment,
+            payload: Option<Bytes>,
+            force: bool,
+        ) -> Result<(), StoreError> {
+            self.inner
+                .clone()
+                .put(partition, address, fragment, payload, force)
+                .await
+        }
+
+        async fn obliterate(
+            self: Arc<Self>,
+            partition: Partition,
+            address: Address,
+            stats: Arc<StoreObliterateStats>,
+        ) -> Result<(), StoreError> {
+            self.inner
+                .clone()
+                .obliterate(partition, address, stats)
+                .await
+        }
+
+        async fn evict(
+            self: Arc<Self>,
+            max_capacity: usize,
+            sync_data: bool,
+            sink: Option<lore_storage::gc_event::GcEventSinkRef>,
+        ) -> Result<usize, StoreError> {
+            self.inner
+                .clone()
+                .evict(max_capacity, sync_data, sink)
+                .await
+        }
+
+        async fn compact(
+            self: Arc<Self>,
+            max_size: usize,
+            at: Option<usize>,
+            sync_data: bool,
+            sink: Option<lore_storage::gc_event::GcEventSinkRef>,
+        ) -> Result<Option<usize>, StoreError> {
+            self.inner
+                .clone()
+                .compact(max_size, at, sync_data, sink)
+                .await
+        }
+
+        async fn compact_resume_at(self: Arc<Self>) -> Option<usize> {
+            self.inner.clone().compact_resume_at().await
+        }
+
+        async fn compact_stop(self: Arc<Self>) {
+            self.inner.clone().compact_stop().await;
+        }
+
+        fn max_query_batch(&self) -> Option<usize> {
+            self.inner.max_query_batch()
+        }
+
+        async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), StoreError> {
+            self.inner.clone().flush(sync_data).await
+        }
+
+        async fn verify(self: Arc<Self>, heal: bool) -> Result<(), StoreError> {
+            self.inner.clone().verify(heal).await
+        }
+    }
+
+    /// A repository over a counting store, and a state written into it carrying
+    /// one node block and one file metadata block.
+    struct Seed {
+        _tempdir: TempDir,
+        store: Arc<CountingStore>,
+        repository: Arc<RepositoryContext>,
+        signature: Hash,
+        block_index: usize,
+        /// Store address of the node block, so a burst can be held to reading
+        /// that address once rather than to a total that says nothing about
+        /// which block was read.
+        node_block: Address,
+        /// Store address of the file metadata block.
+        metadata_block: Address,
+    }
+
+    /// Store address of block `block_index` in the address list rooted at `list`.
+    async fn block_address(
+        repository: &Arc<RepositoryContext>,
+        list: Hash,
+        block_index: usize,
+    ) -> Address {
+        let bytes = immutable::read(
+            repository.clone(),
+            Address::zero_context_hash(list),
+            None,
+            immutable::read_options_from_repository(repository),
+        )
+        .await
+        .expect("Failed to read a block address list");
+        Address::zero_context_hash(bytes.as_type_slice::<Hash>()[block_index])
+    }
+
+    async fn seeded_repository(mutable_store: Arc<dyn MutableStore>) -> Seed {
+        let tempdir = generate_tempdir();
+        let path = tempdir.to_path_buf();
+
+        let store = Arc::new(CountingStore {
+            inner: LocalImmutableStore::new(
+                None,
+                lore_storage::local::immutable_store::ImmutableStoreSettings::default(),
+            )
+            .await
+            .expect("Failed to create store"),
+            reads: Mutex::default(),
+        });
+
+        let write_token = RepositoryWriteToken::acquire(path.as_path()).await;
+        let repository = Arc::new(
+            RepositoryContext::new(
+                default_repository_creation_args(store.clone(), mutable_store).with_path(&path),
+            )
+            .with_write_token(write_token.share()),
+        );
+
+        let state = State::new();
+        let node = state
+            .node_add(
+                repository.clone(),
+                ROOT_NODE,
+                Node {
+                    name_hash: hash_string("first"),
+                    ..Default::default()
+                },
+                "first",
+            )
+            .await
+            .expect("Failed to add a node");
+
+        let metadata_node = node_to_file_metadata(node);
+        let block_index = NodeFileMetadataBlock::index(metadata_node);
+        let metadata_block = state
+            .block_file_metadata(repository.clone(), block_index)
+            .await
+            .expect("Failed to read the file metadata block");
+        {
+            let mut writer = metadata_block.write();
+            writer.node(NodeFileMetadata::index(metadata_node)).metadata = Hash::from_u64(9);
+            writer.mark_dirty();
+        }
+        state.block_file_metadata_modified(metadata_block, block_index);
+        state.mark_dirty();
+
+        let signature = state
+            .serialize(repository.clone(), &write_token)
+            .await
+            .expect("Failed to serialize");
+
+        let tree = State::deserialize(repository.clone(), signature)
+            .await
+            .expect("Failed to deserialize state")
+            .tree(repository.clone())
+            .await
+            .expect("Failed to load the tree");
+
+        Seed {
+            node_block: block_address(&repository, tree.hash_node, block_index).await,
+            metadata_block: block_address(&repository, tree.hash_file_metadata, block_index).await,
+            _tempdir: tempdir,
+            store,
+            repository,
+            signature,
+            block_index,
+        }
+    }
+
+    /// Payload reads per address, taken while [`BURST`] tasks all ask one freshly
+    /// deserialized state for the same block.
+    ///
+    /// The tree is loaded before counting starts, because it has a check-then-read
+    /// of its own that the burst would otherwise measure instead.
+    ///
+    /// Blocks are held until the counts are taken, as a walk holds one it is
+    /// descending through. A file metadata block is published only as a `Weak`, so
+    /// a burst that dropped each block on arrival would read it again for the next
+    /// task whatever the gate does.
+    async fn reads_during_burst<F, Fut, T>(
+        seed: &Seed,
+        execution: &Arc<ExecutionContext>,
+        read: F,
+    ) -> BTreeMap<Address, u32>
+    where
+        F: Fn(Arc<State>, Arc<RepositoryContext>) -> Fut + Copy + Send + 'static,
+        Fut: std::future::Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let state = State::deserialize(seed.repository.clone(), seed.signature)
+            .await
+            .expect("Failed to deserialize state");
+        state
+            .tree(seed.repository.clone())
+            .await
+            .expect("Failed to load the tree");
+
+        seed.store.take_reads();
+
+        let mut tasks = Vec::with_capacity(BURST);
+        for _ in 0..BURST {
+            let state = state.clone();
+            let repository = seed.repository.clone();
+            #[allow(clippy::disallowed_methods)]
+            tasks.push(
+                runtime().spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                    read(state, repository).await
+                })),
+            );
+        }
+        let mut held = Vec::with_capacity(BURST);
+        for task in tasks {
+            held.push(task.await.expect("Block read task failed"));
+        }
+
+        let reads = seed.store.take_reads();
+        drop(held);
+        reads
+    }
+
+    /// Every walk descending through a block that is not resident wants it at the
+    /// same time, and deserializing one is a store read and a decompress. The
+    /// burst must cost the store one read of that block.
+    #[tokio::test]
+    async fn concurrent_readers_of_a_node_block_read_it_once() {
+        let (_, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let spawn_execution = execution.clone();
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let seed = Box::pin(seeded_repository(mutable_store)).await;
+                let block_index = seed.block_index;
+
+                let reads = reads_during_burst(
+                    &seed,
+                    &spawn_execution,
+                    move |state: Arc<State>, repository: Arc<RepositoryContext>| async move {
+                        state
+                            .block(repository, block_index)
+                            .await
+                            .expect("Failed to read the node block")
+                    },
+                )
+                .await;
+
+                assert_eq!(
+                    reads.get(&seed.node_block).copied(),
+                    Some(1),
+                    "{BURST} readers of one node block must read it once"
+                );
+                assert!(
+                    reads.values().all(|&count| count == 1),
+                    "the burst must read nothing twice, got {reads:?}"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// The file metadata block is reached the same way and is far larger, and it
+    /// draws on the same permits, so it owes the same guarantee.
+    #[tokio::test]
+    async fn concurrent_readers_of_a_file_metadata_block_read_it_once() {
+        let (_, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let spawn_execution = execution.clone();
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let seed = Box::pin(seeded_repository(mutable_store)).await;
+                let block_index = seed.block_index;
+
+                let reads = reads_during_burst(
+                    &seed,
+                    &spawn_execution,
+                    move |state: Arc<State>, repository: Arc<RepositoryContext>| async move {
+                        state
+                            .block_file_metadata(repository, block_index)
+                            .await
+                            .expect("Failed to read the file metadata block")
+                    },
+                )
+                .await;
+
+                assert_eq!(
+                    reads.get(&seed.metadata_block).copied(),
+                    Some(1),
+                    "{BURST} readers of one file metadata block must read it once"
+                );
+                assert!(
+                    reads.values().all(|&count| count == 1),
+                    "the burst must read nothing twice, got {reads:?}"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+}
