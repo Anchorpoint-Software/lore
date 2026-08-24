@@ -4074,7 +4074,10 @@ mod tests {
         let token = repository
             .try_write_token()
             .expect("a null context carries a write token");
-        let state = State::new();
+        // Behind an `Arc`, as every other holder of a `State` has it: a bare one
+        // is held across the serialize await, which puts the whole of it in this
+        // future rather than a pointer to it.
+        let state = Arc::new(State::new());
         state.set_parent_self(parent);
         state.set_revision_number(revision_number);
         state

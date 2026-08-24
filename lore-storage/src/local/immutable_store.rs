@@ -1938,6 +1938,125 @@ impl LocalImmutableStore {
         }
     }
 
+    /// Tombstone one address and release the payload it holds, if nothing else
+    /// refers to that payload.
+    ///
+    /// Whatever the address itself references is the caller's to have dealt with
+    /// first; see [`ImmutableStore::obliterate`].
+    async fn obliterate_one(
+        self: Arc<Self>,
+        partition: Partition,
+        address: Address,
+        stats: Arc<StoreObliterateStats>,
+    ) -> Result<(), StoreError> {
+        let group_index = address.hash.data()[0] as usize;
+        let group = &self.group[group_index];
+        let (bucket_index, mut bucket) = loop {
+            let n = group.bucket_count.load(atomic::Ordering::Relaxed);
+            let idx = crate::local::fan_out::bucket_index_for(&address.hash, n);
+            let lock = group.bucket(idx).clone().write_owned().await;
+            if group.bucket_count.load(atomic::Ordering::Relaxed) == n {
+                break (idx, lock);
+            }
+            drop(lock);
+        };
+
+        if !bucket.deserialized && self.path.is_some() {
+            Box::pin(bucket.deserialize(
+                &group.dirty[bucket_index],
+                self.path.clone().unwrap().as_ref(),
+                group_index,
+                bucket_index,
+                Some(&self.gc_counters),
+            ))
+            .await
+            .forward::<StoreError>("Failed to deserialize store data.")?;
+        }
+
+        let (match_slot, _, match_made) =
+            Self::lookup(&bucket, partition, address, StoreMatch::MatchFull);
+
+        if match_made != StoreMatch::MatchFull {
+            return Err(StoreError::from(AddressNotFound::from(address)));
+        }
+
+        let index = bucket.sorted_index[match_slot] as usize;
+        let entry = &bucket.entry[index];
+
+        let is_last_fragment = {
+            let previous_match = (0..match_slot)
+                .rev()
+                .map(|idx| bucket.sorted_index[idx] as usize)
+                .map(|idx| &bucket.entry[idx])
+                .take_while(|entry| entry.address.hash == address.hash)
+                .any(|entry| entry.data.flags != FragmentFlags::PayloadObliterated.bits());
+
+            let next_match = ((match_slot + 1)..bucket.sorted_index.len())
+                .map(|idx| bucket.sorted_index[idx] as usize)
+                .map(|idx| &bucket.entry[idx])
+                .take_while(|entry| entry.address.hash == address.hash)
+                .any(|entry| entry.data.flags != FragmentFlags::PayloadObliterated.bits());
+
+            !previous_match && !next_match
+        };
+
+        if entry.data.flags & FragmentFlags::PayloadObliterated.bits()
+            == FragmentFlags::PayloadObliterated
+        {
+            lore_base::lore_warn!("Address {address} already obliterated");
+            return Ok(());
+        }
+
+        if is_last_fragment && entry.data.pack_file != 0 {
+            lore_base::lore_debug!(
+                "Fragment payload has no other references, obliterating from packstore"
+            );
+
+            stats.num_payloads.fetch_add(1, atomic::Ordering::Relaxed);
+
+            group
+                .packstore
+                .obliterate(
+                    entry.data.pack_file,
+                    entry.data.pack_offset,
+                    entry.data.size_payload,
+                )
+                .await
+                .forward::<StoreError>("Failed to obliterate payload from pack store.")?;
+        }
+
+        stats.num_fragments.fetch_add(1, atomic::Ordering::Relaxed);
+
+        bucket.entry[index].data = ImmutableData {
+            flags: FragmentFlags::PayloadObliterated.bits(),
+            size_payload: 0,
+            size_content: 0,
+            pack_file: 0,
+            pack_offset: 0,
+            last_access: 0,
+        };
+
+        group.dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
+        drop(bucket);
+
+        let mut flush = group.flush.lock().await;
+        let _ = flush.try_join_next();
+
+        if flush.is_empty() {
+            let weak_self = Arc::downgrade(&self);
+            lore_base::lore_spawn!(
+                flush,
+                ImmutableStoreGroup::flush_delayed(
+                    weak_self,
+                    group_index,
+                    self.settings.flush_delay_seconds,
+                )
+            );
+        }
+
+        Ok(())
+    }
+
     pub async fn load(
         packstore: &crate::PackStore,
         data: ImmutableData,
@@ -3575,51 +3694,38 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
     ) -> Result<(), StoreError> {
         timed!(
             self.instruments.operation_latency,
-            &self.instruments.get_labels_for_operation_context("obliterate"),
+            &self
+                .instruments
+                .get_labels_for_operation_context("obliterate"),
             {
-                let group_index = address.hash.data()[0] as usize;
                 lore_base::lore_debug!("Obliterating address {address}");
 
-                let group = &self.group[group_index];
-                let (bucket_index, mut bucket) = loop {
-                    let n = group.bucket_count.load(atomic::Ordering::Relaxed);
-                    let idx = crate::local::fan_out::bucket_index_for(&address.hash, n);
-                    let lock = group.bucket(idx).clone().write_owned().await;
-                    if group.bucket_count.load(atomic::Ordering::Relaxed) == n {
-                        break (idx, lock);
-                    }
-                    drop(lock);
-                };
+                // `find` reads the entry and releases the bucket, which is what
+                // this needs: the sub-fragments below each choose their own group
+                // and bucket from their own hash, and one in `bucket_count` of
+                // them chooses the bucket this address lives in.
+                // `tokio::sync::RwLock` is not reentrant, so descending into them
+                // while holding that lock waits on a lock this task already owns.
+                // The fan-out level sets the odds: one child in 65,536 at 256
+                // buckets to a group, one in 256 at one bucket, where every child
+                // in the parent's group collides.
+                let found = self
+                    .find(partition, address)
+                    .await
+                    .forward::<StoreError>("Failed to deserialize store data.")?;
 
-                if !bucket.deserialized && self.path.is_some() {
-                    Box::pin(bucket
-                        .deserialize(
-                            &group.dirty[bucket_index],
-                            self.path.clone().unwrap().as_ref(),
-                            group_index,
-                            bucket_index,
-                            Some(&self.gc_counters),
-                        ))
-                        .await
-                        .forward::<StoreError>("Failed to deserialize store data.")?;
-                }
+                lore_base::lore_debug!("Lookup match for {address}: {:?}", found.matching);
 
-                let (match_slot, _, match_made) =
-                    Self::lookup(&bucket, partition, address, StoreMatch::MatchFull);
-
-                lore_base::lore_debug!("Lookup match for {address}: {match_made:?}");
-
-                if match_made != StoreMatch::MatchFull {
+                if found.matching != StoreMatch::MatchFull {
                     return Err(StoreError::from(AddressNotFound::from(address)));
                 }
+                let data = found.data;
 
-                let index = bucket.sorted_index[match_slot] as usize;
-                let entry = &bucket.entry[index];
-
-                if (entry.data.flags & FragmentFlags::PayloadFragmented) != 0 {
+                if (data.flags & FragmentFlags::PayloadFragmented) != 0 {
                     lore_base::lore_debug!("Payload fragmented, obliterating subfragments");
 
-                    if let Ok(payload) = Self::load(&group.packstore, entry.data).await.inspect_err(|e| {
+                    let group = &self.group[address.hash.data()[0] as usize];
+                    if let Ok(payload) = Self::load(&group.packstore, data).await.inspect_err(|e| {
                         lore_base::lore_warn!(
                             "Failed to load fragment while obliterating address {address}: {e:?}"
                         );
@@ -3643,83 +3749,14 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
                     }
                 }
 
-                let is_last_fragment = {
-                    let previous_match = (0..match_slot)
-                        .rev()
-                        .map(|idx| bucket.sorted_index[idx] as usize)
-                        .map(|idx| &bucket.entry[idx])
-                        .take_while(|entry| entry.address.hash == address.hash)
-                        .any(|entry| entry.data.flags != FragmentFlags::PayloadObliterated.bits());
-
-                    let next_match = ((match_slot + 1)..bucket.sorted_index.len())
-                        .map(|idx| bucket.sorted_index[idx] as usize)
-                        .map(|idx| &bucket.entry[idx])
-                        .take_while(|entry| entry.address.hash == address.hash)
-                        .any(|entry| entry.data.flags != FragmentFlags::PayloadObliterated.bits());
-
-                    !previous_match && !next_match
-                };
-
-                if entry.data.flags & FragmentFlags::PayloadObliterated.bits() == FragmentFlags::PayloadObliterated {
-                    lore_base::lore_warn!("Address {address} already obliterated");
-                    return Ok(());
-                }
-
-                if is_last_fragment && entry.data.pack_file != 0 {
-                    lore_base::lore_debug!(
-                        "Fragment payload has no other references, obliterating from packstore"
-                    );
-
-                    stats
-                        .num_payloads
-                        .fetch_add(1, atomic::Ordering::Relaxed);
-
-                    group.packstore
-                        .obliterate(
-                            entry.data.pack_file,
-                            entry.data.pack_offset,
-                            entry.data.size_payload,
-                        )
-                        .await
-                        .forward::<StoreError>(
-                            "Failed to obliterate payload from pack store.",
-                        )?;
-                }
-
-                stats
-                    .num_fragments
-                    .fetch_add(1, atomic::Ordering::Relaxed);
-
-                bucket.entry[index].data = ImmutableData {
-                    flags: FragmentFlags::PayloadObliterated.bits(),
-                    size_payload: 0,
-                    size_content: 0,
-                    pack_file: 0,
-                    pack_offset: 0,
-                    last_access: 0
-                };
-
-                group.dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
-                drop(bucket);
-
-                let mut flush = group.flush.lock().await;
-                let _ = flush.try_join_next();
-
-                if flush.is_empty() {
-                    let weak_self = Arc::downgrade(&self);
-                    lore_base::lore_spawn!(
-                        flush,
-                        ImmutableStoreGroup::flush_delayed(
-                            weak_self,
-                            group_index,
-                            self.settings.flush_delay_seconds,
-                        )
-                    );
-                }
-
-                Ok(())
+                // Everything this address referenced is gone, so the address
+                // itself can go. The lock is taken again rather than held
+                // throughout: what it guards is this entry, and none of the walk
+                // above needed it.
+                self.clone().obliterate_one(partition, address, stats).await
             }
-        ).into()
+        )
+        .into()
     }
 
     async fn evict(
@@ -5528,6 +5565,135 @@ mod tests {
                 .await
                 .expect_err("a context the partition does not hold must not resolve to a sibling");
             assert!(matches!(err, StoreError::AddressNotFound(_)));
+        }
+
+        /// Obliterating a fragment tree must terminate when a child shares its
+        /// parent's bucket.
+        ///
+        /// Obliterating an address takes the write lock on the bucket that address
+        /// lives in, and a child chooses its own bucket from its own hash.
+        /// `tokio::sync::RwLock` is not reentrant, so a child that lands in the
+        /// bucket its parent is holding used to wait on a lock the same task
+        /// already owned, and the obliterate never returned. At one bucket to a
+        /// group - where a client store starts - every child in the parent's group
+        /// collides, which is one child in 256; a 3.4 MB file of 53 chunks hung one
+        /// run in five.
+        ///
+        /// The collision is searched for rather than written down because both
+        /// hashes are content-derived: the first byte chooses the group, and with
+        /// one bucket in it the group is the bucket.
+        #[tokio::test]
+        async fn a_child_in_its_parent_bucket_does_not_deadlock_the_obliterate() {
+            let partition = Partition::from([0x61u8; 16]);
+            let context = Context::from([0x62u8; 16]);
+
+            let (payload, leaf_hash, root_hash, references) = (0u32..)
+                .find_map(|salt| {
+                    let payload = format!("leaf payload {salt}").into_bytes();
+                    let leaf_hash = crate::hash::hash_slice(&payload);
+                    let references = vec![FragmentReference {
+                        hash: leaf_hash,
+                        offset_content: 0,
+                    }];
+                    let root_hash = crate::hash::hash_slice(references.as_bytes());
+                    (root_hash.data()[0] == leaf_hash.data()[0])
+                        .then_some((payload, leaf_hash, root_hash, references))
+                })
+                .expect("a leaf hashing into its own list's group");
+
+            let store = create(
+                None::<&Path>,
+                ImmutableStoreCreateOptions::none(),
+                false,
+                ImmutableStoreSettings::default(),
+            )
+            .await
+            .expect("create store");
+
+            store
+                .clone()
+                .put(
+                    partition,
+                    Address {
+                        hash: leaf_hash,
+                        context,
+                    },
+                    Fragment {
+                        flags: 0,
+                        size_payload: payload.len() as u32,
+                        size_content: payload.len() as u64,
+                    },
+                    Some(Bytes::copy_from_slice(&payload)),
+                    false,
+                )
+                .await
+                .expect("put leaf");
+
+            let references = Bytes::copy_from_slice(references.as_bytes());
+            store
+                .clone()
+                .put(
+                    partition,
+                    Address {
+                        hash: root_hash,
+                        context,
+                    },
+                    Fragment {
+                        flags: FragmentFlags::PayloadFragmented.bits(),
+                        size_payload: references.len() as u32,
+                        size_content: payload.len() as u64,
+                    },
+                    Some(references),
+                    false,
+                )
+                .await
+                .expect("put fragment list");
+
+            let stats = Arc::new(crate::store_types::StoreObliterateStats::default());
+            tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                store.clone().obliterate(
+                    partition,
+                    Address {
+                        hash: root_hash,
+                        context,
+                    },
+                    stats.clone(),
+                ),
+            )
+            .await
+            .expect("obliterating a tree whose child shares its parent's bucket must terminate")
+            .expect("obliterate");
+
+            assert_eq!(
+                stats.num_fragments.load(atomic::Ordering::Relaxed),
+                2,
+                "both the list and the leaf it references are fragments"
+            );
+
+            let addresses = [
+                Address {
+                    hash: root_hash,
+                    context,
+                },
+                Address {
+                    hash: leaf_hash,
+                    context,
+                },
+            ];
+            let mut results = [StoreMatchResult::default(); 2];
+            store
+                .clone()
+                .query(partition, &addresses, &mut results)
+                .await
+                .expect("query");
+            for result in results {
+                assert_eq!(
+                    result.match_made,
+                    StoreMatch::MatchNone,
+                    "an obliterated address must not resolve"
+                );
+            }
         }
 
         /// A tombstone is not a representation to adopt, so the walk passes over it and copies the
