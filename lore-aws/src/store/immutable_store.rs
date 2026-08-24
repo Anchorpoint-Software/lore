@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Debug;
 use std::fmt::Formatter;
+use std::mem::size_of;
 use std::string::ToString;
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -31,6 +32,7 @@ use lore_base::types::Hash;
 use lore_base::types::Partition;
 use lore_base::types::TypedBytes;
 use lore_storage::ImmutableStore as ImmutableStoreTrait;
+use lore_storage::Oversized;
 use lore_storage::StoreError;
 use lore_storage::StoreGetData;
 use lore_storage::StoreMatch;
@@ -1554,17 +1556,40 @@ impl AwsImmutableStore {
                 }
             })?;
 
-        let fragment = from_object_metadata(output.metadata());
-
-        // Clamped because the length is the response's claim, and a fragment cannot exceed the
-        // threshold.
-        let capacity = output
+        // The Content-Length header arrives with the response before the body is streamed.
+        // Check it here to abort before reading a single byte of an oversized object.
+        // Legacy S3 blobs had a Fragment struct prepended to the payload, so the maximum
+        // legitimate object size is the threshold plus that prefix.
+        let content_length: Option<usize> = output
             .content_length()
-            .and_then(|length| usize::try_from(length).ok())
-            .filter(|length| *length > 0)
-            .map_or(FRAGMENT_SIZE_THRESHOLD, |length| {
-                length.min(FRAGMENT_SIZE_THRESHOLD)
-            });
+            .and_then(|l| usize::try_from(l).ok())
+            .filter(|l| *l > 0);
+
+        const MAX_OBJECT_SIZE: usize = FRAGMENT_SIZE_THRESHOLD + size_of::<Fragment>();
+        if let Some(size) = content_length
+            && size > MAX_OBJECT_SIZE
+        {
+            warn!(
+                hash = %hash,
+                size,
+                max = MAX_OBJECT_SIZE,
+                "S3 object exceeds maximum allowed size; treating as malicious"
+            );
+            return Err(StoreError::from(Oversized {
+                context: format!(
+                    "S3 object size {size} for {hash} exceeds maximum {MAX_OBJECT_SIZE}"
+                ),
+            }));
+        }
+
+        let fragment = from_object_metadata(output.metadata());
+        if let Ok(fragment) = &fragment {
+            lore_storage::validate_fragment_size(fragment)?;
+        }
+
+        // Clamped to MAX_OBJECT_SIZE: legacy blobs carried a Fragment prefix that pushes their
+        // size above FRAGMENT_SIZE_THRESHOLD, so capping at the threshold would under-allocate.
+        let capacity = content_length.map_or(MAX_OBJECT_SIZE, |length| length.min(MAX_OBJECT_SIZE));
 
         let mut buffer = BytesMut::with_capacity(capacity);
         let mut read = 0_usize;
@@ -1575,7 +1600,6 @@ impl AwsImmutableStore {
             })?;
             read += bytes.len();
             trace!("Read {read} bytes from S3 stream");
-
             buffer.extend_from_slice(bytes.as_ref());
         }
         trace!("Total read {read} bytes from S3 stream");
@@ -4075,6 +4099,87 @@ mod test {
                 body.iter().all(|byte| *byte == expected_byte),
                 "the bytes must be the ones the winning writer uploaded, not a mix"
             );
+        }
+    }
+
+    mod malicious_s3_object_tests {
+        use super::*;
+
+        const MAX_OBJECT_SIZE: usize = FRAGMENT_SIZE_THRESHOLD + size_of::<Fragment>();
+
+        #[tokio::test]
+        async fn load_rejects_object_one_byte_over_max_size() {
+            let fake = Fake::default();
+            let hash: Hash = random();
+            fake.put_object_without_metadata(hash, &vec![0u8; MAX_OBJECT_SIZE + 1]);
+            assert!(matches!(
+                store(&fake).await.load(hash).await,
+                Err(StoreError::Oversized(_))
+            ));
+        }
+
+        #[tokio::test]
+        async fn load_rejects_object_far_over_max_size() {
+            let fake = Fake::default();
+            let hash: Hash = random();
+            fake.put_object_without_metadata(hash, &vec![0u8; MAX_OBJECT_SIZE * 2]);
+            assert!(matches!(
+                store(&fake).await.load(hash).await,
+                Err(StoreError::Oversized(_))
+            ));
+        }
+
+        #[tokio::test]
+        async fn load_accepts_object_exactly_at_max_size() {
+            // An object at exactly MAX_OBJECT_SIZE must not be rejected by the size guard.
+            // It has no fragment metadata header and no legacy row, so load will fail for a
+            // different reason — but the error must not be Oversized.
+            let fake = Fake::default();
+            let hash: Hash = random();
+            fake.put_object_without_metadata(hash, &vec![0u8; MAX_OBJECT_SIZE]);
+            assert!(!matches!(
+                store(&fake).await.load(hash).await,
+                Err(StoreError::Oversized(_))
+            ));
+        }
+
+        #[tokio::test]
+        async fn load_rejects_oversized_s3_object_with_valid_fragment_header() {
+            // Content-Length guard fires even when the object carries a valid lore-fragment
+            // header — the raw S3 object size check runs before the body is read.
+            let fake = Fake::default();
+            let body = vec![0u8; MAX_OBJECT_SIZE + 1];
+            let hash: Hash = random();
+            let fragment = Fragment {
+                flags: 0,
+                size_payload: body.len() as u32,
+                size_content: body.len() as u64,
+            };
+            fake.put_object_with_fragment_metadata(hash, &body, fragment);
+            assert!(matches!(
+                store(&fake).await.load(hash).await,
+                Err(StoreError::Oversized(_))
+            ));
+        }
+
+        #[tokio::test]
+        async fn load_rejects_fragment_metadata_claiming_oversized_payload() {
+            // A small S3 object (passes the content_length guard) but whose lore-fragment
+            // header declares size_payload > FRAGMENT_SIZE_THRESHOLD is caught by
+            // validate_fragment_size.
+            let fake = Fake::default();
+            let body = vec![0u8; 64];
+            let hash: Hash = random();
+            let malicious_fragment = Fragment {
+                flags: 0,
+                size_payload: (FRAGMENT_SIZE_THRESHOLD + 1) as u32,
+                size_content: (FRAGMENT_SIZE_THRESHOLD + 1) as u64,
+            };
+            fake.put_object_with_fragment_metadata(hash, &body, malicious_fragment);
+            assert!(matches!(
+                store(&fake).await.load(hash).await,
+                Err(StoreError::Oversized(_))
+            ));
         }
     }
 }

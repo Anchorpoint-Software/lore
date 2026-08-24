@@ -252,6 +252,22 @@ impl Fake {
         );
     }
 
+    /// Store an object with the `lore-fragment` metadata header encoded from `fragment`.
+    pub(crate) fn put_object_with_fragment_metadata(
+        &self,
+        hash: Hash,
+        body: &[u8],
+        fragment: Fragment,
+    ) {
+        self.lock().objects.insert(
+            hash.to_string().into_bytes(),
+            (
+                body.to_vec(),
+                crate::store::object_metadata::to_object_metadata(&fragment),
+            ),
+        );
+    }
+
     /// Store an object whose metadata is present but unreadable.
     pub(crate) fn put_object_with_damaged_metadata(&self, hash: Hash, body: &[u8]) {
         let mut metadata = HashMap::new();
@@ -321,15 +337,18 @@ pub(crate) fn wire(fake: &Fake) -> (MockS3Impl, MockDynamoDb) {
         let mut storage = f.lock();
         storage.object_reads += 1;
         if let Some((body, metadata)) = storage.objects_once.remove(key.as_bytes()) {
+            let len = body.len() as i64;
             return Ok(GetObjectOutput::builder()
                 .set_body(Some(body.into()))
                 .set_metadata(Some(metadata))
+                .content_length(len)
                 .build());
         }
         match storage.objects.get(key.as_bytes()) {
             Some((body, metadata)) => Ok(GetObjectOutput::builder()
                 .set_body(Some(body.clone().into()))
                 .set_metadata(Some(metadata.clone()))
+                .content_length(body.len() as i64)
                 .build()),
             None => Err(aws_error(
                 GetObjectError::NoSuchKey(NoSuchKey::builder().build()),
