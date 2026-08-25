@@ -579,7 +579,9 @@ pub async fn run_migrator(
     stats: Arc<RewriteStats>,
     aborted: Arc<AtomicBool>,
 ) -> bool {
+    let is_dry_run = migrator_config.is_dry_run;
     info!(
+        is_dry_run,
         num_consumers = orchestration_config.num_consumers,
         segment = migrator_config.scan_config.segment,
         total_segments = migrator_config.scan_config.total_segments,
@@ -645,6 +647,7 @@ pub async fn run_migrator(
     let num_error_stats = stats.errored.load(Ordering::Relaxed);
     let is_aborted = aborted.load(Ordering::Relaxed);
     info!(
+        is_dry_run,
         discovery_task_ok,
         num_consumer_errors,
         num_error_stats,
@@ -654,10 +657,10 @@ pub async fn run_migrator(
     );
 
     if !discovery_task_ok || num_consumer_errors > 0 || num_error_stats > 0 || is_aborted {
-        warn!("Migration segment incomplete");
+        warn!(is_dry_run, "Migration segment incomplete");
         false
     } else {
-        info!("Migration segment completed");
+        info!(is_dry_run, "Migration segment completed");
         true
     }
 }
