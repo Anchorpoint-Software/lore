@@ -1084,18 +1084,31 @@ mod tests {
         }
     }
 
-    /// Stage `initial` so the tree holds those names, put the file system into
-    /// `on_disk`, and stage `given` under `case_change`.
-    ///
-    /// The file system is rebuilt rather than renamed into place: on Windows,
-    /// writing to a path that differs from an existing one only by case reuses
-    /// the name already stored, so the only way to be sure of the case on disk
-    /// is to delete what is there and create it afresh.
+    /// [`stage_case_scenario_with_scan`], taking `given` as the paths to stage
+    /// rather than walking the directory listing.
     async fn stage_case_scenario(
         initial: &[&str],
         on_disk: &[&str],
         given: &[&str],
         case_change: stage::StageCaseChange,
+    ) -> CaseOutcome {
+        stage_case_scenario_with_scan(initial, on_disk, given, case_change, false).await
+    }
+
+    /// Stage `initial` so the tree holds those names, put the file system into
+    /// `on_disk`, and stage `given` under `case_change`, walking the directory
+    /// listing where `scan` is set and taking the paths as given otherwise.
+    ///
+    /// The file system is rebuilt rather than renamed into place: on Windows,
+    /// writing to a path that differs from an existing one only by case reuses
+    /// the name already stored, so the only way to be sure of the case on disk
+    /// is to delete what is there and create it afresh.
+    async fn stage_case_scenario_with_scan(
+        initial: &[&str],
+        on_disk: &[&str],
+        given: &[&str],
+        case_change: stage::StageCaseChange,
+        scan: bool,
     ) -> CaseOutcome {
         let (immutable_store, mutable_store, execution) =
             test_store_create().await.expect("Failed to create stores");
@@ -1202,7 +1215,7 @@ mod tests {
                         node_flags: NodeFlags::NoFlags,
                         file_id: None,
                         no_children: false,
-                        scan: false,
+                        scan,
                     },
                 )
                 .await;
@@ -1288,6 +1301,34 @@ mod tests {
                 "{label}: a refused stage must leave the file system alone"
             );
         }
+    }
+
+    /// `Error` leaves two names in one directory differing only in case to the
+    /// walk, so the second entry finds the child the first one claimed already
+    /// taken and only the search behind it reaches the node, which is what
+    /// reports the mismatch.
+    ///
+    /// A case insensitive file system holds one of the two names, leaving
+    /// nothing to collide and the stage to stand. That is asserted rather than
+    /// skipped, so the test cannot pass without having tested anything.
+    #[tokio::test]
+    #[allow(clippy::large_futures)]
+    async fn stage_case_of_two_variations_in_one_directory() {
+        let outcome = stage_case_scenario_with_scan(
+            LEAF_TREE,
+            &["Assets/Rock.mesh", "Assets/rock.mesh"],
+            &["Assets"],
+            stage::StageCaseChange::Error,
+            true,
+        )
+        .await;
+
+        let both_variations_on_disk = outcome.filesystem.len() == 2;
+        assert_eq!(
+            outcome.staged, !both_variations_on_disk,
+            "a directory holding both case variations must be refused and one holding a single name must not, fs={:?} tree={:?}",
+            outcome.filesystem, outcome.tree
+        );
     }
 
     /// `Keep` treats the difference as unintended and puts the file system back

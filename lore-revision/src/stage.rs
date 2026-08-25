@@ -37,6 +37,7 @@ use crate::lore::execution_context;
 use crate::lore_debug;
 use crate::lore_error;
 use crate::lore_trace;
+use crate::node::INVALID_NODE;
 use crate::node::Node;
 use crate::node::NodeBlock;
 use crate::node::NodeFlags;
@@ -424,6 +425,7 @@ pub(crate) async fn stage_filesystem_path(
                 options,
                 stats.clone(),
                 link_tracker.clone(),
+                None, // One component at a time, so there is no listing to look in
             )
             .await?;
 
@@ -1156,6 +1158,58 @@ async fn resolve_case_variant_collisions(
     Ok(())
 }
 
+/// The children of a directory node, indexed by name hash, and which of them a
+/// file system entry has claimed.
+///
+/// Ties are held in sibling order: two names differing only in case hash the
+/// same, and a claim takes the first child not already claimed.
+struct DirectoryChildren {
+    /// Child node ids in sibling order, [`INVALID_NODE`] where a file system
+    /// entry has claimed the child.
+    node: Vec<NodeID>,
+    /// `(name hash, index into `node`)` for every child, ordered by both, so a
+    /// tie on the hash is claimed in sibling order.
+    by_name_hash: Vec<(u64, u32)>,
+}
+
+impl DirectoryChildren {
+    /// `node` in sibling order, and a `(name hash, index into `node`)` pair for
+    /// every child, in any order.
+    fn new(node: Vec<NodeID>, mut by_name_hash: Vec<(u64, u32)>) -> Self {
+        debug_assert_eq!(node.len(), by_name_hash.len());
+        by_name_hash.sort_unstable();
+        Self { node, by_name_hash }
+    }
+
+    /// The first child carrying `name_hash` that nothing has claimed yet, marked
+    /// as claimed. `None` where the directory holds no such child, or holds only
+    /// ones already claimed.
+    fn claim(&mut self, name_hash: u64) -> Option<NodeID> {
+        let start = self
+            .by_name_hash
+            .partition_point(|&(hash, _)| hash < name_hash);
+        for &(hash, index) in &self.by_name_hash[start..] {
+            if hash != name_hash {
+                break;
+            }
+            let node = &mut self.node[index as usize];
+            if *node != INVALID_NODE {
+                return Some(std::mem::replace(node, INVALID_NODE));
+            }
+        }
+        None
+    }
+
+    /// The children no file system entry claimed, in sibling order. Each one is a
+    /// path the tree holds and the file system does not.
+    fn unclaimed(&self) -> impl Iterator<Item = NodeID> + '_ {
+        self.node
+            .iter()
+            .copied()
+            .filter(|&node| node != INVALID_NODE)
+    }
+}
+
 static DIRECTORY_TASK_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
 /// Process-wide rather than per-operation: the cap has to hold across all the
@@ -1179,7 +1233,7 @@ pub(crate) async fn stage_directory(
     link_tracker: Option<Arc<crate::link::LinkTracker>>,
     layer_mask: Option<Arc<Vec<String>>>,
 ) -> Result<(), StageError> {
-    let mut children = state
+    let child_node = state
         .node_children(repository.clone(), directory_node)
         .await
         .forward::<StageError>("Failed to list directory node children")?;
@@ -1189,8 +1243,8 @@ pub(crate) async fn stage_directory(
         .block(repository.clone(), current_block_index)
         .await
         .forward::<StageError>("Failed deserializing state node block")?;
-    let mut children_name = vec![];
-    for child in children.iter() {
+    let mut child_name_hash = Vec::with_capacity(child_node.len());
+    for (index, child) in child_node.iter().enumerate() {
         let block_index = NodeBlock::index(*child);
         let node_index = Node::index(*child);
         if block_index != current_block_index {
@@ -1200,8 +1254,9 @@ pub(crate) async fn stage_directory(
                 .await
                 .forward::<StageError>("Failed deserializing state node block")?;
         }
-        children_name.push(current_block.node(node_index).name_hash);
+        child_name_hash.push((current_block.node(node_index).name_hash, index as u32));
     }
+    let mut children = DirectoryChildren::new(child_node, child_name_hash);
 
     let mut file_list = util::fs::list_directory(absolute_path.to_path_buf())
         .await
@@ -1280,6 +1335,8 @@ pub(crate) async fn stage_directory(
                 relative_path.as_str()
             );
 
+            let claimed = children.claim(directory.name_hash);
+
             let node_link = match stage_node_from_metadata(
                 repository.clone(),
                 state.clone(),
@@ -1291,6 +1348,7 @@ pub(crate) async fn stage_directory(
                 options,
                 stats.clone(),
                 link_tracker.clone(),
+                claimed,
             )
             .await
             {
@@ -1347,14 +1405,6 @@ pub(crate) async fn stage_directory(
                 failure = failure.or(result.err());
             }
 
-            for (index, child_name) in children_name.iter().enumerate() {
-                if directory.name_hash == *child_name {
-                    children.remove(index);
-                    children_name.remove(index);
-                    break;
-                }
-            }
-
             while let Some(result) = directory_tasks.try_join_next() {
                 failure = failure.or(result
                     .map_err(|e| StageError::internal_with_context(e, "Failed to join task"))
@@ -1371,6 +1421,8 @@ pub(crate) async fn stage_directory(
                 relative_path.as_str()
             );
 
+            let claimed = children.claim(file.name_hash);
+
             let result = stage_node_from_metadata(
                 repository.clone(),
                 state.clone(),
@@ -1382,17 +1434,10 @@ pub(crate) async fn stage_directory(
                 options,
                 stats.clone(),
                 link_tracker.clone(),
+                claimed,
             )
             .await;
             failure = failure.or(result.err());
-
-            for (index, child_name) in children_name.iter().enumerate() {
-                if file.name_hash == *child_name {
-                    children.remove(index);
-                    children_name.remove(index);
-                    break;
-                }
-            }
         }
 
         while let Some(result) = directory_tasks.try_join_next() {
@@ -1408,8 +1453,7 @@ pub(crate) async fn stage_directory(
         }
     }
 
-    // Remaining child nodes no longer exist, stage deletion unless filtered out
-    for child in children {
+    for child in children.unclaimed() {
         if failure.is_some() {
             break;
         }
@@ -1600,6 +1644,12 @@ fn stage_directory_recurse(
     ))
 }
 
+/// Stage one child of `base_node` from metadata the caller already holds.
+///
+/// `known_child` is the child the name belongs to where the caller has already
+/// located it, which a walk holding the directory listing has. It is a shortcut
+/// past the search and never a statement that there is none: `None` searches, so
+/// an entry whose child appeared after the listing was taken still finds it.
 #[allow(clippy::too_many_arguments, unused_assignments)]
 pub(crate) async fn stage_node_from_metadata(
     repository: Arc<RepositoryContext>,
@@ -1612,6 +1662,7 @@ pub(crate) async fn stage_node_from_metadata(
     options: StageOptions,
     stats: Arc<StageStats>,
     link_tracker: Option<Arc<crate::link::LinkTracker>>,
+    known_child: Option<NodeID>,
 ) -> Result<NodeLink, StageError> {
     if base_relative_path.is_empty() && (name.is_empty() || name.as_str() == ".") {
         return Ok(NodeLink {
@@ -1660,11 +1711,16 @@ pub(crate) async fn stage_node_from_metadata(
 
     let name_hash = hash::hash_string(name.as_str());
 
-    // Find the node
-    let node_link = match state
-        .find_subnode(repository.clone(), base_node, name_hash)
-        .await
-    {
+    let found_child = match known_child {
+        Some(node) => Ok(node),
+        None => {
+            state
+                .find_subnode(repository.clone(), base_node, name_hash)
+                .await
+        }
+    };
+
+    let node_link = match found_child {
         Ok(found_node_id) => {
             // Verify that the found node matches the type in the filesystem
             let block_index = NodeBlock::index(found_node_id);
@@ -3263,6 +3319,7 @@ pub(crate) async fn stage_from_parent_state(
                     options,
                     stats,
                     None, // TODO(vri): UCS-17955 - Merging and conflict resolution for links
+                    None, // One target at a time, so there is no listing to look in
                 )
                 .await
             });
@@ -3282,4 +3339,115 @@ pub(crate) async fn stage_from_parent_state(
         };
     }
     final_result
+}
+
+#[cfg(test)]
+mod directory_children_tests {
+    use super::*;
+
+    /// The children in sibling order, as `stage_directory` indexes them.
+    fn children(entries: &[(NodeID, u64)]) -> DirectoryChildren {
+        DirectoryChildren::new(
+            entries.iter().map(|&(node, _)| node).collect(),
+            entries
+                .iter()
+                .enumerate()
+                .map(|(index, &(_, hash))| (hash, index as u32))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn a_claim_finds_the_child_with_that_name() {
+        let mut children = children(&[(10, 0xAA), (11, 0xBB), (12, 0xCC)]);
+        assert_eq!(children.claim(0xBB), Some(11));
+        assert_eq!(children.claim(0xAA), Some(10));
+        assert_eq!(children.claim(0xCC), Some(12));
+        assert_eq!(
+            children.unclaimed().collect::<Vec<_>>(),
+            Vec::<NodeID>::new()
+        );
+    }
+
+    #[test]
+    fn a_name_the_directory_does_not_hold_claims_nothing() {
+        let mut children = children(&[(10, 0xAA)]);
+        assert_eq!(children.claim(0xBB), None);
+        assert_eq!(children.unclaimed().collect::<Vec<_>>(), vec![10]);
+    }
+
+    /// Two names differing only in case hash the same, and a claim takes the
+    /// first child not already claimed. Sibling order is what makes that choice
+    /// reproducible, so it has to survive the sort.
+    #[test]
+    fn equal_hashes_are_claimed_in_sibling_order() {
+        let mut children = children(&[(10, 0xAA), (11, 0xAA), (12, 0xAA)]);
+        assert_eq!(children.claim(0xAA), Some(10));
+        assert_eq!(children.claim(0xAA), Some(11));
+        assert_eq!(children.claim(0xAA), Some(12));
+        assert_eq!(children.claim(0xAA), None);
+    }
+
+    /// The index is ordered by hash and then by position, so sibling order
+    /// decides a tie whatever order the pairs were handed over in.
+    #[test]
+    fn a_tie_is_claimed_in_sibling_order_however_it_was_indexed() {
+        let mut children =
+            DirectoryChildren::new(vec![10, 11, 12], vec![(0xAA, 2), (0xAA, 0), (0xAA, 1)]);
+        assert_eq!(children.claim(0xAA), Some(10));
+        assert_eq!(children.claim(0xAA), Some(11));
+        assert_eq!(children.claim(0xAA), Some(12));
+    }
+
+    #[test]
+    fn what_nothing_claimed_comes_back_in_sibling_order() {
+        let mut children = children(&[(10, 0xAA), (11, 0xBB), (12, 0xAA), (13, 0xCC)]);
+        assert_eq!(children.claim(0xAA), Some(10));
+        assert_eq!(children.claim(0xCC), Some(13));
+        assert_eq!(children.unclaimed().collect::<Vec<_>>(), vec![11, 12]);
+    }
+
+    #[test]
+    fn an_empty_directory_claims_nothing_and_deletes_nothing() {
+        let mut children = children(&[]);
+        assert_eq!(children.claim(0xAA), None);
+        assert_eq!(children.unclaimed().count(), 0);
+    }
+
+    /// The index has to agree with a scan of the same children on every input,
+    /// not just the ones written out above: same children, same sequence of
+    /// claims, same answers and same leftovers.
+    #[test]
+    fn the_index_answers_exactly_as_a_scan_of_the_same_children_would() {
+        // A handful of hashes over a wider set of children, so duplicates,
+        // misses and exhausted runs all occur.
+        let entries: Vec<(NodeID, u64)> = (0..32u64)
+            .map(|index| (index as NodeID + 100, index % 5))
+            .collect();
+        let mut indexed = children(&entries);
+
+        // The scan: the first child with this hash that has not been taken.
+        let mut scanned: Vec<Option<(NodeID, u64)>> = entries.iter().copied().map(Some).collect();
+        let mut scan_claim = |name_hash: u64| -> Option<NodeID> {
+            let position = scanned
+                .iter()
+                .position(|entry| entry.is_some_and(|(_, hash)| hash == name_hash))?;
+            scanned[position].take().map(|(node, _)| node)
+        };
+
+        for name_hash in [0, 3, 3, 1, 3, 9, 0, 3, 3, 3, 3, 2, 4, 4, 0, 7] {
+            assert_eq!(
+                indexed.claim(name_hash),
+                scan_claim(name_hash),
+                "claim({name_hash})"
+            );
+        }
+        assert_eq!(
+            indexed.unclaimed().collect::<Vec<_>>(),
+            scanned
+                .iter()
+                .filter_map(|entry| entry.map(|(node, _)| node))
+                .collect::<Vec<_>>()
+        );
+    }
 }
