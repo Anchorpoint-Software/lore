@@ -1656,4 +1656,249 @@ mod tests {
             .await
             .expect("Test task failed");
     }
+
+    /// How the targets given to one `stage` call are handed to it.
+    enum TargetDelivery {
+        /// Every target in one call, which resolves them concurrently and
+        /// collects them in completion order.
+        Together,
+        /// One target per call, which leaves a single resolution in flight and
+        /// so cannot reorder anything.
+        OneAtATime,
+    }
+
+    /// Every file node reachable from the root as `path size flags`, sorted, as
+    /// the tree the staging arrived at.
+    ///
+    /// Size and flags are what make this an assertion rather than a listing: the
+    /// seed commit already put every path in the tree, so a staging that reached
+    /// fewer targets than it should still names them all, and only the edit it
+    /// failed to take up tells the two apart.
+    async fn staged_file_listing(
+        repository: Arc<RepositoryContext>,
+        state: Arc<state::State>,
+    ) -> Vec<String> {
+        let mut found = Vec::new();
+        let mut stack = vec![(node::ROOT_NODE, String::new())];
+        while let Some((parent, prefix)) = stack.pop() {
+            let children = state
+                .node_children(repository.clone(), parent)
+                .await
+                .expect("Failed to read children");
+            for child in children {
+                let name = state
+                    .node_name_clone(repository.clone(), child)
+                    .await
+                    .expect("Failed to read a node name");
+                let path = if prefix.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{prefix}/{name}")
+                };
+                let node = state
+                    .node(repository.clone(), child)
+                    .await
+                    .expect("Failed to read a node");
+                if node.is_directory() {
+                    stack.push((child, path));
+                } else {
+                    found.push(format!("{path} {} {:#x}", node.size, node.flags));
+                }
+            }
+        }
+        found.sort();
+        found
+    }
+
+    /// Seed a repository, commit it, dirty an edit under each target, then stage
+    /// the targets the given way and return the tree it produced.
+    ///
+    /// The targets are three directories and a loose file, so one list covers
+    /// both resolution results: a directory resolves to its dirty descendants,
+    /// the file resolves to itself.
+    async fn stage_targets_and_list(
+        immutable_store: Arc<dyn lore_storage::immutable_store::ImmutableStore>,
+        mutable_store: Arc<dyn lore_storage::mutable_store::MutableStore>,
+        delivery: TargetDelivery,
+    ) -> Vec<String> {
+        let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+        let tempdir = generate_tempdir();
+        let path = tempdir.to_path_buf();
+        std::fs::create_dir_all(path.as_path()).expect("Create directory failed");
+        let default_branch_id = Context::from(uuid::Uuid::now_v7());
+        let write_token = repository::RepositoryWriteToken::acquire(path.as_path()).await;
+        let created_repo = repository::create_local(
+            path.as_path(),
+            &write_token,
+            repository_id,
+            default_branch_id,
+            branch::DEFAULT_DEFAULT_NAME.to_string(),
+            repository::RepositoryConfig::default(),
+            false,
+        )
+        .await
+        .expect("Failed to initialize repository");
+
+        let repository = Arc::new(
+            RepositoryContext::new(
+                default_repository_creation_args(immutable_store, mutable_store)
+                    .with_path(&path)
+                    .with_id(repository_id)
+                    .with_instance_id(created_repo.instance_id),
+            )
+            .with_write_token(write_token.share()),
+        );
+
+        lore_revision::instance::store_current_anchor_branch(&repository, default_branch_id)
+            .await
+            .expect("Failed to store anchor branch");
+
+        let directories = ["alpha", "beta", "gamma"];
+        for directory in directories {
+            std::fs::create_dir(path.as_path().join(directory)).expect("Create directory failed");
+            for name in ["one.file", "two.file"] {
+                let mut file = std::fs::File::create(path.as_path().join(directory).join(name))
+                    .expect("Failed to create test file");
+                file.write_all(b"seed").expect("Failed to write test file");
+            }
+        }
+        let mut loose =
+            std::fs::File::create(path.as_path().join("root.file")).expect("Failed to create");
+        loose.write_all(b"seed").expect("Failed to write");
+
+        let scan_options = StageOptions {
+            case_change: stage::StageCaseChange::Error,
+            node_flags: NodeFlags::NoFlags,
+            file_id: None,
+            no_children: false,
+            scan: true,
+        };
+        Box::pin(file::stage::stage(
+            repository.clone(),
+            &write_token,
+            LoreArray::from_vec(vec![LoreString::from(&path)]),
+            scan_options,
+        ))
+        .await
+        .expect("Failed to stage the seed tree");
+        Box::pin(commit::commit(
+            repository.clone(),
+            &write_token,
+            CommitOptions {
+                message: String::new(),
+                link_messages: std::collections::HashMap::new(),
+                link: None,
+                layer_messages: std::collections::HashMap::new(),
+                layer: None,
+                stats: false,
+            },
+        ))
+        .await
+        .expect("Failed to commit the seed tree");
+
+        let mut edited = Vec::new();
+        for directory in directories {
+            let edit = path.as_path().join(directory).join("one.file");
+            let mut file = std::fs::File::create(edit.as_path()).expect("Failed to reopen");
+            file.write_all(b"edited").expect("Failed to write");
+            edited.push(LoreString::from(&edit));
+        }
+        let loose_edit = path.as_path().join("root.file");
+        let mut file = std::fs::File::create(loose_edit.as_path()).expect("Failed to reopen");
+        file.write_all(b"edited").expect("Failed to write");
+        edited.push(LoreString::from(&loose_edit));
+
+        file::dirty::dirty(repository.clone(), LoreArray::from_vec(edited))
+            .await
+            .expect("Failed to mark the edits dirty");
+
+        let mut targets: Vec<LoreString> = directories
+            .iter()
+            .map(|directory| LoreString::from(&path.as_path().join(directory)))
+            .collect();
+        targets.push(LoreString::from(&loose_edit));
+
+        let stage_options = StageOptions {
+            case_change: stage::StageCaseChange::Error,
+            node_flags: NodeFlags::NoFlags,
+            file_id: None,
+            no_children: false,
+            scan: false,
+        };
+        let signature = match delivery {
+            TargetDelivery::Together => Box::pin(file::stage::stage(
+                repository.clone(),
+                &write_token,
+                LoreArray::from_vec(targets),
+                stage_options,
+            ))
+            .await
+            .expect("Failed to stage the targets together"),
+            TargetDelivery::OneAtATime => {
+                let mut last = None;
+                for target in targets {
+                    last = Some(
+                        Box::pin(file::stage::stage(
+                            repository.clone(),
+                            &write_token,
+                            LoreArray::from_vec(vec![target]),
+                            stage_options,
+                        ))
+                        .await
+                        .expect("Failed to stage a target"),
+                    );
+                }
+                last.expect("No target was staged")
+            }
+        };
+
+        let staged = state::State::deserialize(repository.clone(), signature)
+            .await
+            .expect("Failed to deserialize the staged state");
+        let listed = staged_file_listing(repository.clone(), staged).await;
+        let _ = std::fs::remove_dir_all(path.as_path());
+        listed
+    }
+
+    /// Resolution collects targets in completion order, and only the antichain
+    /// built from them decides what the walk covers. A target list resolved all at
+    /// once must therefore reach the tree it reaches when one resolution is ever
+    /// in flight.
+    ///
+    /// What that catches is a result lost or left unreaped once several are in
+    /// flight, which no other test sees: reaping one task instead of draining
+    /// stages the first target and leaves the rest at their committed contents.
+    #[tokio::test]
+    async fn targets_staged_together_reach_the_same_tree_as_one_at_a_time() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let together = stage_targets_and_list(
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    TargetDelivery::Together,
+                )
+                .await;
+                let one_at_a_time = stage_targets_and_list(
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    TargetDelivery::OneAtATime,
+                )
+                .await;
+
+                assert!(
+                    !together.is_empty(),
+                    "the fixture must stage something for the comparison to mean anything"
+                );
+                assert_eq!(
+                    together, one_at_a_time,
+                    "targets resolved at once must reach the same tree as targets resolved singly"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
 }

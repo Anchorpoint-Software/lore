@@ -49,6 +49,12 @@ use crate::util::path::shared_component_depth;
 /// task state is not free.
 const MAX_PRECREATE_TASKS: usize = 1000;
 
+/// Targets resolved at once. A targets file can name a million paths, and
+/// spawning one task each before any of them runs costs the task state for all
+/// of them up front. Above the block permits the resolutions contend for, so the
+/// permits and not this bound are what limit concurrent block loads.
+const MAX_RESOLVE_TASKS: usize = 1000;
+
 /// The node of each shared ancestor already created, borrowed from the list they
 /// are created from.
 type AncestorNodes<'a> = std::collections::HashMap<&'a str, crate::node::NodeID>;
@@ -204,7 +210,7 @@ async fn stage_into_single_layer(
     layer: &crate::layer::Layer,
     layer_state: &crate::layer::LayerState,
     parent_repository: Arc<RepositoryContext>,
-    remain: &str,
+    remain: RelativePath,
     stats: Arc<StageStats>,
     options: StageOptions,
 ) -> Result<(), StageError> {
@@ -212,11 +218,6 @@ async fn stage_into_single_layer(
 
     let layer_relative_path = RelativePathBuf::new_from_initial_path(&layer.source_path)
         .forward::<StageError>("Failed to construct layer relative path")?;
-    let remain_relative_path = if remain.is_empty() {
-        RelativePath::new()
-    } else {
-        RelativePath::new_from_initial_path(remain).unwrap_or_default()
-    };
 
     // TODO(mjansson): If this has gone past a link into a subrepository, we
     // need to stage the link node and upwards in the layer repository. The base
@@ -241,7 +242,7 @@ async fn stage_into_single_layer(
         "Staging path in layer {}: {} / {}",
         layer.target_path,
         layer.source_path,
-        remain_relative_path
+        remain
     );
 
     lore_spawn!(
@@ -252,7 +253,7 @@ async fn stage_into_single_layer(
             absolute_path,
             layer_relative_path,
             layer_staged_node.node,
-            remain_relative_path,
+            remain,
             stats,
             options,
             None, // No link tracking in layer staging
@@ -264,8 +265,12 @@ async fn stage_into_single_layer(
     Ok(())
 }
 
-async fn try_stage_path(
-    repository: Arc<RepositoryContext>,
+/// Normalize a path as given into one relative to the repository root.
+///
+/// A path that does not land inside the repository is reported ignored and
+/// yields nothing, so a caller that skips it has already told the user why.
+async fn normalize_stage_path(
+    repository: &Arc<RepositoryContext>,
     path: &LoreString,
 ) -> Option<RelativePath> {
     let repository_path = repository.require_path().ok()?;
@@ -349,49 +354,18 @@ pub async fn stage(
         .map(|paths| paths.iter().map(String::as_str).collect())
         .unwrap_or_default();
 
-    let mut main_targets: Vec<RelativePath> = Vec::new();
-    let mut layer_jobs: Vec<(usize, String)> = Vec::new();
-    let mut staged_layers: Vec<usize> = Vec::new();
-
-    for path in paths.as_slice().iter() {
-        let Some(relative_path) = try_stage_path(repository.clone(), path).await else {
-            continue;
-        };
-
-        match classify_stage_path(relative_path.as_str(), &layer_target_refs) {
-            LayerRoute::Inside {
-                layer_index,
-                remain,
-            } => {
-                layer_jobs.push((layer_index, remain));
-                staged_layers.push(layer_index);
-            }
-            LayerRoute::AncestorOf { layer_indices } => {
-                let expanded =
-                    expand_stage_target(repository.clone(), state.clone(), relative_path, options)
-                        .await?;
-                main_targets.extend(expanded);
-                for layer_index in layer_indices {
-                    layer_jobs.push((layer_index, String::new()));
-                    staged_layers.push(layer_index);
-                }
-            }
-            LayerRoute::Disjoint => {
-                let expanded =
-                    expand_stage_target(repository.clone(), state.clone(), relative_path, options)
-                        .await?;
-                main_targets.extend(expanded);
-            }
-        }
-    }
+    let RoutedTargets {
+        current_repository_paths,
+        layer_paths,
+    } = route_and_resolve_targets(&repository, &state, &paths, &layer_target_refs, options).await?;
 
     // A root target covers the whole tree; otherwise collapse overlaps so a
     // parent target subsumes anything that would be staged beneath it.
-    let stage_root = main_targets.iter().any(|p| p.is_empty());
+    let stage_root = current_repository_paths.iter().any(|p| p.is_empty());
     let antichain: Vec<RelativePath> = if stage_root {
         vec![RelativePath::new()]
     } else {
-        RelativePath::dedup_to_supersets(main_targets)
+        RelativePath::dedup_to_supersets(current_repository_paths)
     };
     let antichain_len = antichain.len();
 
@@ -543,9 +517,15 @@ pub async fn stage(
     }
     let main_count = antichain_len + precreate_count;
 
+    // A layer may be targeted by several paths; serialize each only once.
+    let staged_layers: std::collections::BTreeSet<usize> = layer_paths
+        .iter()
+        .map(|(layer_index, _)| *layer_index)
+        .collect();
+
     if failure.is_none() {
-        for (layer_index, remain) in &layer_jobs {
-            let (layer, layer_state) = &layers[*layer_index];
+        for (layer_index, remain) in layer_paths {
+            let (layer, layer_state) = &layers[layer_index];
             if let Err(err) = stage_into_single_layer(
                 &mut tasks,
                 layer,
@@ -594,12 +574,9 @@ pub async fn stage(
         return Err(err);
     }
 
-    // A layer may be targeted by several paths; serialize each only once.
-    staged_layers.sort_unstable();
-    staged_layers.dedup();
     let layer_staged: Vec<_> = staged_layers
-        .iter()
-        .map(|&i| (&layers[i].0, &layers[i].1))
+        .into_iter()
+        .map(|layer_index| (&layers[layer_index].0, &layers[layer_index].1))
         .collect();
 
     let count = LoreFileStageCountData::new(stats.clone());
@@ -720,21 +697,157 @@ pub async fn stage(
     Ok(staged_revision)
 }
 
+/// What a stage target list resolved to.
+struct RoutedTargets {
+    /// Paths to walk in the current repository.
+    current_repository_paths: Vec<RelativePath>,
+    /// Layer index, and the path relative to that layer's mount. An empty path
+    /// stages the layer's whole subtree.
+    ///
+    /// Ordered by input, so the failure reported when several layers fail is the
+    /// one belonging to the earliest target given.
+    layer_paths: Vec<(usize, RelativePath)>,
+}
+
+/// Route each of `paths` through the configured layers and resolve what it
+/// stages.
+///
+/// A path inside a layer belongs to that layer alone and resolves to nothing
+/// here. A path a layer sits under takes the layers below it and resolves as
+/// well. A path disjoint from every layer only resolves.
+///
+/// Resolving one is a tree lookup per component with no shared state, so the
+/// whole list resolves at once, bounded by [`MAX_RESOLVE_TASKS`]. Routing stays
+/// in the loop instead: it is string work against the layer mounts, and it
+/// appends to lists a task would need a lock to reach. The resolved paths need
+/// no order, since the caller collapses them into a sorted antichain, and their
+/// list is sized by the input count, most targets resolving to themselves.
+///
+/// A failure is the first to land rather than the first in input order, and does
+/// not return until every resolution in flight has finished, since each is
+/// reading state it has to finish reading.
+async fn route_and_resolve_targets(
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    paths: &LoreArray<LoreString>,
+    layer_target_refs: &[&str],
+    options: StageOptions,
+) -> Result<RoutedTargets, StageError> {
+    let mut routed = RoutedTargets {
+        current_repository_paths: Vec::with_capacity(paths.len()),
+        layer_paths: Vec::new(),
+    };
+    let mut resolve_tasks: JoinSet<Result<ResolvedTarget, StageError>> = JoinSet::new();
+    let mut failure: Option<StageError> = None;
+
+    for path in paths.as_slice().iter() {
+        if failure.is_some() {
+            break;
+        }
+        let Some(relative_path) = normalize_stage_path(repository, path).await else {
+            continue;
+        };
+
+        match classify_stage_path(relative_path.as_str(), layer_target_refs) {
+            LayerRoute::Inside {
+                layer_index,
+                remain,
+            } => {
+                routed.layer_paths.push((layer_index, remain));
+                continue;
+            }
+            LayerRoute::AncestorOf { layer_indices } => {
+                for layer_index in layer_indices {
+                    routed.layer_paths.push((layer_index, RelativePath::new()));
+                }
+            }
+            LayerRoute::Disjoint => {}
+        }
+
+        let task_repository = repository.clone();
+        let task_state = state.clone();
+        lore_spawn!(resolve_tasks, async move {
+            resolve_stage_target(task_repository, task_state, relative_path, options).await
+        });
+        while let Some(joined) = resolve_tasks.try_join_next() {
+            collect_resolved(joined, &mut routed.current_repository_paths, &mut failure);
+        }
+        while resolve_tasks.len() >= MAX_RESOLVE_TASKS
+            && let Some(joined) = resolve_tasks.join_next().await
+        {
+            collect_resolved(joined, &mut routed.current_repository_paths, &mut failure);
+        }
+    }
+
+    while let Some(joined) = resolve_tasks.join_next().await {
+        collect_resolved(joined, &mut routed.current_repository_paths, &mut failure);
+    }
+    match failure {
+        Some(err) => Err(err),
+        None => Ok(routed),
+    }
+}
+
+/// What one stage target resolves to.
+///
+/// A target that is not a directory being descended - a single file, a `scan`
+/// target, a path with no node - resolves to itself, and a targets file is
+/// mostly those. Naming that case keeps the common result off the heap.
+enum ResolvedTarget {
+    Single(RelativePath),
+    Multiple(Vec<RelativePath>),
+}
+
+impl ResolvedTarget {
+    fn collect_into(self, targets: &mut Vec<RelativePath>) {
+        match self {
+            ResolvedTarget::Single(path) => targets.push(path),
+            ResolvedTarget::Multiple(paths) => targets.extend(paths),
+        }
+    }
+}
+
+/// Fold one finished target resolution into the target list, keeping the first
+/// error rather than propagating it - the caller has to drain the rest either
+/// way, since a resolution in flight is reading state it has to finish reading.
+fn collect_resolved(
+    joined: Result<Result<ResolvedTarget, StageError>, tokio::task::JoinError>,
+    targets: &mut Vec<RelativePath>,
+    failure: &mut Option<StageError>,
+) {
+    match joined {
+        Ok(Ok(resolved)) => resolved.collect_into(targets),
+        Ok(Err(err)) => {
+            if failure.is_none() {
+                *failure = Some(err);
+            }
+        }
+        Err(err) => {
+            if failure.is_none() {
+                *failure = Some(StageError::internal_with_context(
+                    err,
+                    "Failed to join target resolution task",
+                ));
+            }
+        }
+    }
+}
+
 /// Resolve `relative_path` to the concrete set of repository-relative paths to
-/// stage. Without `scan`, a directory expands to its dirty descendants (empty
-/// when none); `scan`, single files, and unresolved paths expand to the path
+/// stage. Without `scan`, a directory resolves to its dirty descendants (empty
+/// when none); `scan`, single files, and paths with no node resolve to the path
 /// itself.
 ///
 /// `find_node_link` follows link mounts transparently — a crossed link is read
 /// from the state that owns it, otherwise a colliding block at the same
 /// coordinates in the parent state would misclassify the target. The returned
 /// paths stay parent-relative, since the filesystem walk traverses links itself.
-async fn expand_stage_target(
+async fn resolve_stage_target(
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
     relative_path: RelativePath,
     options: StageOptions,
-) -> Result<Vec<RelativePath>, StageError> {
+) -> Result<ResolvedTarget, StageError> {
     if !options.scan {
         let resolved: Option<(
             Arc<State>,
@@ -785,11 +898,11 @@ async fn expand_stage_target(
                 )
                 .await
                 .forward::<StageError>("Failed to collect dirty paths")?;
-            return Ok(dirty_paths);
+            return Ok(ResolvedTarget::Multiple(dirty_paths));
         }
     }
 
-    Ok(vec![relative_path])
+    Ok(ResolvedTarget::Single(relative_path))
 }
 
 /// Recursively mark all children of a directory node as moved.
@@ -876,7 +989,7 @@ pub async fn stage_merge(
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(500));
     let stats = Arc::new(StageStats::default());
     for path in paths.as_slice() {
-        let Some(relative_path) = try_stage_path(repository.clone(), path).await else {
+        let Some(relative_path) = normalize_stage_path(&repository, path).await else {
             continue;
         };
 
@@ -1313,10 +1426,15 @@ pub async fn stage_move(
 /// to the parent only.
 ///
 /// Layer indices refer into the slice passed to [`classify_stage_path`].
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub(crate) enum LayerRoute {
-    Inside { layer_index: usize, remain: String },
-    AncestorOf { layer_indices: Vec<usize> },
+    Inside {
+        layer_index: usize,
+        remain: RelativePath,
+    },
+    AncestorOf {
+        layer_indices: Vec<usize>,
+    },
     Disjoint,
 }
 
@@ -1341,7 +1459,7 @@ pub(crate) fn classify_stage_path(relative_path: &str, layer_target_paths: &[&st
         if relative_path == *target {
             return LayerRoute::Inside {
                 layer_index: i,
-                remain: String::new(),
+                remain: RelativePath::new(),
             };
         }
         if let Some(rest) = relative_path.strip_prefix(target)
@@ -1349,7 +1467,7 @@ pub(crate) fn classify_stage_path(relative_path: &str, layer_target_paths: &[&st
         {
             return LayerRoute::Inside {
                 layer_index: i,
-                remain: rest[1..].to_string(),
+                remain: RelativePath::new_from_clean_parts(&rest[1..], ""),
             };
         }
     }
@@ -1702,7 +1820,7 @@ mod classify_tests {
             classify_stage_path("external/lib", &layers),
             LayerRoute::Inside {
                 layer_index: 0,
-                remain: String::new(),
+                remain: RelativePath::new(),
             }
         );
     }
@@ -1714,7 +1832,7 @@ mod classify_tests {
             classify_stage_path("external/lib/src/foo.rs", &layers),
             LayerRoute::Inside {
                 layer_index: 0,
-                remain: "src/foo.rs".into(),
+                remain: RelativePath::new_from_clean_parts("src/foo.rs", ""),
             }
         );
     }
