@@ -1173,11 +1173,16 @@ struct DirectoryChildren {
 }
 
 impl DirectoryChildren {
-    /// `node` in sibling order, and a `(name hash, index into `node`)` pair for
-    /// every child, in any order.
-    fn new(node: Vec<NodeID>, mut by_name_hash: Vec<(u64, u32)>) -> Self {
-        debug_assert_eq!(node.len(), by_name_hash.len());
+    /// The children of a directory node in sibling order, with the name hash
+    /// each of them carries.
+    fn new(child: Vec<(NodeID, u64)>) -> Self {
+        let mut by_name_hash: Vec<(u64, u32)> = child
+            .iter()
+            .enumerate()
+            .map(|(index, &(_, name_hash))| (name_hash, index as u32))
+            .collect();
         by_name_hash.sort_unstable();
+        let node = child.into_iter().map(|(node, _)| node).collect();
         Self { node, by_name_hash }
     }
 
@@ -1233,30 +1238,12 @@ pub(crate) async fn stage_directory(
     link_tracker: Option<Arc<crate::link::LinkTracker>>,
     layer_mask: Option<Arc<Vec<String>>>,
 ) -> Result<(), StageError> {
-    let child_node = state
-        .node_children(repository.clone(), directory_node)
-        .await
-        .forward::<StageError>("Failed to list directory node children")?;
-
-    let mut current_block_index = 0;
-    let mut current_block = state
-        .block(repository.clone(), current_block_index)
-        .await
-        .forward::<StageError>("Failed deserializing state node block")?;
-    let mut child_name_hash = Vec::with_capacity(child_node.len());
-    for (index, child) in child_node.iter().enumerate() {
-        let block_index = NodeBlock::index(*child);
-        let node_index = Node::index(*child);
-        if block_index != current_block_index {
-            current_block_index = block_index;
-            current_block = state
-                .block(repository.clone(), block_index)
-                .await
-                .forward::<StageError>("Failed deserializing state node block")?;
-        }
-        child_name_hash.push((current_block.node(node_index).name_hash, index as u32));
-    }
-    let mut children = DirectoryChildren::new(child_node, child_name_hash);
+    let mut children = DirectoryChildren::new(
+        state
+            .node_children_with_name_hash(repository.clone(), directory_node)
+            .await
+            .forward::<StageError>("Failed to list directory node children")?,
+    );
 
     let mut file_list = util::fs::list_directory(absolute_path.to_path_buf())
         .await
@@ -3347,14 +3334,7 @@ mod directory_children_tests {
 
     /// The children in sibling order, as `stage_directory` indexes them.
     fn children(entries: &[(NodeID, u64)]) -> DirectoryChildren {
-        DirectoryChildren::new(
-            entries.iter().map(|&(node, _)| node).collect(),
-            entries
-                .iter()
-                .enumerate()
-                .map(|(index, &(_, hash))| (hash, index as u32))
-                .collect(),
-        )
+        DirectoryChildren::new(entries.to_vec())
     }
 
     #[test]
@@ -3388,15 +3368,27 @@ mod directory_children_tests {
         assert_eq!(children.claim(0xAA), None);
     }
 
-    /// The index is ordered by hash and then by position, so sibling order
-    /// decides a tie whatever order the pairs were handed over in.
+    /// A run of children sharing a hash, wide enough that a sort keyed on the
+    /// hash alone reorders it.
+    fn wide_runs_of_equal_hashes() -> Vec<(NodeID, u64)> {
+        (0..64u64)
+            .map(|index| (index as NodeID + 100, index % 3))
+            .collect()
+    }
+
+    /// The index keys on the sibling position as well as the hash, so a run of
+    /// equal hashes carries no ties for the sort to order as it likes.
     #[test]
-    fn a_tie_is_claimed_in_sibling_order_however_it_was_indexed() {
-        let mut children =
-            DirectoryChildren::new(vec![10, 11, 12], vec![(0xAA, 2), (0xAA, 0), (0xAA, 1)]);
-        assert_eq!(children.claim(0xAA), Some(10));
-        assert_eq!(children.claim(0xAA), Some(11));
-        assert_eq!(children.claim(0xAA), Some(12));
+    fn the_index_leaves_no_ties_among_equal_hashes() {
+        let children = children(&wide_runs_of_equal_hashes());
+        assert!(
+            children
+                .by_name_hash
+                .windows(2)
+                .all(|pair| pair[0] < pair[1]),
+            "the index must be strictly ordered: {:?}",
+            children.by_name_hash
+        );
     }
 
     #[test]
@@ -3414,32 +3406,34 @@ mod directory_children_tests {
         assert_eq!(children.unclaimed().count(), 0);
     }
 
+    /// The first child carrying `name_hash` that nothing has taken, taken, found
+    /// by scanning `scanned` in sibling order.
+    fn scan_claim(scanned: &mut [Option<(NodeID, u64)>], name_hash: u64) -> Option<NodeID> {
+        let position = scanned
+            .iter()
+            .position(|entry| entry.is_some_and(|(_, hash)| hash == name_hash))?;
+        scanned[position].take().map(|(node, _)| node)
+    }
+
     /// The index has to agree with a scan of the same children on every input,
     /// not just the ones written out above: same children, same sequence of
     /// claims, same answers and same leftovers.
+    ///
+    /// The claims cover every hash the children hold and two they do not, each
+    /// asked for more times than the children can answer, so duplicates, misses
+    /// and exhausted runs all occur.
     #[test]
     fn the_index_answers_exactly_as_a_scan_of_the_same_children_would() {
-        // A handful of hashes over a wider set of children, so duplicates,
-        // misses and exhausted runs all occur.
-        let entries: Vec<(NodeID, u64)> = (0..32u64)
-            .map(|index| (index as NodeID + 100, index % 5))
-            .collect();
+        let entries = wide_runs_of_equal_hashes();
         let mut indexed = children(&entries);
-
-        // The scan: the first child with this hash that has not been taken.
         let mut scanned: Vec<Option<(NodeID, u64)>> = entries.iter().copied().map(Some).collect();
-        let mut scan_claim = |name_hash: u64| -> Option<NodeID> {
-            let position = scanned
-                .iter()
-                .position(|entry| entry.is_some_and(|(_, hash)| hash == name_hash))?;
-            scanned[position].take().map(|(node, _)| node)
-        };
 
-        for name_hash in [0, 3, 3, 1, 3, 9, 0, 3, 3, 3, 3, 2, 4, 4, 0, 7] {
+        for step in 0..160u64 {
+            let name_hash = (step * 7) % 5;
             assert_eq!(
                 indexed.claim(name_hash),
-                scan_claim(name_hash),
-                "claim({name_hash})"
+                scan_claim(&mut scanned, name_hash),
+                "claim({name_hash}) at step {step}"
             );
         }
         assert_eq!(

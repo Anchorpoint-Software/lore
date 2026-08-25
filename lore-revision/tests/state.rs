@@ -575,6 +575,88 @@ mod tests {
             .unwrap_or_else(|error| panic!("Failed to add node {name}: {error}"))
     }
 
+    /// The hash comes back from the record the walk read for the child, so it has
+    /// to be the hash of that child's name, for the same children in the same
+    /// order as the walk that reports ids alone.
+    #[tokio::test]
+    async fn children_with_name_hash_report_the_hash_of_every_child_name() {
+        with_state(|repository, state| async move {
+            let names = ["first", "second", "third", "fourth"];
+            for name in names {
+                add_node(&repository, &state, ROOT_NODE, name, NodeFlags::File).await;
+            }
+
+            let children = state
+                .node_children(repository.clone(), ROOT_NODE)
+                .await
+                .expect("Failed to walk the children");
+            let with_name_hash = state
+                .node_children_with_name_hash(repository.clone(), ROOT_NODE)
+                .await
+                .expect("Failed to walk the children with their name hash");
+
+            assert_eq!(
+                with_name_hash
+                    .iter()
+                    .map(|&(node, _)| node)
+                    .collect::<Vec<_>>(),
+                children,
+                "the children and their order must be what the walk without the hash reports"
+            );
+
+            let mut reported: Vec<u64> = with_name_hash.iter().map(|&(_, hash)| hash).collect();
+            reported.sort_unstable();
+            let mut expected: Vec<u64> = names.iter().map(|name| hash_string(name)).collect();
+            expected.sort_unstable();
+            assert_eq!(
+                reported, expected,
+                "every child must report the hash of the name it was added under"
+            );
+        })
+        .await;
+    }
+
+    /// A directory holding more children than one node block takes: the walk
+    /// reads a run of siblings under one lock on the block they share and takes
+    /// the next block where the run ends, which a directory inside a single
+    /// block never reaches.
+    #[tokio::test]
+    async fn children_spanning_node_blocks_are_all_reported_with_their_hash() {
+        with_state(|repository, state| async move {
+            let names: Vec<String> = (0..BLOCK_NODE_COUNT + 64)
+                .map(|index| format!("child-{index}"))
+                .collect();
+            let mut added: Vec<(NodeID, u64)> = Vec::with_capacity(names.len());
+            for name in &names {
+                let node = add_node(&repository, &state, ROOT_NODE, name, NodeFlags::File).await;
+                added.push((node, hash_string(name)));
+            }
+            assert!(
+                state.block_count() > 1,
+                "the children must span more than one node block for this to reach the walk \
+                 that takes the next one"
+            );
+
+            let mut reported = state
+                .node_children_with_name_hash(repository.clone(), ROOT_NODE)
+                .await
+                .expect("Failed to walk the children with their name hash");
+
+            assert_eq!(
+                reported.len(),
+                added.len(),
+                "the walk must report every child, including those past the first block"
+            );
+            reported.sort_unstable();
+            added.sort_unstable();
+            assert_eq!(
+                reported, added,
+                "every child must carry the hash of its own name, whichever block holds it"
+            );
+        })
+        .await;
+    }
+
     /// Reparenting rewrites the chain the node sat in, and the node it is unlinked from
     /// is whichever one points at it: this is the case where that is a sibling rather
     /// than the parent, which the parent's own `child` pointer never exercises.

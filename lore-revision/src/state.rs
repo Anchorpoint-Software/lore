@@ -2905,32 +2905,81 @@ impl State {
         Ok(())
     }
 
-    pub async fn node_children(
+    /// The children of a directory node in sibling order, each taken from the
+    /// record the walk read for it by `extract`.
+    ///
+    /// A run of siblings sharing a block is read under one lock on it.
+    ///
+    /// `extract` runs while that lock is held, so it must not read the block
+    /// again: a second shared lock behind a queued writer deadlocks. A link
+    /// resolves to the children of the node it points at.
+    async fn node_children_map<T, F>(
         &self,
         repository: Arc<RepositoryContext>,
         node: NodeID,
-    ) -> Result<Vec<NodeID>, StateError> {
+        extract: F,
+    ) -> Result<Vec<T>, StateError>
+    where
+        F: Fn(NodeID, &Node) -> T + Copy,
+    {
         let parent_id = node;
         let node = self.node(repository.clone(), node).await?;
         if node.is_directory() {
             let mut children = vec![];
-            let mut child_node = node.child();
             let mut cycle = SiblingCycleGuard::new(parent_id);
-            while let Some(child_id) = child_node {
-                let child = self.node(repository.clone(), child_id).await?;
-                child.walk_step(child_id, parent_id, &mut cycle)?;
-                children.push(child_id);
-                child_node = child.sibling();
+            let mut child_node = node.child();
+            while let Some(first_in_block) = child_node {
+                let iblock = NodeBlock::index(first_in_block);
+                let block = self.block(repository.clone(), iblock).await?;
+                let reader = block.read();
+                let mut next = Some(first_in_block);
+                while let Some(child_id) = next {
+                    if NodeBlock::index(child_id) != iblock {
+                        break;
+                    }
+                    let child = reader.node(Node::index(child_id));
+                    child.walk_step(child_id, parent_id, &mut cycle)?;
+                    children.push(extract(child_id, child));
+                    next = child.sibling();
+                }
+                child_node = next;
             }
             Ok(children)
         } else if node.is_link() {
             let link = node.linked_node();
             let linked_repository = Arc::new(repository.to_link_context(link.repository).await);
             let link_state = State::deserialize(linked_repository.clone(), link.revision).await?;
-            Box::pin(link_state.node_children(linked_repository.clone(), link.node)).await
+            Box::pin(link_state.node_children_map(linked_repository.clone(), link.node, extract))
+                .await
         } else {
             Ok(vec![])
         }
+    }
+
+    /// The children of a directory node in sibling order.
+    ///
+    /// A link resolves to the children of the node it points at; a node that
+    /// takes no children, such as a file, reports none.
+    pub async fn node_children(
+        &self,
+        repository: Arc<RepositoryContext>,
+        node: NodeID,
+    ) -> Result<Vec<NodeID>, StateError> {
+        self.node_children_map(repository, node, |child_id, _| child_id)
+            .await
+    }
+
+    /// [`Self::node_children`], and the name hash each of them carries, which
+    /// the walk has already read.
+    pub async fn node_children_with_name_hash(
+        &self,
+        repository: Arc<RepositoryContext>,
+        node: NodeID,
+    ) -> Result<Vec<(NodeID, u64)>, StateError> {
+        self.node_children_map(repository, node, |child_id, child| {
+            (child_id, child.name_hash)
+        })
+        .await
     }
 
     pub async fn node_name_clone(
