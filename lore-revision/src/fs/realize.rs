@@ -1114,7 +1114,7 @@ async fn realize_changes_delete(
                 }
             }
 
-            state::file_modified_time_clear(repository.clone(), change.path.as_str()).await;
+            state::file_modified_time_clear(repository.clone(), &change.path).await;
         }
 
         stats.complete.file_delete.fetch_add(1, Ordering::Relaxed);

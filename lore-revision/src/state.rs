@@ -7665,17 +7665,22 @@ async fn stream_matches_file(
     bytes_compared == file_size
 }
 
-pub fn file_modified_time_key(salt: &[u8], instance: InstanceId, path: impl AsRef<str>) -> Hash {
+/// The key a file's modification time is stored under.
+///
+/// The store is case-insensitive over paths, and [`RelativePath`] already carries
+/// the fold, so the key is taken from it rather than folded again. Folding here
+/// would allocate a `String` per file, half a million of them in one scan of a
+/// large tree.
+pub fn file_modified_time_key(salt: &[u8], instance: InstanceId, path: &RelativePath) -> Hash {
     hash::hash_function_args_slice(
         salt,
         FILE_MTIME,
         instance.data(),
-        path.as_ref().to_lowercase().as_bytes(),
+        path.as_lowercase_str().as_bytes(),
     )
 }
 
-pub async fn file_modified_time(repository: Arc<RepositoryContext>, path: impl AsRef<str>) -> u64 {
-    let path = path.as_ref();
+pub async fn file_modified_time(repository: Arc<RepositoryContext>, path: &RelativePath) -> u64 {
     let key = file_modified_time_key(repository.salt(), repository.instance_id, path);
     let mtime = if let Ok(value) = repository
         .read_mutable_store()
@@ -7696,10 +7701,9 @@ pub async fn file_modified_time(repository: Arc<RepositoryContext>, path: impl A
 
 pub async fn file_modified_time_store(
     repository: Arc<RepositoryContext>,
-    path: impl AsRef<str>,
+    path: &RelativePath,
     mtime: u64,
 ) {
-    let path = path.as_ref();
     lore_trace!("Store mtime {mtime} for {path}");
     let Some(handle) = repository.try_write_mutable_store() else {
         return;
@@ -7727,8 +7731,7 @@ pub async fn file_modified_time_store_batch(
     }
 }
 
-pub async fn file_modified_time_clear(repository: Arc<RepositoryContext>, path: impl AsRef<str>) {
-    let path = path.as_ref();
+pub async fn file_modified_time_clear(repository: Arc<RepositoryContext>, path: &RelativePath) {
     lore_trace!("Clear mtime for {path}");
     let Some(handle) = repository.try_write_mutable_store() else {
         return;
@@ -8957,6 +8960,85 @@ mod tests {
         let (_dir, file) = file_holding(b"content").await;
         let mut stream = stream_of(&[]);
         assert!(!stream_matches_file(&mut stream, &file, 7).await);
+    }
+
+    /// The key every stored modification time is filed under. It has to stay the
+    /// digest over the path's own lowercase form, or a scan finds nothing it wrote
+    /// and rehashes every file in the repository.
+    fn mtime_key_reference(salt: &[u8], instance: InstanceId, path: &RelativePath) -> Hash {
+        hash::hash_function_args_slice(
+            salt,
+            FILE_MTIME,
+            instance.data(),
+            path.as_str().to_lowercase().as_bytes(),
+        )
+    }
+
+    /// Taking the fold [`RelativePath`] carries is only the same key as folding the
+    /// path here where the two folds agree, which above ASCII is not free: the
+    /// mapping can change a component's length and can depend on where in a word a
+    /// character falls.
+    #[test]
+    fn the_mtime_key_is_the_digest_over_the_paths_own_lowercase_form() {
+        let salt = b"lore";
+        let instance = InstanceId::default();
+        for name in [
+            "Rock.mesh",
+            "Assets/Meshes/ROCK.MESH",
+            "MIXED_Case-123/PATH/To.TXT",
+            // Above ASCII: a fold that changes the length, one that depends on
+            // position in a word, and one of each across a separator.
+            "\u{0130}stanbul/Map.umap",
+            "\u{039f}\u{0394}\u{039f}\u{03a3}",
+            "\u{039f}\u{0394}\u{039f}\u{03a3}/Stra\u{00df}e/\u{1e9e}.uasset",
+        ] {
+            let path = RelativePath::new_from_initial_path(name).expect("a clean relative path");
+            assert_eq!(
+                file_modified_time_key(salt, instance, &path),
+                mtime_key_reference(salt, instance, &path),
+                "{name:?}"
+            );
+        }
+    }
+
+    /// A path built up a component at a time is what the clone and walk paths hand
+    /// in, and it folds each component as it is appended rather than the whole.
+    #[test]
+    fn a_pushed_path_keys_the_same_as_the_whole_of_it() {
+        let salt = b"lore";
+        let instance = InstanceId::default();
+        let mut buf = RelativePathBuf::new();
+        buf.push("\u{039f}\u{0394}\u{039f}\u{03a3}");
+        buf.push("Stra\u{00df}E");
+        buf.push("\u{0130}.uasset");
+        let pushed = buf.freeze();
+        assert_eq!(
+            file_modified_time_key(salt, instance, &pushed),
+            mtime_key_reference(salt, instance, &pushed)
+        );
+    }
+
+    /// The lowercase form carries offsets of its own, since a fold can change a
+    /// component's byte length, so a path narrowed to a suffix has to key as that
+    /// suffix and not as a window into the wrong one.
+    #[test]
+    fn a_path_narrowed_to_a_suffix_keys_as_that_suffix() {
+        let salt = b"lore";
+        let instance = InstanceId::default();
+        let mut narrowed = RelativePath::new_from_initial_path("\u{0130}\u{0130}/Assets/Rock.mesh")
+            .expect("a clean relative path");
+        narrowed.pop_root();
+        assert_eq!(narrowed.as_str(), "Assets/Rock.mesh");
+        let whole =
+            RelativePath::new_from_initial_path("Assets/Rock.mesh").expect("a clean relative path");
+        assert_eq!(
+            file_modified_time_key(salt, instance, &narrowed),
+            file_modified_time_key(salt, instance, &whole)
+        );
+        assert_eq!(
+            file_modified_time_key(salt, instance, &narrowed),
+            mtime_key_reference(salt, instance, &narrowed)
+        );
     }
 
     #[test]

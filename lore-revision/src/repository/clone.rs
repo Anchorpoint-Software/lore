@@ -2025,7 +2025,7 @@ async fn clone_file(
         let key = state::file_modified_time_key(
             repository.salt(),
             repository.instance_id,
-            relative_path.as_str(),
+            &relative_path,
         );
         let mtime = util::fs::file_mtime(&metadata);
 
