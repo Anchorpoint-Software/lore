@@ -445,6 +445,34 @@ pub async fn filesystem_path(
     find_path: &RelativePath,
     prefixes: Option<&ResolvedPrefixes>,
 ) -> tokio::io::Result<RelativePath> {
+    filesystem_path_and_metadata(base_path, find_path, prefixes)
+        .await
+        .map(|(path, _)| path)
+}
+
+/// The metadata of `path`, stat'ed unless [`filesystem_path_and_metadata`]
+/// already read it while resolving the path. A path the file system does not
+/// hold has none, which is what the callers act on.
+pub async fn metadata_or_stat(
+    resolved: Option<Metadata>,
+    path: impl Into<PathBuf>,
+) -> Option<Metadata> {
+    match resolved {
+        Some(metadata) => Some(metadata),
+        None => lore_io::IoDriver::global().metadata(path).await.ok(),
+    }
+}
+
+/// [`filesystem_path`], and the metadata of the resolved path where establishing
+/// it read that metadata, so a caller needing both reads it once.
+///
+/// `None` where the path was resolved a component at a time, which establishes
+/// each name without reading the metadata of the whole.
+pub async fn filesystem_path_and_metadata(
+    base_path: impl AsRef<Path>,
+    find_path: &RelativePath,
+    prefixes: Option<&ResolvedPrefixes>,
+) -> tokio::io::Result<(RelativePath, Option<std::fs::Metadata>)> {
     let base_path = base_path.as_ref();
 
     // TODO(mjansson): This should be a test for file system case sensitivity, in the sense that the file system
@@ -452,12 +480,8 @@ pub async fn filesystem_path(
     #[cfg(target_os = "linux")]
     {
         let initial_path = base_path.join(find_path.as_str());
-        if lore_io::IoDriver::global()
-            .metadata(initial_path)
-            .await
-            .is_ok()
-        {
-            return Ok(find_path.clone());
+        if let Ok(metadata) = lore_io::IoDriver::global().metadata(initial_path).await {
+            return Ok((find_path.clone(), Some(metadata)));
         }
     }
 
@@ -554,7 +578,7 @@ pub async fn filesystem_path(
         find_path.as_str(),
         base_path.display()
     );
-    Ok(found_path.freeze())
+    Ok((found_path.freeze(), None))
 }
 
 pub fn filesystem_path_fork(
@@ -1197,12 +1221,14 @@ mod tests {
 
         let asked: RelativePath =
             std::str::FromStr::from_str("Assets/Meshes/Rock.mesh").expect("relative path");
+        let (resolved, metadata) = filesystem_path_and_metadata(dir.path(), &asked, None)
+            .await
+            .expect("the path must resolve");
+        assert_eq!(resolved.as_str(), "Assets/Meshes/Rock.mesh");
         assert_eq!(
-            filesystem_path(dir.path(), &asked, None)
-                .await
-                .expect("the path must resolve")
-                .as_str(),
-            "Assets/Meshes/Rock.mesh"
+            metadata.is_some(),
+            cfg!(target_os = "linux"),
+            "the metadata comes back from the platforms that settle the path by reading it whole"
         );
     }
 
@@ -1351,12 +1377,14 @@ mod tests {
 
         let asked: RelativePath =
             std::str::FromStr::from_str("assets/meshes/rock.MESH").expect("relative path");
-        assert_eq!(
-            filesystem_path(dir.path(), &asked, Some(&prefixes))
+        let (resolved, metadata) =
+            filesystem_path_and_metadata(dir.path(), &asked, Some(&prefixes))
                 .await
-                .expect("the path must resolve")
-                .as_str(),
-            "Assets/Meshes/Rock.mesh"
+                .expect("the path must resolve");
+        assert_eq!(resolved.as_str(), "Assets/Meshes/Rock.mesh");
+        assert!(
+            metadata.is_none(),
+            "a path settled a component at a time is never read whole"
         );
     }
 

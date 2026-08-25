@@ -324,17 +324,24 @@ pub(crate) async fn stage_filesystem_path(
 
     // A path the file system does not hold falls back to the one given, which is
     // the delete the not-found branch below stages.
-    let (full_absolute_path, mut relative_path) = if relative_path.is_empty() {
-        (base_absolute_path.clone(), relative_path)
+    let (full_absolute_path, mut relative_path, resolved_metadata) = if relative_path.is_empty() {
+        (base_absolute_path.clone(), relative_path, None)
     } else {
-        let resolved = util::fs::filesystem_path(
+        let resolved = util::fs::filesystem_path_and_metadata(
             base_absolute_path.as_path(),
             &relative_path,
             prefixes.as_deref(),
         )
         .await;
-        let resolved = resolved.unwrap_or(relative_path);
-        (base_absolute_path.join(resolved.as_str()), resolved)
+        let (resolved, resolved_metadata) = match resolved {
+            Ok((resolved, resolved_metadata)) => (resolved, resolved_metadata),
+            Err(_) => (relative_path, None),
+        };
+        (
+            base_absolute_path.join(resolved.as_str()),
+            resolved,
+            resolved_metadata,
+        )
     };
 
     // The filter and the delete lookup below are repository-relative, while
@@ -355,9 +362,7 @@ pub(crate) async fn stage_filesystem_path(
         return Ok(NodeLink::invalid());
     }
 
-    if let Ok(metadata) = lore_io::IoDriver::global()
-        .metadata(&full_absolute_path)
-        .await
+    if let Some(metadata) = util::fs::metadata_or_stat(resolved_metadata, &full_absolute_path).await
     {
         if metadata.is_dir() {
             lore_debug!(
@@ -389,20 +394,26 @@ pub(crate) async fn stage_filesystem_path(
         let mut current_state = state.clone();
 
         while !relative_path.is_empty() {
+            // The final component is the staged path, whose metadata is read above.
+            let is_final_component = relative_path.parent().is_none();
             let current_name = relative_path.pop_root();
             if current_name == "." {
                 continue;
             }
 
-            let current_metadata = lore_io::IoDriver::global()
-                .metadata(current_absolute_path.join(current_name))
-                .await
-                .internal_with(|| {
-                    format!(
-                        "Failed to query file system metadata for path {}",
-                        current_absolute_path.join(current_name).display()
-                    )
-                })?;
+            let current_metadata = if is_final_component {
+                metadata.clone()
+            } else {
+                lore_io::IoDriver::global()
+                    .metadata(current_absolute_path.join(current_name))
+                    .await
+                    .internal_with(|| {
+                        format!(
+                            "Failed to query file system metadata for path {}",
+                            current_absolute_path.join(current_name).display()
+                        )
+                    })?
+            };
 
             let node_link = stage_node_from_metadata(
                 current_repository.clone(),
