@@ -1331,6 +1331,34 @@ mod tests {
         );
     }
 
+    /// Two names differing only in case that the tree holds neither of: the
+    /// first stages as a new child, and the second has to find the child the
+    /// first one linked in, which is ahead of the listing the walk holds.
+    ///
+    /// Whichever of the two the walk reaches first creates it, so the second is
+    /// refused either way, unlike a scenario where the tree already holds one of
+    /// the names and the order decides which entry the mismatch falls to.
+    #[tokio::test]
+    #[allow(clippy::large_futures)]
+    async fn stage_case_of_two_variations_neither_already_in_the_tree() {
+        let outcome = stage_case_scenario_with_scan(
+            &["Assets/other.file"],
+            &["Assets/other.file", "Assets/Rock.mesh", "Assets/rock.mesh"],
+            &["Assets"],
+            stage::StageCaseChange::Error,
+            true,
+        )
+        .await;
+
+        let both_variations_on_disk = outcome.filesystem.len() == 3;
+        assert_eq!(
+            outcome.staged, !both_variations_on_disk,
+            "the second of two case variations must find the child the first one added, \
+             fs={:?} tree={:?}",
+            outcome.filesystem, outcome.tree
+        );
+    }
+
     /// `Keep` treats the difference as unintended and puts the file system back
     /// to what the tree holds, leaving the tree as it was.
     #[tokio::test]

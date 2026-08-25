@@ -616,6 +616,134 @@ mod tests {
         .await;
     }
 
+    /// A child is prepended, so the search for what was linked in since a head
+    /// was seen covers everything ahead of that head and stops there: it finds
+    /// the new children and never the ones the caller already holds.
+    #[tokio::test]
+    async fn a_search_since_a_head_covers_what_was_linked_in_ahead_of_it() {
+        with_state(|repository, state| async move {
+            let held = add_node(&repository, &state, ROOT_NODE, "held", NodeFlags::File).await;
+            let added = add_node(&repository, &state, ROOT_NODE, "added", NodeFlags::File).await;
+
+            let since_held = |name: &str| {
+                let repository = repository.clone();
+                let state = state.clone();
+                let name_hash = hash_string(name);
+                async move {
+                    state
+                        .find_subnode_added_since(repository, ROOT_NODE, Some(held), name_hash)
+                        .await
+                        .expect("Failed to search the children added since")
+                }
+            };
+
+            assert_eq!(
+                since_held("added").await,
+                Some(added),
+                "a child linked in after the head was seen is ahead of it"
+            );
+            assert_eq!(
+                since_held("held").await,
+                None,
+                "the head itself is where the search stops, so what it holds is not reported"
+            );
+            assert_eq!(
+                since_held("never").await,
+                None,
+                "a name no child carries is not reported"
+            );
+            assert_eq!(
+                state
+                    .find_subnode_added_since(
+                        repository.clone(),
+                        ROOT_NODE,
+                        None,
+                        hash_string("held")
+                    )
+                    .await
+                    .expect("Failed to search the children added since"),
+                Some(held),
+                "a caller holding no children has the whole chain searched"
+            );
+        })
+        .await;
+    }
+
+    /// Children linked in since a head was seen that do not all fit in the block
+    /// that head sits in: the search crosses into the block it started from and
+    /// only then reaches the head it stops at.
+    #[tokio::test]
+    async fn a_search_since_a_head_crosses_blocks_before_it_reaches_the_head() {
+        with_state(|repository, state| async move {
+            let mut head = ROOT_NODE;
+            for index in 0..BLOCK_NODE_COUNT - 64 {
+                head = add_node(
+                    &repository,
+                    &state,
+                    ROOT_NODE,
+                    &format!("held-{index:05}"),
+                    NodeFlags::File,
+                )
+                .await;
+            }
+            let mut added = Vec::new();
+            for index in 0..128 {
+                added.push(
+                    add_node(
+                        &repository,
+                        &state,
+                        ROOT_NODE,
+                        &format!("added-{index:05}"),
+                        NodeFlags::File,
+                    )
+                    .await,
+                );
+            }
+            assert!(
+                state.block_count() > 1,
+                "the children added since must reach past the block the head sits in"
+            );
+
+            let since_head = |name: String| {
+                let repository = repository.clone();
+                let state = state.clone();
+                async move {
+                    state
+                        .find_subnode_added_since(
+                            repository,
+                            ROOT_NODE,
+                            Some(head),
+                            hash_string(&name),
+                        )
+                        .await
+                        .expect("Failed to search the children added since")
+                }
+            };
+
+            assert_eq!(
+                since_head("added-00127".to_string()).await,
+                added.last().copied(),
+                "the child linked in last heads the chain"
+            );
+            assert_eq!(
+                since_head("added-00000".to_string()).await,
+                added.first().copied(),
+                "a child linked in before the block boundary is still reached"
+            );
+            assert_eq!(
+                since_head(format!("held-{:05}", BLOCK_NODE_COUNT - 65)).await,
+                None,
+                "the head is where the search stops"
+            );
+            assert_eq!(
+                since_head("held-00000".to_string()).await,
+                None,
+                "nothing behind the head is reached"
+            );
+        })
+        .await;
+    }
+
     /// A directory holding more children than one node block takes: the walk
     /// reads a run of siblings under one lock on the block they share and takes
     /// the next block where the run ends, which a directory inside a single

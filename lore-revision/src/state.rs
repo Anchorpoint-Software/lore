@@ -1955,6 +1955,13 @@ impl State {
     ///
     /// Slot allocation is serialized per tree by a single permit, so concurrent
     /// adds overlap only in the initialize and publish that follow it.
+    ///
+    /// The publish **prepends**, and that is relied on rather than incidental: a
+    /// caller holding a chain it walked earlier knows everything linked since
+    /// lies ahead of the head it saw, which is what
+    /// [`Self::find_subnode_added_since`] walks to. Appending instead would put
+    /// a new child past the end of what such a caller holds, and it would stop
+    /// finding them.
     pub async fn node_add(
         &self,
         repository: Arc<RepositoryContext>,
@@ -2905,13 +2912,54 @@ impl State {
         Ok(())
     }
 
+    /// The children of `parent`, in sibling order, until `step` answers for one
+    /// of them or `stop_at` heads what is left of the chain.
+    ///
+    /// A run of siblings sharing a block is walked under one lock on it, so
+    /// `step` must not read that block again: a second shared lock behind a
+    /// queued writer deadlocks. `None` where `step` answered for none of them.
+    async fn walk_children<T, F>(
+        &self,
+        repository: Arc<RepositoryContext>,
+        parent_node: NodeID,
+        parent: &Node,
+        stop_at: Option<NodeID>,
+        mut step: F,
+    ) -> Result<Option<T>, StateError>
+    where
+        F: FnMut(NodeID, &Node) -> Option<T>,
+    {
+        let mut cycle = SiblingCycleGuard::new(parent_node);
+        let mut child_node = parent.child();
+        while let Some(first_in_block) = child_node {
+            if Some(first_in_block) == stop_at {
+                return Ok(None);
+            }
+            let iblock = NodeBlock::index(first_in_block);
+            let block = self.block(repository.clone(), iblock).await?;
+            let reader = block.read();
+            let mut next = Some(first_in_block);
+            while let Some(child_id) = next {
+                if Some(child_id) == stop_at || NodeBlock::index(child_id) != iblock {
+                    break;
+                }
+                let child = reader.node(Node::index(child_id));
+                child.walk_step(child_id, parent_node, &mut cycle)?;
+                if let Some(answer) = step(child_id, child) {
+                    return Ok(Some(answer));
+                }
+                next = child.sibling();
+            }
+            child_node = next;
+        }
+        Ok(None)
+    }
+
     /// The children of a directory node in sibling order, each taken from the
     /// record the walk read for it by `extract`.
     ///
-    /// A run of siblings sharing a block is read under one lock on it.
-    ///
-    /// `extract` runs while that lock is held, so it must not read the block
-    /// again: a second shared lock behind a queued writer deadlocks. A link
+    /// `extract` runs under the lock [`Self::walk_children`] holds, so the
+    /// constraint that carries is that it must not read the block again. A link
     /// resolves to the children of the node it points at.
     async fn node_children_map<T, F>(
         &self,
@@ -2926,24 +2974,11 @@ impl State {
         let node = self.node(repository.clone(), node).await?;
         if node.is_directory() {
             let mut children = vec![];
-            let mut cycle = SiblingCycleGuard::new(parent_id);
-            let mut child_node = node.child();
-            while let Some(first_in_block) = child_node {
-                let iblock = NodeBlock::index(first_in_block);
-                let block = self.block(repository.clone(), iblock).await?;
-                let reader = block.read();
-                let mut next = Some(first_in_block);
-                while let Some(child_id) = next {
-                    if NodeBlock::index(child_id) != iblock {
-                        break;
-                    }
-                    let child = reader.node(Node::index(child_id));
-                    child.walk_step(child_id, parent_id, &mut cycle)?;
-                    children.push(extract(child_id, child));
-                    next = child.sibling();
-                }
-                child_node = next;
-            }
+            self.walk_children(repository, parent_id, &node, None, |child_id, child| {
+                children.push(extract(child_id, child));
+                None::<()>
+            })
+            .await?;
             Ok(children)
         } else if node.is_link() {
             let link = node.linked_node();
@@ -2967,6 +3002,34 @@ impl State {
     ) -> Result<Vec<NodeID>, StateError> {
         self.node_children_map(repository, node, |child_id, _| child_id)
             .await
+    }
+
+    /// The first child of `parent_node` carrying `name_hash` among those linked
+    /// into its chain since `known_head` headed it.
+    ///
+    /// A child is prepended, so everything linked since lies ahead of
+    /// `known_head` and the walk stops there rather than covering children the
+    /// caller already holds. `known_head` of `None` walks the whole chain, which
+    /// is what a caller holding no children has to do.
+    pub async fn find_subnode_added_since(
+        &self,
+        repository: Arc<RepositoryContext>,
+        parent_node: NodeID,
+        known_head: Option<NodeID>,
+        name_hash: u64,
+    ) -> Result<Option<NodeID>, StateError> {
+        let parent = self.node(repository.clone(), parent_node).await?;
+        if !parent.is_directory() {
+            return Ok(None);
+        }
+        self.walk_children(
+            repository,
+            parent_node,
+            &parent,
+            known_head,
+            |child_id, child| (child.name_hash == name_hash).then_some(child_id),
+        )
+        .await
     }
 
     /// [`Self::node_children`], and the name hash each of them carries, which

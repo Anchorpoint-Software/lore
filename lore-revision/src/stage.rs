@@ -425,7 +425,7 @@ pub(crate) async fn stage_filesystem_path(
                 options,
                 stats.clone(),
                 link_tracker.clone(),
-                None, // One component at a time, so there is no listing to look in
+                KnownChild::Unresolved,
             )
             .await?;
 
@@ -1167,42 +1167,61 @@ struct DirectoryChildren {
     /// Child node ids in sibling order, [`INVALID_NODE`] where a file system
     /// entry has claimed the child.
     node: Vec<NodeID>,
-    /// `(name hash, index into `node`)` for every child, ordered by both, so a
-    /// tie on the hash is claimed in sibling order.
-    by_name_hash: Vec<(u64, u32)>,
+    /// `(name hash, index into `node`, child node id)` for every child, ordered
+    /// by the first two, so a tie on the hash is claimed in sibling order. The
+    /// id is held here as well, where a claim has taken it out of `node`.
+    by_name_hash: Vec<(u64, u32, NodeID)>,
+    /// The child the chain was headed by when the listing was taken, which
+    /// everything linked into it since sits ahead of.
+    listing_head: Option<NodeID>,
 }
 
 impl DirectoryChildren {
     /// The children of a directory node in sibling order, with the name hash
     /// each of them carries.
     fn new(child: Vec<(NodeID, u64)>) -> Self {
-        let mut by_name_hash: Vec<(u64, u32)> = child
+        let listing_head = child.first().map(|&(node, _)| node);
+        let mut by_name_hash: Vec<(u64, u32, NodeID)> = child
             .iter()
             .enumerate()
-            .map(|(index, &(_, name_hash))| (name_hash, index as u32))
+            .map(|(index, &(node, name_hash))| (name_hash, index as u32, node))
             .collect();
         by_name_hash.sort_unstable();
         let node = child.into_iter().map(|(node, _)| node).collect();
-        Self { node, by_name_hash }
+        Self {
+            node,
+            by_name_hash,
+            listing_head,
+        }
+    }
+
+    /// The entries of the index carrying `name_hash`, in sibling order.
+    fn matching(&self, name_hash: u64) -> impl Iterator<Item = (u32, NodeID)> + '_ {
+        let start = self
+            .by_name_hash
+            .partition_point(|&(hash, _, _)| hash < name_hash);
+        self.by_name_hash[start..]
+            .iter()
+            .take_while(move |&&(hash, _, _)| hash == name_hash)
+            .map(|&(_, index, node)| (index, node))
     }
 
     /// The first child carrying `name_hash` that nothing has claimed yet, marked
     /// as claimed. `None` where the directory holds no such child, or holds only
     /// ones already claimed.
     fn claim(&mut self, name_hash: u64) -> Option<NodeID> {
-        let start = self
-            .by_name_hash
-            .partition_point(|&(hash, _)| hash < name_hash);
-        for &(hash, index) in &self.by_name_hash[start..] {
-            if hash != name_hash {
-                break;
-            }
-            let node = &mut self.node[index as usize];
-            if *node != INVALID_NODE {
-                return Some(std::mem::replace(node, INVALID_NODE));
-            }
-        }
-        None
+        let (index, node) = self
+            .matching(name_hash)
+            .find(|&(index, _)| self.node[index as usize] != INVALID_NODE)?;
+        self.node[index as usize] = INVALID_NODE;
+        Some(node)
+    }
+
+    /// The first child the listing holds carrying `name_hash`, claimed or not,
+    /// which is the one a search of the chain reaches once past what was linked
+    /// into it since.
+    fn holds(&self, name_hash: u64) -> Option<NodeID> {
+        self.matching(name_hash).next().map(|(_, node)| node)
     }
 
     /// The children no file system entry claimed, in sibling order. Each one is a
@@ -1213,6 +1232,48 @@ impl DirectoryChildren {
             .copied()
             .filter(|&node| node != INVALID_NODE)
     }
+}
+
+/// Whether the caller has established which child of a directory a name belongs
+/// to.
+#[derive(Clone, Copy)]
+pub(crate) enum KnownChild {
+    /// The child, or that the directory holds none. Taken as given.
+    Resolved(Option<NodeID>),
+    /// Nothing established; search the directory's chain.
+    Unresolved,
+}
+
+/// The child of `directory_node` that `name_hash` belongs to, claimed where the
+/// listing still holds it unclaimed.
+///
+/// A child is prepended, so whatever was linked into the chain since the listing
+/// was taken lies ahead of it. Only that much is walked; the listing answers from
+/// the index behind it, claimed children included. The answer is the one a search
+/// of the whole chain reaches.
+async fn claim_child(
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    directory_node: NodeID,
+    children: &mut DirectoryChildren,
+    name_hash: u64,
+) -> Result<Option<NodeID>, StageError> {
+    if let Some(node) = children.claim(name_hash) {
+        return Ok(Some(node));
+    }
+    if let Some(node) = state
+        .find_subnode_added_since(
+            repository.clone(),
+            directory_node,
+            children.listing_head,
+            name_hash,
+        )
+        .await
+        .forward::<StageError>("Failed to search the directory node children")?
+    {
+        return Ok(Some(node));
+    }
+    Ok(children.holds(name_hash))
 }
 
 static DIRECTORY_TASK_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
@@ -1322,7 +1383,21 @@ pub(crate) async fn stage_directory(
                 relative_path.as_str()
             );
 
-            let claimed = children.claim(directory.name_hash);
+            let claimed = match claim_child(
+                &repository,
+                &state,
+                directory_node,
+                &mut children,
+                directory.name_hash,
+            )
+            .await
+            {
+                Ok(claimed) => claimed,
+                Err(err) => {
+                    failure = failure.or(Some(err));
+                    break;
+                }
+            };
 
             let node_link = match stage_node_from_metadata(
                 repository.clone(),
@@ -1335,7 +1410,7 @@ pub(crate) async fn stage_directory(
                 options,
                 stats.clone(),
                 link_tracker.clone(),
-                claimed,
+                KnownChild::Resolved(claimed),
             )
             .await
             {
@@ -1408,7 +1483,21 @@ pub(crate) async fn stage_directory(
                 relative_path.as_str()
             );
 
-            let claimed = children.claim(file.name_hash);
+            let claimed = match claim_child(
+                &repository,
+                &state,
+                directory_node,
+                &mut children,
+                file.name_hash,
+            )
+            .await
+            {
+                Ok(claimed) => claimed,
+                Err(err) => {
+                    failure = failure.or(Some(err));
+                    break;
+                }
+            };
 
             let result = stage_node_from_metadata(
                 repository.clone(),
@@ -1421,7 +1510,7 @@ pub(crate) async fn stage_directory(
                 options,
                 stats.clone(),
                 link_tracker.clone(),
-                claimed,
+                KnownChild::Resolved(claimed),
             )
             .await;
             failure = failure.or(result.err());
@@ -1633,10 +1722,11 @@ fn stage_directory_recurse(
 
 /// Stage one child of `base_node` from metadata the caller already holds.
 ///
-/// `known_child` is the child the name belongs to where the caller has already
-/// located it, which a walk holding the directory listing has. It is a shortcut
-/// past the search and never a statement that there is none: `None` searches, so
-/// an entry whose child appeared after the listing was taken still finds it.
+/// `known_child` answers which child the name belongs to where the caller has
+/// established it, a walk holding the directory's listing among them, and is
+/// [`KnownChild::Unresolved`] where nothing has. A resolved answer is taken as
+/// given, one holding no child included, so a caller giving one has to account
+/// for the children linked into the chain since it looked.
 #[allow(clippy::too_many_arguments, unused_assignments)]
 pub(crate) async fn stage_node_from_metadata(
     repository: Arc<RepositoryContext>,
@@ -1649,7 +1739,7 @@ pub(crate) async fn stage_node_from_metadata(
     options: StageOptions,
     stats: Arc<StageStats>,
     link_tracker: Option<Arc<crate::link::LinkTracker>>,
-    known_child: Option<NodeID>,
+    known_child: KnownChild,
 ) -> Result<NodeLink, StageError> {
     if base_relative_path.is_empty() && (name.is_empty() || name.as_str() == ".") {
         return Ok(NodeLink {
@@ -1699,16 +1789,19 @@ pub(crate) async fn stage_node_from_metadata(
     let name_hash = hash::hash_string(name.as_str());
 
     let found_child = match known_child {
-        Some(node) => Ok(node),
-        None => {
-            state
-                .find_subnode(repository.clone(), base_node, name_hash)
-                .await
-        }
+        KnownChild::Resolved(node) => Ok(node),
+        KnownChild::Unresolved => match state
+            .find_subnode(repository.clone(), base_node, name_hash)
+            .await
+        {
+            Ok(node) => Ok(Some(node)),
+            Err(err) if err.is_node_not_found() => Ok(None),
+            Err(err) => Err(err),
+        },
     };
 
     let node_link = match found_child {
-        Ok(found_node_id) => {
+        Ok(Some(found_node_id)) => {
             // Verify that the found node matches the type in the filesystem
             let block_index = NodeBlock::index(found_node_id);
             let node_index = Node::index(found_node_id);
@@ -1749,7 +1842,7 @@ pub(crate) async fn stage_node_from_metadata(
                 }
             }
         }
-        Err(e) if e.is_node_not_found() => NodeLink::invalid(),
+        Ok(None) => NodeLink::invalid(),
         Err(err) => {
             return Err(StageError::internal_with_context(
                 err,
@@ -3306,7 +3399,7 @@ pub(crate) async fn stage_from_parent_state(
                     options,
                     stats,
                     None, // TODO(vri): UCS-17955 - Merging and conflict resolution for links
-                    None, // One target at a time, so there is no listing to look in
+                    KnownChild::Unresolved,
                 )
                 .await
             });
@@ -3389,6 +3482,35 @@ mod directory_children_tests {
             "the index must be strictly ordered: {:?}",
             children.by_name_hash
         );
+    }
+
+    /// A claim takes the child out of what the listing offers, not out of what
+    /// it holds: a search of the chain still reaches it, so the index still
+    /// answers for it.
+    #[test]
+    fn a_claimed_child_is_still_held() {
+        let mut children = children(&[(10, 0xAA), (11, 0xAA), (12, 0xBB)]);
+        assert_eq!(children.claim(0xAA), Some(10));
+        assert_eq!(children.holds(0xAA), Some(10));
+        assert_eq!(children.claim(0xAA), Some(11));
+        assert_eq!(children.claim(0xAA), None, "the listing offers no more");
+        assert_eq!(children.holds(0xAA), Some(10), "the listing still holds it");
+        assert_eq!(children.holds(0xCC), None, "a name it never held");
+    }
+
+    /// The head is the child the chain was headed by, which everything linked in
+    /// since sits ahead of.
+    #[test]
+    fn the_listing_head_is_the_first_child_in_sibling_order() {
+        let mut indexed = children(&[(10, 0xAA), (11, 0xBB)]);
+        assert_eq!(indexed.listing_head, Some(10));
+        assert_eq!(indexed.claim(0xAA), Some(10));
+        assert_eq!(
+            indexed.listing_head,
+            Some(10),
+            "claiming the head does not move it"
+        );
+        assert_eq!(children(&[]).listing_head, None, "an empty listing");
     }
 
     #[test]
