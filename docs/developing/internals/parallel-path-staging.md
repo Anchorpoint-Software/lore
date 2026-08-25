@@ -24,8 +24,8 @@ user paths
     ├── pre-create ──────────────────► one depth at a time,
     │                                                  concurrent within a depth
     │
-    └── target fan-out ──────────────► every target walked from the root,
-                                                       concurrent
+    └── target fan-out ──────────────► every target walked from its deepest
+                                                       pre-created ancestor, concurrent
 ```
 
 ## Layer routing and expansion
@@ -88,26 +88,28 @@ A prefix resolves to one case variation or to none. Three cases produce none, an
 | **Ambiguous**         | Two or more children match, which only a case-sensitive file system holds. |
 | **Unreadable parent** | The parent couldn't be read, because it's missing or the read failed.      |
 
-A path beneath a missing prefix resolves as it would with no map at all: `filesystem_path` walks the components itself, and where a component is ambiguous it forks over the variations and picks the one that carries the rest of the path. A pre-creation walk starting below the root reads the map differently — see Depth-level pre-creation.
+A path beneath a missing prefix resolves as it would with no map at all: `filesystem_path` walks the components itself, and where a component is ambiguous it forks over the variations and picks the one that carries the rest of the path. A walk starting below the root reads the map differently — see Where a walk starts.
 
 No map is built under `StageCaseChange::Keep`. That mode stages by renaming the file system to match the tree, and the first such rename would leave the map naming a directory that's no longer there.
 
-## Depth-level pre-creation
+## Where a walk starts
 
-The shared ancestors are created one depth at a time. A depth is spawned into one task set, and the next depth starts only once that set has drained.
+Pre-creation and the target fan-out both spawn their walks through `walk_base`, which starts each one at the deepest ancestor that already has a node:
 
-For each ancestor, `walk_base` picks where its walk starts:
-
-| Case                             | Base absolute path   | Base relative path | Base node   | Walked                  |
-| -------------------------------- | -------------------- | ------------------ | ----------- | ----------------------- |
-| An ancestor above it was created | `<repo>/<variation>` | `<variation>`      | that node   | the remainder below it  |
-| None was                         | `<repo>`             | empty              | `ROOT_NODE` | the whole ancestor path |
+| Case                             | Base absolute path   | Base relative path | Base node   | Walked                 |
+| -------------------------------- | -------------------- | ------------------ | ----------- | ---------------------- |
+| An ancestor above it was created | `<repo>/<variation>` | `<variation>`      | that node   | the remainder below it |
+| None was                         | `<repo>`             | empty              | `ROOT_NODE` | the whole path         |
 
 `variation` is the resolved case when the prefix map covers the whole prefix, and the requested one otherwise. A map entry for a shorter prefix answers for a shorter path, so taking it would drop the components between.
 
 The requested case is what a walk starting below the root gets whenever the map has no entry for its prefix — under `StageCaseChange::Keep`, which builds no map, and for the three cases above that leave a prefix out of one. The base is where a walk starts rather than a component it resolves, so a walk given a base the file system doesn't hold can't resolve its target at all. It takes the path-not-found branch, which stages a delete when the tree holds the path and reports an invalid path when it doesn't.
 
 The prefix map is passed to a walk starting at the root and withheld from one starting lower down, because its keys are repository-relative and a path relative to a prefix isn't.
+
+## Depth-level pre-creation
+
+The shared ancestors are created one depth at a time. A depth is spawned into one task set, and the next depth starts only once that set has drained.
 
 Each walk runs with `no_children`, so it creates its own final component and nothing beneath it.
 
@@ -119,7 +121,7 @@ Only a walk that returns a valid node link is recorded. A filtered-out or delete
 
 ## Target fan-out
 
-Every antichain entry is then spawned as a walk from the repository root, with the full target path and the prefix map. The shared ancestors already exist, so each walk finds them and creates only what's unique to it. Every remaining creation is either single-writer or a distinct sibling, both of which `node_add` supports concurrently.
+Every antichain entry is then spawned as a walk, from the same base its shared ancestors left it. That chain already exists and is already resolved, so the walk creates only what's unique to it and skips a metadata syscall and a node lookup per component it would otherwise re-resolve. Every remaining creation is either single-writer or a distinct sibling, both of which `node_add` supports concurrently.
 
 Layer jobs are appended to the same task set once the main targets are spawned.
 
@@ -200,12 +202,23 @@ depth 2   ASSETS/Meshes     base <repo>/Assets / "Assets" / node  creates Meshes
           ── drain ──
 ```
 
-The six targets then walk from the root together. Four of them find `Assets` and their own subdirectory already present, and add only their leaf. `Config/Maps` and `Docs/readme.md` create their own parents, which no other walk reaches.
+The six targets then walk together, each from its own base:
+
+```text
+ASSETS/Meshes/rock.mesh    base <repo>/Assets/Meshes   / "Assets/Meshes"   / node       adds rock.mesh
+ASSETS/Meshes/tree.mesh    base <repo>/Assets/Meshes   / "Assets/Meshes"   / node       adds tree.mesh
+ASSETS/Textures/bark.png   base <repo>/Assets/Textures / "Assets/Textures" / node       adds bark.png
+ASSETS/Textures/leaf.png   base <repo>/Assets/Textures / "Assets/Textures" / node       adds leaf.png
+Config/Maps                base <repo>                 / ""                / ROOT_NODE  creates both
+Docs/readme.md             base <repo>                 / ""                / ROOT_NODE  creates both
+```
+
+The four under `ASSETS` add a leaf to a node the pre-creation handed them. `Config/Maps` and `Docs/readme.md` are under no shared ancestor, so they walk from the root and create their own parents, which no other walk reaches.
 
 ## Source pointers
 
 - `lore-revision/src/file/stage.rs::stage` — the pipeline.
-- `lore-revision/src/file/stage.rs::walk_base` — where a pre-creation walk starts.
+- `lore-revision/src/file/stage.rs::walk_base` — where a walk starts.
 - `lore-revision/src/file/stage.rs::collect_precreate` — folds a finished pre-creation into the ancestor node map.
 - `lore-revision/src/util/path.rs::RelativePath::dedup_to_supersets` — normalization and case unification.
 - `lore-revision/src/util/fs.rs::resolve_prefixes` — the shared-ancestor case map.

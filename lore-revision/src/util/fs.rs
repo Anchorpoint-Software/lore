@@ -435,11 +435,16 @@ fn join_relative(parent: &str, name: &str) -> String {
     }
 }
 
+/// `find_path` in the case the file system holds it, relative to `base_path`.
+///
+/// The components are read off the file system and joined here, so the result is
+/// clean by construction and a caller can walk it without validating or cleaning
+/// it again.
 pub async fn filesystem_path(
     base_path: impl AsRef<Path>,
     find_path: &RelativePath,
     prefixes: Option<&ResolvedPrefixes>,
-) -> tokio::io::Result<String> {
+) -> tokio::io::Result<RelativePath> {
     let base_path = base_path.as_ref();
 
     // TODO(mjansson): This should be a test for file system case sensitivity, in the sense that the file system
@@ -452,7 +457,7 @@ pub async fn filesystem_path(
             .await
             .is_ok()
         {
-            return Ok(find_path.as_str().to_string());
+            return Ok(find_path.clone());
         }
     }
 
@@ -549,13 +554,13 @@ pub async fn filesystem_path(
         find_path.as_str(),
         base_path.display()
     );
-    Ok(found_path.as_str().to_string())
+    Ok(found_path.freeze())
 }
 
 pub fn filesystem_path_fork(
     base_path: impl AsRef<Path>,
     find_path: &RelativePath,
-) -> Pin<Box<dyn Future<Output = tokio::io::Result<String>> + Send>> {
+) -> Pin<Box<dyn Future<Output = tokio::io::Result<RelativePath>> + Send>> {
     let base_path = base_path.as_ref().to_path_buf();
     let find_path = find_path.clone();
     // The fork resolves a path under one of several case variations of a
@@ -1195,7 +1200,8 @@ mod tests {
         assert_eq!(
             filesystem_path(dir.path(), &asked, None)
                 .await
-                .expect("the path must resolve"),
+                .expect("the path must resolve")
+                .as_str(),
             "Assets/Meshes/Rock.mesh"
         );
     }
@@ -1300,11 +1306,14 @@ mod tests {
 
         let asked = std::str::FromStr::from_str("assets/MESHES/rock.MESH")
             .expect("relative path is infallible");
+        let resolved = filesystem_path(dir.path(), &asked, None)
+            .await
+            .expect("the path must resolve");
+        assert_eq!(resolved.as_str(), "Assets/Meshes/Rock.mesh");
         assert_eq!(
-            filesystem_path(dir.path(), &asked, None)
-                .await
-                .expect("the path must resolve"),
-            "Assets/Meshes/Rock.mesh"
+            resolved.as_lowercase_str(),
+            "assets/meshes/rock.mesh",
+            "the lowercase form answers for the case that was resolved"
         );
     }
 
@@ -1345,7 +1354,8 @@ mod tests {
         assert_eq!(
             filesystem_path(dir.path(), &asked, Some(&prefixes))
                 .await
-                .expect("the path must resolve"),
+                .expect("the path must resolve")
+                .as_str(),
             "Assets/Meshes/Rock.mesh"
         );
     }
@@ -1401,16 +1411,18 @@ mod tests {
 
         let asked: RelativePath =
             std::str::FromStr::from_str("Assets/rock.mesh").expect("relative path");
+        let afresh = filesystem_path(dir.path(), &asked, None).await.ok();
         assert_eq!(
-            filesystem_path(dir.path(), &asked, None).await.ok(),
-            Some("ASSETS/rock.mesh".to_string()),
+            afresh.as_ref().map(RelativePath::as_str),
+            Some("ASSETS/rock.mesh"),
             "resolving afresh finds the directory under the name it now has"
         );
+        let mapped = filesystem_path(dir.path(), &asked, Some(&prefixes))
+            .await
+            .ok();
         assert_ne!(
-            filesystem_path(dir.path(), &asked, Some(&prefixes))
-                .await
-                .ok(),
-            Some("ASSETS/rock.mesh".to_string()),
+            mapped.as_ref().map(RelativePath::as_str),
+            Some("ASSETS/rock.mesh"),
             "the map still answers with the name the directory had"
         );
     }

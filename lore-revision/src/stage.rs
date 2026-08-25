@@ -322,26 +322,20 @@ pub(crate) async fn stage_filesystem_path(
         relative_path.as_str(),
     );
 
-    let full_absolute_path = if !relative_path.is_empty() {
-        // Find the file system case variation that corresponds to the user given path
-        // If no path found, assume it's a delete and use the user given path
-        let fs_path = util::fs::filesystem_path(
+    // A path the file system does not hold falls back to the one given, which is
+    // the delete the not-found branch below stages.
+    let (full_absolute_path, mut relative_path) = if relative_path.is_empty() {
+        (base_absolute_path.clone(), relative_path)
+    } else {
+        let resolved = util::fs::filesystem_path(
             base_absolute_path.as_path(),
             &relative_path,
             prefixes.as_deref(),
         )
-        .await
-        .unwrap_or(relative_path.as_str().to_string());
-        base_absolute_path.join(fs_path.as_str())
-    } else {
-        base_absolute_path.clone()
+        .await;
+        let resolved = resolved.unwrap_or(relative_path);
+        (base_absolute_path.join(resolved.as_str()), resolved)
     };
-
-    let mut relative_path = RelativePath::new_from_user_path(
-        base_absolute_path.as_path(),
-        full_absolute_path.to_string_lossy().as_ref(),
-    )
-    .forward_with::<StageError, _>(|| format!("Invalid path {relative_path}"))?;
 
     // The filter and the delete lookup below are repository-relative, while
     // `relative_path` is relative to the base the walk starts from.

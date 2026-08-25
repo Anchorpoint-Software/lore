@@ -424,22 +424,13 @@ async fn unstage_path(
         relative_path.as_str(),
     );
 
-    let repository_root = repository.require_path()?.to_path_buf();
-    let full_path = if !relative_path.is_empty() {
-        // Find file system case variation that corresponds to user given path
-        let fs_path = util::fs::filesystem_path(repository_root.as_path(), &relative_path, None)
-            .await
-            .unwrap_or(relative_path.as_str().to_string());
-        repository_root.join(fs_path.as_str())
+    let relative_path = if relative_path.is_empty() {
+        relative_path
     } else {
-        repository_root.clone()
+        let repository_root = repository.require_path()?;
+        let resolved = util::fs::filesystem_path(repository_root, &relative_path, None).await;
+        resolved.unwrap_or(relative_path)
     };
-
-    let relative_path = RelativePath::new_from_user_path(
-        repository.require_path()?,
-        full_path.to_string_lossy().as_ref(),
-    )
-    .forward::<UnstageError>(&format!("Invalid path {relative_path}"))?;
 
     let force = execution_context().globals().force();
     if !force

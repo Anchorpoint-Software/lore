@@ -954,22 +954,13 @@ async fn reset_walk_path(ctx: ResetContext, relative_path: RelativePath) -> Resu
         state_target.revision_number()
     );
 
-    let full_path = if !relative_path.is_empty() {
-        // Find file system case variation that corresponds to user given path
-        let repository_path = repository.require_path()?.to_path_buf();
-        let fs_path = util::fs::filesystem_path(repository_path.as_path(), &relative_path, None)
-            .await
-            .unwrap_or(relative_path.as_str().to_string());
-        repository_path.join(fs_path.as_str())
+    let relative_path = if relative_path.is_empty() {
+        relative_path
     } else {
-        repository.require_path()?.to_path_buf()
+        let repository_path = repository.require_path()?;
+        let resolved = util::fs::filesystem_path(repository_path, &relative_path, None).await;
+        resolved.unwrap_or(relative_path)
     };
-
-    let relative_path = RelativePath::new_from_user_path(
-        repository.require_path()?,
-        full_path.to_string_lossy().as_ref(),
-    )
-    .forward::<ResetError>(&format!("Invalid path {relative_path}"))?;
 
     if relative_path.is_empty() {
         if options.single_node {

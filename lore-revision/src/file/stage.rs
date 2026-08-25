@@ -71,24 +71,49 @@ fn longest_ancestor<'a>(
     }
 }
 
+/// What [`stage::stage_filesystem_path`] takes as the point a walk starts from,
+/// and the path it covers below that point.
+struct WalkBase {
+    absolute: std::path::PathBuf,
+    relative: RelativePathBuf,
+    node: crate::node::NodeID,
+    path: RelativePath,
+    /// The prefix map, which is keyed by repository-relative paths and so only
+    /// answers for a walk that starts at the repository root.
+    prefixes: Option<Arc<crate::util::fs::ResolvedPrefixes>>,
+}
+
+impl WalkBase {
+    /// The whole of `path` walked from the repository root, for a path with no
+    /// pre-created ancestor.
+    fn from_root(
+        repository_root: &std::path::Path,
+        path: RelativePath,
+        prefixes: Option<Arc<crate::util::fs::ResolvedPrefixes>>,
+    ) -> Self {
+        Self {
+            absolute: repository_root.to_path_buf(),
+            relative: RelativePathBuf::new(),
+            node: ROOT_NODE,
+            path,
+            prefixes,
+        }
+    }
+}
+
 /// Where the walk for `target` should start: the deepest ancestor that already
 /// has a node, or `None` for a target with no such ancestor, which has to start
 /// at the repository root.
 ///
-/// Returns what [`stage::stage_filesystem_path`] takes as its base - absolute
-/// path, repository-relative path and node - plus what is left of the target
-/// below it.
+/// The chain above the base is resolved once, while it is created, rather than
+/// once per target: a metadata syscall and a node lookup per component per
+/// target, for an answer that does not change.
 fn walk_base(
     target: &str,
-    repository_path: &std::path::Path,
+    repository_root: &std::path::Path,
     ancestor_nodes: &AncestorNodes<'_>,
     prefixes: Option<&Arc<crate::util::fs::ResolvedPrefixes>>,
-) -> Option<(
-    std::path::PathBuf,
-    RelativePathBuf,
-    crate::node::NodeID,
-    RelativePath,
-)> {
+) -> Option<WalkBase> {
     let (prefix, node) = longest_ancestor(target, ancestor_nodes)?;
     // The case the prefix resolved to, and only when it resolved as a whole: a
     // shorter match answers for a shorter path and would drop components.
@@ -98,14 +123,13 @@ fn walk_base(
         .map_or(prefix, |(_, variation)| variation);
     // Both sides are already clean: one is a slice of `target`, the other a map
     // value built from cleaned parts, so neither needs validating or rewriting.
-    let remainder = RelativePath::new_from_clean_parts(&target[prefix.len() + 1..], "");
-    let base_relative = RelativePathBuf::new_from_clean_parts(variation, "");
-    Some((
-        repository_path.join(variation),
-        base_relative,
+    Some(WalkBase {
+        absolute: repository_root.join(variation),
+        relative: RelativePathBuf::new_from_clean_parts(variation, ""),
         node,
-        remainder,
-    ))
+        path: RelativePath::new_from_clean_parts(&target[prefix.len() + 1..], ""),
+        prefixes: None,
+    })
 }
 
 /// Fold one finished pre-create into the ancestor node map, keeping the first
@@ -412,26 +436,19 @@ pub async fn stage(
                 break;
             }
             let ancestor = ancestor.path();
-            let (base_absolute, base_relative, base_node, ancestor_path, base_prefixes) =
-                match walk_base(
-                    ancestor,
+            let base = walk_base(
+                ancestor,
+                repository_root.as_path(),
+                &ancestor_nodes,
+                prefixes.as_ref(),
+            );
+            let base = base.unwrap_or_else(|| {
+                WalkBase::from_root(
                     repository_root.as_path(),
-                    &ancestor_nodes,
-                    prefixes.as_ref(),
-                ) {
-                    // The prefix map is keyed by repository-relative paths, which a
-                    // path relative to the prefix is not.
-                    Some((absolute, relative, node, remainder)) => {
-                        (absolute, relative, node, remainder, None)
-                    }
-                    None => (
-                        repository_root.clone(),
-                        RelativePathBuf::new(),
-                        ROOT_NODE,
-                        RelativePath::new_from_clean_parts(ancestor, ""),
-                        prefixes.clone(),
-                    ),
-                };
+                    RelativePath::new_from_clean_parts(ancestor, ""),
+                    prefixes.clone(),
+                )
+            });
             let repository = repository.clone();
             let state = state.clone();
             let stats = stats.clone();
@@ -441,15 +458,15 @@ pub async fn stage(
                 let result = stage::stage_filesystem_path(
                     repository,
                     state,
-                    base_absolute,
-                    base_relative,
-                    base_node,
-                    ancestor_path,
+                    base.absolute,
+                    base.relative,
+                    base.node,
+                    base.path,
                     stats,
                     precreate_options,
                     Some(link_tracker),
                     global_mask,
-                    base_prefixes,
+                    base.prefixes,
                 )
                 .await;
                 (index, result)
@@ -488,20 +505,29 @@ pub async fn stage(
     const MAX_TASKS: usize = 1000;
 
     for target in antichain {
+        let base = walk_base(
+            target.as_str(),
+            repository_root.as_path(),
+            &ancestor_nodes,
+            prefixes.as_ref(),
+        );
+        let base = base.unwrap_or_else(|| {
+            WalkBase::from_root(repository_root.as_path(), target, prefixes.clone())
+        });
         lore_spawn!(
             tasks,
             stage::stage_filesystem_path(
                 repository.clone(),
                 state.clone(),
-                repository_root.clone(),
-                RelativePathBuf::new(),
-                ROOT_NODE,
-                target,
+                base.absolute,
+                base.relative,
+                base.node,
+                base.path,
                 stats.clone(),
                 options,
                 Some(link_tracker.clone()),
                 global_mask.clone(),
-                prefixes.clone(),
+                base.prefixes,
             )
         );
         if let Err(err) = lore_limit_drain_tasks!(
@@ -1499,9 +1525,9 @@ mod shared_ancestor_tests {
         assert!(depths.windows(2).all(|pair| pair[0] <= pair[1]));
     }
 
-    /// Two spellings of one directory would be two ancestors naming one node,
-    /// and the depth holding both would add it twice. The target set they are
-    /// taken from settles on one, and that is what carries into here.
+    /// Two case variations of one directory would be two ancestors naming one
+    /// node, and the depth holding both would add it twice. The target set they
+    /// are taken from settles on one, and that is what carries into here.
     #[test]
     fn targets_on_one_case_variation_give_ancestors_on_one() {
         assert_eq!(
@@ -1577,18 +1603,20 @@ mod walk_base_tests {
         let root = std::path::Path::new("/repo");
         let nodes = created(&[("a", NODE_A), ("a/b", NODE_AB)]);
 
-        let (absolute, relative, node, remainder) =
-            walk_base("a/b/c", root, &nodes, None).expect("an ancestor was created");
-        assert_eq!(absolute, root.join("a/b"));
-        assert_eq!(relative.as_str(), "a/b");
-        assert_eq!(node, NODE_AB);
-        assert_eq!(remainder.as_str(), "c");
+        let base = walk_base("a/b/c", root, &nodes, None).expect("an ancestor was created");
+        assert_eq!(base.absolute, root.join("a/b"));
+        assert_eq!(base.relative.as_str(), "a/b");
+        assert_eq!(base.node, NODE_AB);
+        assert_eq!(base.path.as_str(), "c");
+        assert!(
+            base.prefixes.is_none(),
+            "the map answers from the root only"
+        );
 
-        let (_, relative, node, remainder) =
-            walk_base("a/x/y/z", root, &nodes, None).expect("an ancestor was created");
-        assert_eq!(relative.as_str(), "a");
-        assert_eq!(node, NODE_A);
-        assert_eq!(remainder.as_str(), "x/y/z");
+        let base = walk_base("a/x/y/z", root, &nodes, None).expect("an ancestor was created");
+        assert_eq!(base.relative.as_str(), "a");
+        assert_eq!(base.node, NODE_A);
+        assert_eq!(base.path.as_str(), "x/y/z");
     }
 
     #[test]
@@ -1601,17 +1629,34 @@ mod walk_base_tests {
     }
 
     #[test]
+    fn from_root_covers_the_whole_path_and_keeps_the_prefix_map() {
+        let root = std::path::Path::new("/repo");
+        let prefixes = resolved(&[("a", "A")]);
+
+        let base = WalkBase::from_root(
+            root,
+            RelativePath::new_from_clean_parts("a/b", ""),
+            Some(prefixes),
+        );
+        assert_eq!(base.absolute, root);
+        assert!(base.relative.is_empty());
+        assert_eq!(base.node, ROOT_NODE);
+        assert_eq!(base.path.as_str(), "a/b");
+        assert!(base.prefixes.is_some(), "a walk from the root can use it");
+    }
+
+    #[test]
     fn walk_base_takes_the_case_the_prefix_resolved_to() {
         let root = std::path::Path::new("/repo");
         let nodes = created(&[("a", NODE_A), ("a/b", NODE_AB)]);
         let prefixes = resolved(&[("a", "A"), ("a/b", "A/B")]);
 
-        let (absolute, relative, node, remainder) =
+        let base =
             walk_base("a/b/c", root, &nodes, Some(&prefixes)).expect("an ancestor was created");
-        assert_eq!(absolute, root.join("A/B"));
-        assert_eq!(relative.as_str(), "A/B");
-        assert_eq!(node, NODE_AB);
-        assert_eq!(remainder.as_str(), "c", "the remainder is not recased");
+        assert_eq!(base.absolute, root.join("A/B"));
+        assert_eq!(base.relative.as_str(), "A/B");
+        assert_eq!(base.node, NODE_AB);
+        assert_eq!(base.path.as_str(), "c", "the remainder is not recased");
     }
 
     /// A prefix resolves as a whole or not at all: the map answers for the
@@ -1622,11 +1667,11 @@ mod walk_base_tests {
         let nodes = created(&[("a", NODE_A), ("a/b", NODE_AB)]);
         let prefixes = resolved(&[("a", "A")]);
 
-        let (absolute, relative, node, _) =
+        let base =
             walk_base("a/b/c", root, &nodes, Some(&prefixes)).expect("an ancestor was created");
-        assert_eq!(absolute, root.join("a/b"));
-        assert_eq!(relative.as_str(), "a/b");
-        assert_eq!(node, NODE_AB);
+        assert_eq!(base.absolute, root.join("a/b"));
+        assert_eq!(base.relative.as_str(), "a/b");
+        assert_eq!(base.node, NODE_AB);
     }
 }
 
