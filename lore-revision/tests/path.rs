@@ -536,6 +536,26 @@ mod tests {
         );
     }
 
+    /// A fold can change the length of a component, so the boundary between the
+    /// repository and what is under it cannot be a byte offset taken from one
+    /// form of the path and applied to the other.
+    #[test]
+    fn new_from_user_path_matches_a_repository_whose_fold_changes_its_length() {
+        let root = format!("{ROOT}/\u{0130}\u{0130}");
+        assert_eq!(
+            relative_of(&root, &format!("{root}/Assets/Rock.mesh")),
+            "Assets/Rock.mesh"
+        );
+    }
+
+    /// The repository is an ancestor of the path or it is nothing to it. A
+    /// directory whose name it merely begins is not one.
+    #[test]
+    fn new_from_user_path_rejects_a_path_under_a_longer_name() {
+        let sibling = format!("{ROOT}sitory/Assets");
+        assert!(RelativePathBuf::new_from_user_path(Path::new(ROOT), &sibling).is_err());
+    }
+
     #[test]
     fn new_from_user_path_rejects_a_path_outside_the_repository() {
         let outside = ROOT.replace("repo", "elsewhere");

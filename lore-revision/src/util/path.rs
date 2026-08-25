@@ -255,6 +255,30 @@ pub fn clean(mut path: String) -> String {
     path
 }
 
+/// What is left of `path` below the components of `prefix_lower`, or `None`
+/// where they do not name its ancestors.
+///
+/// Matches one component at a time against the lowercase form. A fold can change
+/// the length of a component, which leaves a byte offset taken from one form of
+/// a path no longer naming the same place in the other, and a prefix that stops
+/// part way through a component names a sibling rather than an ancestor.
+fn strip_lowercase_prefix<'a>(path: &'a str, prefix_lower: &str) -> Option<&'a str> {
+    let mut remainder = path.trim_start_matches('/');
+    let mut folded = String::new();
+
+    for expected in prefix_lower.split('/').filter(|part| !part.is_empty()) {
+        let (component, rest) = remainder.split_once('/').unwrap_or((remainder, ""));
+        folded.clear();
+        push_lowercase(&mut folded, component);
+        if folded != expected {
+            return None;
+        }
+        remainder = rest;
+    }
+
+    Some(remainder)
+}
+
 /// `path` in cleaned absolute form, resolved against the working directory if it
 /// is not already absolute.
 ///
@@ -1018,20 +1042,14 @@ impl RelativePathBuf {
         let mut repository_path = absolute_clean(repository_path)?;
         make_lowercase(&mut repository_path);
 
-        if !absolute_path
-            .to_lowercase()
-            .starts_with(repository_path.as_str())
-        {
+        let Some(relative_path) = strip_lowercase_prefix(&absolute_path, &repository_path) else {
             return Err(InvalidPath {
                 path: absolute_path,
             }
             .into());
-        }
+        };
 
-        let relative_path = absolute_path
-            .split_at(repository_path.len())
-            .1
-            .trim_matches('/');
+        let relative_path = relative_path.trim_matches('/');
         if relative_path.is_empty() || relative_path == "." {
             return Ok(RelativePathBuf::with_capacity(0));
         }
