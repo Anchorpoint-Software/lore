@@ -439,6 +439,21 @@ mod tests {
         assert_eq!(dedup(&["Foo/x", "bar/Y"]), vec!["Foo/x", "bar/Y"]);
     }
 
+    /// Node lookup hashes names lowercased, so a path resolved from user input
+    /// can differ in case from the stored paths it is compared against.
+    /// `covers` alone would miss those; the prefix boundary still has to hold.
+    #[test]
+    fn covers_ignore_case() {
+        fn path(value: &str) -> RelativePath {
+            RelativePath::new_from_initial_path(value).expect("Path init failed")
+        }
+
+        assert!(!path("libs/Shared").covers(&"libs/shared/inner.txt"));
+
+        assert!(path("libs/Shared").covers_ignore_case(&path("LIBS/shared/inner.txt")));
+        assert!(!path("libs/Shared").covers_ignore_case(&path("libs/SHARED-extra/inner.txt")));
+    }
+
     #[test]
     fn new_from_user_path() {
         let repository_path = "my_repo";

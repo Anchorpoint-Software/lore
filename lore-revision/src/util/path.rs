@@ -652,6 +652,13 @@ impl RelativePath {
         covers_impl(self.as_str(), child.as_ref())
     }
 
+    /// [`covers`](Self::covers) on the lowercased form. Node lookup hashes
+    /// names case-insensitively, so a path the caller resolved a node from can
+    /// differ in case from the stored paths it has to be compared against.
+    pub fn covers_ignore_case(&self, child: &RelativePath) -> bool {
+        covers_impl(self.as_lowercase_str(), child.as_lowercase_str())
+    }
+
     /// Reduces a set of paths to the minimal covering set by removing exact
     /// duplicates and replacing any descendant path with its ancestor — so each
     /// returned path is a superset of the input paths it covers.
