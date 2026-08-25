@@ -246,6 +246,7 @@ async fn connect_impl(
         .get()
         .await
         .forward::<ProtocolError>("failed to get environment config")?;
+    lore_debug!("Server environment config from {remote_url}: {environment:?}");
 
     let auth_url = environment
         .endpoint
@@ -293,7 +294,18 @@ async fn connect_impl(
                 &access_token,
             )
             .await
-            .internal("loading user token")?;
+            .map_err(|err| {
+                // A configured identity with no stored token is the normal
+                // logged-out state (login saves the identity to the repo
+                // config; logout removes only the tokens) — report it as
+                // NotAuthenticated rather than an internal failure.
+                if err.is_token_not_found() {
+                    lore_debug!("No token stored for identity {identity} at {auth_url}");
+                    ProtocolError::from(lore_base::error::NotAuthenticated)
+                } else {
+                    ProtocolError::internal_with_context(err, "loading user token")
+                }
+            })?;
         }
     }
 

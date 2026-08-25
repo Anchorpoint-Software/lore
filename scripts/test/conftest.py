@@ -320,13 +320,14 @@ def lore_server_executable_path(request):
 
 
 @pytest.fixture(scope="session")
-def lore_library(request):
+def lore_library_path(request):
     """
-    Loads the public Lore C API library (`liblore`) for tests that need to
+    Locates the public Lore C API library (`liblore`) for tests that need to
     observe API-level behavior the CLI does not surface. Skips if the library
-    was not built alongside the client binary.
+    was not built alongside the client binary. Returns the path rather than a
+    loaded library: tests drive it out of process via `auth_user_info_capi`.
     """
-    from lore_ffi import LoreLibrary, library_filename
+    from lore_ffi import library_filename
 
     library_path = os.getenv("LORE_LIBRARY_PATH")
     if not library_path:
@@ -340,7 +341,7 @@ def lore_library(request):
             "set LORE_LIBRARY_PATH to run C API tests"
         )
 
-    return LoreLibrary(library_path)
+    return library_path
 
 
 @pytest.fixture(scope="session")
