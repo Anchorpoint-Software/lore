@@ -114,7 +114,7 @@ pub async fn create_shared_store(
         let identity = global_cli_args.identity().unwrap_or_default();
         protocol::connect(&remote_url, identity, RepositoryId::default())
             .await
-            .internal(&format!("Failed to connect to remote URL {remote_url}"))?;
+            .internal_with(|| format!("Failed to connect to remote URL {remote_url}"))?;
     }
 
     let directory_containing_shared_store = if let Some(path) = path {

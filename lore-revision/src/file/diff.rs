@@ -1126,7 +1126,7 @@ async fn diff_read_file(
         let content = lore_io::IoDriver::global()
             .read_file_bytes(path.as_path())
             .await
-            .internal(&format!("Failed reading file for diff: {}", path.display()))?;
+            .internal_with(|| format!("Failed reading file for diff: {}", path.display()))?;
         return Ok(make_diff_content(&content));
     };
 

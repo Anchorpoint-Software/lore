@@ -693,11 +693,12 @@ async fn wrap_path_error(
     let absolute = relative_path.to_absolute_path(repository.require_path()?);
     let wrapped: Result<(), ResetError> = Err(err);
     match lore_io::IoDriver::global().metadata(&absolute).await {
-        Ok(_) => wrapped
-            .forward::<ResetError>(&format!("Failed resetting an existing path: {user_path}")),
-        _ => wrapped.forward::<ResetError>(&format!(
-            "Failed resetting a non-existent path: {user_path}"
-        )),
+        Ok(_) => wrapped.forward_with::<ResetError, _>(|| {
+            format!("Failed resetting an existing path: {user_path}")
+        }),
+        _ => wrapped.forward_with::<ResetError, _>(|| {
+            format!("Failed resetting a non-existent path: {user_path}")
+        }),
     }
 }
 
@@ -1512,10 +1513,12 @@ async fn reset_walk_directory(
     let mut filesystem_children =
         util::fs::list_directory(absolute_dir)
             .await
-            .internal(&format!(
-                "Failed to list directory files in {}",
-                directory_path.as_str()
-            ))?;
+            .internal_with(|| {
+                format!(
+                    "Failed to list directory files in {}",
+                    directory_path.as_str()
+                )
+            })?;
 
     let force = execution_context().globals().force();
     let mut tasks = JoinSet::new();

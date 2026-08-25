@@ -700,7 +700,7 @@ pub async fn connect(
         .unwrap_or(parsed_url.port().unwrap_or(default_port).to_string());
 
     let remote = Url::parse(&format!("{scheme}://{host}:{port}"))
-        .internal(&format!("remote {remote_url} is invalid"))?;
+        .internal_with(|| format!("remote {remote_url} is invalid"))?;
 
     let map_lock = lock_connection(&remote).await;
     let connection_lock = if reuse {

@@ -397,10 +397,12 @@ pub(crate) async fn stage_filesystem_path(
             let current_metadata = lore_io::IoDriver::global()
                 .metadata(current_absolute_path.join(current_name))
                 .await
-                .internal(&format!(
-                    "Failed to query file system metadata for path {}",
-                    current_absolute_path.join(current_name).display()
-                ))?;
+                .internal_with(|| {
+                    format!(
+                        "Failed to query file system metadata for path {}",
+                        current_absolute_path.join(current_name).display()
+                    )
+                })?;
 
             let node_link = stage_node_from_metadata(
                 current_repository.clone(),
@@ -1194,10 +1196,12 @@ pub(crate) async fn stage_directory(
 
     let mut file_list = util::fs::list_directory(absolute_path.to_path_buf())
         .await
-        .internal(&format!(
-            "Failed to list directory files in {}",
-            absolute_path.to_string_lossy()
-        ))?;
+        .internal_with(|| {
+            format!(
+                "Failed to list directory files in {}",
+                absolute_path.to_string_lossy()
+            )
+        })?;
 
     // Collect all filesystem entries, then resolve case variant collisions before staging.
     // On a case-sensitive filesystem, multiple entries differing only in case can coexist
@@ -3233,10 +3237,12 @@ pub(crate) async fn stage_from_parent_state(
                 let metadata = lore_io::IoDriver::global()
                     .metadata(absolute_path.as_path())
                     .await
-                    .internal(&format!(
-                        "Failed to query file system metadata for path {}",
-                        absolute_path.display()
-                    ))?;
+                    .internal_with(|| {
+                        format!(
+                            "Failed to query file system metadata for path {}",
+                            absolute_path.display()
+                        )
+                    })?;
                 stage_node_from_metadata(
                     repository,
                     state,

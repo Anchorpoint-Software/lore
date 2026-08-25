@@ -453,7 +453,7 @@ pub async fn filesystem_path(
     {
         let initial_path = base_path.join(find_path.as_str());
         if lore_io::IoDriver::global()
-            .metadata(initial_path.as_path())
+            .metadata(initial_path)
             .await
             .is_ok()
         {

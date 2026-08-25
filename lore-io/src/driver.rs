@@ -359,8 +359,12 @@ impl IoDriver {
         }
     }
 
-    pub async fn metadata(&self, path: impl AsRef<Path>) -> std::io::Result<std::fs::Metadata> {
-        let path = path.as_ref().to_path_buf();
+    /// The metadata of `path`.
+    ///
+    /// Takes the path by value so a caller building one for the call hands it
+    /// over rather than having it copied, which a walk does once per component.
+    pub async fn metadata(&self, path: impl Into<PathBuf>) -> std::io::Result<std::fs::Metadata> {
+        let path = path.into();
         match &*self.inner {
             DriverInner::Psync(driver) => driver.metadata(path).await,
             #[cfg(target_os = "linux")]

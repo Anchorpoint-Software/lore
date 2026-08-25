@@ -1054,9 +1054,9 @@ pub async fn stage_move(
 
     let from_path =
         RelativePath::new_from_user_path(repository.require_path()?, from_path.as_str())
-            .forward::<StageError>(&format!("Invalid path {from_path}"))?;
+            .forward_with::<StageError, _>(|| format!("Invalid path {from_path}"))?;
     let to_path = RelativePath::new_from_user_path(repository.require_path()?, to_path.as_str())
-        .forward::<StageError>(&format!("Invalid path {to_path}"))?;
+        .forward_with::<StageError, _>(|| format!("Invalid path {to_path}"))?;
     lore_debug!(
         "Stage move {} -> {} in repository {}",
         from_path.as_str(),
@@ -1089,7 +1089,9 @@ pub async fn stage_move(
     let from_node_link = state
         .find_node_link(repository.clone(), from_path.as_str())
         .await
-        .forward::<StageError>(&format!("Path {from_path} does not exist in repository "))?;
+        .forward_with::<StageError, _>(|| {
+            format!("Path {from_path} does not exist in repository ")
+        })?;
     if !from_node_link.is_valid() {
         return Err(StageError::internal(format!(
             "Path {from_path} does not exist in repository "
@@ -1112,7 +1114,7 @@ pub async fn stage_move(
     let to_metadata = lore_io::IoDriver::global()
         .metadata(to_absolute_path)
         .await
-        .internal(&format!("Path {to_path} does not exist in repository "))?;
+        .internal_with(|| format!("Path {to_path} does not exist in repository "))?;
 
     if from_node.is_directory() && !to_metadata.is_dir() {
         return Err(StageError::internal("Cannot move a directory to a file"));

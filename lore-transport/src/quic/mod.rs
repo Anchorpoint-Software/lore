@@ -97,7 +97,7 @@ pub async fn storage(
     access_token: &str,
 ) -> Result<Arc<dyn Storage>, ProtocolError> {
     let remote_domain = domain_from_url_str_or_url(remote_url)
-        .internal(&format!("remote {remote_url} is invalid"))?;
+        .internal_with(|| format!("remote {remote_url} is invalid"))?;
 
     let storage = StorageClient::connect(
         connection,
@@ -110,7 +110,7 @@ pub async fn storage(
         access_token,
     )
     .await
-    .internal(&format!("connecting to {remote_url}"))?;
+    .internal_with(|| format!("connecting to {remote_url}"))?;
 
     Ok(Arc::new(storage))
 }

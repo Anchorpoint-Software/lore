@@ -210,15 +210,15 @@ pub async fn unstage(
 
     let state_current = State::deserialize(repository.clone(), current_revision)
         .await
-        .forward::<UnstageError>(&format!(
-            "Failed to deserialize revision state {current_revision}"
-        ))?;
+        .forward_with::<UnstageError, _>(|| {
+            format!("Failed to deserialize revision state {current_revision}")
+        })?;
 
     let state_staged = State::deserialize(repository.clone(), staged_revision)
         .await
-        .forward::<UnstageError>(&format!(
-            "Failed to deserialize revision state {staged_revision}"
-        ))?;
+        .forward_with::<UnstageError, _>(|| {
+            format!("Failed to deserialize revision state {staged_revision}")
+        })?;
 
     event::LoreEvent::FileUnstageBegin(LoreFileUnstageBeginEventData {
         path_count: paths.len(),
