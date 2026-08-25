@@ -486,6 +486,62 @@ mod tests {
         assert_eq!(relative_path.as_str(), "test");
     }
 
+    /// An absolute root in the form the platform holds one. A path the platform
+    /// does not call absolute is resolved against the working directory instead,
+    /// which is not what the tests below cover.
+    #[cfg(target_os = "windows")]
+    const ROOT: &str = r"C:\repo";
+    #[cfg(not(target_os = "windows"))]
+    const ROOT: &str = "/repo";
+
+    fn relative_of(repository_path: &str, user_path: &str) -> String {
+        RelativePathBuf::new_from_user_path(Path::new(repository_path), user_path)
+            .expect("the path is under the repository")
+            .as_str()
+            .to_owned()
+    }
+
+    #[test]
+    fn new_from_user_path_takes_the_repository_off_the_front() {
+        assert_eq!(
+            relative_of(ROOT, &format!("{ROOT}/Assets/Rock.mesh")),
+            "Assets/Rock.mesh"
+        );
+        assert_eq!(
+            relative_of(ROOT, &format!("{}/Assets", ROOT.to_uppercase())),
+            "Assets",
+            "the repository is matched whatever case it is named in"
+        );
+        assert_eq!(
+            relative_of(&format!("{ROOT}/"), &format!("{ROOT}/Assets")),
+            "Assets"
+        );
+        assert_eq!(
+            relative_of(ROOT, &format!("{ROOT}//Assets//Rock.mesh")),
+            "Assets/Rock.mesh"
+        );
+        assert!(relative_of(ROOT, ROOT).is_empty());
+    }
+
+    /// A repository named beyond ASCII is matched on the fold the rest of the
+    /// system uses, which for these characters is the length it already has.
+    #[test]
+    fn new_from_user_path_matches_a_repository_named_beyond_ascii() {
+        let root = format!("{ROOT}/\u{00c5}NGSTR\u{00d6}M");
+        assert_eq!(relative_of(&root, &format!("{root}/Assets")), "Assets");
+        assert_eq!(
+            relative_of(&root, &format!("{ROOT}/\u{00e5}ngstr\u{00f6}m/Assets")),
+            "Assets",
+            "the repository is matched whatever case it is named in"
+        );
+    }
+
+    #[test]
+    fn new_from_user_path_rejects_a_path_outside_the_repository() {
+        let outside = ROOT.replace("repo", "elsewhere");
+        assert!(RelativePathBuf::new_from_user_path(Path::new(ROOT), &outside).is_err());
+    }
+
     // ========================================
     // COW (Copy-on-Write) Behavior Tests
     // ========================================

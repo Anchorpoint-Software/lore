@@ -207,7 +207,7 @@ impl FilterInstance {
             for part in path_parts.iter() {
                 subpath.push(part);
                 self.lines.push(FilterLine {
-                    glob: subpath.as_str().to_lowercase(),
+                    glob: subpath.as_lowercase_str().to_owned(),
                     negated: true,
                     directory: true,
                     generated: true,

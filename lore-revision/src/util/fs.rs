@@ -440,6 +440,8 @@ fn join_relative(parent: &str, name: &str) -> String {
 /// The components are read off the file system and joined here, so the result is
 /// clean by construction and a caller can walk it without validating or cleaning
 /// it again.
+///
+/// A path the file system does not hold is an error rather than a case.
 pub async fn filesystem_path(
     base_path: impl AsRef<Path>,
     find_path: &RelativePath,
@@ -487,7 +489,7 @@ pub async fn filesystem_path_and_metadata(
 
     let mut full_path = base_path.to_path_buf();
     let mut remain_path = find_path.clone();
-    let mut found_path = RelativePathBuf::new();
+    let mut found_path = RelativePathBuf::with_capacity(find_path.len());
 
     // Whatever an earlier path already established is not established again.
     if let Some((components, resolved)) =
@@ -495,9 +497,7 @@ pub async fn filesystem_path_and_metadata(
     {
         full_path.push(resolved);
         found_path.push(resolved);
-        for _ in 0..components {
-            let _ = remain_path.pop_root();
-        }
+        remain_path.pop_root_repeat(components);
     }
 
     while !remain_path.is_empty() {
@@ -1382,6 +1382,11 @@ mod tests {
                 .await
                 .expect("the path must resolve");
         assert_eq!(resolved.as_str(), "Assets/Meshes/Rock.mesh");
+        assert_eq!(
+            resolved.as_lowercase_str(),
+            "assets/meshes/rock.mesh",
+            "the prefix the map answered with carries a lowercase form of its own"
+        );
         assert!(
             metadata.is_none(),
             "a path settled a component at a time is never read whole"

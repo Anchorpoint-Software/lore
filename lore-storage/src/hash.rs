@@ -163,6 +163,8 @@ mod tests {
             "Stra\u{00df}e",
             "\u{0130}stanbul",
             "\u{03a3}\u{03bf}\u{03c6}\u{03bf}\u{03c2}",
+            // A capital sigma ending a word, the fold that depends on position.
+            "\u{039f}\u{0394}\u{039f}\u{03a3}",
             "\u{4f60}\u{597d}",
             &long_ascii,
             &long_unicode,

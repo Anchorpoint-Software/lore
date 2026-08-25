@@ -108,32 +108,49 @@ impl WalkBase {
 }
 
 /// Where the walk for `target` should start: the deepest ancestor that already
-/// has a node, or `None` for a target with no such ancestor, which has to start
-/// at the repository root.
+/// has a node, with what is left of the target below it. `Err` returns `target`
+/// untouched, for one with no such ancestor, which has to start at the
+/// repository root.
 ///
 /// The chain above the base is resolved once, while it is created, rather than
 /// once per target: a metadata syscall and a node lookup per component per
 /// target, for an answer that does not change.
+///
+/// Takes `target` by value so what is left below the base is a view of it
+/// rather than a second path built from its bytes.
 fn walk_base(
-    target: &str,
+    mut target: RelativePath,
     repository_root: &std::path::Path,
     ancestor_nodes: &AncestorNodes<'_>,
     prefixes: Option<&Arc<crate::util::fs::ResolvedPrefixes>>,
-) -> Option<WalkBase> {
-    let (prefix, node) = longest_ancestor(target, ancestor_nodes)?;
-    // The case the prefix resolved to, and only when it resolved as a whole: a
-    // shorter match answers for a shorter path and would drop components.
-    let variation = prefixes
-        .and_then(|resolved| resolved.longest_prefix_of(prefix))
-        .filter(|(depth, _)| *depth == path_depth(prefix))
-        .map_or(prefix, |(_, variation)| variation);
-    // Both sides are already clean: one is a slice of `target`, the other a map
-    // value built from cleaned parts, so neither needs validating or rewriting.
-    Some(WalkBase {
-        absolute: repository_root.join(variation),
-        relative: RelativePathBuf::new_from_clean_parts(variation, ""),
+) -> Result<WalkBase, RelativePath> {
+    let (absolute, relative, node, prefix_depth) = {
+        let Some((prefix, node)) = longest_ancestor(target.as_str(), ancestor_nodes) else {
+            return Err(target);
+        };
+        let prefix_depth = path_depth(prefix);
+        // The case the prefix resolved to, and only when it resolved as a whole:
+        // a shorter match answers for a shorter path and would drop components.
+        let variation = prefixes
+            .and_then(|resolved| resolved.longest_prefix_of(prefix))
+            .filter(|(depth, _)| *depth == prefix_depth)
+            .map_or(prefix, |(_, variation)| variation);
+        // Already clean: a map value built from cleaned parts, so it needs no
+        // validating or rewriting.
+        let relative = RelativePathBuf::new_from_clean_parts(variation, "");
+        (
+            repository_root.join(variation),
+            relative,
+            node,
+            prefix_depth,
+        )
+    };
+    target.pop_root_repeat(prefix_depth);
+    Ok(WalkBase {
+        absolute,
+        relative,
         node,
-        path: RelativePath::new_from_clean_parts(&target[prefix.len() + 1..], ""),
+        path: target,
         prefixes: None,
     })
 }
@@ -409,19 +426,15 @@ pub async fn stage(
             if precreate_failure.is_some() {
                 break;
             }
-            let ancestor = ancestor.path();
+            let ancestor = RelativePath::new_from_clean_parts(ancestor.path(), "");
             let base = walk_base(
                 ancestor,
                 repository_root.as_path(),
                 &ancestor_nodes,
                 prefixes.as_ref(),
             );
-            let base = base.unwrap_or_else(|| {
-                WalkBase::from_root(
-                    repository_root.as_path(),
-                    RelativePath::new_from_clean_parts(ancestor, ""),
-                    prefixes.clone(),
-                )
+            let base = base.unwrap_or_else(|ancestor| {
+                WalkBase::from_root(repository_root.as_path(), ancestor, prefixes.clone())
             });
             let repository = repository.clone();
             let state = state.clone();
@@ -480,12 +493,12 @@ pub async fn stage(
 
     for target in antichain {
         let base = walk_base(
-            target.as_str(),
+            target,
             repository_root.as_path(),
             &ancestor_nodes,
             prefixes.as_ref(),
         );
-        let base = base.unwrap_or_else(|| {
+        let base = base.unwrap_or_else(|target| {
             WalkBase::from_root(repository_root.as_path(), target, prefixes.clone())
         });
         lore_spawn!(
@@ -1718,12 +1731,16 @@ mod walk_base_tests {
         assert_eq!(longest_ancestor("x/y", &nodes), None);
     }
 
+    fn path(path: &str) -> RelativePath {
+        RelativePath::new_from_clean_parts(path, "")
+    }
+
     #[test]
     fn walk_base_starts_at_that_ancestor_with_the_rest_below_it() {
         let root = std::path::Path::new("/repo");
         let nodes = created(&[("a", NODE_A), ("a/b", NODE_AB)]);
 
-        let base = walk_base("a/b/c", root, &nodes, None).expect("an ancestor was created");
+        let base = walk_base(path("a/b/c"), root, &nodes, None).expect("an ancestor was created");
         assert_eq!(base.absolute, root.join("a/b"));
         assert_eq!(base.relative.as_str(), "a/b");
         assert_eq!(base.node, NODE_AB);
@@ -1733,19 +1750,37 @@ mod walk_base_tests {
             "the map answers from the root only"
         );
 
-        let base = walk_base("a/x/y/z", root, &nodes, None).expect("an ancestor was created");
+        let base = walk_base(path("a/x/y/z"), root, &nodes, None).expect("an ancestor was created");
         assert_eq!(base.relative.as_str(), "a");
         assert_eq!(base.node, NODE_A);
         assert_eq!(base.path.as_str(), "x/y/z");
     }
 
+    /// The remainder is a view of the target, so its lowercase form has to be
+    /// advanced along with it rather than left naming the whole path.
     #[test]
-    fn walk_base_is_none_when_no_ancestor_was_created() {
+    fn walk_base_leaves_the_remainder_lowercased_from_the_base_down() {
+        let root = std::path::Path::new("/repo");
+        let nodes = created(&[("Assets", NODE_A)]);
+
+        let base =
+            walk_base(path("Assets/Meshes/Rock"), root, &nodes, None).expect("one was created");
+        assert_eq!(base.path.as_str(), "Meshes/Rock");
+        assert_eq!(base.path.as_lowercase_str(), "meshes/rock");
+    }
+
+    #[test]
+    fn walk_base_gives_the_target_back_when_no_ancestor_was_created() {
         let root = std::path::Path::new("/repo");
         let nodes = created(&[("x", NODE_A)]);
-        assert!(walk_base("a/b", root, &nodes, None).is_none());
-        assert!(walk_base("a", root, &nodes, None).is_none());
-        assert!(walk_base("a", root, &created(&[]), None).is_none());
+
+        let Err(returned) = walk_base(path("a/b"), root, &nodes, None) else {
+            panic!("no ancestor was created");
+        };
+        assert_eq!(returned.as_str(), "a/b", "the target comes back untouched");
+
+        assert!(walk_base(path("a"), root, &nodes, None).is_err());
+        assert!(walk_base(path("a"), root, &created(&[]), None).is_err());
     }
 
     #[test]
@@ -1771,8 +1806,8 @@ mod walk_base_tests {
         let nodes = created(&[("a", NODE_A), ("a/b", NODE_AB)]);
         let prefixes = resolved(&[("a", "A"), ("a/b", "A/B")]);
 
-        let base =
-            walk_base("a/b/c", root, &nodes, Some(&prefixes)).expect("an ancestor was created");
+        let base = walk_base(path("a/b/c"), root, &nodes, Some(&prefixes))
+            .expect("an ancestor was created");
         assert_eq!(base.absolute, root.join("A/B"));
         assert_eq!(base.relative.as_str(), "A/B");
         assert_eq!(base.node, NODE_AB);
@@ -1787,8 +1822,8 @@ mod walk_base_tests {
         let nodes = created(&[("a", NODE_A), ("a/b", NODE_AB)]);
         let prefixes = resolved(&[("a", "A")]);
 
-        let base =
-            walk_base("a/b/c", root, &nodes, Some(&prefixes)).expect("an ancestor was created");
+        let base = walk_base(path("a/b/c"), root, &nodes, Some(&prefixes))
+            .expect("an ancestor was created");
         assert_eq!(base.absolute, root.join("a/b"));
         assert_eq!(base.relative.as_str(), "a/b");
         assert_eq!(base.node, NODE_AB);

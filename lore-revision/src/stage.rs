@@ -322,8 +322,6 @@ pub(crate) async fn stage_filesystem_path(
         relative_path.as_str(),
     );
 
-    // A path the file system does not hold falls back to the one given, which is
-    // the delete the not-found branch below stages.
     let (full_absolute_path, mut relative_path, resolved_metadata) = if relative_path.is_empty() {
         (base_absolute_path.clone(), relative_path, None)
     } else {
