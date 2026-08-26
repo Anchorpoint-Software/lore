@@ -20,3 +20,4 @@ pub use token_store::TokenStoreError;
 pub use util::domain_from_url_or_url;
 pub use util::domain_from_url_str_or_url;
 pub use util::get_domain_or_empty;
+pub use util::token_fingerprint;

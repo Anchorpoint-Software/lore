@@ -448,4 +448,134 @@ mod tests {
             .await
             .expect("Task failure");
     }
+
+    /// A JWT naming "alice", unexpired (`exp` 2000000000).
+    /// `{"iss":"lore","sub":"alice","name":"Alice","exp":2000000000,"aud":["example.com"]}`
+    const SUPPLIED_JWT: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJsb3JlIiwic3ViIjoiYWxpY2UiLCJuYW1lIjoiQWxpY2UiLCJleHAiOjIwMDAwMDAwMDAsImF1ZCI6WyJleGFtcGxlLmNvbSJdfQ.signature";
+
+    /// An access token with no identity token beside it must not fall back to
+    /// the store: the caller is working from tokens they supplied, and the
+    /// stored identities came from a login this call is not using. Proven
+    /// against a store that does hold a token for the identity, so a regression
+    /// to the fallback is visible here.
+    #[tokio::test]
+    async fn access_token_alone_does_not_fall_back_to_the_store() {
+        let _lock = sequential_mutex_lock().await;
+
+        let (execution, _auth_dir) = setup_test_env().await;
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let identity = "supplied-credentials-identity";
+
+                token_store::store_user_token(
+                    AUTH_ENDPOINT,
+                    identity,
+                    "stored-token",
+                    vec!["example.com".into()],
+                )
+                .await
+                .expect("Failed to store token");
+
+                // Nothing supplied: the stored token answers, so the fixture is real.
+                let stored = token_store::load_user_token(
+                    AUTH_ENDPOINT,
+                    identity,
+                    tokens_only_for_recipient_domain("example.com".into()),
+                    "",
+                    "",
+                )
+                .await
+                .expect("the stored token is found when nothing is supplied");
+                assert_eq!(stored, "stored-token");
+
+                // An access token supplied instead: the same lookup refuses.
+                let refused = token_store::load_user_token(
+                    AUTH_ENDPOINT,
+                    identity,
+                    tokens_only_for_recipient_domain("example.com".into()),
+                    "",
+                    "access-token",
+                )
+                .await
+                .unwrap_err();
+                assert!(
+                    refused.is_token_not_found(),
+                    "an access token must not fall back to the stored identity"
+                );
+            }))
+            .await
+            .expect("Task failure");
+    }
+
+    /// When called with an externally supplied `identity_token` or access token,
+    /// the on-disk token store is bypassed for both reads and writes. We do not
+    /// want to store authz exchange results for supplied identity tokens, and
+    /// do not want to read on-disk authz tokens for externally supplied tokens,
+    /// since the stored tokens have all originated from other login mechanisms.
+    /// We do not want to mix externally provided tokens with internal login
+    /// results.
+    ///
+    /// `AUTH_ENDPOINT` has an `http` scheme, which no `Authentication`
+    /// implementation is registered for, so the exchange the supplied call falls
+    /// through to fails before any network call.
+    #[tokio::test]
+    async fn a_supplied_identity_token_bypasses_the_stored_authorization_token() {
+        let _lock = sequential_mutex_lock().await;
+
+        let (execution, _auth_dir) = setup_test_env().await;
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let identity = "supplied-authz-identity";
+                let repository: RepositoryId = "00112233445566778899aabbccddeeff"
+                    .parse()
+                    .expect("a valid repository id");
+
+                // An authorization token in the store, keyed as `exchange` keys them.
+                let store_key = format!("{AUTH_ENDPOINT}/{repository}");
+                token_store::store_user_token(
+                    &store_key,
+                    identity,
+                    SUPPLIED_JWT,
+                    vec!["example.com".into()],
+                )
+                .await
+                .expect("Failed to store authorization token");
+
+                // Nothing supplied: the stored authorization token answers.
+                let stored = lore_transport::auth::exchange::exchange(
+                    AUTH_ENDPOINT,
+                    identity,
+                    repository,
+                    "example.com".to_string(),
+                    "",
+                    "",
+                )
+                .await
+                .expect("the stored authorization token is used");
+                assert_eq!(stored, SUPPLIED_JWT);
+
+                // An identity token supplied: neither the store nor the entry the
+                // call above cached answers, so this goes on to exchange and
+                // fails on the unregistered scheme.
+                let result = lore_transport::auth::exchange::exchange(
+                    AUTH_ENDPOINT,
+                    identity,
+                    repository,
+                    "example.com".to_string(),
+                    SUPPLIED_JWT,
+                    "",
+                )
+                .await;
+                assert!(
+                    result.is_err(),
+                    "a supplied identity token must not be served a stored authorization token"
+                );
+            }))
+            .await
+            .expect("Task failure");
+    }
 }

@@ -1439,66 +1439,6 @@ token = "tok-b"
         assert_eq!(token, SUPPLIED_TOKEN);
     }
 
-    /// The caller is working from tokens they supplied, so the store is off
-    /// limits: an access token with no identity token beside it reports
-    /// `TokenNotFound` rather than reading whichever identity happens to be
-    /// stored. Proven against a store that does hold a matching token, so a
-    /// regression to the fallback would be visible here.
-    ///
-    /// Redirects the store to a temp directory and takes the file fallback for
-    /// the encryption key, so the developer's real keyring and tokens are never
-    /// touched.
-    #[tokio::test]
-    async fn access_token_alone_does_not_fall_back_to_the_store() {
-        const AUTH_URL: &str = "ucs-auth://store-fallback.test.invalid";
-        let store_dir = std::env::temp_dir().join("lore-token-store-fallback-test");
-        fs::create_dir_all(&store_dir).expect("a temp store directory");
-        // SAFETY: single-threaded setup for this test; no other test in this
-        // binary reads the token store.
-        unsafe {
-            std::env::set_var("LORE_AUTH_PATH", store_dir.display().to_string());
-            std::env::set_var("LORE_AUTH_STORE", "fallback");
-        }
-
-        store_user_token(
-            AUTH_URL,
-            "alice",
-            "stored-token",
-            vec!["test.invalid".to_string()],
-        )
-        .await
-        .expect("storing a token");
-
-        // Nothing supplied: the stored token is found, so the store really does
-        // answer for this identity.
-        let stored = load_user_token(
-            AUTH_URL,
-            "alice",
-            tokens_only_for_recipient_domain("test.invalid".to_string()),
-            "",
-            "",
-        )
-        .await
-        .expect("the stored token is found");
-        assert_eq!(stored, "stored-token");
-
-        // An access token supplied instead: the same lookup now refuses.
-        let refused = load_user_token(
-            AUTH_URL,
-            "alice",
-            tokens_only_for_recipient_domain("test.invalid".to_string()),
-            "",
-            "supplied-access-token",
-        )
-        .await;
-        assert!(
-            refused.is_err(),
-            "an access token must not fall back to the stored identity"
-        );
-
-        let _ = fs::remove_dir_all(&store_dir);
-    }
-
     #[tokio::test]
     async fn no_supplied_token_reads_the_store() {
         // Nothing supplied, so this is a plain store read, which has no entry
