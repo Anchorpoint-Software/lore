@@ -4524,6 +4524,50 @@ async fn push_dirty_child_name(
     Ok(!child_name.is_empty())
 }
 
+/// One directory on the way down, and where the walk left off in its children.
+///
+/// `appended` says whether this level's own name is on the path buffer, so the
+/// buffer is restored to its parent's path when the level is done. A level opened
+/// for a node with an empty name appended nothing and must take nothing off.
+///
+/// Each level carries its own [`BlockCursor`], because a level resumes its chain
+/// after its children are walked and the levels below will have moved their own
+/// cursors elsewhere.
+struct DirtyWalkLevel {
+    node: NodeID,
+    next_child: Option<NodeID>,
+    cycle: SiblingCycleGuard,
+    cursor: BlockCursor,
+    appended: bool,
+}
+
+/// Tree depth a dirty walk's stack is sized for. A deeper tree grows it.
+const DIRTY_WALK_LEVELS: usize = 32;
+
+/// The level walking `node_id`'s children, or nothing where there are none.
+///
+/// A file holds no children, and a link's children live in another repository's
+/// state, so neither is descended. [`Node::child`] means nothing on either.
+async fn dirty_walk_level(
+    state: &State,
+    repository: &Arc<RepositoryContext>,
+    node_id: NodeID,
+    appended: bool,
+) -> Result<Option<DirtyWalkLevel>, StateError> {
+    let mut cursor = BlockCursor::open(state, repository, node_id).await?;
+    let node = cursor.node(state, repository, node_id).await?;
+    if node.is_link() || !node.is_directory() {
+        return Ok(None);
+    }
+    Ok(Some(DirtyWalkLevel {
+        node: node_id,
+        next_child: node.child(),
+        cycle: SiblingCycleGuard::new(node_id),
+        cursor,
+        appended,
+    }))
+}
+
 /// Walks the children of `parent_node`, recording dirty paths under `parent_path`.
 ///
 /// A child is named only once [`dirty_path_contributes`] or [`dirty_path_descends`]
@@ -4536,80 +4580,80 @@ async fn push_dirty_child_name(
 ///
 /// `parent_path` is the path of `parent_node` and the buffer every descendant is
 /// named into, so naming costs no allocation and a path is allocated only where one
-/// is recorded. A walk that records nothing allocates nothing. The name a child
-/// appends is taken off at the one place the loop body ends, so the buffer holds
-/// `parent_path` again for the next sibling. An error abandons the walk and the
-/// buffer with it, so it needs no unwinding.
-fn collect_dirty_paths_inner<'a>(
+/// is recorded. A walk that records nothing allocates nothing. A name is taken off
+/// where the child that appended it is finished with: at the end of the loop body
+/// for a child that is only recorded, and when its level is exhausted for one that
+/// is descended. An error abandons the walk and the buffer with it, so it needs no
+/// unwinding.
+///
+/// Descent is an explicit stack of [`DirtyWalkLevel`], so the walk runs at a fixed
+/// call depth however deep the tree is. Depth-first order in the sibling chain is
+/// preserved by resuming a level where it left off rather than queueing subtrees: a
+/// directory's own path is recorded before its level is pushed, and its next
+/// sibling is visited once that level is exhausted.
+async fn collect_dirty_paths_inner(
     state: Arc<State>,
     repository: Arc<RepositoryContext>,
     parent_node: NodeID,
-    parent_path: &'a mut RelativePathBuf,
-    paths: &'a mut Vec<RelativePath>,
+    parent_path: &mut RelativePathBuf,
+    paths: &mut Vec<RelativePath>,
     options: DirtyWalkOptions,
-) -> Pin<Box<dyn Future<Output = Result<(), StateError>> + Send + 'a>> {
-    Box::pin(async move {
-        let mut cursor = BlockCursor::open(&state, &repository, parent_node).await?;
-        let node = cursor.node(&state, &repository, parent_node).await?;
-        if node.is_link() || !node.is_directory() {
-            return Ok(());
-        }
+) -> Result<(), StateError> {
+    let mut levels: Vec<DirtyWalkLevel> = Vec::with_capacity(DIRTY_WALK_LEVELS);
+    levels.extend(dirty_walk_level(&state, &repository, parent_node, false).await?);
 
-        let mut child_node_opt = node.child();
-        let mut cycle = SiblingCycleGuard::new(parent_node);
-        while let Some(child_id) = child_node_opt {
-            let child = cursor.node(&state, &repository, child_id).await?;
-            child.walk_step(child_id, parent_node, &mut cycle)?;
-            child_node_opt = child.sibling();
-
-            if !child.is_dirty() {
-                continue;
-            }
-
-            let contributes = dirty_path_contributes(&child, options.skip_staged);
-            let descends = dirty_path_descends(&child);
-            if !contributes && !descends {
-                continue;
-            }
-
-            let appended =
-                push_dirty_child_name(&state, repository.clone(), parent_path, child_id).await?;
-
-            // Don't carry forward dirty paths that the view/ignore filter
-            // excludes — they cannot be re-applied against a checkout that
-            // never materializes them. --force bypasses the filter.
-            let excluded = !options.force
-                && repository.filter.excludes(
-                    &*parent_path,
-                    child.is_directory(),
-                    FilterMode::Full,
-                );
-
-            if !excluded {
-                if contributes {
-                    paths.push(parent_path.clone().freeze());
-                }
-
-                if descends {
-                    collect_dirty_paths_inner(
-                        state.clone(),
-                        repository.clone(),
-                        child_id,
-                        parent_path,
-                        paths,
-                        options,
-                    )
-                    .await?;
-                }
-            }
-
-            if appended {
+    while let Some(level) = levels.last_mut() {
+        let Some(child_id) = level.next_child else {
+            if levels.pop().is_some_and(|done| done.appended) {
                 parent_path.pop();
             }
+            continue;
+        };
+
+        let child = level.cursor.node(&state, &repository, child_id).await?;
+        child.walk_step(child_id, level.node, &mut level.cycle)?;
+        level.next_child = child.sibling();
+
+        if !child.is_dirty() {
+            continue;
         }
 
-        Ok(())
-    })
+        let contributes = dirty_path_contributes(&child, options.skip_staged);
+        let descends = dirty_path_descends(&child);
+        if !contributes && !descends {
+            continue;
+        }
+
+        let appended =
+            push_dirty_child_name(&state, repository.clone(), parent_path, child_id).await?;
+
+        // Don't carry forward dirty paths that the view/ignore filter
+        // excludes — they cannot be re-applied against a checkout that
+        // never materializes them. --force bypasses the filter.
+        let excluded = !options.force
+            && repository
+                .filter
+                .excludes(&*parent_path, child.is_directory(), FilterMode::Full);
+
+        let mut descended = false;
+        if !excluded {
+            if contributes {
+                paths.push(parent_path.clone().freeze());
+            }
+
+            if descends {
+                let opened = dirty_walk_level(&state, &repository, child_id, appended).await?;
+                descended = opened.is_some();
+                levels.extend(opened);
+            }
+        }
+
+        if appended && !descended {
+            parent_path.pop();
+        }
+    }
+
+    Ok(())
 }
 
 pub struct TreePath {
@@ -9470,24 +9514,36 @@ mod tests {
         collected
     }
 
-    /// The dirty paths of the whole tree, in the order the walk records them.
-    async fn walk_dirty_paths_in_order(
-        state: Arc<State>,
-        repository: Arc<RepositoryContext>,
-        options: DirtyWalkOptions,
-    ) -> Vec<String> {
-        let mut paths = Vec::new();
-        collect_dirty_paths_inner(
-            state,
-            repository,
+    /// An empty name on a directory, which is descended, so the name is taken off
+    /// where its level ends rather than where the loop body does.
+    ///
+    /// The directory appended nothing, so its level must take nothing off. A level
+    /// that popped unconditionally would remove its parent's own last component,
+    /// and the sibling walked next would be named against the wrong parent.
+    #[tokio::test]
+    async fn an_empty_directory_name_leaves_its_parent_on_the_path() {
+        let repository = null_repository().await;
+        let state = Arc::new(State::new());
+
+        let file = NodeFlags::DirtyModify | NodeFlags::File;
+        let outer = add_dirty_node(
+            &state,
+            repository.clone(),
             ROOT_NODE,
-            &mut RelativePathBuf::new(),
-            &mut paths,
-            options,
+            "outer",
+            NodeFlags::Dirty,
         )
-        .await
-        .expect("walking the tree");
-        paths.iter().map(|p| p.as_str().to_string()).collect()
+        .await;
+        // Added first so the prepending chain walks it last, after the empty name.
+        add_dirty_node(&state, repository.clone(), outer, "after.txt", file).await;
+        let unnamed = add_dirty_node(&state, repository.clone(), outer, "", NodeFlags::Dirty).await;
+        add_dirty_node(&state, repository.clone(), unnamed, "inner.txt", file).await;
+
+        assert_eq!(
+            walk_dirty_paths_in_order(state, repository, DirtyWalkOptions::default()).await,
+            vec!["outer/inner.txt", "outer/after.txt"],
+            "the sibling after an empty-named directory keeps its parent's prefix"
+        );
     }
 
     /// `U+0130` folds to two scalars, so the directory is one byte longer in the
@@ -9569,6 +9625,420 @@ mod tests {
         assert_eq!(
             walked, expected,
             "every child is recorded once, whichever block it lives in"
+        );
+    }
+
+    /// Points `node`'s sibling link at `sibling`, forging a chain no tree edit
+    /// produces.
+    async fn forge_sibling(
+        state: &State,
+        repository: Arc<RepositoryContext>,
+        node: NodeID,
+        sibling: NodeID,
+    ) {
+        let block = state
+            .block(repository, NodeBlock::index(node))
+            .await
+            .expect("the block holding the node");
+        block.write().node(Node::index(node)).sibling = sibling;
+    }
+
+    /// The dirty paths under `parent_node`, in the order the walk records them.
+    async fn walk_dirty_paths_under(
+        state: Arc<State>,
+        repository: Arc<RepositoryContext>,
+        parent_node: NodeID,
+        options: DirtyWalkOptions,
+    ) -> Result<Vec<String>, StateError> {
+        let mut paths = Vec::new();
+        collect_dirty_paths_inner(
+            state,
+            repository,
+            parent_node,
+            &mut RelativePathBuf::new(),
+            &mut paths,
+            options,
+        )
+        .await?;
+        Ok(paths.iter().map(|p| p.as_str().to_string()).collect())
+    }
+
+    /// The dirty paths of the whole tree, in the order the walk records them.
+    async fn walk_dirty_paths_in_order(
+        state: Arc<State>,
+        repository: Arc<RepositoryContext>,
+        options: DirtyWalkOptions,
+    ) -> Vec<String> {
+        walk_dirty_paths_under(state, repository, ROOT_NODE, options)
+            .await
+            .expect("walking the tree")
+    }
+
+    /// Adding a node prepends it, so each level's chain is the reverse of the
+    /// order its children were added in here.
+    #[tokio::test]
+    async fn dirty_paths_are_recorded_depth_first_along_each_sibling_chain() {
+        let repository = null_repository().await;
+        let state = Arc::new(State::new());
+
+        let gamma = add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "gamma",
+            NodeFlags::Dirty,
+        )
+        .await;
+        add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "beta.txt",
+            NodeFlags::DirtyModify | NodeFlags::File,
+        )
+        .await;
+        let alpha = add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "alpha",
+            NodeFlags::DirtyAdd,
+        )
+        .await;
+
+        let deep =
+            add_dirty_node(&state, repository.clone(), alpha, "deep", NodeFlags::Dirty).await;
+        add_dirty_node(
+            &state,
+            repository.clone(),
+            alpha,
+            "one.txt",
+            NodeFlags::DirtyModify | NodeFlags::File,
+        )
+        .await;
+        add_dirty_node(
+            &state,
+            repository.clone(),
+            deep,
+            "two.txt",
+            NodeFlags::DirtyModify | NodeFlags::File,
+        )
+        .await;
+
+        add_dirty_node(
+            &state,
+            repository.clone(),
+            gamma,
+            "four.txt",
+            NodeFlags::DirtyModify | NodeFlags::File,
+        )
+        .await;
+        add_dirty_node(
+            &state,
+            repository.clone(),
+            gamma,
+            "three.txt",
+            NodeFlags::DirtyModify | NodeFlags::File,
+        )
+        .await;
+
+        assert_eq!(
+            walk_dirty_paths_in_order(state, repository, DirtyWalkOptions::default()).await,
+            vec![
+                "alpha",
+                "alpha/one.txt",
+                "alpha/deep/two.txt",
+                "beta.txt",
+                "gamma/three.txt",
+                "gamma/four.txt",
+            ],
+            "each subtree is recorded where its directory sits in its parent's chain"
+        );
+    }
+
+    /// A directory that carries an action of its own and is also descended is
+    /// recorded before anything below it: the action re-creates the directory the
+    /// paths under it are re-applied into.
+    #[tokio::test]
+    async fn a_directory_is_recorded_before_the_paths_under_it() {
+        let repository = null_repository().await;
+        let state = Arc::new(State::new());
+
+        add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "later.txt",
+            NodeFlags::DirtyModify | NodeFlags::File,
+        )
+        .await;
+        let added = add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "added",
+            NodeFlags::DirtyAdd,
+        )
+        .await;
+        let inner = add_dirty_node(
+            &state,
+            repository.clone(),
+            added,
+            "inner",
+            NodeFlags::DirtyAdd,
+        )
+        .await;
+        add_dirty_node(
+            &state,
+            repository.clone(),
+            inner,
+            "leaf.txt",
+            NodeFlags::DirtyModify | NodeFlags::File,
+        )
+        .await;
+
+        assert_eq!(
+            walk_dirty_paths_in_order(state, repository, DirtyWalkOptions::default()).await,
+            vec!["added", "added/inner", "added/inner/leaf.txt", "later.txt"],
+            "a directory precedes its descendants, and its whole subtree precedes its sibling"
+        );
+    }
+
+    /// A child the walk passes over — clean, staged where staged paths are
+    /// skipped, or a directory with nothing dirty under it — leaves its level
+    /// walking: the siblings behind it are still visited, in chain order.
+    #[tokio::test]
+    async fn a_passed_over_child_does_not_end_its_sibling_chain() {
+        let repository = null_repository().await;
+        let state = Arc::new(State::new());
+
+        add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "last.txt",
+            NodeFlags::DirtyModify | NodeFlags::File,
+        )
+        .await;
+        add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "empty",
+            NodeFlags::Dirty,
+        )
+        .await;
+        add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "staged.txt",
+            NodeFlags::DirtyModify | NodeFlags::StagedModify | NodeFlags::File,
+        )
+        .await;
+        add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "clean.txt",
+            NodeFlags::File,
+        )
+        .await;
+        add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "first.txt",
+            NodeFlags::DirtyModify | NodeFlags::File,
+        )
+        .await;
+
+        assert_eq!(
+            walk_dirty_paths_under(
+                state,
+                repository,
+                ROOT_NODE,
+                DirtyWalkOptions {
+                    skip_staged: true,
+                    force: false
+                }
+            )
+            .await
+            .expect("walking the tree"),
+            vec!["first.txt", "last.txt"],
+            "the chain is walked past a clean child, a staged child and an empty directory"
+        );
+    }
+
+    /// Descent costs a stack entry, not a frame, so nesting past the depth the
+    /// stack is sized for is walked whole and in constant stack.
+    #[tokio::test]
+    async fn a_path_nested_deeper_than_the_walk_stack_is_recorded_in_full() {
+        const DEPTH: usize = 1024;
+
+        let repository = null_repository().await;
+        let state = Arc::new(State::new());
+
+        let mut parent = ROOT_NODE;
+        for level in 0..DEPTH {
+            parent = add_dirty_node(
+                &state,
+                repository.clone(),
+                parent,
+                &format!("d{level}"),
+                NodeFlags::Dirty,
+            )
+            .await;
+        }
+        add_dirty_node(
+            &state,
+            repository.clone(),
+            parent,
+            "leaf.txt",
+            NodeFlags::DirtyModify | NodeFlags::File,
+        )
+        .await;
+
+        let expected = (0..DEPTH)
+            .map(|level| format!("d{level}"))
+            .chain(std::iter::once("leaf.txt".to_string()))
+            .collect::<Vec<String>>()
+            .join("/");
+        assert_eq!(
+            walk_dirty_paths_in_order(state, repository, DirtyWalkOptions::default()).await,
+            vec![expected],
+            "the only dirty node is the leaf, named under all {DEPTH} levels above it"
+        );
+    }
+
+    /// Every level guards its own sibling chain, so a cycle is reported against
+    /// the directory whose chain holds it and not against the walk's root.
+    #[tokio::test]
+    async fn a_sibling_cycle_below_the_root_is_reported_against_its_own_parent() {
+        let repository = null_repository().await;
+        let state = Arc::new(State::new());
+
+        let sub = add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "sub",
+            NodeFlags::Dirty,
+        )
+        .await;
+        let second = add_dirty_node(
+            &state,
+            repository.clone(),
+            sub,
+            "second.txt",
+            NodeFlags::DirtyModify | NodeFlags::File,
+        )
+        .await;
+        let first = add_dirty_node(
+            &state,
+            repository.clone(),
+            sub,
+            "first.txt",
+            NodeFlags::DirtyModify | NodeFlags::File,
+        )
+        .await;
+        forge_sibling(&state, repository.clone(), second, first).await;
+
+        let error = walk_dirty_paths_under(
+            state,
+            repository,
+            ROOT_NODE,
+            DirtyWalkOptions {
+                skip_staged: false,
+                force: false,
+            },
+        )
+        .await
+        .expect_err("a sibling chain that loops must be reported");
+        let hierarchy = error
+            .as_invalid_node_hierarchy()
+            .unwrap_or_else(|| panic!("a looping chain is an invalid hierarchy, got {error}"));
+        assert_eq!(
+            hierarchy.expected_parent, sub,
+            "the guard that tripped belongs to the level holding the cycle"
+        );
+    }
+
+    /// Only a directory holds a chain to walk. A link's children live in another
+    /// repository's state and a file has none, so a walk rooted at either records
+    /// nothing, and from above they are recorded without being descended.
+    #[tokio::test]
+    async fn a_link_or_file_walk_root_is_not_descended() {
+        let repository = null_repository().await;
+        let state = Arc::new(State::new());
+
+        let link = add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "link",
+            NodeFlags::DirtyModify | NodeFlags::Link,
+        )
+        .await;
+        add_dirty_node(
+            &state,
+            repository.clone(),
+            link,
+            "linked.txt",
+            NodeFlags::DirtyModify | NodeFlags::File,
+        )
+        .await;
+        let file = add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "file.txt",
+            NodeFlags::DirtyModify | NodeFlags::File,
+        )
+        .await;
+        add_dirty_node(
+            &state,
+            repository.clone(),
+            file,
+            "under.txt",
+            NodeFlags::DirtyModify | NodeFlags::File,
+        )
+        .await;
+
+        assert!(
+            walk_dirty_paths_under(
+                state.clone(),
+                repository.clone(),
+                link,
+                DirtyWalkOptions {
+                    skip_staged: false,
+                    force: false
+                }
+            )
+            .await
+            .expect("walking a link")
+            .is_empty(),
+            "a link is not descended"
+        );
+        assert!(
+            walk_dirty_paths_under(
+                state.clone(),
+                repository.clone(),
+                file,
+                DirtyWalkOptions {
+                    skip_staged: false,
+                    force: false
+                }
+            )
+            .await
+            .expect("walking a file")
+            .is_empty(),
+            "a file is not descended"
+        );
+        assert_eq!(
+            walk_dirty_paths(state, repository, DirtyWalkOptions::default()).await,
+            vec!["file.txt", "link"],
+            "both are recorded from above, neither is descended"
         );
     }
 
