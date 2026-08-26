@@ -475,6 +475,26 @@ pub async fn hash_file(
     .forward("hashing file")
 }
 
+/// Whether `path` still holds the content `previous` addresses, fetching fragment metadata
+/// but never content payloads.
+pub async fn file_matches(
+    repository: Arc<RepositoryContext>,
+    path: impl AsRef<Path>,
+    previous: Address,
+    previous_size: Option<usize>,
+) -> Result<lore_storage::FileMatch, ImmutableError> {
+    lore_storage::file_matches(
+        repository.immutable_store(),
+        repository.id,
+        path,
+        previous,
+        previous_size,
+        None,
+    )
+    .await
+    .forward("comparing file against stored content")
+}
+
 // ---------------------------------------------------------------------------
 // Cache and query helpers
 // ---------------------------------------------------------------------------

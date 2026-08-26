@@ -1255,6 +1255,186 @@ pub async fn write_from_file(
     })
 }
 
+/// Whether a file on disk holds the content a stored object addresses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileMatch {
+    /// The file is the stored content.
+    Match,
+    /// The file is not the stored content.
+    Differs,
+    /// The stored object could not be described or walked, so nothing was established
+    /// about the file either way.
+    Indeterminate,
+}
+
+/// Whether `path` still holds the content `previous` addresses.
+///
+/// Transfers fragment metadata only: the stored object's header and, when it is fragmented,
+/// its fragment lists. Content payloads are never fetched — chunks are compared by hashing
+/// the file's own bytes over the ranges the stored list records, so the cost is bounded by
+/// the file and its metadata however large the object is.
+///
+/// A file at or below the fragment threshold is one fragment under the current chunking, so
+/// its buffer hash is tried first and settles the question when it matches, without touching
+/// the store at all. A mismatch settles nothing on its own: a commit may reuse a previous
+/// fragmentation, so a stored object of any size may be a fragment list, and no buffer hash
+/// equals a fragment list hash. The stored header then says which it is, and a list is
+/// walked like any other.
+///
+/// A stored object that cannot be described or walked falls back to
+/// [`hashed_under_current_chunking`], which reads nothing but the file.
+pub async fn file_matches(
+    store: Arc<dyn ImmutableStore>,
+    partition: Partition,
+    path: impl AsRef<Path>,
+    previous: Address,
+    previous_size: Option<usize>,
+    remote_session: Option<Arc<StorageSession>>,
+) -> Result<FileMatch, StorageError> {
+    let _count_permit = file_count_limit_acquire()
+        .await
+        .forward::<StorageError>("permit failed")?;
+
+    let path = path.as_ref();
+    let Ok(metadata) = lore_io::IoDriver::global().metadata(path).await else {
+        return Err(StorageError::internal(format!(
+            "failed to query file metadata: {}",
+            path.display()
+        )));
+    };
+    let file_size = metadata.len() as usize;
+
+    if previous_size.is_some_and(|size| size != file_size) {
+        return Ok(FileMatch::Differs);
+    }
+    if file_size == 0 {
+        // Empty is empty under any fragmentation.
+        return Ok(if previous.hash.is_zero() {
+            FileMatch::Match
+        } else {
+            FileMatch::Differs
+        });
+    }
+    if previous.is_zero() {
+        return Ok(FileMatch::Differs);
+    }
+
+    if file_size <= crate::compress::FRAGMENT_SIZE_THRESHOLD {
+        let data = lore_io::IoDriver::global()
+            .read_file_bytes(path)
+            .await
+            .map_err(|e| {
+                StorageError::internal_with_context(e, &format!("read file: {}", path.display()))
+            })?;
+        if Hash::hash_buffer(&data) == previous.hash {
+            return Ok(FileMatch::Match);
+        }
+
+        // The header says whether the stored object is a list this buffer hash could never
+        // have equalled, or a single fragment whose hash it was directly comparable with.
+        let Ok(described) = store.clone().get_metadata(partition, previous).await else {
+            return Ok(FileMatch::Indeterminate);
+        };
+        if described.match_made == StoreMatch::MatchNone {
+            return Ok(FileMatch::Indeterminate);
+        }
+        if described.fragment.flags & FragmentFlags::PayloadFragmented == 0 {
+            return Ok(FileMatch::Differs);
+        }
+        if described.fragment.size_content != file_size as u64 {
+            return Ok(FileMatch::Differs);
+        }
+    }
+
+    let options = ReadOptions::default().no_decompress().no_verify();
+    let loaded = load_fragment(
+        store.clone(),
+        partition,
+        previous,
+        options,
+        remote_session.clone(),
+    )
+    .await
+    .ok();
+
+    if let Some((fragment, _)) = loaded.as_ref()
+        && fragment.size_content != file_size as u64
+    {
+        return Ok(FileMatch::Differs);
+    }
+
+    let file = open_for_compare(path).await?;
+
+    if let Some((fragment, payload)) = loaded
+        && fragment.flags & FragmentFlags::PayloadFragmented != 0
+    {
+        let fragment_list = payload.to_aligned::<FragmentReference>();
+        let previous_fragmentation = fragment_list.as_type_slice::<FragmentReference>();
+        if !previous_fragmentation.is_empty() {
+            match compare_previous_chunks(
+                SublistSource {
+                    store: &store,
+                    partition,
+                    context: previous.context,
+                    remote_session: &remote_session,
+                },
+                path,
+                &file,
+                file_size as u64,
+                previous_fragmentation,
+            )
+            .await?
+            {
+                FileMatch::Match => return Ok(FileMatch::Match),
+                FileMatch::Differs => return Ok(FileMatch::Differs),
+                FileMatch::Indeterminate => {}
+            }
+        }
+    }
+
+    hashed_under_current_chunking(store, partition, previous, file, file_size).await
+}
+
+/// Whether hashing the file under the current chunking reproduces `previous`.
+///
+/// The fallback for a stored object that could not be described or walked, which is what a
+/// clone into a directory of existing files sees: nothing is in the local store yet, so
+/// there is no fragmentation to measure against. A file the current chunker was what stored
+/// still hashes to the address it was stored under, and that settles it while reading
+/// nothing but the file. A different hash settles nothing, since the stored object may have
+/// been chunked another way.
+async fn hashed_under_current_chunking(
+    store: Arc<dyn ImmutableStore>,
+    partition: Partition,
+    previous: Address,
+    file: lore_io::IoFile,
+    file_size: usize,
+) -> Result<FileMatch, StorageError> {
+    if file_size <= crate::compress::FRAGMENT_SIZE_THRESHOLD {
+        // One fragment covers the file, so its buffer hash was already the whole answer.
+        return Ok(FileMatch::Indeterminate);
+    }
+
+    let address = crate::fragment_engine::write_fragmented_from_file(
+        store,
+        partition,
+        previous.context,
+        file,
+        file_size,
+        WriteOptions::default().no_remote_write(),
+        true,
+        None,
+        None,
+    )
+    .await?;
+
+    Ok(if address.0.hash == previous.hash {
+        FileMatch::Match
+    } else {
+        FileMatch::Indeterminate
+    })
+}
+
 /// Hash a file's content, using previous fragmentation hints when available.
 ///
 /// Takes a store, partition, and optional remote session directly. Internally
@@ -1332,29 +1512,13 @@ pub async fn hash_file(
     // Chunks are read on demand, so a mismatch early in the list stops after reading only
     // the chunks it compared.
     // Opened rather than measured again: the size above is the one the chunker is opened at.
-    let mut retry = crate::retry(10, 10_000, 10);
-    let file = loop {
-        match lore_io::IoDriver::global()
-            .open(path, &lore_io::OpenOptions::new().read(true))
-            .await
-        {
-            Ok(file) => break file,
-            Err(err) => {
-                if !retry.wait().await {
-                    return Err(StorageError::internal_with_context(
-                        err,
-                        &format!("open file: {}", path.display()),
-                    ));
-                }
-            }
-        }
-    };
+    let file = open_for_compare(path).await?;
 
     // If we have a non-empty previous fragment list, check if chunks still match
     if let Some(ref frag_bytes) = fragment_list {
         let previous_fragmentation = frag_bytes.as_type_slice::<FragmentReference>();
         if !previous_fragmentation.is_empty()
-            && previous_chunks_still_match(
+            && compare_previous_chunks(
                 SublistSource {
                     store: &store,
                     partition,
@@ -1367,6 +1531,7 @@ pub async fn hash_file(
                 previous_fragmentation,
             )
             .await?
+                == FileMatch::Match
         {
             return Ok(previous.hash);
         }
@@ -1386,6 +1551,27 @@ pub async fn hash_file(
     .await?;
 
     Ok(address.0.hash)
+}
+
+/// Open `path` for the chunk walk, retrying a file another process may still be closing.
+async fn open_for_compare(path: &Path) -> Result<lore_io::IoFile, StorageError> {
+    let mut retry = crate::retry(10, 10_000, 10);
+    loop {
+        match lore_io::IoDriver::global()
+            .open(path, &lore_io::OpenOptions::new().read(true))
+            .await
+        {
+            Ok(file) => return Ok(file),
+            Err(err) => {
+                if !retry.wait().await {
+                    return Err(StorageError::internal_with_context(
+                        err,
+                        &format!("open file: {}", path.display()),
+                    ));
+                }
+            }
+        }
+    }
 }
 
 /// One read covering several consecutive chunks. Sized like the chunker's window and for
@@ -1500,8 +1686,7 @@ struct SublistSource<'a> {
     remote_session: &'a Option<Arc<StorageSession>>,
 }
 
-/// Whether the file still hashes to `previous_fragmentation` chunk for chunk, i.e. it is
-/// unchanged and its previous address can be reused.
+/// Measure the file against `previous_fragmentation` chunk for chunk.
 ///
 /// Reads cover as many consecutive chunks as a window holds and run one window ahead of
 /// the hashing, which is then taken in place. This is the *unchanged* file path for
@@ -1509,16 +1694,22 @@ struct SublistSource<'a> {
 /// changed: one blocking read per chunk would be ~16,384 sequential dispatches per GiB,
 /// each allocating and filling its own buffer.
 ///
-/// A chunk that no longer matches returns immediately. The walk then stops having read at
-/// most one window more than it compared, where reading per chunk stopped exactly at the
-/// mismatch — the cost of not paying a round trip per chunk on every unchanged file.
-async fn previous_chunks_still_match(
+/// A chunk that no longer matches returns [`FileMatch::Differs`] immediately, and a walk
+/// that cannot proceed at all — a sublist that fails to load or is not a list — returns
+/// [`FileMatch::Indeterminate`]. A list that merely misdescribes the content reads as a
+/// difference rather than as indeterminate, since the list is what defines the ranges being
+/// hashed: wrong offsets simply hash the wrong bytes.
+///
+/// The walk stops having read at most one window more than it compared, where reading per
+/// chunk stopped exactly at the mismatch — the cost of not paying a round trip per chunk on
+/// every unchanged file.
+async fn compare_previous_chunks(
     sublists: SublistSource<'_>,
     path: &Path,
     file: &lore_io::IoFile,
     file_size: u64,
     previous_fragmentation: &[FragmentReference],
-) -> Result<bool, StorageError> {
+) -> Result<FileMatch, StorageError> {
     // Recursive fragmentation is spliced in as it is found, so the list grows.
     let mut chunks = previous_fragmentation.to_vec();
 
@@ -1544,10 +1735,10 @@ async fn previous_chunks_still_match(
         let start = current.offset_content;
         let Some(end) = chunk_end(&chunks, index, file_size) else {
             lore_base::lore_trace!(
-                "Previous chunk {index} at offset {start} does not ascend, hash mismatch for {}",
+                "Previous chunk {index} at offset {start} does not ascend, cannot compare {}",
                 path.display()
             );
-            return Ok(false);
+            return Ok(FileMatch::Indeterminate);
         };
         let chunk_size = end - start;
 
@@ -1571,12 +1762,12 @@ async fn previous_chunks_still_match(
             )
             .await
             else {
-                return Ok(false);
+                return Ok(FileMatch::Indeterminate);
             };
 
             if sub_fragment.flags & FragmentFlags::PayloadFragmented == 0 {
                 lore_base::lore_warn!("Subfragment was not expected fragment list");
-                return Ok(false);
+                return Ok(FileMatch::Indeterminate);
             }
 
             // A window already covering these bytes stays usable: the sublist tiles the
@@ -1600,10 +1791,10 @@ async fn previous_chunks_still_match(
 
         if end > file_size {
             lore_base::lore_trace!(
-                "Previous chunk {index} [{start}..{end}] extends beyond file end, hash mismatch for {}",
+                "Previous chunk {index} [{start}..{end}] extends beyond file end, cannot compare {}",
                 path.display()
             );
-            return Ok(false);
+            return Ok(FileMatch::Indeterminate);
         }
 
         let resident = match window.take() {
@@ -1656,7 +1847,7 @@ async fn previous_chunks_still_match(
                 "Checking previous chunk {index} [{start}..{end}] hash yielded different file hash, abandon {}",
                 path.display()
             );
-            return Ok(false);
+            return Ok(FileMatch::Differs);
         }
         lore_base::lore_trace!(
             "Checking previous chunk {index} [{start}..{end}] hash yielded same file hash, continue {}",
@@ -1667,7 +1858,7 @@ async fn previous_chunks_still_match(
         index += 1;
     }
 
-    Ok(true)
+    Ok(FileMatch::Match)
 }
 
 /// Follower future: waits for the leader token to fire, then observes the
@@ -2942,13 +3133,13 @@ mod tests {
         sizes
     }
 
-    async fn compare_file(content: &[u8], chunks: &[FragmentReference]) -> bool {
+    async fn compare_file(content: &[u8], chunks: &[FragmentReference]) -> FileMatch {
         let (dir, store) = make_test_store().await;
         let path = PathBuf::from(dir.as_ref()).join("hash-compare.bin");
         std::fs::write(&path, content).expect("write test file");
         let (file, file_size) = crate::chunker::open_read(&path).await.expect("open");
 
-        previous_chunks_still_match(
+        compare_previous_chunks(
             SublistSource {
                 store: &store,
                 partition: Partition::from([7u8; 16]),
@@ -2971,8 +3162,9 @@ mod tests {
         let chunks = fragment_list_for(&content, &chunk_sizes(content.len(), 100_003));
         assert!(chunks.len() > 20, "test wants many chunks per window");
 
-        assert!(
+        assert_eq!(
             compare_file(&content, &chunks).await,
+            FileMatch::Match,
             "unchanged file must match its own fragment list"
         );
     }
@@ -2982,8 +3174,9 @@ mod tests {
         let content = hash_test_content(HASH_WINDOW_SIZE - 17);
         let chunks = fragment_list_for(&content, &chunk_sizes(content.len(), 200_000));
 
-        assert!(
+        assert_eq!(
             compare_file(&content, &chunks).await,
+            FileMatch::Match,
             "file smaller than one window must match"
         );
     }
@@ -2993,7 +3186,7 @@ mod tests {
     /// mismatches for a file that is in fact unchanged, and every `status` would
     /// re-fragment it.
     #[tokio::test]
-    async fn a_byte_changed_in_a_late_chunk_does_not_match() {
+    async fn a_byte_changed_in_a_late_chunk_differs() {
         let content = hash_test_content(5 * HASH_WINDOW_SIZE + 4_321);
         let chunks = fragment_list_for(&content, &chunk_sizes(content.len(), 100_003));
 
@@ -3001,36 +3194,38 @@ mod tests {
         let victim = 2 * HASH_WINDOW_SIZE + 11;
         changed[victim] ^= 0xff;
 
-        assert!(
-            !compare_file(&changed, &chunks).await,
-            "a changed byte in the third window must not match"
+        assert_eq!(
+            compare_file(&changed, &chunks).await,
+            FileMatch::Differs,
+            "a changed byte in the third window is a difference in content"
         );
     }
 
+    /// The same list against a shorter file. The last chunk is measured to the end of the
+    /// file rather than to the offset the list records, so the missing bytes show up as the
+    /// content difference they are.
     #[tokio::test]
-    async fn a_list_covering_more_than_the_file_does_not_match() {
+    async fn a_file_shorter_than_its_list_differs() {
         let content = hash_test_content(3 * HASH_WINDOW_SIZE);
         let chunks = fragment_list_for(&content, &chunk_sizes(content.len(), 100_003));
 
-        // The same list against a shorter file: the last chunk now runs past the end.
-        assert!(
-            !compare_file(&content[..content.len() - 1_000], &chunks).await,
-            "a list extending beyond the file must not match"
+        assert_eq!(
+            compare_file(&content[..content.len() - 1_000], &chunks).await,
+            FileMatch::Differs,
         );
     }
 
-    /// A list whose offsets do not ascend describes something other than this file. The
-    /// chunk size used to be an unchecked subtraction, which underflowed on it.
+    /// A list whose offsets do not ascend describes something other than this file, and the
+    /// walk reports that as a difference: the list is what defines the ranges being hashed,
+    /// so one that misdescribes the content is indistinguishable from content that changed.
+    /// The chunk size used to be an unchecked subtraction, which underflowed on it.
     #[tokio::test]
-    async fn a_list_that_does_not_ascend_does_not_match() {
+    async fn a_list_that_does_not_ascend_differs_without_underflowing() {
         let content = hash_test_content(3 * HASH_WINDOW_SIZE);
         let mut chunks = fragment_list_for(&content, &chunk_sizes(content.len(), 100_003));
         chunks.swap(1, 2);
 
-        assert!(
-            !compare_file(&content, &chunks).await,
-            "a descending offset pair must not match"
-        );
+        assert_eq!(compare_file(&content, &chunks).await, FileMatch::Differs);
     }
 
     /// A chunk over the threshold is itself a fragment list, and the walk compares that
@@ -3043,16 +3238,35 @@ mod tests {
         let (chunks, store, partition, path, _dir) =
             recursive_case(&content, nested, &chunk_sizes(nested, 100 * 1024)).await;
 
-        assert!(
+        assert_eq!(
             compare_recursive(&store, partition, &path, &content, &chunks).await,
+            FileMatch::Match,
             "unchanged file must match through the sublist"
+        );
+    }
+
+    /// A nested entry pointing at a sublist nothing stored leaves the walk unable to read
+    /// the bytes it would have compared. Reporting that as a content difference would drop
+    /// the caller's content-comparison fallback for a file that may well be unchanged.
+    #[tokio::test]
+    async fn a_sublist_that_cannot_be_loaded_is_indeterminate() {
+        let content = hash_test_content(3 * HASH_WINDOW_SIZE + 4_321);
+        let nested = 300 * 1024;
+        let (mut chunks, store, partition, path, _dir) =
+            recursive_case(&content, nested, &chunk_sizes(nested, 100 * 1024)).await;
+        chunks[0].hash = Hash::hash_buffer(b"a sublist that was never stored");
+
+        assert_eq!(
+            compare_recursive(&store, partition, &path, &content, &chunks).await,
+            FileMatch::Indeterminate,
+            "an unloadable sublist settles nothing about the content"
         );
     }
 
     /// Proves the sublist is genuinely compared rather than accepted because its parent
     /// entry loaded: the changed byte is only covered by a sub-chunk hash.
     #[tokio::test]
-    async fn a_byte_changed_inside_a_recursively_fragmented_chunk_does_not_match() {
+    async fn a_byte_changed_inside_a_recursively_fragmented_chunk_differs() {
         let content = hash_test_content(3 * HASH_WINDOW_SIZE + 4_321);
         let nested = 300 * 1024;
         let (chunks, store, partition, path, _dir) =
@@ -3062,9 +3276,10 @@ mod tests {
         changed[250 * 1024] ^= 0xff;
         std::fs::write(&path, &changed).expect("rewrite test file");
 
-        assert!(
-            !compare_recursive(&store, partition, &path, &changed, &chunks).await,
-            "a changed byte inside the nested range must not match"
+        assert_eq!(
+            compare_recursive(&store, partition, &path, &changed, &chunks).await,
+            FileMatch::Differs,
+            "a changed byte inside the nested range is a difference in content"
         );
     }
 
@@ -3136,11 +3351,11 @@ mod tests {
         path: &Path,
         content: &[u8],
         chunks: &[FragmentReference],
-    ) -> bool {
+    ) -> FileMatch {
         let (file, file_size) = crate::chunker::open_read(path).await.expect("open");
         assert_eq!(file_size, content.len() as u64);
 
-        previous_chunks_still_match(
+        compare_previous_chunks(
             SublistSource {
                 store,
                 partition,

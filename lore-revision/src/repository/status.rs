@@ -511,7 +511,7 @@ async fn dirty_change_is_modified(
     }
 
     let (file_mtime, file_size) = crate::util::fs::file_mtime_and_size(&metadata);
-    let (is_modified, _file_hash) = state::is_file_modified(
+    let is_modified = state::is_file_modified(
         repository.clone(),
         &node,
         file_mtime,

@@ -10,7 +10,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use lore_base::types::Address;
 use lore_base::types::Fragment;
 use lore_base::types::Hash;
 use lore_error_set::WrapInternal;
@@ -155,7 +154,7 @@ impl InstanceOperation for OsOperation {
                 info.size
             );
             if from_node.is_file() {
-                let (modified, hash) = crate::state::is_file_modified(
+                let modified = crate::state::is_file_modified(
                     repository,
                     from_node,
                     info.mtime,
@@ -165,7 +164,7 @@ impl InstanceOperation for OsOperation {
                 )
                 .await
                 .internal("Failed to check file modification")?;
-                Some(FileDifferenceFromNode { modified, hash })
+                Some(FileDifferenceFromNode { modified })
             } else {
                 None
             }
@@ -197,7 +196,7 @@ impl InstanceOperation for OsOperation {
                 }
             }),
             node_hint.and_then(|node| {
-                if !node.size > 0 {
+                if node.size > 0 {
                     Some(node.size as usize)
                 } else {
                     None
@@ -208,20 +207,25 @@ impl InstanceOperation for OsOperation {
         .unwrap_or_default())
     }
 
-    async fn file_compare(
+    async fn file_modified_from_node(
         &self,
         repository: Arc<RepositoryContext>,
-        address: Address,
-        path: FilesystemPath<'_>,
-        known_disk_file_size: u64,
+        node: &Node,
+        path: &RelativePath,
+        file_mtime: u64,
+        file_size: u64,
+        force_full_check: bool,
     ) -> Result<bool, FsError> {
-        Ok(crate::state::is_file_content_equal(
+        Ok(crate::state::is_file_modified(
             repository,
-            address,
-            path.as_absolute_path(),
-            known_disk_file_size,
+            node,
+            file_mtime,
+            file_size,
+            path,
+            force_full_check,
         )
-        .await)
+        .await
+        .internal("Failed to check file modification")?)
     }
 
     async fn make_executable(

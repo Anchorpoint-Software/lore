@@ -1876,7 +1876,7 @@ async fn clone_file(
             force,
         )
         .await
-        .map_or(true, |(modified, _)| modified)
+        .unwrap_or(true)
         {
             // Existing file is identical, just use it
             let node_executable = node.mode & NodeFileMode::Executable == NodeFileMode::Executable;

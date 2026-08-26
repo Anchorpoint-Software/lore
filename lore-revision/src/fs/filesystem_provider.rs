@@ -11,7 +11,6 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use lore_base::error::InvalidArguments;
-use lore_base::types::Address;
 use lore_base::types::Fragment;
 use lore_error_set::error_set;
 use tokio::sync::RwLock;
@@ -76,8 +75,6 @@ impl FileInfo {
 pub struct FileDifferenceFromNode {
     /// Whether the file content differs from the node.
     pub modified: bool,
-    /// Hash of the file if computed during the modification check.
-    pub hash: Hash,
 }
 
 /// Result of checking whether a file differs from a node.
@@ -211,17 +208,18 @@ pub trait InstanceOperation: Send + Sync {
         node_hint: Option<&Node>,
     ) -> impl Future<Output = Result<Hash, FsError>> + Send;
 
-    /// Compare if an address matches what's on disk.
+    /// Whether the file at `path` differs from the content `node` addresses.
     ///
-    /// # Arguments
-    /// * `known_disk_file_size` - The size of the file on disk, which should have been accessed by
-    ///   the caller.
-    fn file_compare(
+    /// Takes the node to compare against rather than deriving it from a change, so a caller
+    /// holding both sides of a change can ask about either.
+    fn file_modified_from_node(
         &self,
         repository: Arc<RepositoryContext>,
-        address: Address,
-        path: FilesystemPath<'_>,
-        known_disk_file_size: u64,
+        node: &Node,
+        path: &RelativePath,
+        file_mtime: u64,
+        file_size: u64,
+        force_full_check: bool,
     ) -> impl Future<Output = Result<bool, FsError>> + Send;
 
     /// Make a file executable (Unix) or set executable bit equivalent.
@@ -447,19 +445,28 @@ impl InstanceOperation for InstanceOperationImpl {
         }
     }
 
-    async fn file_compare(
+    async fn file_modified_from_node(
         &self,
         repository: Arc<RepositoryContext>,
-        address: Address,
-        path: FilesystemPath<'_>,
-        known_disk_file_size: u64,
+        node: &Node,
+        path: &RelativePath,
+        file_mtime: u64,
+        file_size: u64,
+        force_full_check: bool,
     ) -> Result<bool, FsError> {
         match &self.dispatch {
             #[cfg(test)]
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
             StaticDispatchInstanceOperation::Os(this) => {
-                this.file_compare(repository, address, path, known_disk_file_size)
-                    .await
+                this.file_modified_from_node(
+                    repository,
+                    node,
+                    path,
+                    file_mtime,
+                    file_size,
+                    force_full_check,
+                )
+                .await
             }
         }
     }
@@ -590,9 +597,7 @@ pub mod tests {
     use std::sync::Arc;
 
     use async_trait::async_trait;
-    use lore_base::types::Address;
     use lore_base::types::Fragment;
-    use lore_base::types::Hash;
     use parking_lot::Mutex;
 
     use crate::change::NodeChange;
@@ -605,6 +610,7 @@ pub mod tests {
     use crate::fs::filesystem_provider::InstanceOperation;
     use crate::fs::filesystem_provider::InstanceOperationImpl;
     use crate::fs::filesystem_provider::StaticDispatchInstanceOperation;
+    use crate::lore::Hash;
     use crate::merge::MergeTextMode;
     use crate::node::Node;
     use crate::node::NodeID;
@@ -687,12 +693,14 @@ pub mod tests {
             panic!("Test operation unimplemented except finalize")
         }
 
-        async fn file_compare(
+        async fn file_modified_from_node(
             &self,
             _repository: Arc<RepositoryContext>,
-            _address: Address,
-            _path: FilesystemPath<'_>,
-            _known_disk_file_size: u64,
+            _node: &Node,
+            _path: &RelativePath,
+            _file_mtime: u64,
+            _file_size: u64,
+            _force_full_check: bool,
         ) -> Result<bool, FsError> {
             panic!("Test operation unimplemented except finalize")
         }

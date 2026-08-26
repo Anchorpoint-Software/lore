@@ -1661,7 +1661,7 @@ async fn reset_file_realize(
 
     if !force && let Ok(file_metadata) = metadata.as_ref() {
         let (mtime, size) = crate::util::fs::file_mtime_and_size(file_metadata);
-        let (file_modified, _) = state::is_file_modified(
+        let file_modified = state::is_file_modified(
             repository.clone(),
             &node,
             mtime,

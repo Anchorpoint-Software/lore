@@ -705,7 +705,7 @@ fn walk_layer_subtree<'a>(
                                 true,
                             )
                             .await
-                            .map_or(true, |(m, _)| m);
+                            .unwrap_or(true);
                             if is_modified {
                                 modified.push(child_path.as_str().to_string());
                             }

@@ -1628,13 +1628,15 @@ mod single_file_compare_result_tests {
     }
 }
 
-/// Tests for `is_file_modified` chunking compatibility: files stored with
-/// old-style fragmentation (multiple 64 KiB chunks) must be recognized as
-/// unmodified when the current chunking threshold (256 KiB) would hash them
-/// as a single buffer.
+/// Tests for `is_file_modified` against objects whose stored fragmentation is not the one
+/// the current chunker would produce — here multiple 64 KiB chunks. Replaying the stored
+/// list is the only comparison that holds, since a commit may reuse a previous
+/// fragmentation and the stored hash is then a function of that history too.
 mod is_file_modified_chunking_compat {
     #![allow(clippy::disallowed_methods)] // Test fixture writes; not subject to repository write-token discipline.
 
+    use std::future::Future;
+    use std::path::PathBuf;
     use std::sync::Arc;
 
     use bytes::Bytes;
@@ -1728,11 +1730,15 @@ mod is_file_modified_chunking_compat {
         list_address
     }
 
-    /// 128 KiB file stored as two 64 KiB chunks (old chunking strategy).
-    /// The file on disk is unmodified — `is_file_modified` must detect this
-    /// via content comparison despite the hash mismatch.
-    #[tokio::test]
-    async fn unmodified_128k_file_with_legacy_two_chunk_fragmentation() {
+    /// Runs `body` on a repository rooted in a fresh temporary directory, inside the
+    /// execution context the store operations read.
+    ///
+    /// The directory outlives `body`, which is what lets it write the files to hash.
+    async fn on_a_repository<Body, Run>(body: Body)
+    where
+        Body: FnOnce(Arc<RepositoryContext>, PathBuf, Context) -> Run,
+        Run: Future<Output = ()>,
+    {
         let tempdir = generate_tempdir();
         let dir = tempdir.path().to_path_buf();
 
@@ -1740,160 +1746,251 @@ mod is_file_modified_chunking_compat {
             test_store_create().await.expect("Failed to create stores");
 
         LORE_CONTEXT
-            .scope(execution.clone(), async move {
-                let mut rng = rand::rng();
+            .scope(execution, async move {
                 let context: Context = rand::random();
-                let repository_id = rand::random();
-
                 let repository = Arc::new(RepositoryContext::new(
                     default_repository_creation_args(immutable_store, mutable_store)
                         .with_path(dir.as_path())
-                        .with_id(repository_id),
+                        .with_id(rand::random()),
                 ));
 
-                // Generate 128 KiB of random content
-                let content_size = 128 * 1024;
-                let content: Vec<u8> = (0..content_size)
-                    .map(|_| rng.random_range(0..=255u8))
-                    .collect();
-
-                // Store as two 64 KiB chunks (simulating old chunking strategy)
-                let root_address =
-                    store_as_legacy_chunks(&repository, context, &content, 64 * 1024).await;
-
-                // Write the identical content to a file on disk
-                let file_path = dir.join("test_file_128k.bin");
-                std::fs::write(&file_path, &content).expect("Failed to write test file");
-
-                let metadata = std::fs::metadata(&file_path).expect("Failed to get metadata");
-                let relative_path =
-                    RelativePath::new_from_initial_path("test_file_128k.bin").unwrap();
-
-                // Build a Node referencing the legacy chunked address
-                let node = Node {
-                    flags: NodeFlags::File.bits(),
-                    size: content_size as u64,
-                    address: root_address,
-                    ..Default::default()
-                };
-
-                // is_file_modified should detect content equality despite hash mismatch
-                let (mtime, size) = lore_revision::util::fs::file_mtime_and_size(&metadata);
-                let (modified, new_hash) = is_file_modified(
-                    repository.clone(),
-                    &node,
-                    mtime,
-                    size,
-                    &relative_path,
-                    true, // force hash check
-                )
-                .await
-                .expect("is_file_modified failed");
-
-                assert!(
-                    !modified,
-                    "128 KiB file with legacy two-chunk fragmentation should NOT be detected as modified"
-                );
-
-                // The returned hash (computed with current chunking) must differ
-                // from the stored legacy fragment-list hash — this confirms the
-                // content comparison fallback was actually exercised.
-                assert_ne!(
-                    new_hash, root_address.hash,
-                    "Returned hash should differ from legacy chunked hash"
-                );
-                assert!(
-                    !new_hash.is_zero(),
-                    "Returned hash should be non-zero"
-                );
-
-                // The new hash should be a direct hash of the full content
-                let expected_hash = Hash::hash_buffer(&content);
-                assert_eq!(
-                    new_hash, expected_hash,
-                    "Returned hash should be the new CDC-based single-buffer hash"
-                );
+                body(repository, dir, context).await;
             })
             .await;
     }
 
-    /// 640 KiB file stored as ten 64 KiB chunks. Verifies that rehashing
-    /// reuses the previous chunk fragmentation — each chunk is validated
-    /// individually and the stored root hash is returned unchanged.
+    /// `size` bytes of random content, which no chunker collapses into fewer chunks than
+    /// the sizes it is stored under.
+    fn random_content(size: usize) -> Vec<u8> {
+        let mut rng = rand::rng();
+        (0..size).map(|_| rng.random_range(0..=255u8)).collect()
+    }
+
+    /// A buffer hash is tried first for a file this size and misses here, because the stored
+    /// object is a list no buffer hash can equal. The miss settles nothing, so the stored
+    /// list is walked and recognises the content.
+    #[tokio::test]
+    async fn a_buffer_hash_miss_falls_through_to_the_stored_list() {
+        on_a_repository(|repository, dir, context| async move {
+            let size = 128 * 1024;
+            let content = random_content(size);
+            let address = store_as_legacy_chunks(&repository, context, &content, 64 * 1024).await;
+            let path = dir.join("small.bin");
+            std::fs::write(&path, &content).expect("Failed to write small file");
+
+            assert_ne!(
+                Hash::hash_buffer(&content),
+                address.hash,
+                "a buffer hash cannot equal a fragment list hash"
+            );
+            assert_eq!(
+                immutable::file_matches(repository.clone(), path.as_path(), address, Some(size))
+                    .await
+                    .expect("Failed to compare small file"),
+                lore_storage::FileMatch::Match,
+                "the stored list holds this content whatever the buffer hash says"
+            );
+        })
+        .await;
+    }
+
+    /// The fall-through walks the stored list rather than assuming the buffer hash miss was
+    /// the answer, so it still reports a small file whose content really did change.
+    #[tokio::test]
+    async fn a_modified_small_file_differs_through_the_stored_list() {
+        on_a_repository(|repository, dir, context| async move {
+            let size = 128 * 1024;
+            let content = random_content(size);
+            let address = store_as_legacy_chunks(&repository, context, &content, 64 * 1024).await;
+
+            let mut modified = content.clone();
+            modified[size / 2] ^= 0xff;
+            let path = dir.join("small.bin");
+            std::fs::write(&path, &modified).expect("Failed to write small file");
+
+            assert_eq!(
+                immutable::file_matches(repository.clone(), path.as_path(), address, Some(size))
+                    .await
+                    .expect("Failed to compare small file"),
+                lore_storage::FileMatch::Differs,
+            );
+        })
+        .await;
+    }
+
+    /// A clone into a directory of existing files starts with an empty store, so there is no
+    /// stored fragmentation to measure the file against. Hashing it under the current
+    /// chunking is what recognises it, reading nothing but the file.
+    #[tokio::test]
+    async fn a_large_file_is_recognised_with_nothing_in_the_store() {
+        on_a_repository(|repository, dir, context| async move {
+            let size = 1_234_567;
+            let content = random_content(size);
+            let path = dir.join("large.bin");
+            std::fs::write(&path, &content).expect("Failed to write large file");
+
+            let (address, _) = immutable::write_from_file(
+                repository.clone(),
+                path.as_path(),
+                context,
+                lore_storage::WriteOptions::default().no_remote_write(),
+            )
+            .await
+            .expect("Failed to store large file");
+
+            let (empty_immutable, empty_mutable, _) =
+                test_store_create().await.expect("Failed to create stores");
+            let empty = Arc::new(RepositoryContext::new(
+                default_repository_creation_args(empty_immutable, empty_mutable)
+                    .with_path(dir.as_path())
+                    .with_id(rand::random()),
+            ));
+
+            assert_eq!(
+                immutable::file_matches(empty, path.as_path(), address, Some(size))
+                    .await
+                    .expect("Failed to compare large file"),
+                lore_storage::FileMatch::Match,
+                "the current chunking reproduces the address it was stored under"
+            );
+        })
+        .await;
+    }
+
+    /// Above the threshold the file is measured against the stored object's own chunking,
+    /// which is what settles a difference without reading any stored content.
+    #[tokio::test]
+    async fn a_modified_large_file_differs_against_the_stored_chunking() {
+        on_a_repository(|repository, dir, context| async move {
+            let size = 640 * 1024;
+            let content = random_content(size);
+            let address = store_as_legacy_chunks(&repository, context, &content, 64 * 1024).await;
+
+            let mut modified = content.clone();
+            modified[size / 2] ^= 0xff;
+            let path = dir.join("large.bin");
+            std::fs::write(&path, &modified).expect("Failed to write large file");
+
+            assert_eq!(
+                immutable::file_matches(repository.clone(), path.as_path(), address, Some(size))
+                    .await
+                    .expect("Failed to compare large file"),
+                lore_storage::FileMatch::Differs,
+            );
+        })
+        .await;
+    }
+
+    /// The verdict has to reach `is_file_modified`, which is the caller that would otherwise
+    /// read the whole stored object to reach the same answer.
+    #[tokio::test]
+    async fn a_modified_fragmented_file_is_reported_modified() {
+        on_a_repository(|repository, dir, context| async move {
+            let size = 640 * 1024;
+            let content = random_content(size);
+            let address = store_as_legacy_chunks(&repository, context, &content, 64 * 1024).await;
+
+            let mut modified = content.clone();
+            modified[size / 2] ^= 0xff;
+            let path = dir.join("large.bin");
+            std::fs::write(&path, &modified).expect("Failed to write large file");
+
+            let metadata = std::fs::metadata(&path).expect("Failed to get metadata");
+            let (mtime, file_size) = lore_revision::util::fs::file_mtime_and_size(&metadata);
+            let node = Node {
+                flags: NodeFlags::File.bits(),
+                size: size as u64,
+                address,
+                ..Default::default()
+            };
+
+            let is_modified = is_file_modified(
+                repository.clone(),
+                &node,
+                mtime,
+                file_size,
+                &RelativePath::new_from_initial_path("large.bin").unwrap(),
+                true,
+            )
+            .await
+            .expect("is_file_modified failed");
+
+            assert!(is_modified, "a file with one byte changed is modified");
+        })
+        .await;
+    }
+
+    /// 128 KiB file stored as two 64 KiB chunks under the old strategy, unmodified on disk.
+    /// Under the current threshold one fragment would cover it, so the buffer hash misses and
+    /// the stored list is what recognises the content.
+    #[tokio::test]
+    async fn unmodified_128k_file_with_legacy_two_chunk_fragmentation() {
+        on_a_repository(|repository, dir, context| async move {
+            let content_size = 128 * 1024;
+            let content = random_content(content_size);
+            let root_address =
+                store_as_legacy_chunks(&repository, context, &content, 64 * 1024).await;
+
+            let file_path = dir.join("test_file_128k.bin");
+            std::fs::write(&file_path, &content).expect("Failed to write test file");
+
+            let metadata = std::fs::metadata(&file_path).expect("Failed to get metadata");
+            let relative_path = RelativePath::new_from_initial_path("test_file_128k.bin").unwrap();
+            let node = Node {
+                flags: NodeFlags::File.bits(),
+                size: content_size as u64,
+                address: root_address,
+                ..Default::default()
+            };
+
+            let (mtime, size) = lore_revision::util::fs::file_mtime_and_size(&metadata);
+            let modified =
+                is_file_modified(repository.clone(), &node, mtime, size, &relative_path, true)
+                    .await
+                    .expect("is_file_modified failed");
+
+            assert!(
+                !modified,
+                "128 KiB file with legacy two-chunk fragmentation should NOT be detected as modified"
+            );
+        })
+        .await;
+    }
+
+    /// 640 KiB file stored as ten 64 KiB chunks. Each chunk is validated against the stored
+    /// list individually, so the file is recognised without reading any stored content.
     #[tokio::test]
     async fn unmodified_640k_file_reuses_previous_chunk_fragmentation() {
-        let tempdir = generate_tempdir();
-        let dir = tempdir.path().to_path_buf();
+        on_a_repository(|repository, dir, context| async move {
+            let content_size = 640 * 1024;
+            let content = random_content(content_size);
+            let root_address =
+                store_as_legacy_chunks(&repository, context, &content, 64 * 1024).await;
 
-        let (immutable_store, mutable_store, execution) =
-            test_store_create().await.expect("Failed to create stores");
+            let file_path = dir.join("test_file_640k.bin");
+            std::fs::write(&file_path, &content).expect("Failed to write test file");
 
-        LORE_CONTEXT
-            .scope(execution.clone(), async move {
-                let mut rng = rand::rng();
-                let context: Context = rand::random();
-                let repository_id = rand::random();
+            let metadata = std::fs::metadata(&file_path).expect("Failed to get metadata");
+            let relative_path = RelativePath::new_from_initial_path("test_file_640k.bin").unwrap();
+            let node = Node {
+                flags: NodeFlags::File.bits(),
+                size: content_size as u64,
+                address: root_address,
+                ..Default::default()
+            };
 
-                let repository = Arc::new(RepositoryContext::new(
-                    default_repository_creation_args(immutable_store, mutable_store)
-                        .with_path(dir.as_path())
-                        .with_id(repository_id),
-                ));
+            let (mtime, size) = lore_revision::util::fs::file_mtime_and_size(&metadata);
+            let modified =
+                is_file_modified(repository.clone(), &node, mtime, size, &relative_path, true)
+                    .await
+                    .expect("is_file_modified failed");
 
-                // Generate 640 KiB of random content
-                let content_size = 640 * 1024;
-                let content: Vec<u8> = (0..content_size)
-                    .map(|_| rng.random_range(0..=255u8))
-                    .collect();
-
-                // Store as ten 64 KiB chunks (simulating old chunking strategy)
-                let root_address =
-                    store_as_legacy_chunks(&repository, context, &content, 64 * 1024).await;
-
-                // Write the identical content to a file on disk
-                let file_path = dir.join("test_file_640k.bin");
-                std::fs::write(&file_path, &content).expect("Failed to write test file");
-
-                let metadata = std::fs::metadata(&file_path).expect("Failed to get metadata");
-                let relative_path =
-                    RelativePath::new_from_initial_path("test_file_640k.bin").unwrap();
-
-                // Build a Node referencing the legacy chunked address
-                let node = Node {
-                    flags: NodeFlags::File.bits(),
-                    size: content_size as u64,
-                    address: root_address,
-                    ..Default::default()
-                };
-
-                // is_file_modified should detect content equality despite hash mismatch
-                let (mtime, size) = lore_revision::util::fs::file_mtime_and_size(&metadata);
-                let (modified, new_hash) = is_file_modified(
-                    repository.clone(),
-                    &node,
-                    mtime,
-                    size,
-                    &relative_path,
-                    true, // force hash check
-                )
-                .await
-                .expect("is_file_modified failed");
-
-                assert!(
-                    !modified,
-                    "640 KiB file with legacy ten-chunk fragmentation should NOT be detected as modified"
-                );
-
-                // For files > 256 KiB, hash_file validates each chunk against
-                // the previous fragment list and returns the stored root hash
-                // when all chunks match. The content comparison fallback is NOT
-                // needed here — the chunk-level validation succeeds directly.
-                assert_eq!(
-                    new_hash, root_address.hash,
-                    "Returned hash should equal the stored hash (chunk validation path)"
-                );
-            })
-            .await;
+            assert!(
+                !modified,
+                "640 KiB file with legacy ten-chunk fragmentation should NOT be detected as modified"
+            );
+        })
+        .await;
     }
 }
 

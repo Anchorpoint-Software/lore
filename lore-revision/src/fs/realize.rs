@@ -6,7 +6,6 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use lore_base::lore_spawn;
-use lore_base::types::Hash;
 use lore_error_set::prelude::*;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -364,8 +363,6 @@ pub async fn verify_filesystem(
     }
 
     let is_file = modifications.info.is_file;
-    let mut file_hash = Hash::default();
-
     let file_size = modifications.info.size;
 
     if let Some(modification) = modifications.modification {
@@ -373,12 +370,8 @@ pub async fn verify_filesystem(
         if !modification.modified {
             stats.file_retain.fetch_add(1, Ordering::Relaxed);
             return Ok(Some(change));
-        } else {
-            if !modification.hash.is_zero() {
-                file_hash = modification.hash;
-            }
-            stats.file_replace.fetch_add(1, Ordering::Relaxed);
         }
+        stats.file_replace.fetch_add(1, Ordering::Relaxed);
     }
 
     let is_delete = change.action == change::FileAction::Delete;
@@ -437,50 +430,25 @@ pub async fn verify_filesystem(
             return Ok(Some(change));
         }
 
-        let change_path = RepositoryPath::from_relative(&repository, change.path.clone())?;
-
         // At this point (not deleted and target is a file) the to block is valid and the remaining
-        // check is to see if the local file system file matches the target incoming file
-        if file_hash.is_zero() {
-            file_hash = operation
-                .file_hash(
-                    change.from.repository.clone(),
-                    FilesystemPath::Repository(&change_path),
-                    Some(&node_to),
-                )
-                .await
-                .unwrap_or_default();
-        }
-        lore_trace!(
-            "File {} hash {} : to hash {}",
-            change.path,
-            file_hash,
-            node_to.address.hash
-        );
-        if file_hash != node_to.address.hash {
+        // check is to see if the local file system file matches the target incoming file. The
+        // file already differs from the from node, so the same comparison is asked again about
+        // the to node: measuring against each node's own fragmentation is the only way to tell,
+        // and the answer for one says nothing about the other.
+        let differs_from_target = operation
+            .file_modified_from_node(
+                change.from.repository.clone(),
+                &node_to,
+                &change.path,
+                modifications.info.mtime,
+                file_size,
+                force_full_check,
+            )
+            .await?;
+
+        if differs_from_target {
             if forward_changes {
                 lore_info!("Keeping modified file as locally modified: {}", change.path);
-                return Ok(None);
-            }
-
-            // Hash mismatch with matching size may be caused by chunking strategy
-            // differences rather than actual content changes. Compare actual content
-            // to determine if the file is truly modified.
-            if file_size == node_to.size
-                && file_size <= state::CONTENT_COMPARE_MAX_SIZE
-                && operation
-                    .file_compare(
-                        change.from.repository.clone(),
-                        node_to.address,
-                        FilesystemPath::Repository(&change_path),
-                        file_size,
-                    )
-                    .await?
-            {
-                lore_trace!(
-                    "File {} hash mismatch with target but content equal (chunking compatibility)",
-                    change.path
-                );
                 return Ok(None);
             }
 
@@ -493,6 +461,11 @@ pub async fn verify_filesystem(
 
             return Err(LocalModifications.into());
         }
+
+        lore_trace!(
+            "File {} already holds the incoming content, nothing to realize",
+            change.path
+        );
 
         return Ok(None);
     }

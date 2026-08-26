@@ -2143,7 +2143,6 @@ pub(crate) async fn stage_node_from_metadata(
                 )
                 .await
                 .forward::<StageError>("Failed to determine if file is modified")?
-                .0
             };
 
             if stage_file_node {

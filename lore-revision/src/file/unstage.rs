@@ -886,7 +886,7 @@ async fn unstage_node(
                         .forward::<UnstageError>("Invalid path")?;
                         let (file_mtime, file_size) =
                             crate::util::fs::file_mtime_and_size(&file_metadata);
-                        let (file_modified, _) = crate::state::is_file_modified(
+                        let file_modified = crate::state::is_file_modified(
                             current_repository.clone(),
                             &current_node,
                             file_mtime,

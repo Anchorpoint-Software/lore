@@ -149,9 +149,11 @@ pub use types::deserialize_context;
 pub use types::deserialize_hash;
 /// Serde field-level helpers for hex encoding. Use with `#[serde(serialize_with = "...")]`.
 pub use types::serialize_hex;
+pub use write::FileMatch;
 pub use write::StoreResult;
 pub use write::content_write_inflight;
 pub use write::content_write_peak;
+pub use write::file_matches;
 pub use write::hash_file;
 pub use write::remote_copies;
 pub use write::reset_content_write_peak;

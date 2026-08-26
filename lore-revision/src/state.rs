@@ -6297,7 +6297,7 @@ async fn compare_single_file_against_state(
             current_node.is_none_or(|n| n.address.hash != from_node.address.hash);
 
         let (file_mtime, file_size) = util::fs::file_mtime_and_size(file_metadata);
-        let (modified, _) = is_file_modified(
+        let modified = is_file_modified(
             repository,
             from_node,
             file_mtime,
@@ -7817,15 +7817,18 @@ pub async fn count_staged_files(
 }
 
 // TODO(UCS-13059): Extend with file mode check
-/// Content comparison size limit: files larger than this skip the fallback
-/// content comparison when hash mismatches occur due to chunking strategy
-/// differences.
-pub const CONTENT_COMPARE_MAX_SIZE: u64 = 1024 * 1024 * 1024; // 1 GiB
-
-/// Content comparison streaming threshold: files larger than this use
-/// streaming comparison instead of loading entire content into memory.
-const CONTENT_COMPARE_STREAM_THRESHOLD: u64 = 4 * 1024 * 1024; // 4 MiB
-
+/// Whether the file on disk differs from the content `node` addresses.
+///
+/// Size and modification time answer first where they can. Beyond that the file is measured
+/// against the stored object's own fragmentation, which is the only comparison that holds:
+/// a commit may reuse a previous fragmentation, so the stored hash is a function of the
+/// content and of how it came to be chunked, and re-hashing the content from scratch does
+/// not reproduce it.
+///
+/// Fetches fragment metadata but never content payloads, so the cost is bounded by the file
+/// however large the stored object is. When the stored object cannot be described or walked
+/// the file is reported modified: nothing was established, and treating it as unmodified
+/// would let a real local change be overwritten.
 pub async fn is_file_modified(
     repository: Arc<RepositoryContext>,
     node: &Node,
@@ -7833,12 +7836,12 @@ pub async fn is_file_modified(
     file_size: u64,
     file_path: &RelativePath,
     force_check_hash: bool,
-) -> Result<(bool, Hash), StateError> {
+) -> Result<bool, StateError> {
     // Assume files are identical if size and timestamp match
     let node_size = node.size;
     if file_size != node_size {
         lore_trace!("File {file_path} size changed, modified");
-        return Ok((true, Hash::default()));
+        return Ok(true);
     }
 
     let node_mtime = if !force_check_hash {
@@ -7846,138 +7849,45 @@ pub async fn is_file_modified(
     } else {
         0
     };
-    let mtime_match = file_mtime == node_mtime;
-
-    if !mtime_match {
-        lore_trace!(
-            "Hash check file {file_path} - file size {file_size} node size {node_size}, file mtime {file_mtime}, node mtime {node_mtime}, force {force_check_hash}"
-        );
-        let absolute_path = file_path.to_absolute_path(repository.require_path()?);
-        let file_hash = immutable::hash_file(
-            repository.clone(),
-            &absolute_path,
-            Some(node.address),
-            Some(node.size as usize),
-        )
-        .await
-        .internal("Failed to hash file")
-        .map_err(StateError::from);
-
-        if let Ok(file_hash) = file_hash {
-            if file_hash == node.address.hash {
-                lore_trace!("File {file_path} unmodified, content hash equal to node");
-                file_modified_time_store(repository.clone(), file_path, file_mtime).await;
-                return Ok((false, file_hash));
-            } else if file_size <= CONTENT_COMPARE_MAX_SIZE
-                && is_file_content_equal(
-                    repository.clone(),
-                    node.address,
-                    &absolute_path,
-                    file_size,
-                )
-                .await
-            {
-                lore_trace!(
-                    "File {file_path} hash mismatch but content equal (chunking compatibility)"
-                );
-                file_modified_time_store(repository.clone(), file_path, file_mtime).await;
-                return Ok((false, file_hash));
-            } else {
-                lore_trace!("File {file_path} hash mismatch, modified");
-                return Ok((true, file_hash));
-            }
-        } else {
-            lore_trace!("File {file_path} hash failed, consider unmodified");
-        }
-    } else {
+    if file_mtime == node_mtime {
         lore_trace!("File {file_path} unmodified, size {file_size} and mtime {file_mtime} match");
+        return Ok(false);
     }
 
-    Ok((false, Hash::default()))
-}
+    lore_trace!(
+        "Hash check file {file_path} - file size {file_size} node size {node_size}, file mtime {file_mtime}, node mtime {node_mtime}, force {force_check_hash}"
+    );
+    let absolute_path = file_path.to_absolute_path(repository.require_path()?);
+    let matches = immutable::file_matches(
+        repository.clone(),
+        &absolute_path,
+        node.address,
+        Some(node.size as usize),
+    )
+    .await;
 
-/// Compare the actual content of a stored object with a file on disk.
-///
-/// This handles cases where the hash representation differs due to chunking
-/// strategy changes (e.g. threshold change from 64 KiB to 256 KiB) but the
-/// underlying content is identical. Uses `immutable::read()` for files up to
-/// 4 MiB and streaming comparison for larger files.
-pub async fn is_file_content_equal(
-    repository: Arc<RepositoryContext>,
-    address: Address,
-    absolute_path: &std::path::Path,
-    file_size: u64,
-) -> bool {
-    if address.is_zero() {
-        return false;
-    }
-
-    let options = read_options_from_repository(&repository);
-
-    if file_size <= CONTENT_COMPARE_STREAM_THRESHOLD {
-        // Small file: load both into memory and compare
-        let stored = immutable::read(repository, address, None, options).await;
-        let local = lore_io::IoDriver::global()
-            .read_file_bytes(absolute_path)
-            .await;
-        match (stored, local) {
-            (Ok(stored_bytes), Ok(local_bytes)) => stored_bytes == local_bytes,
-            _ => false,
+    match matches {
+        Ok(lore_storage::FileMatch::Match) => {
+            lore_trace!("File {file_path} unmodified, matches stored content");
+            file_modified_time_store(repository.clone(), file_path, file_mtime).await;
+            Ok(false)
         }
-    } else {
-        // Large file: stream stored content and compare chunk-by-chunk against
-        // the file read in matching chunks
-        let (sender, mut receiver) =
-            tokio::sync::mpsc::channel::<Result<Bytes, lore_storage::StorageError>>(4);
-        let repo_clone = repository.clone();
-        let stream_handle = lore_spawn!(async move {
-            immutable::read_stream(repo_clone, address, None, options, sender).await
-        });
-
-        let file = match lore_io::IoDriver::global()
-            .open(absolute_path, &lore_io::OpenOptions::new().read(true))
-            .await
-        {
-            Ok(f) => f,
-            Err(_) => return false,
-        };
-
-        let matched = stream_matches_file(&mut receiver, &file, file_size).await;
-
-        // Verify the stream completed successfully and we compared the
-        // entire file. A failed or partial stream must not be treated as
-        // content equality.
-        let stream_ok = stream_handle.await.is_ok_and(|r| r.is_ok());
-        matched && stream_ok
-    }
-}
-
-/// Whether every streamed chunk matched the file at the offset it belongs at, and whether they
-/// together covered it.
-///
-/// Each read is sized to the chunk that arrived rather than to a fixed window, since the stored
-/// chunking need not match anything about the file on disk — only the bytes have to agree. The
-/// byte count against `file_size` is what catches a local file *longer* than the stored content:
-/// every chunk matches and the loop still ends when the stream does, so the length is the only
-/// thing left that disagrees. A shorter local file fails earlier, on the read.
-async fn stream_matches_file(
-    receiver: &mut tokio::sync::mpsc::Receiver<Result<Bytes, lore_storage::StorageError>>,
-    file: &lore_io::IoFile,
-    file_size: u64,
-) -> bool {
-    let mut bytes_compared: u64 = 0;
-    while let Some(chunk) = receiver.recv().await {
-        let Ok(chunk) = chunk else {
-            return false;
-        };
-        match file.read_exact_at(chunk.len(), bytes_compared).await {
-            Ok(local) if local == chunk => {
-                bytes_compared += chunk.len() as u64;
-            }
-            _ => return false,
+        Ok(lore_storage::FileMatch::Differs) => {
+            lore_trace!("File {file_path} differs from stored content, modified");
+            Ok(true)
+        }
+        Ok(lore_storage::FileMatch::Indeterminate) => {
+            lore_trace!("File {file_path} could not be compared, treated as modified");
+            Ok(true)
+        }
+        // The file itself could not be read, which a scan running alongside a branch switch
+        // sees whenever one is deleted under it. Reporting it modified would make a routine
+        // race look like local changes, so it is left to the next scan that can read it.
+        Err(_) => {
+            lore_trace!("File {file_path} could not be read, consider unmodified");
+            Ok(false)
         }
     }
-    bytes_compared == file_size
 }
 
 /// The key a file's modification time is stored under.
@@ -9187,95 +9097,6 @@ pub async fn apply_tree_changes(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A file holding `contents` plus a handle open on it, alive while the directory is.
-    #[allow(clippy::disallowed_methods)] // A test fixture in its own temporary directory.
-    async fn file_holding(contents: &[u8]) -> (tempfile::TempDir, lore_io::IoFile) {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let path = dir.path().join("local");
-        std::fs::write(&path, contents).expect("write local file");
-        let file = lore_io::IoDriver::global()
-            .open(&path, &lore_io::OpenOptions::new().read(true))
-            .await
-            .expect("open local file");
-        (dir, file)
-    }
-
-    /// Feeds `chunks` through a channel the way the stored-content stream does.
-    fn stream_of(
-        chunks: &[&[u8]],
-    ) -> tokio::sync::mpsc::Receiver<Result<Bytes, lore_storage::StorageError>> {
-        let (sender, receiver) = tokio::sync::mpsc::channel::<
-            Result<Bytes, lore_storage::StorageError>,
-        >(chunks.len().max(1));
-        for chunk in chunks {
-            sender
-                .try_send(Ok(Bytes::copy_from_slice(chunk)))
-                .expect("channel sized for the chunks");
-        }
-        receiver
-    }
-
-    #[tokio::test]
-    async fn a_file_matching_every_chunk_is_equal() {
-        let (_dir, file) = file_holding(b"one-two-three").await;
-        let mut stream = stream_of(&[b"one-", b"two-", b"three"]);
-        assert!(stream_matches_file(&mut stream, &file, 13).await);
-    }
-
-    /// The chunking of the stored content says nothing about the file, so a single chunk and
-    /// many chunks over the same bytes must agree.
-    #[tokio::test]
-    async fn chunk_boundaries_do_not_affect_the_result() {
-        let (_dir, file) = file_holding(b"one-two-three").await;
-        let mut stream = stream_of(&[b"one-two-three"]);
-        assert!(stream_matches_file(&mut stream, &file, 13).await);
-    }
-
-    /// Every chunk matches and the stream still describes less than the file holds. Nothing in
-    /// the loop can see that, which is why the byte count is checked after it.
-    #[tokio::test]
-    async fn a_local_file_longer_than_the_stream_is_not_equal() {
-        let (_dir, file) = file_holding(b"one-two-three-and-more").await;
-        let mut stream = stream_of(&[b"one-", b"two-", b"three"]);
-        assert!(!stream_matches_file(&mut stream, &file, 22).await);
-    }
-
-    /// A short file fails on the read rather than on the count, since the last chunk asks for
-    /// bytes past the end.
-    #[tokio::test]
-    async fn a_local_file_shorter_than_the_stream_is_not_equal() {
-        let (_dir, file) = file_holding(b"one-two").await;
-        let mut stream = stream_of(&[b"one-", b"two-", b"three"]);
-        assert!(!stream_matches_file(&mut stream, &file, 7).await);
-    }
-
-    #[tokio::test]
-    async fn a_chunk_differing_mid_stream_is_not_equal() {
-        let (_dir, file) = file_holding(b"one-XXX-three").await;
-        let mut stream = stream_of(&[b"one-", b"two-", b"three"]);
-        assert!(!stream_matches_file(&mut stream, &file, 13).await);
-    }
-
-    /// The offsets are the running total of what came before, so a mismatch in the first chunk
-    /// is caught where a comparison anchored at zero would have missed it.
-    #[tokio::test]
-    async fn a_chunk_differing_at_the_start_is_not_equal() {
-        let (_dir, file) = file_holding(b"XXX-two-three").await;
-        let mut stream = stream_of(&[b"one-", b"two-", b"three"]);
-        assert!(!stream_matches_file(&mut stream, &file, 13).await);
-    }
-
-    #[tokio::test]
-    async fn an_empty_stream_matches_only_an_empty_file() {
-        let (_dir, file) = file_holding(b"").await;
-        let mut stream = stream_of(&[]);
-        assert!(stream_matches_file(&mut stream, &file, 0).await);
-
-        let (_dir, file) = file_holding(b"content").await;
-        let mut stream = stream_of(&[]);
-        assert!(!stream_matches_file(&mut stream, &file, 7).await);
-    }
 
     /// The key every stored modification time is filed under. It has to stay the
     /// digest over the path's own lowercase form, or a scan finds nothing it wrote
