@@ -36,6 +36,7 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 lore-server = { workspace = true }
+lore-transport = { workspace = true }
 rcgen = { workspace = true }
 
 [features]

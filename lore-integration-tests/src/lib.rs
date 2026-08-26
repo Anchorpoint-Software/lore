@@ -7,6 +7,7 @@ mod hashicorp;
 mod locks_test;
 mod presign_test;
 mod remote_store_test;
+mod replicated_store_test;
 mod replication_service_test;
 mod revision_tree_test;
 mod shared_store_test;
