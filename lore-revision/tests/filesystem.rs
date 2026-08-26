@@ -422,9 +422,12 @@ mod tests {
 
             let rel_path = RelativePath::new_from_initial_path("script.sh").unwrap();
             operation
-                .make_executable(FilesystemPath::Repository(
-                    &RepositoryPath::from_relative(&repository, rel_path).unwrap(),
-                ))
+                .make_executable(
+                    FilesystemPath::Repository(
+                        &RepositoryPath::from_relative(&repository, rel_path).unwrap(),
+                    ),
+                    true,
+                )
                 .await
                 .expect("make_executable should succeed");
 

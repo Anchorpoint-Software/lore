@@ -5,12 +5,14 @@
 //! This module defines the two-trait architecture that separates operation context creation
 //! (freeze for SWFS) from actual file operations (work against frozen snapshot).
 
+use std::fs::Metadata;
 use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use lore_base::error::InvalidArguments;
 use lore_base::types::Address;
+use lore_base::types::Fragment;
 use lore_error_set::error_set;
 use tokio::sync::RwLock;
 
@@ -53,6 +55,21 @@ pub struct FileInfo {
     pub size: u64,
     /// Modification time as Unix timestamp in milliseconds.
     pub mtime: u64,
+}
+
+impl FileInfo {
+    pub fn from_metadata(metadata: Metadata) -> Self {
+        let (mtime, size) = crate::util::fs::file_mtime_and_size(&metadata);
+        let executable = crate::util::fs::file_is_executable(&metadata);
+        FileInfo {
+            exists: true,
+            is_file: metadata.is_file(),
+            is_dir: metadata.is_dir(),
+            executable,
+            size,
+            mtime,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -213,6 +230,7 @@ pub trait InstanceOperation: Send + Sync {
     fn make_executable(
         &self,
         path: FilesystemPath<'_>,
+        executable: bool,
     ) -> impl Future<Output = Result<(), FsError>> + Send;
 
     /// Create a directory if it doesn't exist (mkdir -p behavior).
@@ -250,7 +268,7 @@ pub trait InstanceOperation: Send + Sync {
         repository: Arc<RepositoryContext>,
         node: &Node,
         path: FilesystemPath<'_>,
-    ) -> impl Future<Output = Result<(), FsError>> + Send;
+    ) -> impl Future<Output = Result<(Fragment, Option<FileInfo>), FsError>> + Send;
 
     /// Copy the contents of `source_path` to `destination_path`, with the destination being a
     /// scratch file that is not expected to be part of the repository even if it's in its path.
@@ -446,11 +464,17 @@ impl InstanceOperation for InstanceOperationImpl {
         }
     }
 
-    async fn make_executable(&self, path: FilesystemPath<'_>) -> Result<(), FsError> {
+    async fn make_executable(
+        &self,
+        path: FilesystemPath<'_>,
+        executable: bool,
+    ) -> Result<(), FsError> {
         match &self.dispatch {
             #[cfg(test)]
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
-            StaticDispatchInstanceOperation::Os(this) => this.make_executable(path).await,
+            StaticDispatchInstanceOperation::Os(this) => {
+                this.make_executable(path, executable).await
+            }
         }
     }
 
@@ -503,7 +527,7 @@ impl InstanceOperation for InstanceOperationImpl {
         repository: Arc<RepositoryContext>,
         node: &Node,
         path: FilesystemPath<'_>,
-    ) -> Result<(), FsError> {
+    ) -> Result<(Fragment, Option<FileInfo>), FsError> {
         match &self.dispatch {
             #[cfg(test)]
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
@@ -567,6 +591,7 @@ pub mod tests {
 
     use async_trait::async_trait;
     use lore_base::types::Address;
+    use lore_base::types::Fragment;
     use lore_base::types::Hash;
     use parking_lot::Mutex;
 
@@ -672,7 +697,11 @@ pub mod tests {
             panic!("Test operation unimplemented except finalize")
         }
 
-        async fn make_executable(&self, _path: FilesystemPath<'_>) -> Result<(), FsError> {
+        async fn make_executable(
+            &self,
+            _path: FilesystemPath<'_>,
+            _executable: bool,
+        ) -> Result<(), FsError> {
             panic!("Test operation unimplemented except finalize")
         }
 
@@ -705,7 +734,7 @@ pub mod tests {
             _repository: Arc<RepositoryContext>,
             _node: &Node,
             _path: FilesystemPath<'_>,
-        ) -> Result<(), FsError> {
+        ) -> Result<(Fragment, Option<FileInfo>), FsError> {
             panic!("Test operation unimplemented except finalize")
         }
 

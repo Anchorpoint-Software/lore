@@ -13,11 +13,12 @@ mod tests {
     use lore_revision::repository::RepositoryContext;
     use lore_revision::repository::clone::CLONE_FILE_DISCOVERY;
     use lore_revision::repository::clone::CLONE_FILE_MAX;
-    use lore_revision::repository::clone::CloneOptions;
+    use lore_revision::repository::clone::CloneContext;
     use lore_revision::repository::clone::CloneStats;
     use lore_revision::repository::clone::CloneWorkItem;
     use lore_revision::repository::clone::clone_execute;
     use lore_revision::util::path::RelativePath;
+    use lore_revision::util::path::RepositoryPath;
     use lore_storage::local::immutable_store;
     use lore_storage::local::mutable_store;
     use tokio::sync::Semaphore;
@@ -29,14 +30,14 @@ mod tests {
         TempDir::new("lore-clone-test-")
     }
 
-    async fn new_test_context(path: impl AsRef<Path>) -> Arc<RepositoryContext> {
+    async fn new_test_context(path: impl AsRef<Path>) -> CloneContext {
         let immutable_store = immutable_store::LocalImmutableStore::new(
             None,
             immutable_store::ImmutableStoreSettings::default(),
         )
         .await
         .expect("Failed to create immutable store");
-        Arc::new(RepositoryContext::new(
+        let repository = Arc::new(RepositoryContext::new(
             default_repository_creation_args(
                 immutable_store.clone(),
                 Arc::new(
@@ -50,7 +51,14 @@ mod tests {
                 ),
             )
             .with_path(path),
-        ))
+        ));
+        CloneContext {
+            operation: repository.file_system().begin_operation().await.unwrap(),
+            repository,
+            state: Arc::default(),
+            options: Arc::default(),
+            stats: Arc::default(),
+        }
     }
 
     fn zero_size_file_node() -> Node {
@@ -74,7 +82,11 @@ mod tests {
         CloneWorkItem {
             repository: repository.clone(),
             node: zero_size_file_node(),
-            relative_path: RelativePath::new_from_initial_path(name).expect("valid relative path"),
+            repository_path: RepositoryPath::from_relative(
+                repository,
+                RelativePath::new_from_initial_path(name).expect("valid relative path"),
+            )
+            .expect("valid repository path"),
         }
     }
 
@@ -85,29 +97,27 @@ mod tests {
         LORE_CONTEXT
             .scope(execution, async {
                 let temp_dir = generate_clone_tempdir();
-                let repository = new_test_context(&temp_dir).await;
-                let stats = Arc::new(CloneStats::default());
-                let options = Arc::new(CloneOptions::default());
+                let context = new_test_context(&temp_dir).await;
 
                 let file_count = 5;
                 let (tx, rx) = mpsc::channel(file_count);
 
                 for i in 0..file_count {
                     let name = format!("file_{i}.txt");
-                    tx.send(make_work_item(&repository, &name)).await.unwrap();
+                    tx.send(make_work_item(&context.repository, &name))
+                        .await
+                        .unwrap();
                 }
                 drop(tx);
 
-                clone_execute(rx, repository.clone(), options, stats.clone())
-                    .await
-                    .unwrap();
+                clone_execute(rx, context.clone()).await.unwrap();
 
                 assert_eq!(
-                    stats.complete.file_complete.load(Ordering::Relaxed),
+                    context.stats.complete.file_complete.load(Ordering::Relaxed),
                     file_count as u64,
                 );
                 assert_eq!(
-                    stats.complete.file_count.load(Ordering::Relaxed),
+                    context.stats.complete.file_count.load(Ordering::Relaxed),
                     file_count as u64,
                 );
 
@@ -128,35 +138,36 @@ mod tests {
         LORE_CONTEXT
             .scope(execution, async {
                 let temp_dir = generate_clone_tempdir();
-                let repository = new_test_context(&temp_dir).await;
                 // Start with only 3 permits; send 20 items.
                 let permit_count = 3;
-                let stats = Arc::new(CloneStats {
-                    file_inflight: Arc::new(Semaphore::new(permit_count)),
-                    ..Default::default()
-                });
-                let options = Arc::new(CloneOptions::default());
+                let context = CloneContext {
+                    stats: Arc::new(CloneStats {
+                        file_inflight: Arc::new(Semaphore::new(permit_count)),
+                        ..Default::default()
+                    }),
+                    ..new_test_context(&temp_dir).await
+                };
 
                 let file_count = 20usize;
                 let (tx, rx) = mpsc::channel(file_count);
 
                 for i in 0..file_count {
                     let name = format!("recycle_{i}.txt");
-                    tx.send(make_work_item(&repository, &name)).await.unwrap();
+                    tx.send(make_work_item(&context.repository, &name))
+                        .await
+                        .unwrap();
                 }
                 drop(tx);
 
-                clone_execute(rx, repository.clone(), options, stats.clone())
-                    .await
-                    .unwrap();
+                clone_execute(rx, context.clone()).await.unwrap();
 
                 // All files processed despite permit_count < file_count.
                 assert_eq!(
-                    stats.complete.file_complete.load(Ordering::Relaxed),
+                    context.stats.complete.file_complete.load(Ordering::Relaxed),
                     file_count as u64,
                 );
                 // No files should be in-flight after completion.
-                assert_eq!(stats.file_inflight_count.load(Ordering::Relaxed), 0);
+                assert_eq!(context.stats.file_inflight_count.load(Ordering::Relaxed), 0);
             })
             .await;
     }
@@ -169,24 +180,27 @@ mod tests {
         LORE_CONTEXT
             .scope(execution, async {
                 let temp_dir = generate_clone_tempdir();
-                let repository = new_test_context(&temp_dir).await;
-                let stats = Arc::new(CloneStats::default());
-                let options = Arc::new(CloneOptions::default());
+                let context = new_test_context(&temp_dir).await;
 
                 let (tx, rx) = mpsc::channel(16);
-                tx.send(make_work_item(&repository, "discovered.txt"))
+                tx.send(make_work_item(&context.repository, "discovered.txt"))
                     .await
                     .unwrap();
                 // Mark discovery complete before the consumer runs.
-                stats.discovery.complete.store(true, Ordering::Relaxed);
+                context
+                    .stats
+                    .discovery
+                    .complete
+                    .store(true, Ordering::Relaxed);
                 drop(tx);
 
-                clone_execute(rx, repository.clone(), options, stats.clone())
-                    .await
-                    .unwrap();
+                clone_execute(rx, context.clone()).await.unwrap();
 
                 // After processing, the semaphore should have been raised.
-                assert_eq!(stats.file_inflight.available_permits(), CLONE_FILE_MAX);
+                assert_eq!(
+                    context.stats.file_inflight.available_permits(),
+                    CLONE_FILE_MAX
+                );
             })
             .await;
     }
@@ -200,9 +214,7 @@ mod tests {
         LORE_CONTEXT
             .scope(execution, async {
                 let temp_dir = generate_clone_tempdir();
-                let repository = new_test_context(&temp_dir).await;
-                let stats = Arc::new(CloneStats::default());
-                let options = Arc::new(CloneOptions::default());
+                let context = new_test_context(&temp_dir).await;
 
                 // Enqueue enough items that the first-iteration target
                 // (rx.len() + 1 + CLONE_FILE_DISCOVERY) is >= CLONE_FILE_MAX.
@@ -210,19 +222,22 @@ mod tests {
                 let (tx, rx) = mpsc::channel(backlog + 1);
                 for i in 0..backlog {
                     let name = format!("ramp_{i}.txt");
-                    tx.send(make_work_item(&repository, &name)).await.unwrap();
+                    tx.send(make_work_item(&context.repository, &name))
+                        .await
+                        .unwrap();
                 }
                 // Discovery is NOT complete -- ramp path only.
-                assert!(!stats.discovery.complete.load(Ordering::Relaxed));
+                assert!(!context.stats.discovery.complete.load(Ordering::Relaxed));
                 drop(tx);
 
-                clone_execute(rx, repository.clone(), options, stats.clone())
-                    .await
-                    .unwrap();
+                clone_execute(rx, context.clone()).await.unwrap();
 
-                assert_eq!(stats.file_inflight.available_permits(), CLONE_FILE_MAX);
                 assert_eq!(
-                    stats.complete.file_complete.load(Ordering::Relaxed),
+                    context.stats.file_inflight.available_permits(),
+                    CLONE_FILE_MAX
+                );
+                assert_eq!(
+                    context.stats.complete.file_complete.load(Ordering::Relaxed),
                     backlog as u64,
                 );
             })
@@ -238,29 +253,28 @@ mod tests {
         LORE_CONTEXT
             .scope(execution, async {
                 let temp_dir = generate_clone_tempdir();
-                let repository = new_test_context(&temp_dir).await;
-                let stats = Arc::new(CloneStats::default());
-                let options = Arc::new(CloneOptions::default());
+                let context = new_test_context(&temp_dir).await;
 
                 // One item, large channel: backlog is tiny, ramp target
                 // after the first recv is rx.len() + 1 + HEADROOM =
                 // 0 + 1 + CLONE_FILE_DISCOVERY. Should stay well below MAX.
                 let (tx, rx) = mpsc::channel(1000);
-                tx.send(make_work_item(&repository, "small.txt"))
+                tx.send(make_work_item(&context.repository, "small.txt"))
                     .await
                     .unwrap();
                 drop(tx);
 
-                clone_execute(rx, repository.clone(), options, stats.clone())
-                    .await
-                    .unwrap();
+                clone_execute(rx, context.clone()).await.unwrap();
 
-                let permits = stats.file_inflight.available_permits();
+                let permits = context.stats.file_inflight.available_permits();
                 assert!(
                     (CLONE_FILE_DISCOVERY..CLONE_FILE_MAX).contains(&permits),
                     "expected permits in [{CLONE_FILE_DISCOVERY}, {CLONE_FILE_MAX}), got {permits}",
                 );
-                assert_eq!(stats.complete.file_complete.load(Ordering::Relaxed), 1);
+                assert_eq!(
+                    context.stats.complete.file_complete.load(Ordering::Relaxed),
+                    1
+                );
             })
             .await;
     }

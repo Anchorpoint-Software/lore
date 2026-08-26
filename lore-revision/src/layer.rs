@@ -32,12 +32,14 @@ use crate::repository;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
 use crate::repository::clone;
+use crate::repository::clone::CloneContext;
 use crate::revision::sync;
 use crate::revision::sync::SyncOptions;
 use crate::revision::sync::SyncRealizeStats;
 use crate::state;
 use crate::state::State;
 use crate::util::path::RelativePath;
+use crate::util::path::RepositoryPath;
 
 #[error_set]
 pub enum LayerError {
@@ -406,7 +408,7 @@ pub async fn add(
         staged: Hash::default(),
     });
 
-    let absolute_path = target_path.to_absolute_path(repository.require_path()?);
+    let target_path = RepositoryPath::from_relative(&repository, target_path)?;
 
     // Materialize layer
     lore_debug!("Connecting remote storage");
@@ -420,7 +422,7 @@ pub async fn add(
         .forward::<LayerError>("Not connected")?;
 
     event::LoreEvent::LayerAdd(LoreLayerAddEventData {
-        target_path: LoreString::from(&target_path),
+        target_path: LoreString::from(target_path.relative().clone()),
         source_repository: layer_repository.id,
         source_path: LoreString::from(&source_path),
         metadata: metadata.into(),
@@ -430,25 +432,32 @@ pub async fn add(
 
     // Ensure the target path exist to clone into
     lore_io::IoDriver::global()
-        .create_dir_all(&absolute_path)
+        .create_dir_all(target_path.absolute())
         .await
         .internal("Failed to create the target directory for layer")?;
 
-    clone::clone_node(
-        layer_repository.clone(),
-        layer_storage,
-        layer_state,
-        absolute_path,
-        source_path,
-        layer_node_link.node,
-        Arc::new(clone::CloneOptions {
+    let layer_operation = layer_repository
+        .file_system()
+        .begin_operation()
+        .await
+        .forward::<LayerError>("Failed to start operation")?;
+    let clone_ctx = CloneContext {
+        repository: layer_repository.clone(),
+        state: layer_state,
+        operation: layer_operation.clone(),
+        options: Arc::new(clone::CloneOptions {
             ignore_existing: false,
             ..Default::default()
         }),
-        Arc::default(), /* Default stats */
-    )
-    .await
-    .forward::<LayerError>("Failed cloning target layer")?;
+        stats: Arc::default(),
+    };
+    clone::clone_node(clone_ctx, layer_storage, target_path, layer_node_link.node)
+        .await
+        .forward::<LayerError>("Failed cloning target layer")?;
+    layer_operation
+        .finalize(true)
+        .await
+        .forward::<LayerError>("Failed to finalize operation")?;
 
     save_config(
         token,

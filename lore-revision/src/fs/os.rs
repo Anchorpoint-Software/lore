@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use lore_base::types::Address;
+use lore_base::types::Fragment;
 use lore_base::types::Hash;
 use lore_error_set::WrapInternal;
 
@@ -106,18 +107,7 @@ impl InstanceOperation for OsOperation {
             .metadata(path.as_absolute_path())
             .await
         {
-            Ok(metadata) => {
-                let (mtime, size) = crate::util::fs::file_mtime_and_size(&metadata);
-                let executable = crate::util::fs::file_is_executable(&metadata);
-                Ok(FileInfo {
-                    exists: true,
-                    is_file: metadata.is_file(),
-                    is_dir: metadata.is_dir(),
-                    executable,
-                    size,
-                    mtime,
-                })
-            }
+            Ok(metadata) => Ok(FileInfo::from_metadata(metadata)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(FileInfo::default()),
             Err(e) => Err(e.into()),
         }
@@ -234,7 +224,11 @@ impl InstanceOperation for OsOperation {
         .await)
     }
 
-    async fn make_executable(&self, path: FilesystemPath<'_>) -> Result<(), FsError> {
+    async fn make_executable(
+        &self,
+        path: FilesystemPath<'_>,
+        executable: bool,
+    ) -> Result<(), FsError> {
         #[cfg(unix)]
         {
             let absolute_path = path.as_absolute_path();
@@ -242,7 +236,11 @@ impl InstanceOperation for OsOperation {
             let metadata = lore_io::IoDriver::global().metadata(&absolute_path).await?;
             let mut permissions = metadata.permissions();
             let mode = permissions.mode();
-            permissions.set_mode(mode | 0o111); // Add execute permission for user, group, others
+            if executable {
+                permissions.set_mode(mode | 0o111); // Add execute permission for user, group, others
+            } else {
+                permissions.set_mode(mode & !0o111); // Add execute permission for user, group, others
+            }
             lore_io::IoDriver::global()
                 .set_permissions(&absolute_path, permissions)
                 .await?;
@@ -251,7 +249,9 @@ impl InstanceOperation for OsOperation {
         // No-op on Windows
         #[cfg(not(unix))]
         {
-            let _ = path; // Suppress unused variable warning
+            // Suppress unused variable warnings
+            let _ = path;
+            let _ = executable;
         }
 
         Ok(())
@@ -295,20 +295,18 @@ impl InstanceOperation for OsOperation {
         repository: Arc<RepositoryContext>,
         node: &Node,
         path: FilesystemPath<'_>,
-    ) -> Result<(), FsError> {
-        if node.size > 0 {
-            let options = immutable::read_options_from_repository(&repository);
-            immutable::read_into_file(
-                repository,
-                node.address,
-                path.as_absolute_path(),
-                None,
-                options,
-            )
-            .await
-            .internal("Failed to read file")?;
-        }
-        Ok(())
+    ) -> Result<(Fragment, Option<FileInfo>), FsError> {
+        let options = immutable::read_options_from_repository(&repository);
+        let (fragment, metadata) = immutable::read_into_file(
+            repository,
+            node.address,
+            path.as_absolute_path(),
+            None,
+            options,
+        )
+        .await
+        .internal("Failed to read file")?;
+        Ok((fragment, metadata.map(FileInfo::from_metadata)))
     }
 
     async fn copy_to_scratch_file(

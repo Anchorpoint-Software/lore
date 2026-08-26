@@ -51,7 +51,7 @@ use crate::repository::MINE_SUFFIX;
 use crate::repository::RepositoryContext;
 use crate::repository::THEIRS_SUFFIX;
 use crate::repository::clone;
-use crate::repository::clone::CloneStats;
+use crate::repository::clone::CloneContext;
 use crate::revision::sync::LoreRevisionSyncFileEventData;
 use crate::revision::sync::LoreRevisionSyncProgressEventData;
 use crate::revision::sync::SyncError;
@@ -907,7 +907,9 @@ pub async fn realize_scratch_file(
 
     let node_executable = node.mode & NodeFileMode::Executable == NodeFileMode::Executable;
     if node_executable {
-        operation.make_executable(scratch_path).await?;
+        operation
+            .make_executable(scratch_path, node_executable)
+            .await?;
     }
 
     let info = operation.file_info(scratch_path).await?;
@@ -964,11 +966,9 @@ pub async fn realize_file(
     }
 
     let node_executable = node.mode & NodeFileMode::Executable == NodeFileMode::Executable;
-    if node_executable {
-        operation
-            .make_executable(FilesystemPath::Repository(path))
-            .await?;
-    }
+    operation
+        .make_executable(FilesystemPath::Repository(path), node_executable)
+        .await?;
 
     let info = operation
         .file_info(FilesystemPath::Repository(path))
@@ -1110,6 +1110,8 @@ async fn realize_changes_delete(
                         break;
                     }
                 } else {
+                    // Directory unlink failed, keep it and the locally added/modified files
+                    deleted = false;
                     break;
                 }
             }
@@ -1471,31 +1473,24 @@ async fn realize_change_modify_add(
                     format!("Failed to deserialize state {link_revision}")
                 })?;
 
-            let linked_node_path = link_state
-                .node_path(link.clone(), node.child)
+            let clone_path = RepositoryPath::from_relative(&link, change.path.clone())?;
+
+            let link_operation = operation
+                .associated_operation(link.clone())
                 .await
-                .forward::<SyncError>("Failed to find linked node path")?;
-
-            let source_path = RelativePath::new_from_initial_path(&linked_node_path)
-                .forward::<SyncError>("Failed to find linked node path")?;
-
-            let absolute_path = path.to_absolute_path(repository.require_path()?);
-
-            let clone_stats = Arc::new(CloneStats::default());
+                .forward::<SyncError>("Failed starting operation in linked repository")?;
             // Don't use the existing operation because virtualization needs to be resolved for the
             // linked repository separately.
-            clone::clone_node(
-                link.clone(),
-                link_storage,
-                link_state,
-                absolute_path,
-                source_path,
-                node.child,
-                Arc::default(), /* Default options */
-                clone_stats.clone(),
-            )
-            .await
-            .forward::<SyncError>("Failed to sync link")?;
+            let clone_ctx = CloneContext {
+                repository: link.clone(),
+                state: link_state,
+                operation: link_operation,
+                options: Arc::default(),
+                stats: Arc::default(),
+            };
+            clone::clone_node(clone_ctx, link_storage, clone_path, node.child)
+                .await
+                .forward::<SyncError>("Failed to sync link")?;
         }
     } else if node.is_file() && !dry_run && write_to_disk {
         // For move changes where content didn't change, the rename already positioned the file correctly and the current branch's content should be preserved.
