@@ -15,6 +15,7 @@ use tokio::sync::SemaphorePermit;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::mpsc::channel;
+use tokio::task::JoinError;
 use tokio::task::JoinHandle;
 use tokio::task::JoinSet;
 
@@ -833,7 +834,7 @@ async fn send_payload(
 /// The permit travels inside the message rather than being released here, so the payload stays
 /// accounted for until the write task that owns it has written it.
 ///
-/// A send that fails is discarded rather than reported. [`write_to_sink_file`] reads to the end
+/// A send that fails is discarded rather than reported. [`write_to_file`] reads to the end
 /// of the channel unless it has already failed, so a sink that has gone is a sink that has an
 /// error of its own to report, and that error is the one saying what went wrong. Raising a
 /// second one here would mask it, since [`defragment_pipeline`] takes the first of the three it
@@ -956,15 +957,12 @@ async fn fetch_ordered_and_stream_from(
     result.and(join_launcher(fetch_queue_rx, launcher).await)
 }
 
-/// Write sink for file targets.
-async fn write_to_sink(sink: DefragmentSink, data_rx: DataReceiver) -> Result<(), StorageError> {
-    match sink {
-        DefragmentSink::File { file, size } => write_to_sink_file(file, size, data_rx).await,
-        DefragmentSink::Stream { .. } => {
-            debug_assert!(false, "write_to_sink called with Stream sink");
-            Ok(())
-        }
-    }
+/// The outcome of a pipeline stage, with a task that did not run to completion counted as a
+/// failure of the stage it was running.
+fn joined(stage: Result<Result<(), StorageError>, JoinError>) -> Result<(), StorageError> {
+    stage
+        .map_err(|e| StorageError::internal_with_context(e, "task failure"))
+        .and_then(|r| r)
 }
 
 /// Drains `(offset, data, permit)` messages from the fetch pool and writes each
@@ -996,7 +994,7 @@ async fn write_to_sink(sink: DefragmentSink, data_rx: DataReceiver) -> Result<()
 /// a zero-filled hole, indistinguishable from content. Every payload for the whole file
 /// passes through here, which makes this the one place that can see the total. The walker's
 /// tiling checks mean it should never fire, which is the point of having it.
-async fn write_to_sink_file(
+async fn write_to_file(
     file: IoFile,
     size: usize,
     mut data_rx: DataReceiver,
@@ -1097,59 +1095,43 @@ pub async fn defragment_pipeline(
         session_walker,
     ));
 
-    if let DefragmentSink::Stream { sender } = sink {
-        // Ordered fetch -> stream directly to caller's channel
-        let store_fetch = store.clone();
-        let session_fetch = remote_session.clone();
-        let fetcher = lore_base::lore_spawn!(fetch_ordered_and_stream(
-            store_fetch,
-            partition,
-            leaf_rx,
-            sender,
-            options,
-            session_fetch,
-        ));
+    match sink {
+        DefragmentSink::Stream { sender } => {
+            let store_fetch = store.clone();
+            let session_fetch = remote_session.clone();
+            let fetcher = lore_base::lore_spawn!(fetch_ordered_and_stream(
+                store_fetch,
+                partition,
+                leaf_rx,
+                sender,
+                options,
+                session_fetch,
+            ));
 
-        let (walk_result, fetch_result) = tokio::join!(walker, fetcher);
-        walk_result
-            .map_err(|e| StorageError::internal_with_context(e, "task failure"))
-            .and_then(|r| r)
-            .and(
-                fetch_result
-                    .map_err(|e| StorageError::internal_with_context(e, "task failure"))
-                    .and_then(|r| r),
-            )
-    } else {
-        // Unordered fetch -> data channel -> write sink
-        let (data_tx, data_rx) = channel::<DataMessage>(PIPELINE_DATA_CHANNEL_SIZE);
+            let (walk_result, fetch_result) = tokio::join!(walker, fetcher);
+            joined(walk_result).and(joined(fetch_result))
+        }
+        DefragmentSink::File { file, size } => {
+            let (data_tx, data_rx) = channel::<DataMessage>(PIPELINE_DATA_CHANNEL_SIZE);
 
-        let store_fetch = store.clone();
-        let session_fetch = remote_session.clone();
-        let fetcher = lore_base::lore_spawn!(fetch_unordered(
-            store_fetch,
-            partition,
-            leaf_rx,
-            data_tx,
-            options,
-            session_fetch,
-        ));
+            let store_fetch = store.clone();
+            let session_fetch = remote_session.clone();
+            let fetcher = lore_base::lore_spawn!(fetch_unordered(
+                store_fetch,
+                partition,
+                leaf_rx,
+                data_tx,
+                options,
+                session_fetch,
+            ));
 
-        let writer = lore_base::lore_spawn!(write_to_sink(sink, data_rx));
+            let writer = lore_base::lore_spawn!(write_to_file(file, size, data_rx));
 
-        let (walk_result, fetch_result, write_result) = tokio::join!(walker, fetcher, writer);
-        walk_result
-            .map_err(|e| StorageError::internal_with_context(e, "task failure"))
-            .and_then(|r| r)
-            .and(
-                fetch_result
-                    .map_err(|e| StorageError::internal_with_context(e, "task failure"))
-                    .and_then(|r| r),
-            )
-            .and(
-                write_result
-                    .map_err(|e| StorageError::internal_with_context(e, "task failure"))
-                    .and_then(|r| r),
-            )
+            let (walk_result, fetch_result, write_result) = tokio::join!(walker, fetcher, writer);
+            joined(walk_result)
+                .and(joined(fetch_result))
+                .and(joined(write_result))
+        }
     }
 }
 
@@ -1583,7 +1565,7 @@ mod tests {
         }
     }
 
-    mod write_to_sink_file {
+    mod write_to_file {
         //! Direct unit tests for the file write sink's runtime bounds check.
         //!
         //! In the full pipeline the leaf contiguity check in `fetch_unordered`
@@ -1623,7 +1605,7 @@ mod tests {
             send_one(&tx, 30, Bytes::from(vec![0xEF; SIZE - 30])).await;
             drop(tx);
 
-            super::super::write_to_sink_file(file.clone(), SIZE, rx)
+            super::super::write_to_file(file.clone(), SIZE, rx)
                 .await
                 .expect("in-bounds write");
 
@@ -1643,7 +1625,7 @@ mod tests {
             send_one(&tx, 40, Bytes::from(vec![0xAB; SIZE - 40])).await;
             drop(tx);
 
-            let err = super::super::write_to_sink_file(file, SIZE, rx)
+            let err = super::super::write_to_file(file, SIZE, rx)
                 .await
                 .expect_err("a hole should be rejected");
             assert!(
@@ -1660,7 +1642,7 @@ mod tests {
             send_one(&tx, 95, Bytes::from(vec![0u8; 10])).await; // 95 + 10 > 100
             drop(tx);
 
-            let err = super::super::write_to_sink_file(file, SIZE, rx)
+            let err = super::super::write_to_file(file, SIZE, rx)
                 .await
                 .expect_err("OOB should be rejected");
             assert!(
@@ -1677,7 +1659,7 @@ mod tests {
             send_one(&tx, SIZE, Bytes::from(vec![0u8; 1])).await;
             drop(tx);
 
-            super::super::write_to_sink_file(file, SIZE, rx)
+            super::super::write_to_file(file, SIZE, rx)
                 .await
                 .expect_err("offset==size with data should be rejected");
         }
@@ -1690,7 +1672,7 @@ mod tests {
             send_one(&tx, usize::MAX - 5, Bytes::from(vec![0u8; 10])).await;
             drop(tx);
 
-            let err = super::super::write_to_sink_file(file, SIZE, rx)
+            let err = super::super::write_to_file(file, SIZE, rx)
                 .await
                 .expect_err("offset + len overflow rejected");
             assert!(
@@ -1983,7 +1965,7 @@ mod tests {
 
         /// The file pool stops asking for leaves once its sink has gone, and reports nothing.
         ///
-        /// [`write_to_sink_file`] reads to the end of the channel unless it has already failed,
+        /// [`write_to_file`] reads to the end of the channel unless it has already failed,
         /// so a sink that lets go is a sink with an error of its own to report, and a second one
         /// raised here would mask it: [`defragment_pipeline`] combines the three results with
         /// `and`, which keeps the first.
