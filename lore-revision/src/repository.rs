@@ -40,6 +40,7 @@ use lore_error_set::prelude::*;
 use lore_transport::Connection;
 use lore_transport::ProtocolError;
 use lore_transport::RepositoryData;
+use lore_transport::SessionPool;
 use serde::Deserialize;
 use serde::Serialize;
 use tokio::task::JoinHandle;
@@ -575,6 +576,16 @@ pub struct RepositoryContext {
     is_layer: bool,
     write_token: Option<RepositoryWriteToken>,
     repo_lock: Option<Arc<RepositoryLock>>,
+    /// The storage session pool this repository's reads and writes pick from,
+    /// resolved on first use.
+    ///
+    /// Weak on purpose. The strong reference lives in the connection's session
+    /// cache, and `StorageSession::invalidate` clears that cache when the server
+    /// reports a stale session id — after a reconnect that rotated its session
+    /// map, say. An invalidated pool then stops upgrading here, so the next caller
+    /// resolves a fresh one rather than handing out sessions the server has
+    /// forgotten.
+    session_pool: parking_lot::RwLock<Weak<SessionPool>>,
 }
 
 impl std::fmt::Debug for RepositoryContext {
@@ -655,6 +666,7 @@ impl RepositoryContext {
             is_layer: false,
             write_token: None,
             repo_lock: None,
+            session_pool: Default::default(),
             file_system,
         }
     }
@@ -876,6 +888,7 @@ impl RepositoryContext {
             is_layer: false,
             write_token: Some(RepositoryWriteToken::server(&INTERNAL_SERVER_CONTEXT)),
             repo_lock: None,
+            session_pool: Default::default(),
         }
     }
 
@@ -895,6 +908,7 @@ impl RepositoryContext {
             is_layer: false,
             write_token: Some(RepositoryWriteToken::server(&INTERNAL_SERVER_CONTEXT)),
             repo_lock: None,
+            session_pool: Default::default(),
             file_system: self.file_system.clone(),
         }
     }
@@ -919,6 +933,7 @@ impl RepositoryContext {
             is_layer: false,
             write_token: Some(RepositoryWriteToken::server(&INTERNAL_SERVER_CONTEXT)),
             repo_lock: None,
+            session_pool: Default::default(),
         }
     }
 
@@ -938,6 +953,7 @@ impl RepositoryContext {
             is_layer: false,
             write_token: None,
             repo_lock: None,
+            session_pool: Default::default(),
             file_system: self.file_system.clone(),
         }
     }
@@ -971,6 +987,7 @@ impl RepositoryContext {
             is_layer: self.is_layer,
             write_token: self.write_token.as_ref().map(|t| t.share()),
             repo_lock: self.repo_lock.clone(),
+            session_pool: Default::default(),
             file_system: self.file_system.clone(),
         }
     }
@@ -998,6 +1015,7 @@ impl RepositoryContext {
             is_layer: false,
             write_token: self.write_token.as_ref().map(|t| t.share()),
             repo_lock: self.repo_lock.clone(),
+            session_pool: Default::default(),
             file_system: self.file_system.clone(),
         }
     }
@@ -1025,6 +1043,7 @@ impl RepositoryContext {
             is_layer: true,
             write_token: self.write_token.as_ref().map(|t| t.share()),
             repo_lock: self.repo_lock.clone(),
+            session_pool: Default::default(),
             file_system: self.file_system.clone(),
         }
     }
@@ -1045,6 +1064,7 @@ impl RepositoryContext {
             is_layer: self.is_layer,
             write_token: None,
             repo_lock: self.repo_lock.clone(),
+            session_pool: Default::default(),
             file_system: self.file_system.clone(),
         }
     }
@@ -1120,6 +1140,59 @@ impl RepositoryContext {
             };
         }
         result
+    }
+
+    /// The storage session pool for this repository, resolved once and reused for
+    /// as long as it lives.
+    ///
+    /// `correlation_id` is only read when the pool has to be resolved. It belongs
+    /// to the command being executed and a context belongs to one command, so a
+    /// cached pool is always the one this context's correlation id asked for.
+    pub(crate) async fn session_pool(
+        &self,
+        correlation_id: &str,
+    ) -> Result<Arc<SessionPool>, ProtocolError> {
+        if let Some(pool) = self.cached_session_pool() {
+            return Ok(pool);
+        }
+        let remote = self.remote().await?;
+        let pool = remote.session_pool(self.id, correlation_id).await?;
+        *self.session_pool.write() = Arc::downgrade(&pool);
+        Ok(pool)
+    }
+
+    /// The session pool if one is already resolved and still live, without
+    /// touching the remote. `None` means "resolve it", not "there is none".
+    ///
+    /// Private so the pool is only ever reached through [`Self::session_pool`]. A
+    /// caller handed the pool directly would pick from it eagerly, and an eager
+    /// session cannot be invalidated and retried — see [`crate::immutable`]'s
+    /// session resolution.
+    fn cached_session_pool(&self) -> Option<Arc<SessionPool>> {
+        self.session_pool.read().upgrade()
+    }
+
+    /// Hold `pool` as resolved, standing in for a resolution against a live remote.
+    /// The caller keeps the strong reference, as the connection's session cache
+    /// does.
+    #[cfg(test)]
+    pub(crate) fn set_session_pool(&self, pool: &Arc<SessionPool>) {
+        *self.session_pool.write() = Arc::downgrade(pool);
+    }
+
+    /// Whether this context is known to hold no remote, answered without waiting
+    /// on the state lock or driving a pending connect.
+    ///
+    /// [`RemoteState::Offline`] is terminal, so a `true` answer stands for the life
+    /// of the context and a caller can skip building a storage session outright.
+    /// Everything else answers `false`, a state lock held elsewhere included: that
+    /// costs only the session the caller would have built anyway. A failed connect
+    /// is not offline — a session built on one reports the failure, which is the
+    /// answer that belongs to it.
+    pub(crate) fn is_offline(&self) -> bool {
+        self.remote
+            .try_read()
+            .is_ok_and(|state| matches!(&*state, RemoteState::Offline))
     }
 
     /// Snapshot of the remote state. Awaits the state lock (cheap — only contended
@@ -1775,9 +1848,9 @@ fn connect(
     let handle: JoinHandle<Result<Arc<Connection>, ProtocolError>> = lore_spawn!(async move {
         let connection =
             protocol::connect(remote_url.as_str(), identity.as_str(), repository).await?;
-        // Pre-warm session so it's ready when the command runs
+        // Pre-warm the session pool so it's ready when the command runs
         if !repository.is_zero() {
-            let _ = connection.session(repository, &correlation_id).await;
+            let _ = connection.session_pool(repository, &correlation_id).await;
         }
         Ok(connection)
     });
@@ -3595,6 +3668,104 @@ mod remote_state_tests {
             crate::repository::RepositoryFormat::Lore,
             None,
         ))
+    }
+
+    /// Nothing is cached until something resolves it, so the first reader or
+    /// writer drives the connect and a command that does neither remotely never
+    /// does.
+    #[tokio::test]
+    async fn a_fresh_context_has_no_session_pool_to_reuse() {
+        for state in [RemoteState::Offline, RemoteState::Failed(no_remote())] {
+            let context = context_with_state(state).await;
+            assert!(
+                context.cached_session_pool().is_none(),
+                "a context that has resolved nothing reported a pool"
+            );
+        }
+    }
+
+    /// Asking an offline context for a pool must not invent one, and must not
+    /// leave anything cached for the next caller to find.
+    #[tokio::test]
+    async fn an_offline_context_resolves_no_session_pool() {
+        let context = context_with_state(RemoteState::Offline).await;
+        assert!(context.session_pool("correlation").await.is_err());
+        assert!(context.cached_session_pool().is_none());
+    }
+
+    /// A pool for a context to hold, the strong reference left to the caller as the
+    /// connection's session cache holds it. The session in it is never resolved:
+    /// these tests ask which pool answered, not what it yields.
+    fn held_pool() -> Arc<lore_transport::SessionPool> {
+        let session = Arc::new(lore_transport::StorageSession::pending(|| async {
+            Err(ProtocolError::internal("a pooled session no test resolves"))
+        }));
+        Arc::new(lore_transport::SessionPool::new(vec![session]))
+    }
+
+    /// A pool once resolved is handed back without consulting the remote. This
+    /// context's connect has failed, so an answer at all is proof the pool was
+    /// reused rather than looked up again per call.
+    #[tokio::test]
+    async fn a_resolved_pool_is_reused_without_touching_the_remote() {
+        let context = context_with_state(RemoteState::Failed(disconnected())).await;
+        let pool = held_pool();
+        context.set_session_pool(&pool);
+
+        let reused = context
+            .session_pool("correlation")
+            .await
+            .expect("a context holding a pool answers from it");
+        assert!(Arc::ptr_eq(&reused, &pool));
+    }
+
+    /// The pool is held weakly, so dropping the pin — which is what
+    /// `StorageSession::invalidate` does to the connection's cache — sends the next
+    /// caller back to the remote rather than handing out sessions the server has
+    /// forgotten.
+    #[tokio::test]
+    async fn a_pool_whose_pin_is_dropped_is_not_reused() {
+        let context = context_with_state(RemoteState::Failed(disconnected())).await;
+        let pool = held_pool();
+        context.set_session_pool(&pool);
+        assert!(context.session_pool("correlation").await.is_ok());
+
+        drop(pool);
+        assert!(
+            context.session_pool("correlation").await.is_err(),
+            "an expired pool must send the caller back to the remote"
+        );
+    }
+
+    /// Only the terminal no-remote state answers yes. A failure and a connect
+    /// still in flight both have an answer a session carries, so a caller has to
+    /// build one.
+    #[tokio::test]
+    async fn only_a_context_without_a_remote_is_offline() {
+        assert!(
+            context_with_state(RemoteState::Offline).await.is_offline(),
+            "a context with no remote configured is offline"
+        );
+        for state in [
+            RemoteState::Failed(disconnected()),
+            RemoteState::Pending(ready_remote(Err(no_remote()))),
+        ] {
+            assert!(
+                !context_with_state(state).await.is_offline(),
+                "a context that has not settled on `Offline` reported itself offline"
+            );
+        }
+    }
+
+    /// The answer is taken without waiting, so a state lock held elsewhere reads
+    /// as not offline rather than blocking a caller that only wanted to skip work.
+    #[tokio::test]
+    async fn a_held_state_lock_does_not_answer_offline() {
+        let context = context_with_state(RemoteState::Offline).await;
+        let guard = context.remote.write().await;
+        assert!(!context.is_offline());
+        drop(guard);
+        assert!(context.is_offline());
     }
 
     #[tokio::test]

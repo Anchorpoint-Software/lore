@@ -823,14 +823,51 @@ impl Connection {
         partition: Partition,
         correlation_id: &str,
     ) -> Result<Arc<StorageSession>, ProtocolError> {
+        Ok(self.session_pool(partition, correlation_id).await?.pick())
+    }
+
+    /// The pool of sessions for `(partition, correlation_id)`, pinned here so the
+    /// connector's `Weak` to it stays upgradeable.
+    ///
+    /// A caller that needs one session per unit of work — a commit needs one per
+    /// file — should hold the pool and [`pick`](SessionPool::pick) from it rather
+    /// than calling [`session`](Self::session) each time. Every call owns a key to
+    /// look the pool up by, twice over, so a caller in a loop allocates two strings
+    /// an iteration and every iteration hashes to the same shard of both maps.
+    pub async fn session_pool(
+        self: &Arc<Self>,
+        partition: Partition,
+        correlation_id: &str,
+    ) -> Result<Arc<SessionPool>, ProtocolError> {
         self.ensure_storage_connected().await?;
         let connector = self.storage_connector()?;
-        let (session, pool) = connector
-            .session(partition, correlation_id, self.clone())
+        let pool = connector
+            .session_pool(partition, correlation_id, self.clone())
             .await?;
-        self.session_cache
-            .insert((partition, correlation_id.to_string()), pool);
-        Ok(session)
+        self.pin_session_pool(partition, correlation_id, &pool);
+        Ok(pool)
+    }
+
+    /// Pin `pool` for `(partition, correlation_id)`, unless that is where it is
+    /// pinned already, so a caller in a loop takes the shard's read lock rather
+    /// than its write lock.
+    ///
+    /// The read guard is released before the insert: holding one across a write to
+    /// the same map deadlocks.
+    fn pin_session_pool(
+        &self,
+        partition: Partition,
+        correlation_id: &str,
+        pool: &Arc<SessionPool>,
+    ) {
+        let key = (partition, correlation_id.to_string());
+        let pinned = self
+            .session_cache
+            .get(&key)
+            .is_some_and(|entry| Arc::ptr_eq(entry.value(), pool));
+        if !pinned {
+            self.session_cache.insert(key, pool.clone());
+        }
     }
 
     /// Unpin a cached session pool so its `Weak` in `StorageConnector` can
@@ -855,12 +892,12 @@ impl Connection {
     }
 
     /// Ensure the server's per-connection `authorized_repos` set contains `partition`,
-    /// without leaving a session pinned. Fast-paths via the connector's
+    /// without leaving a pool pinned. Fast-paths via the connector's
     /// `authorized_partitions` cache: if a previous `session_start` already registered
     /// `partition` on every underlying connection, no wire calls happen. Otherwise a
-    /// fresh session is started (which fans `session_start` across all connections in
+    /// fresh pool is started (which fans `session_start` across all connections in
     /// parallel) and immediately released; the server keeps `authorized_repos` permanent
-    /// for the connection's lifetime, so the registration outlives the session.
+    /// for the connection's lifetime, so the registration outlives the sessions.
     pub async fn ensure_partition_authorized(
         self: &Arc<Self>,
         partition: Partition,
@@ -874,12 +911,12 @@ impl Connection {
         if connector.is_partition_refused(partition) {
             return Err(ProtocolError::from(lore_base::error::NotAuthorized));
         }
-        // Drive the slow path through `session()` so the `authorized_partitions` insert
-        // and the standard race-resolution / pool bookkeeping all run. We immediately
-        // drop the returned `StorageSession` and release the cache entry — the call's
+        // Drive the slow path through `session_pool()` so the `authorized_partitions`
+        // insert and the standard race-resolution / pool bookkeeping all run. We
+        // immediately drop the returned pool and release the cache entry — the call's
         // only purpose was to register authz, not to keep a live session.
-        match self.session(partition, correlation_id).await {
-            Ok(_session) => {
+        match self.session_pool(partition, correlation_id).await {
+            Ok(_pool) => {
                 self.release_session(partition, correlation_id);
                 Ok(())
             }

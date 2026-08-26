@@ -114,6 +114,17 @@ impl StorageSession {
         }
     }
 
+    /// Whether the server-side session is established on first use rather than
+    /// held already.
+    ///
+    /// Only a lazy session survives an [`invalidate`](Self::invalidate): the next
+    /// operation on it re-runs the resolver and obtains a `session_id` the server
+    /// knows about. An eager one keeps the id it was built with, so a caller that
+    /// invalidates and retries the same session has to hold a lazy one.
+    pub fn is_lazy(&self) -> bool {
+        matches!(self.inner, SessionInner::Pending { .. })
+    }
+
     /// Drop any cached server-side session. The next operation re-runs the
     /// resolver, triggering a fresh `session_start` against the current
     /// connection. Also clears the parent `Connection`'s session pool cache
@@ -355,7 +366,23 @@ pub struct SessionPool {
 }
 
 impl SessionPool {
+    /// A pool over `sessions`, which [`pick`](Self::pick) round-robins across.
+    ///
+    /// The connector builds one session per underlying `Storage` connection, so a
+    /// pick spreads a command's operations over every connection the connect phase
+    /// established.
+    pub fn new(sessions: Vec<Arc<StorageSession>>) -> Self {
+        Self {
+            sessions,
+            next: AtomicUsize::new(0),
+        }
+    }
+
     /// Returns the next session in the pool via round-robin.
+    ///
+    /// Every call advances the cursor, so only a caller that is going to use the
+    /// session picks. One that discards what it picked makes every other caller
+    /// stride over the connections rather than visit each in turn.
     pub fn pick(&self) -> Arc<StorageSession> {
         let index = self.next.fetch_add(1, Ordering::Relaxed) % self.sessions.len();
         self.sessions[index].clone()
@@ -378,7 +405,8 @@ struct PoolEntry {
     storages: Vec<Weak<dyn Storage>>,
 }
 
-/// Result of the synchronous `DashMap` entry check in `StorageConnector::session()`.
+/// Result of the synchronous `DashMap` entry check in
+/// [`StorageConnector::session_pool`].
 enum PoolOutcome {
     /// We inserted into a vacant slot -- we own this pool.
     Inserted { pool: Arc<SessionPool> },
@@ -456,29 +484,31 @@ impl StorageConnector {
         self.refused_partitions.remove(&partition);
     }
 
-    /// Get or create a `SessionPool` for the given partition and correlation ID,
-    /// returning a round-robin-picked session from it along with the pool itself
-    /// so the caller can pin the pool to keep all its sessions alive across
-    /// multiple operations within a command.
+    /// Get or create the `SessionPool` for the given partition and correlation ID.
+    /// The caller pins the pool to keep every session it owns alive across the
+    /// operations of one command, and [`picks`](SessionPool::pick) from it per
+    /// operation.
     ///
-    /// On a miss, one server-side session is started per underlying connection,
-    /// in parallel. Race resolution mirrors the previous single-session path:
-    /// the first writer wins (vacant or expired entry); a losing racer stops
-    /// every server-side session it just started.
-    pub async fn session(
+    /// Nothing is picked here. A pick advances the pool's round-robin cursor, so a
+    /// caller that only wanted the pool would leave every picking caller striding
+    /// over the connections instead of visiting each in turn.
+    ///
+    /// On a miss, one server-side session is started per underlying connection, in
+    /// parallel. The first writer wins the key, vacant or expired entry alike; a
+    /// losing racer stops every server-side session it just started.
+    pub async fn session_pool(
         &self,
         partition: Partition,
         correlation_id: &str,
         connection: Arc<Connection>,
-    ) -> Result<(Arc<StorageSession>, Arc<SessionPool>), ProtocolError> {
+    ) -> Result<Arc<SessionPool>, ProtocolError> {
         let key = (partition, correlation_id.to_string());
 
         // Fast path: live pool exists.
         if let Some(entry) = self.pools.get(&key)
             && let Some(pool) = entry.pool.upgrade()
         {
-            let picked = pool.pick();
-            return Ok((picked, pool));
+            return Ok(pool);
         }
 
         // Slow path: start one session per connection in parallel. No lock held.
@@ -524,10 +554,7 @@ impl StorageConnector {
                 ))
             })
             .collect();
-        let pool = Arc::new(SessionPool {
-            sessions,
-            next: AtomicUsize::new(0),
-        });
+        let pool = Arc::new(SessionPool::new(sessions));
         let session_ids: Vec<u32> = started.iter().map(|(_, id)| *id).collect();
         let storages: Vec<Weak<dyn Storage>> =
             started.iter().map(|(s, _)| Arc::downgrade(s)).collect();
@@ -570,10 +597,7 @@ impl StorageConnector {
         }; // entry lock released here
 
         match outcome {
-            PoolOutcome::Inserted { pool } => {
-                let picked = pool.pick();
-                Ok((picked, pool))
-            }
+            PoolOutcome::Inserted { pool } => Ok(pool),
             PoolOutcome::Replaced {
                 pool,
                 old_session_ids,
@@ -585,8 +609,7 @@ impl StorageConnector {
                         let _ = storage.session_stop(id).await;
                     }
                 }
-                let picked = pool.pick();
-                Ok((picked, pool))
+                Ok(pool)
             }
             PoolOutcome::RaceLost { winner } => {
                 // Stop every server-side session we just started -- the winner owns this key.
@@ -595,8 +618,7 @@ impl StorageConnector {
                         let _ = storage.session_stop(id).await;
                     }
                 }
-                let picked = winner.pick();
-                Ok((picked, winner))
+                Ok(winner)
             }
         }
     }
@@ -617,5 +639,53 @@ impl StorageConnector {
         for storage in &self.connections {
             storage.close().await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A lazy session whose resolver counts its calls and always fails, so how
+    /// often it is asked is what the test reads and what it resolves to is out of
+    /// the way.
+    fn counting_session(calls: Arc<AtomicUsize>) -> StorageSession {
+        StorageSession::pending(move || {
+            let calls = calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Err(ProtocolError::internal("nothing to resolve"))
+            }
+        })
+    }
+
+    /// One resolution serves every operation, the outcome being held whether it
+    /// succeeded or not.
+    #[tokio::test]
+    async fn a_lazy_session_resolves_once() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let session = counting_session(calls.clone());
+
+        assert!(session.is_lazy());
+        assert!(session.partition().await.is_err());
+        assert!(session.partition().await.is_err());
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    /// The read path recovers a rotated server session map by invalidating the
+    /// session and retrying that same session, which only gets a `session_id` the
+    /// server knows about where the session resolves again.
+    #[tokio::test]
+    async fn an_invalidated_lazy_session_resolves_again() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let session = counting_session(calls.clone());
+
+        assert!(session.partition().await.is_err());
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        session.invalidate().await;
+
+        assert!(session.partition().await.is_err());
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
     }
 }
