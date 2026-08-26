@@ -3,12 +3,9 @@
 #[cfg(test)]
 mod tests {
     use std::io::Write;
-    use std::sync::Arc;
 
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::runtime::runtime;
-    use lore_base::types::Context;
-    use lore_revision::branch;
     use lore_revision::commit;
     use lore_revision::commit::CommitOptions;
     use lore_revision::file;
@@ -17,8 +14,6 @@ mod tests {
     use lore_revision::lore::RepositoryId;
     use lore_revision::node::NodeFlags;
     use lore_revision::node::ROOT_NODE;
-    use lore_revision::repository;
-    use lore_revision::repository::RepositoryContext;
     use lore_revision::stage;
     use lore_revision::stage::StageOptions;
     use lore_revision::state::State;
@@ -34,42 +29,11 @@ mod tests {
         #[allow(clippy::disallowed_methods)]
         runtime()
             .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
-                let tempdir = generate_tempdir();
-                let path = tempdir.to_path_buf();
-                std::fs::create_dir_all(path.as_path()).expect("Create directory failed");
-                let default_branch_id = Context::from(uuid::Uuid::now_v7());
-                let write_token = repository::RepositoryWriteToken::acquire(path.as_path()).await;
-                let created_repo = repository::create_local(
-                    path.as_path(),
-                    &write_token,
-                    repository_id,
-                    default_branch_id,
-                    branch::DEFAULT_DEFAULT_NAME.to_string(),
-                    repository::RepositoryConfig::default(),
-                    false,
-                )
-                .await
-                .expect("Failed to initialize repository");
-
-                let repository = Arc::new(
-                    RepositoryContext::new(
-                        default_repository_creation_args(
-                            immutable_store.clone(),
-                            mutable_store.clone(),
-                        )
-                        .with_path(&path)
-                        .with_id(repository_id)
-                        .with_instance_id(created_repo.instance_id),
-                    )
-                    .with_write_token(write_token.share()),
-                );
-
-                lore_revision::instance::store_current_anchor_branch(
-                    &repository,
-                    default_branch_id,
-                )
-                .await
-                .expect("Failed to store anchor branch");
+                let fixture =
+                    test_repository_create(immutable_store, mutable_store, repository_id).await;
+                let repository = fixture.repository.clone();
+                let write_token = &fixture.write_token;
+                let path = fixture.path.clone();
 
                 // Create a file in a subdirectory and stage+commit it to get a tree with nodes
                 let subdir = path.join("src");
@@ -84,7 +48,7 @@ mod tests {
                 let paths = LoreArray::from_vec(vec![LoreString::from(&path)]);
                 file::stage::stage(
                     repository.clone(),
-                    &write_token,
+                    write_token,
                     paths,
                     StageOptions {
                         case_change: stage::StageCaseChange::Error,
@@ -100,7 +64,7 @@ mod tests {
                 // Commit to create a base revision with the file
                 Box::pin(commit::commit(
                     repository.clone(),
-                    &write_token,
+                    write_token,
                     CommitOptions::new("Initial commit".to_string()),
                 ))
                 .await
@@ -189,42 +153,11 @@ mod tests {
         #[allow(clippy::disallowed_methods)]
         runtime()
             .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
-                let tempdir = generate_tempdir();
-                let path = tempdir.to_path_buf();
-                std::fs::create_dir_all(path.as_path()).expect("Create directory failed");
-                let default_branch_id = Context::from(uuid::Uuid::now_v7());
-                let write_token = repository::RepositoryWriteToken::acquire(path.as_path()).await;
-                let created_repo = repository::create_local(
-                    path.as_path(),
-                    &write_token,
-                    repository_id,
-                    default_branch_id,
-                    branch::DEFAULT_DEFAULT_NAME.to_string(),
-                    repository::RepositoryConfig::default(),
-                    false,
-                )
-                .await
-                .expect("Failed to initialize repository");
-
-                let repository = Arc::new(
-                    RepositoryContext::new(
-                        default_repository_creation_args(
-                            immutable_store.clone(),
-                            mutable_store.clone(),
-                        )
-                        .with_path(&path)
-                        .with_id(repository_id)
-                        .with_instance_id(created_repo.instance_id),
-                    )
-                    .with_write_token(write_token.share()),
-                );
-
-                lore_revision::instance::store_current_anchor_branch(
-                    &repository,
-                    default_branch_id,
-                )
-                .await
-                .expect("Failed to store anchor branch");
+                let fixture =
+                    test_repository_create(immutable_store, mutable_store, repository_id).await;
+                let repository = fixture.repository.clone();
+                let write_token = &fixture.write_token;
+                let path = fixture.path.clone();
 
                 // Create two files in same directory
                 let subdir = path.join("src");
@@ -244,7 +177,7 @@ mod tests {
                 let paths = LoreArray::from_vec(vec![LoreString::from(&path)]);
                 file::stage::stage(
                     repository.clone(),
-                    &write_token,
+                    write_token,
                     paths,
                     StageOptions {
                         case_change: stage::StageCaseChange::Error,
@@ -259,7 +192,7 @@ mod tests {
 
                 Box::pin(commit::commit(
                     repository.clone(),
-                    &write_token,
+                    write_token,
                     CommitOptions::new("Initial commit".to_string()),
                 ))
                 .await
@@ -333,42 +266,11 @@ mod tests {
         #[allow(clippy::disallowed_methods)]
         runtime()
             .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
-                let tempdir = generate_tempdir();
-                let path = tempdir.to_path_buf();
-                std::fs::create_dir_all(path.as_path()).expect("Create directory failed");
-                let default_branch_id = Context::from(uuid::Uuid::now_v7());
-                let write_token = repository::RepositoryWriteToken::acquire(path.as_path()).await;
-                let created_repo = repository::create_local(
-                    path.as_path(),
-                    &write_token,
-                    repository_id,
-                    default_branch_id,
-                    branch::DEFAULT_DEFAULT_NAME.to_string(),
-                    repository::RepositoryConfig::default(),
-                    false,
-                )
-                .await
-                .expect("Failed to initialize repository");
-
-                let repository = Arc::new(
-                    RepositoryContext::new(
-                        default_repository_creation_args(
-                            immutable_store.clone(),
-                            mutable_store.clone(),
-                        )
-                        .with_path(&path)
-                        .with_id(repository_id)
-                        .with_instance_id(created_repo.instance_id),
-                    )
-                    .with_write_token(write_token.share()),
-                );
-
-                lore_revision::instance::store_current_anchor_branch(
-                    &repository,
-                    default_branch_id,
-                )
-                .await
-                .expect("Failed to store anchor branch");
+                let fixture =
+                    test_repository_create(immutable_store, mutable_store, repository_id).await;
+                let repository = fixture.repository.clone();
+                let write_token = &fixture.write_token;
+                let path = fixture.path.clone();
 
                 // Create and commit a file
                 let file_path = path.join("clean.txt");
@@ -380,7 +282,7 @@ mod tests {
                 let paths = LoreArray::from_vec(vec![LoreString::from(&path)]);
                 file::stage::stage(
                     repository.clone(),
-                    &write_token,
+                    write_token,
                     paths,
                     StageOptions {
                         case_change: stage::StageCaseChange::Error,
@@ -395,7 +297,7 @@ mod tests {
 
                 Box::pin(commit::commit(
                     repository.clone(),
-                    &write_token,
+                    write_token,
                     CommitOptions::new("Initial".to_string()),
                 ))
                 .await
@@ -427,42 +329,11 @@ mod tests {
         #[allow(clippy::disallowed_methods)]
         runtime()
             .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
-                let tempdir = generate_tempdir();
-                let path = tempdir.to_path_buf();
-                std::fs::create_dir_all(path.as_path()).expect("Create directory failed");
-                let default_branch_id = Context::from(uuid::Uuid::now_v7());
-                let write_token = repository::RepositoryWriteToken::acquire(path.as_path()).await;
-                let created_repo = repository::create_local(
-                    path.as_path(),
-                    &write_token,
-                    repository_id,
-                    default_branch_id,
-                    branch::DEFAULT_DEFAULT_NAME.to_string(),
-                    repository::RepositoryConfig::default(),
-                    false,
-                )
-                .await
-                .expect("Failed to initialize repository");
-
-                let repository = Arc::new(
-                    RepositoryContext::new(
-                        default_repository_creation_args(
-                            immutable_store.clone(),
-                            mutable_store.clone(),
-                        )
-                        .with_path(&path)
-                        .with_id(repository_id)
-                        .with_instance_id(created_repo.instance_id),
-                    )
-                    .with_write_token(write_token.share()),
-                );
-
-                lore_revision::instance::store_current_anchor_branch(
-                    &repository,
-                    default_branch_id,
-                )
-                .await
-                .expect("Failed to store anchor branch");
+                let fixture =
+                    test_repository_create(immutable_store, mutable_store, repository_id).await;
+                let repository = fixture.repository.clone();
+                let write_token = &fixture.write_token;
+                let path = fixture.path.clone();
 
                 // Create, stage, commit a file
                 let subdir = path.join("src");
@@ -476,7 +347,7 @@ mod tests {
                 let paths = LoreArray::from_vec(vec![LoreString::from(&path)]);
                 file::stage::stage(
                     repository.clone(),
-                    &write_token,
+                    write_token,
                     paths,
                     StageOptions {
                         case_change: stage::StageCaseChange::Error,
@@ -491,7 +362,7 @@ mod tests {
 
                 Box::pin(commit::commit(
                     repository.clone(),
-                    &write_token,
+                    write_token,
                     CommitOptions::new("Initial".to_string()),
                 ))
                 .await
@@ -507,7 +378,7 @@ mod tests {
                 let paths = LoreArray::from_vec(vec![LoreString::from(&path)]);
                 file::stage::stage(
                     repository.clone(),
-                    &write_token,
+                    write_token,
                     paths,
                     StageOptions {
                         case_change: stage::StageCaseChange::Error,
@@ -580,42 +451,11 @@ mod tests {
         #[allow(clippy::disallowed_methods)]
         runtime()
             .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
-                let tempdir = generate_tempdir();
-                let path = tempdir.to_path_buf();
-                std::fs::create_dir_all(path.as_path()).expect("Create directory failed");
-                let default_branch_id = Context::from(uuid::Uuid::now_v7());
-                let write_token = repository::RepositoryWriteToken::acquire(path.as_path()).await;
-                let created_repo = repository::create_local(
-                    path.as_path(),
-                    &write_token,
-                    repository_id,
-                    default_branch_id,
-                    branch::DEFAULT_DEFAULT_NAME.to_string(),
-                    repository::RepositoryConfig::default(),
-                    false,
-                )
-                .await
-                .expect("Failed to initialize repository");
-
-                let repository = Arc::new(
-                    RepositoryContext::new(
-                        default_repository_creation_args(
-                            immutable_store.clone(),
-                            mutable_store.clone(),
-                        )
-                        .with_path(&path)
-                        .with_id(repository_id)
-                        .with_instance_id(created_repo.instance_id),
-                    )
-                    .with_write_token(write_token.share()),
-                );
-
-                lore_revision::instance::store_current_anchor_branch(
-                    &repository,
-                    default_branch_id,
-                )
-                .await
-                .expect("Failed to store anchor branch");
+                let fixture =
+                    test_repository_create(immutable_store, mutable_store, repository_id).await;
+                let repository = fixture.repository.clone();
+                let write_token = &fixture.write_token;
+                let path = fixture.path.clone();
 
                 // Create, stage, commit
                 {
@@ -627,7 +467,7 @@ mod tests {
                 let paths = LoreArray::from_vec(vec![LoreString::from(&path)]);
                 file::stage::stage(
                     repository.clone(),
-                    &write_token,
+                    write_token,
                     paths,
                     StageOptions {
                         case_change: stage::StageCaseChange::Error,
@@ -642,7 +482,7 @@ mod tests {
 
                 Box::pin(commit::commit(
                     repository.clone(),
-                    &write_token,
+                    write_token,
                     CommitOptions::new("Initial".to_string()),
                 ))
                 .await
@@ -700,42 +540,11 @@ mod tests {
         #[allow(clippy::disallowed_methods)]
         runtime()
             .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
-                let tempdir = generate_tempdir();
-                let path = tempdir.to_path_buf();
-                std::fs::create_dir_all(path.as_path()).expect("Create directory failed");
-                let default_branch_id = Context::from(uuid::Uuid::now_v7());
-                let write_token = repository::RepositoryWriteToken::acquire(path.as_path()).await;
-                let created_repo = repository::create_local(
-                    path.as_path(),
-                    &write_token,
-                    repository_id,
-                    default_branch_id,
-                    branch::DEFAULT_DEFAULT_NAME.to_string(),
-                    repository::RepositoryConfig::default(),
-                    false,
-                )
-                .await
-                .expect("Failed to initialize repository");
-
-                let repository = Arc::new(
-                    RepositoryContext::new(
-                        default_repository_creation_args(
-                            immutable_store.clone(),
-                            mutable_store.clone(),
-                        )
-                        .with_path(&path)
-                        .with_id(repository_id)
-                        .with_instance_id(created_repo.instance_id),
-                    )
-                    .with_write_token(write_token.share()),
-                );
-
-                lore_revision::instance::store_current_anchor_branch(
-                    &repository,
-                    default_branch_id,
-                )
-                .await
-                .expect("Failed to store anchor branch");
+                let fixture =
+                    test_repository_create(immutable_store, mutable_store, repository_id).await;
+                let repository = fixture.repository.clone();
+                let write_token = &fixture.write_token;
+                let path = fixture.path.clone();
 
                 // Create, stage, commit a file
                 {
@@ -747,7 +556,7 @@ mod tests {
                 let paths = LoreArray::from_vec(vec![LoreString::from(&path)]);
                 file::stage::stage(
                     repository.clone(),
-                    &write_token,
+                    write_token,
                     paths,
                     StageOptions {
                         case_change: stage::StageCaseChange::Error,
@@ -762,7 +571,7 @@ mod tests {
 
                 Box::pin(commit::commit(
                     repository.clone(),
-                    &write_token,
+                    write_token,
                     CommitOptions::new("Initial".to_string()),
                 ))
                 .await
@@ -824,42 +633,11 @@ mod tests {
         #[allow(clippy::disallowed_methods)]
         runtime()
             .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
-                let tempdir = generate_tempdir();
-                let path = tempdir.to_path_buf();
-                std::fs::create_dir_all(path.as_path()).expect("Create directory failed");
-                let default_branch_id = Context::from(uuid::Uuid::now_v7());
-                let write_token = repository::RepositoryWriteToken::acquire(path.as_path()).await;
-                let created_repo = repository::create_local(
-                    path.as_path(),
-                    &write_token,
-                    repository_id,
-                    default_branch_id,
-                    branch::DEFAULT_DEFAULT_NAME.to_string(),
-                    repository::RepositoryConfig::default(),
-                    false,
-                )
-                .await
-                .expect("Failed to initialize repository");
-
-                let repository = Arc::new(
-                    RepositoryContext::new(
-                        default_repository_creation_args(
-                            immutable_store.clone(),
-                            mutable_store.clone(),
-                        )
-                        .with_path(&path)
-                        .with_id(repository_id)
-                        .with_instance_id(created_repo.instance_id),
-                    )
-                    .with_write_token(write_token.share()),
-                );
-
-                lore_revision::instance::store_current_anchor_branch(
-                    &repository,
-                    default_branch_id,
-                )
-                .await
-                .expect("Failed to store anchor branch");
+                let fixture =
+                    test_repository_create(immutable_store, mutable_store, repository_id).await;
+                let repository = fixture.repository.clone();
+                let write_token = &fixture.write_token;
+                let path = fixture.path.clone();
 
                 // Create two files, stage, commit
                 {
@@ -875,7 +653,7 @@ mod tests {
 
                 file::stage::stage(
                     repository.clone(),
-                    &write_token,
+                    write_token,
                     LoreArray::from_vec(vec![LoreString::from(&path)]),
                     StageOptions {
                         case_change: stage::StageCaseChange::Error,
@@ -890,7 +668,7 @@ mod tests {
 
                 Box::pin(commit::commit(
                     repository.clone(),
-                    &write_token,
+                    write_token,
                     CommitOptions::new("Initial".to_string()),
                 ))
                 .await
@@ -994,42 +772,11 @@ mod tests {
         #[allow(clippy::disallowed_methods)]
         runtime()
             .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
-                let tempdir = generate_tempdir();
-                let path = tempdir.to_path_buf();
-                std::fs::create_dir_all(path.as_path()).expect("Create directory failed");
-                let default_branch_id = Context::from(uuid::Uuid::now_v7());
-                let write_token = repository::RepositoryWriteToken::acquire(path.as_path()).await;
-                let created_repo = repository::create_local(
-                    path.as_path(),
-                    &write_token,
-                    repository_id,
-                    default_branch_id,
-                    branch::DEFAULT_DEFAULT_NAME.to_string(),
-                    repository::RepositoryConfig::default(),
-                    false,
-                )
-                .await
-                .expect("Failed to initialize repository");
-
-                let repository = Arc::new(
-                    RepositoryContext::new(
-                        default_repository_creation_args(
-                            immutable_store.clone(),
-                            mutable_store.clone(),
-                        )
-                        .with_path(&path)
-                        .with_id(repository_id)
-                        .with_instance_id(created_repo.instance_id),
-                    )
-                    .with_write_token(write_token.share()),
-                );
-
-                lore_revision::instance::store_current_anchor_branch(
-                    &repository,
-                    default_branch_id,
-                )
-                .await
-                .expect("Failed to store anchor branch");
+                let fixture =
+                    test_repository_create(immutable_store, mutable_store, repository_id).await;
+                let repository = fixture.repository.clone();
+                let write_token = &fixture.write_token;
+                let path = fixture.path.clone();
 
                 // Create src/ with two files, stage, commit
                 let subdir = path.join("src");
@@ -1047,7 +794,7 @@ mod tests {
 
                 file::stage::stage(
                     repository.clone(),
-                    &write_token,
+                    write_token,
                     LoreArray::from_vec(vec![LoreString::from(&path)]),
                     StageOptions {
                         case_change: stage::StageCaseChange::Error,
@@ -1062,7 +809,7 @@ mod tests {
 
                 Box::pin(commit::commit(
                     repository.clone(),
-                    &write_token,
+                    write_token,
                     CommitOptions::new("Initial".to_string()),
                 ))
                 .await
@@ -1135,42 +882,11 @@ mod tests {
         #[allow(clippy::disallowed_methods)]
         runtime()
             .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
-                let tempdir = generate_tempdir();
-                let path = tempdir.to_path_buf();
-                std::fs::create_dir_all(path.as_path()).expect("Create directory failed");
-                let default_branch_id = Context::from(uuid::Uuid::now_v7());
-                let write_token = repository::RepositoryWriteToken::acquire(path.as_path()).await;
-                let created_repo = repository::create_local(
-                    path.as_path(),
-                    &write_token,
-                    repository_id,
-                    default_branch_id,
-                    branch::DEFAULT_DEFAULT_NAME.to_string(),
-                    repository::RepositoryConfig::default(),
-                    false,
-                )
-                .await
-                .expect("Failed to initialize repository");
-
-                let repository = Arc::new(
-                    RepositoryContext::new(
-                        default_repository_creation_args(
-                            immutable_store.clone(),
-                            mutable_store.clone(),
-                        )
-                        .with_path(&path)
-                        .with_id(repository_id)
-                        .with_instance_id(created_repo.instance_id),
-                    )
-                    .with_write_token(write_token.share()),
-                );
-
-                lore_revision::instance::store_current_anchor_branch(
-                    &repository,
-                    default_branch_id,
-                )
-                .await
-                .expect("Failed to store anchor branch");
+                let fixture =
+                    test_repository_create(immutable_store, mutable_store, repository_id).await;
+                let repository = fixture.repository.clone();
+                let write_token = &fixture.write_token;
+                let path = fixture.path.clone();
 
                 // Create and commit a base file
                 {
@@ -1180,7 +896,7 @@ mod tests {
                 }
                 file::stage::stage(
                     repository.clone(),
-                    &write_token,
+                    write_token,
                     LoreArray::from_vec(vec![LoreString::from(&path)]),
                     StageOptions {
                         case_change: stage::StageCaseChange::Error,
@@ -1194,7 +910,7 @@ mod tests {
                 .expect("Stage failed");
                 Box::pin(commit::commit(
                     repository.clone(),
-                    &write_token,
+                    write_token,
                     CommitOptions::new("Initial".to_string()),
                 ))
                 .await
@@ -1272,42 +988,11 @@ mod tests {
         #[allow(clippy::disallowed_methods)]
         runtime()
             .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
-                let tempdir = generate_tempdir();
-                let path = tempdir.to_path_buf();
-                std::fs::create_dir_all(path.as_path()).expect("Create directory failed");
-                let default_branch_id = Context::from(uuid::Uuid::now_v7());
-                let write_token = repository::RepositoryWriteToken::acquire(path.as_path()).await;
-                let created_repo = repository::create_local(
-                    path.as_path(),
-                    &write_token,
-                    repository_id,
-                    default_branch_id,
-                    branch::DEFAULT_DEFAULT_NAME.to_string(),
-                    repository::RepositoryConfig::default(),
-                    false,
-                )
-                .await
-                .expect("Failed to initialize repository");
-
-                let repository = Arc::new(
-                    RepositoryContext::new(
-                        default_repository_creation_args(
-                            immutable_store.clone(),
-                            mutable_store.clone(),
-                        )
-                        .with_path(&path)
-                        .with_id(repository_id)
-                        .with_instance_id(created_repo.instance_id),
-                    )
-                    .with_write_token(write_token.share()),
-                );
-
-                lore_revision::instance::store_current_anchor_branch(
-                    &repository,
-                    default_branch_id,
-                )
-                .await
-                .expect("Failed to store anchor branch");
+                let fixture =
+                    test_repository_create(immutable_store, mutable_store, repository_id).await;
+                let repository = fixture.repository.clone();
+                let write_token = &fixture.write_token;
+                let path = fixture.path.clone();
 
                 // Create src/file.txt and dest/ directory, stage, commit
                 let src_dir = path.join("src");
@@ -1328,7 +1013,7 @@ mod tests {
 
                 file::stage::stage(
                     repository.clone(),
-                    &write_token,
+                    write_token,
                     LoreArray::from_vec(vec![LoreString::from(&path)]),
                     StageOptions {
                         case_change: stage::StageCaseChange::Error,
@@ -1343,7 +1028,7 @@ mod tests {
 
                 Box::pin(commit::commit(
                     repository.clone(),
-                    &write_token,
+                    write_token,
                     CommitOptions::new("Initial".to_string()),
                 ))
                 .await
@@ -1415,42 +1100,11 @@ mod tests {
         #[allow(clippy::disallowed_methods)]
         runtime()
             .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
-                let tempdir = generate_tempdir();
-                let path = tempdir.to_path_buf();
-                std::fs::create_dir_all(path.as_path()).expect("Create directory failed");
-                let default_branch_id = Context::from(uuid::Uuid::now_v7());
-                let write_token = repository::RepositoryWriteToken::acquire(path.as_path()).await;
-                let created_repo = repository::create_local(
-                    path.as_path(),
-                    &write_token,
-                    repository_id,
-                    default_branch_id,
-                    branch::DEFAULT_DEFAULT_NAME.to_string(),
-                    repository::RepositoryConfig::default(),
-                    false,
-                )
-                .await
-                .expect("Failed to initialize repository");
-
-                let repository = Arc::new(
-                    RepositoryContext::new(
-                        default_repository_creation_args(
-                            immutable_store.clone(),
-                            mutable_store.clone(),
-                        )
-                        .with_path(&path)
-                        .with_id(repository_id)
-                        .with_instance_id(created_repo.instance_id),
-                    )
-                    .with_write_token(write_token.share()),
-                );
-
-                lore_revision::instance::store_current_anchor_branch(
-                    &repository,
-                    default_branch_id,
-                )
-                .await
-                .expect("Failed to store anchor branch");
+                let fixture =
+                    test_repository_create(immutable_store, mutable_store, repository_id).await;
+                let repository = fixture.repository.clone();
+                let write_token = &fixture.write_token;
+                let path = fixture.path.clone();
 
                 // Create a file, stage, commit
                 {
@@ -1461,7 +1115,7 @@ mod tests {
 
                 file::stage::stage(
                     repository.clone(),
-                    &write_token,
+                    write_token,
                     LoreArray::from_vec(vec![LoreString::from(&path)]),
                     StageOptions {
                         case_change: stage::StageCaseChange::Error,
@@ -1476,7 +1130,7 @@ mod tests {
 
                 Box::pin(commit::commit(
                     repository.clone(),
-                    &write_token,
+                    write_token,
                     CommitOptions::new("Initial".to_string()),
                 ))
                 .await
@@ -1533,42 +1187,11 @@ mod tests {
         #[allow(clippy::disallowed_methods)]
         runtime()
             .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
-                let tempdir = generate_tempdir();
-                let path = tempdir.to_path_buf();
-                std::fs::create_dir_all(path.as_path()).expect("Create directory failed");
-                let default_branch_id = Context::from(uuid::Uuid::now_v7());
-                let write_token = repository::RepositoryWriteToken::acquire(path.as_path()).await;
-                let created_repo = repository::create_local(
-                    path.as_path(),
-                    &write_token,
-                    repository_id,
-                    default_branch_id,
-                    branch::DEFAULT_DEFAULT_NAME.to_string(),
-                    repository::RepositoryConfig::default(),
-                    false,
-                )
-                .await
-                .expect("Failed to initialize repository");
-
-                let repository = Arc::new(
-                    RepositoryContext::new(
-                        default_repository_creation_args(
-                            immutable_store.clone(),
-                            mutable_store.clone(),
-                        )
-                        .with_path(&path)
-                        .with_id(repository_id)
-                        .with_instance_id(created_repo.instance_id),
-                    )
-                    .with_write_token(write_token.share()),
-                );
-
-                lore_revision::instance::store_current_anchor_branch(
-                    &repository,
-                    default_branch_id,
-                )
-                .await
-                .expect("Failed to store anchor branch");
+                let fixture =
+                    test_repository_create(immutable_store, mutable_store, repository_id).await;
+                let repository = fixture.repository.clone();
+                let write_token = &fixture.write_token;
+                let path = fixture.path.clone();
 
                 // Create a file, stage, commit
                 {
@@ -1579,7 +1202,7 @@ mod tests {
 
                 file::stage::stage(
                     repository.clone(),
-                    &write_token,
+                    write_token,
                     LoreArray::from_vec(vec![LoreString::from(&path)]),
                     StageOptions {
                         case_change: stage::StageCaseChange::Error,
@@ -1594,7 +1217,7 @@ mod tests {
 
                 Box::pin(commit::commit(
                     repository.clone(),
-                    &write_token,
+                    write_token,
                     CommitOptions::new("Initial".to_string()),
                 ))
                 .await
@@ -1639,7 +1262,7 @@ mod tests {
                 // Now stage the dirty file
                 file::stage::stage(
                     repository.clone(),
-                    &write_token,
+                    write_token,
                     LoreArray::from_vec(vec![LoreString::from(&path)]),
                     StageOptions {
                         case_change: stage::StageCaseChange::Error,
@@ -1685,42 +1308,11 @@ mod tests {
         #[allow(clippy::disallowed_methods)]
         runtime()
             .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
-                let tempdir = generate_tempdir();
-                let path = tempdir.to_path_buf();
-                std::fs::create_dir_all(path.as_path()).expect("Create directory failed");
-                let default_branch_id = Context::from(uuid::Uuid::now_v7());
-                let write_token = repository::RepositoryWriteToken::acquire(path.as_path()).await;
-                let created_repo = repository::create_local(
-                    path.as_path(),
-                    &write_token,
-                    repository_id,
-                    default_branch_id,
-                    branch::DEFAULT_DEFAULT_NAME.to_string(),
-                    repository::RepositoryConfig::default(),
-                    false,
-                )
-                .await
-                .expect("Failed to initialize repository");
-
-                let repository = Arc::new(
-                    RepositoryContext::new(
-                        default_repository_creation_args(
-                            immutable_store.clone(),
-                            mutable_store.clone(),
-                        )
-                        .with_path(&path)
-                        .with_id(repository_id)
-                        .with_instance_id(created_repo.instance_id),
-                    )
-                    .with_write_token(write_token.share()),
-                );
-
-                lore_revision::instance::store_current_anchor_branch(
-                    &repository,
-                    default_branch_id,
-                )
-                .await
-                .expect("Failed to store anchor branch");
+                let fixture =
+                    test_repository_create(immutable_store, mutable_store, repository_id).await;
+                let repository = fixture.repository.clone();
+                let write_token = &fixture.write_token;
+                let path = fixture.path.clone();
 
                 // Create file, stage, commit
                 {
@@ -1730,7 +1322,7 @@ mod tests {
                 }
                 file::stage::stage(
                     repository.clone(),
-                    &write_token,
+                    write_token,
                     LoreArray::from_vec(vec![LoreString::from(&path)]),
                     StageOptions {
                         case_change: stage::StageCaseChange::Error,
@@ -1744,7 +1336,7 @@ mod tests {
                 .expect("Stage failed");
                 Box::pin(commit::commit(
                     repository.clone(),
-                    &write_token,
+                    write_token,
                     CommitOptions::new("Initial".to_string()),
                 ))
                 .await
@@ -1766,7 +1358,7 @@ mod tests {
                 .expect("Dirty failed");
                 file::stage::stage(
                     repository.clone(),
-                    &write_token,
+                    write_token,
                     LoreArray::from_vec(vec![LoreString::from(&path)]),
                     StageOptions {
                         case_change: stage::StageCaseChange::Error,
@@ -1782,7 +1374,7 @@ mod tests {
                 // Now unstage — file still differs from current revision, so Dirty should remain
                 file::unstage::unstage(
                     repository.clone(),
-                    &write_token,
+                    write_token,
                     LoreArray::from_vec(vec![LoreString::from(&path)]),
                     file::unstage::UnstageOptions { single_node: false },
                 )
@@ -1819,42 +1411,11 @@ mod tests {
         #[allow(clippy::disallowed_methods)]
         runtime()
             .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
-                let tempdir = generate_tempdir();
-                let path = tempdir.to_path_buf();
-                std::fs::create_dir_all(path.as_path()).expect("Create directory failed");
-                let default_branch_id = Context::from(uuid::Uuid::now_v7());
-                let write_token = repository::RepositoryWriteToken::acquire(path.as_path()).await;
-                let created_repo = repository::create_local(
-                    path.as_path(),
-                    &write_token,
-                    repository_id,
-                    default_branch_id,
-                    branch::DEFAULT_DEFAULT_NAME.to_string(),
-                    repository::RepositoryConfig::default(),
-                    false,
-                )
-                .await
-                .expect("Failed to initialize repository");
-
-                let repository = Arc::new(
-                    RepositoryContext::new(
-                        default_repository_creation_args(
-                            immutable_store.clone(),
-                            mutable_store.clone(),
-                        )
-                        .with_path(&path)
-                        .with_id(repository_id)
-                        .with_instance_id(created_repo.instance_id),
-                    )
-                    .with_write_token(write_token.share()),
-                );
-
-                lore_revision::instance::store_current_anchor_branch(
-                    &repository,
-                    default_branch_id,
-                )
-                .await
-                .expect("Failed to store anchor branch");
+                let fixture =
+                    test_repository_create(immutable_store, mutable_store, repository_id).await;
+                let repository = fixture.repository.clone();
+                let write_token = &fixture.write_token;
+                let path = fixture.path.clone();
 
                 // Create two files, stage, commit
                 {
@@ -1869,7 +1430,7 @@ mod tests {
                 }
                 file::stage::stage(
                     repository.clone(),
-                    &write_token,
+                    write_token,
                     LoreArray::from_vec(vec![LoreString::from(&path)]),
                     StageOptions {
                         case_change: stage::StageCaseChange::Error,
@@ -1883,7 +1444,7 @@ mod tests {
                 .expect("Stage failed");
                 Box::pin(commit::commit(
                     repository.clone(),
-                    &write_token,
+                    write_token,
                     CommitOptions::new("Initial".to_string()),
                 ))
                 .await
@@ -1914,7 +1475,7 @@ mod tests {
                 // Stage only staged.txt
                 file::stage::stage(
                     repository.clone(),
-                    &write_token,
+                    write_token,
                     LoreArray::from_vec(vec![LoreString::from(
                         path.join("staged.txt").to_string_lossy().as_ref(),
                     )]),
@@ -1932,7 +1493,7 @@ mod tests {
                 // Unstage staged.txt — now no staged nodes remain, but dirty.txt is still dirty
                 file::unstage::unstage(
                     repository.clone(),
-                    &write_token,
+                    write_token,
                     LoreArray::from_vec(vec![LoreString::from(
                         path.join("staged.txt").to_string_lossy().as_ref(),
                     )]),
@@ -1964,42 +1525,11 @@ mod tests {
         #[allow(clippy::disallowed_methods)]
         runtime()
             .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
-                let tempdir = generate_tempdir();
-                let path = tempdir.to_path_buf();
-                std::fs::create_dir_all(path.as_path()).expect("Create directory failed");
-                let default_branch_id = Context::from(uuid::Uuid::now_v7());
-                let write_token = repository::RepositoryWriteToken::acquire(path.as_path()).await;
-                let created_repo = repository::create_local(
-                    path.as_path(),
-                    &write_token,
-                    repository_id,
-                    default_branch_id,
-                    branch::DEFAULT_DEFAULT_NAME.to_string(),
-                    repository::RepositoryConfig::default(),
-                    false,
-                )
-                .await
-                .expect("Failed to initialize repository");
-
-                let repository = Arc::new(
-                    RepositoryContext::new(
-                        default_repository_creation_args(
-                            immutable_store.clone(),
-                            mutable_store.clone(),
-                        )
-                        .with_path(&path)
-                        .with_id(repository_id)
-                        .with_instance_id(created_repo.instance_id),
-                    )
-                    .with_write_token(write_token.share()),
-                );
-
-                lore_revision::instance::store_current_anchor_branch(
-                    &repository,
-                    default_branch_id,
-                )
-                .await
-                .expect("Failed to store anchor branch");
+                let fixture =
+                    test_repository_create(immutable_store, mutable_store, repository_id).await;
+                let repository = fixture.repository.clone();
+                let write_token = &fixture.write_token;
+                let path = fixture.path.clone();
 
                 // Create file in subdir, stage, commit
                 let subdir = path.join("src");
@@ -2011,7 +1541,7 @@ mod tests {
                 }
                 file::stage::stage(
                     repository.clone(),
-                    &write_token,
+                    write_token,
                     LoreArray::from_vec(vec![LoreString::from(&path)]),
                     StageOptions {
                         case_change: stage::StageCaseChange::Error,
@@ -2025,7 +1555,7 @@ mod tests {
                 .expect("Stage failed");
                 Box::pin(commit::commit(
                     repository.clone(),
-                    &write_token,
+                    write_token,
                     CommitOptions::new("Initial".to_string()),
                 ))
                 .await
@@ -2047,7 +1577,7 @@ mod tests {
                 .expect("Dirty failed");
                 file::stage::stage(
                     repository.clone(),
-                    &write_token,
+                    write_token,
                     LoreArray::from_vec(vec![LoreString::from(&path)]),
                     StageOptions {
                         case_change: stage::StageCaseChange::Error,
@@ -2070,7 +1600,7 @@ mod tests {
                 // Unstage — file now matches current revision, so Dirty should be cleared
                 file::unstage::unstage(
                     repository.clone(),
-                    &write_token,
+                    write_token,
                     LoreArray::from_vec(vec![LoreString::from(
                         subdir.join("file.txt").to_string_lossy().as_ref(),
                     )]),
@@ -2127,42 +1657,11 @@ mod tests {
         #[allow(clippy::disallowed_methods)]
         runtime()
             .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
-                let tempdir = generate_tempdir();
-                let path = tempdir.to_path_buf();
-                std::fs::create_dir_all(path.as_path()).expect("Create directory failed");
-                let default_branch_id = Context::from(uuid::Uuid::now_v7());
-                let write_token = repository::RepositoryWriteToken::acquire(path.as_path()).await;
-                let created_repo = repository::create_local(
-                    path.as_path(),
-                    &write_token,
-                    repository_id,
-                    default_branch_id,
-                    branch::DEFAULT_DEFAULT_NAME.to_string(),
-                    repository::RepositoryConfig::default(),
-                    false,
-                )
-                .await
-                .expect("Failed to initialize repository");
-
-                let repository = Arc::new(
-                    RepositoryContext::new(
-                        default_repository_creation_args(
-                            immutable_store.clone(),
-                            mutable_store.clone(),
-                        )
-                        .with_path(&path)
-                        .with_id(repository_id)
-                        .with_instance_id(created_repo.instance_id),
-                    )
-                    .with_write_token(write_token.share()),
-                );
-
-                lore_revision::instance::store_current_anchor_branch(
-                    &repository,
-                    default_branch_id,
-                )
-                .await
-                .expect("Failed to store anchor branch");
+                let fixture =
+                    test_repository_create(immutable_store, mutable_store, repository_id).await;
+                let repository = fixture.repository.clone();
+                let write_token = &fixture.write_token;
+                let path = fixture.path.clone();
 
                 // Create file in subdir, stage, commit
                 let subdir = path.join("src");
@@ -2174,7 +1673,7 @@ mod tests {
                 }
                 file::stage::stage(
                     repository.clone(),
-                    &write_token,
+                    write_token,
                     LoreArray::from_vec(vec![LoreString::from(&path)]),
                     StageOptions {
                         case_change: stage::StageCaseChange::Error,
@@ -2188,7 +1687,7 @@ mod tests {
                 .expect("Stage failed");
                 Box::pin(commit::commit(
                     repository.clone(),
-                    &write_token,
+                    write_token,
                     CommitOptions::new("Initial".to_string()),
                 ))
                 .await
@@ -2229,7 +1728,7 @@ mod tests {
                 // Reset the file
                 file::reset::reset(
                     repository.clone(),
-                    &write_token,
+                    write_token,
                     LoreArray::from_vec(vec![LoreString::from(
                         subdir.join("file.txt").to_string_lossy().as_ref(),
                     )]),
@@ -2270,42 +1769,11 @@ mod tests {
         #[allow(clippy::disallowed_methods)]
         runtime()
             .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
-                let tempdir = generate_tempdir();
-                let path = tempdir.to_path_buf();
-                std::fs::create_dir_all(path.as_path()).expect("Create directory failed");
-                let default_branch_id = Context::from(uuid::Uuid::now_v7());
-                let write_token = repository::RepositoryWriteToken::acquire(path.as_path()).await;
-                let created_repo = repository::create_local(
-                    path.as_path(),
-                    &write_token,
-                    repository_id,
-                    default_branch_id,
-                    branch::DEFAULT_DEFAULT_NAME.to_string(),
-                    repository::RepositoryConfig::default(),
-                    false,
-                )
-                .await
-                .expect("Failed to initialize repository");
-
-                let repository = Arc::new(
-                    RepositoryContext::new(
-                        default_repository_creation_args(
-                            immutable_store.clone(),
-                            mutable_store.clone(),
-                        )
-                        .with_path(&path)
-                        .with_id(repository_id)
-                        .with_instance_id(created_repo.instance_id),
-                    )
-                    .with_write_token(write_token.share()),
-                );
-
-                lore_revision::instance::store_current_anchor_branch(
-                    &repository,
-                    default_branch_id,
-                )
-                .await
-                .expect("Failed to store anchor branch");
+                let fixture =
+                    test_repository_create(immutable_store, mutable_store, repository_id).await;
+                let repository = fixture.repository.clone();
+                let write_token = &fixture.write_token;
+                let path = fixture.path.clone();
 
                 // Create two files in subdir, stage, commit
                 let subdir = path.join("src");
@@ -2320,7 +1788,7 @@ mod tests {
                 }
                 file::stage::stage(
                     repository.clone(),
-                    &write_token,
+                    write_token,
                     LoreArray::from_vec(vec![LoreString::from(&path)]),
                     StageOptions {
                         case_change: stage::StageCaseChange::Error,
@@ -2334,7 +1802,7 @@ mod tests {
                 .expect("Stage failed");
                 Box::pin(commit::commit(
                     repository.clone(),
-                    &write_token,
+                    write_token,
                     CommitOptions::new("Initial".to_string()),
                 ))
                 .await
@@ -2362,7 +1830,7 @@ mod tests {
                 // Reset only a.txt
                 file::reset::reset(
                     repository.clone(),
-                    &write_token,
+                    write_token,
                     LoreArray::from_vec(vec![LoreString::from(
                         subdir.join("a.txt").to_string_lossy().as_ref(),
                     )]),
@@ -2416,7 +1884,7 @@ mod tests {
                 // Now reset b.txt too
                 file::reset::reset(
                     repository.clone(),
-                    &write_token,
+                    write_token,
                     LoreArray::from_vec(vec![LoreString::from(
                         subdir.join("b.txt").to_string_lossy().as_ref(),
                     )]),
@@ -2457,42 +1925,11 @@ mod tests {
         #[allow(clippy::disallowed_methods)]
         runtime()
             .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
-                let tempdir = generate_tempdir();
-                let path = tempdir.to_path_buf();
-                std::fs::create_dir_all(path.as_path()).expect("Create directory failed");
-                let default_branch_id = Context::from(uuid::Uuid::now_v7());
-                let write_token = repository::RepositoryWriteToken::acquire(path.as_path()).await;
-                let created_repo = repository::create_local(
-                    path.as_path(),
-                    &write_token,
-                    repository_id,
-                    default_branch_id,
-                    branch::DEFAULT_DEFAULT_NAME.to_string(),
-                    repository::RepositoryConfig::default(),
-                    false,
-                )
-                .await
-                .expect("Failed to initialize repository");
-
-                let repository = Arc::new(
-                    RepositoryContext::new(
-                        default_repository_creation_args(
-                            immutable_store.clone(),
-                            mutable_store.clone(),
-                        )
-                        .with_path(&path)
-                        .with_id(repository_id)
-                        .with_instance_id(created_repo.instance_id),
-                    )
-                    .with_write_token(write_token.share()),
-                );
-
-                lore_revision::instance::store_current_anchor_branch(
-                    &repository,
-                    default_branch_id,
-                )
-                .await
-                .expect("Failed to store anchor branch");
+                let fixture =
+                    test_repository_create(immutable_store, mutable_store, repository_id).await;
+                let repository = fixture.repository.clone();
+                let write_token = &fixture.write_token;
+                let path = fixture.path.clone();
 
                 // Create file, stage, commit
                 {
@@ -2502,7 +1939,7 @@ mod tests {
                 }
                 file::stage::stage(
                     repository.clone(),
-                    &write_token,
+                    write_token,
                     LoreArray::from_vec(vec![LoreString::from(&path)]),
                     StageOptions {
                         case_change: stage::StageCaseChange::Error,
@@ -2516,7 +1953,7 @@ mod tests {
                 .expect("Stage failed");
                 Box::pin(commit::commit(
                     repository.clone(),
-                    &write_token,
+                    write_token,
                     CommitOptions::new("Initial".to_string()),
                 ))
                 .await
@@ -2530,7 +1967,7 @@ mod tests {
                 }
                 file::stage::stage(
                     repository.clone(),
-                    &write_token,
+                    write_token,
                     LoreArray::from_vec(vec![LoreString::from(&path)]),
                     StageOptions {
                         case_change: stage::StageCaseChange::Error,
@@ -2546,7 +1983,7 @@ mod tests {
                 // Reset should refuse (file is staged)
                 let result = file::reset::reset(
                     repository.clone(),
-                    &write_token,
+                    write_token,
                     LoreArray::from_vec(vec![LoreString::from(
                         path.join("file.txt").to_string_lossy().as_ref(),
                     )]),
@@ -2573,42 +2010,11 @@ mod tests {
         #[allow(clippy::disallowed_methods)]
         runtime()
             .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
-                let tempdir = generate_tempdir();
-                let path = tempdir.to_path_buf();
-                std::fs::create_dir_all(path.as_path()).expect("Create directory failed");
-                let default_branch_id = Context::from(uuid::Uuid::now_v7());
-                let write_token = repository::RepositoryWriteToken::acquire(path.as_path()).await;
-                let created_repo = repository::create_local(
-                    path.as_path(),
-                    &write_token,
-                    repository_id,
-                    default_branch_id,
-                    branch::DEFAULT_DEFAULT_NAME.to_string(),
-                    repository::RepositoryConfig::default(),
-                    false,
-                )
-                .await
-                .expect("Failed to initialize repository");
-
-                let repository = Arc::new(
-                    RepositoryContext::new(
-                        default_repository_creation_args(
-                            immutable_store.clone(),
-                            mutable_store.clone(),
-                        )
-                        .with_path(&path)
-                        .with_id(repository_id)
-                        .with_instance_id(created_repo.instance_id),
-                    )
-                    .with_write_token(write_token.share()),
-                );
-
-                lore_revision::instance::store_current_anchor_branch(
-                    &repository,
-                    default_branch_id,
-                )
-                .await
-                .expect("Failed to store anchor branch");
+                let fixture =
+                    test_repository_create(immutable_store, mutable_store, repository_id).await;
+                let repository = fixture.repository.clone();
+                let write_token = &fixture.write_token;
+                let path = fixture.path.clone();
 
                 // Create two files, stage, commit
                 {
@@ -2623,7 +2029,7 @@ mod tests {
                 }
                 file::stage::stage(
                     repository.clone(),
-                    &write_token,
+                    write_token,
                     LoreArray::from_vec(vec![LoreString::from(&path)]),
                     StageOptions {
                         case_change: stage::StageCaseChange::Error,
@@ -2637,7 +2043,7 @@ mod tests {
                 .expect("Stage failed");
                 Box::pin(commit::commit(
                     repository.clone(),
-                    &write_token,
+                    write_token,
                     CommitOptions::new("Initial".to_string()),
                 ))
                 .await
@@ -2670,7 +2076,7 @@ mod tests {
                 // Stage only committed.txt (dirty_only.txt stays dirty-only)
                 file::stage::stage(
                     repository.clone(),
-                    &write_token,
+                    write_token,
                     LoreArray::from_vec(vec![LoreString::from(
                         path.join("committed.txt").to_string_lossy().as_ref(),
                     )]),
@@ -2688,7 +2094,7 @@ mod tests {
                 // Commit — committed.txt should be committed, dirty_only.txt preserved
                 Box::pin(commit::commit(
                     repository.clone(),
-                    &write_token,
+                    write_token,
                     CommitOptions::new("Second commit".to_string()),
                 ))
                 .await
@@ -2739,8 +2145,14 @@ mod tests {
             .expect("Test task failed");
     }
 
+    /// The same as above with the two files a directory down, which is what makes
+    /// the commit walk descend rather than only look. Staging `nested/committed.txt`
+    /// stages `nested` as well, so the directory holding the dirty-only file is
+    /// itself staged - and a walk that decided whether to descend from whether the
+    /// directory contributes a path of its own would stop there and lose
+    /// `nested/dirty_only.txt`.
     #[tokio::test]
-    async fn rebase_staged_state_carries_dirty_paths_without_touching_anchor() {
+    async fn commit_preserves_a_dirty_only_file_under_a_staged_directory() {
         let (immutable_store, mutable_store, execution) =
             test_store_create().await.expect("Failed to create stores");
         let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
@@ -2748,52 +2160,26 @@ mod tests {
         #[allow(clippy::disallowed_methods)]
         runtime()
             .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
-                let tempdir = generate_tempdir();
-                let path = tempdir.to_path_buf();
-                std::fs::create_dir_all(path.as_path()).expect("Create directory failed");
-                let default_branch_id = Context::from(uuid::Uuid::now_v7());
-                let write_token = repository::RepositoryWriteToken::acquire(path.as_path()).await;
-                let created_repo = repository::create_local(
-                    path.as_path(),
-                    &write_token,
-                    repository_id,
-                    default_branch_id,
-                    branch::DEFAULT_DEFAULT_NAME.to_string(),
-                    repository::RepositoryConfig::default(),
-                    false,
-                )
-                .await
-                .expect("Failed to initialize repository");
+                let fixture =
+                    test_repository_create(immutable_store, mutable_store, repository_id).await;
+                let repository = fixture.repository.clone();
+                let write_token = &fixture.write_token;
+                let path = fixture.path.clone();
+                std::fs::create_dir_all(path.join("nested")).expect("Create directory failed");
 
-                let repository = Arc::new(
-                    RepositoryContext::new(
-                        default_repository_creation_args(
-                            immutable_store.clone(),
-                            mutable_store.clone(),
-                        )
-                        .with_path(&path)
-                        .with_id(repository_id)
-                        .with_instance_id(created_repo.instance_id),
-                    )
-                    .with_write_token(write_token.share()),
-                );
-
-                lore_revision::instance::store_current_anchor_branch(
-                    &repository,
-                    default_branch_id,
-                )
-                .await
-                .expect("Failed to store anchor branch");
-
-                // Create a file, stage, commit
+                let committed = path.join("nested").join("committed.txt");
+                let dirty_only = path.join("nested").join("dirty_only.txt");
                 {
-                    let mut f =
-                        std::fs::File::create(path.join("carried.txt")).expect("Create failed");
-                    f.write_all(b"original").expect("Write failed");
+                    let mut f = std::fs::File::create(&committed).expect("Create failed");
+                    f.write_all(b"will be committed").expect("Write failed");
+                }
+                {
+                    let mut f = std::fs::File::create(&dirty_only).expect("Create failed");
+                    f.write_all(b"will stay dirty").expect("Write failed");
                 }
                 file::stage::stage(
                     repository.clone(),
-                    &write_token,
+                    write_token,
                     LoreArray::from_vec(vec![LoreString::from(&path)]),
                     StageOptions {
                         case_change: stage::StageCaseChange::Error,
@@ -2807,7 +2193,162 @@ mod tests {
                 .expect("Stage failed");
                 Box::pin(commit::commit(
                     repository.clone(),
-                    &write_token,
+                    write_token,
+                    CommitOptions::new("Initial".to_string()),
+                ))
+                .await
+                .expect("Commit failed");
+
+                {
+                    let mut f = std::fs::File::create(&committed).expect("Create failed");
+                    f.write_all(b"committed modified longer")
+                        .expect("Write failed");
+                }
+                {
+                    let mut f = std::fs::File::create(&dirty_only).expect("Create failed");
+                    f.write_all(b"dirty modified longer").expect("Write failed");
+                }
+
+                file::dirty::dirty(
+                    repository.clone(),
+                    LoreArray::from_vec(vec![
+                        LoreString::from(committed.to_string_lossy().as_ref()),
+                        LoreString::from(dirty_only.to_string_lossy().as_ref()),
+                    ]),
+                )
+                .await
+                .expect("Dirty failed");
+
+                file::stage::stage(
+                    repository.clone(),
+                    write_token,
+                    LoreArray::from_vec(vec![LoreString::from(
+                        committed.to_string_lossy().as_ref(),
+                    )]),
+                    StageOptions {
+                        case_change: stage::StageCaseChange::Error,
+                        node_flags: NodeFlags::NoFlags,
+                        file_id: None,
+                        no_children: false,
+                        scan: true,
+                    },
+                )
+                .await
+                .expect("Stage nested/committed.txt failed");
+
+                Box::pin(commit::commit(
+                    repository.clone(),
+                    write_token,
+                    CommitOptions::new("Second commit".to_string()),
+                ))
+                .await
+                .expect("Commit failed");
+
+                let (_, state_staged, _) =
+                    State::deserialize_current_and_staged(repository.clone())
+                        .await
+                        .expect("Deserialize failed");
+                let state_staged =
+                    state_staged.expect("Anchor should exist (nested/dirty_only.txt still dirty)");
+
+                let link = state_staged
+                    .find_node_link(repository.clone(), "nested/committed.txt")
+                    .await
+                    .expect("Find nested/committed.txt");
+                let node = state_staged
+                    .node(repository.clone(), link.node)
+                    .await
+                    .expect("Get node");
+                assert!(
+                    !node.is_dirty(),
+                    "nested/committed.txt should not be dirty after commit"
+                );
+                assert!(
+                    !node.is_staged(),
+                    "nested/committed.txt should not be staged after commit"
+                );
+
+                let link = state_staged
+                    .find_node_link(repository.clone(), "nested/dirty_only.txt")
+                    .await
+                    .expect("Find nested/dirty_only.txt");
+                let node = state_staged
+                    .node(repository.clone(), link.node)
+                    .await
+                    .expect("Get node");
+                assert!(
+                    node.is_dirty_modify(),
+                    "nested/dirty_only.txt should still be dirty after commit"
+                );
+                assert!(
+                    !node.is_staged(),
+                    "nested/dirty_only.txt should not be staged"
+                );
+
+                let link = state_staged
+                    .find_node_link(repository.clone(), "nested")
+                    .await
+                    .expect("Find nested");
+                let node = state_staged
+                    .node(repository.clone(), link.node)
+                    .await
+                    .expect("Get node");
+                assert!(
+                    node.is_dirty(),
+                    "nested should stay dirty, carrying the dirty file below it"
+                );
+                assert_eq!(
+                    node.action_bits(),
+                    0,
+                    "nested carries no action of its own, only the propagated flag"
+                );
+                assert!(
+                    !node.is_staged(),
+                    "nested should not be staged after commit"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    #[tokio::test]
+    async fn rebase_staged_state_carries_dirty_paths_without_touching_anchor() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let fixture =
+                    test_repository_create(immutable_store, mutable_store, repository_id).await;
+                let repository = fixture.repository.clone();
+                let write_token = &fixture.write_token;
+                let path = fixture.path.clone();
+
+                // Create a file, stage, commit
+                {
+                    let mut f =
+                        std::fs::File::create(path.join("carried.txt")).expect("Create failed");
+                    f.write_all(b"original").expect("Write failed");
+                }
+                file::stage::stage(
+                    repository.clone(),
+                    write_token,
+                    LoreArray::from_vec(vec![LoreString::from(&path)]),
+                    StageOptions {
+                        case_change: stage::StageCaseChange::Error,
+                        node_flags: NodeFlags::NoFlags,
+                        file_id: None,
+                        no_children: false,
+                        scan: true,
+                    },
+                )
+                .await
+                .expect("Stage failed");
+                Box::pin(commit::commit(
+                    repository.clone(),
+                    write_token,
                     CommitOptions::new("Initial".to_string()),
                 ))
                 .await
@@ -2893,42 +2434,11 @@ mod tests {
         #[allow(clippy::disallowed_methods)]
         runtime()
             .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
-                let tempdir = generate_tempdir();
-                let path = tempdir.to_path_buf();
-                std::fs::create_dir_all(path.as_path()).expect("Create directory failed");
-                let default_branch_id = Context::from(uuid::Uuid::now_v7());
-                let write_token = repository::RepositoryWriteToken::acquire(path.as_path()).await;
-                let created_repo = repository::create_local(
-                    path.as_path(),
-                    &write_token,
-                    repository_id,
-                    default_branch_id,
-                    branch::DEFAULT_DEFAULT_NAME.to_string(),
-                    repository::RepositoryConfig::default(),
-                    false,
-                )
-                .await
-                .expect("Failed to initialize repository");
-
-                let repository = Arc::new(
-                    RepositoryContext::new(
-                        default_repository_creation_args(
-                            immutable_store.clone(),
-                            mutable_store.clone(),
-                        )
-                        .with_path(&path)
-                        .with_id(repository_id)
-                        .with_instance_id(created_repo.instance_id),
-                    )
-                    .with_write_token(write_token.share()),
-                );
-
-                lore_revision::instance::store_current_anchor_branch(
-                    &repository,
-                    default_branch_id,
-                )
-                .await
-                .expect("Failed to store anchor branch");
+                let fixture =
+                    test_repository_create(immutable_store, mutable_store, repository_id).await;
+                let repository = fixture.repository.clone();
+                let write_token = &fixture.write_token;
+                let path = fixture.path.clone();
 
                 // Create a file, stage, commit
                 {
@@ -2938,7 +2448,7 @@ mod tests {
                 }
                 file::stage::stage(
                     repository.clone(),
-                    &write_token,
+                    write_token,
                     LoreArray::from_vec(vec![LoreString::from(&path)]),
                     StageOptions {
                         case_change: stage::StageCaseChange::Error,
@@ -2952,7 +2462,7 @@ mod tests {
                 .expect("Stage failed");
                 Box::pin(commit::commit(
                     repository.clone(),
-                    &write_token,
+                    write_token,
                     CommitOptions::new("Initial".to_string()),
                 ))
                 .await

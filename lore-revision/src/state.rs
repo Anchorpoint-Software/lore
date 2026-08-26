@@ -4366,7 +4366,14 @@ pub(crate) fn collect_dirty_paths(
     parent_path: RelativePath,
     paths: &mut Vec<RelativePath>,
 ) -> Pin<Box<dyn Future<Output = Result<(), StateError>> + Send + '_>> {
-    collect_dirty_paths_inner(state, repository, parent_node, parent_path, paths, false)
+    collect_dirty_paths_inner(
+        state,
+        repository,
+        parent_node,
+        parent_path,
+        paths,
+        DirtyWalkOptions::from_context(false),
+    )
 }
 
 /// Like [`collect_dirty_paths`] but skips nodes that are also staged.
@@ -4383,16 +4390,92 @@ pub(crate) fn collect_dirty_only_paths(
     parent_path: RelativePath,
     paths: &mut Vec<RelativePath>,
 ) -> Pin<Box<dyn Future<Output = Result<(), StateError>> + Send + '_>> {
-    collect_dirty_paths_inner(state, repository, parent_node, parent_path, paths, true)
+    collect_dirty_paths_inner(
+        state,
+        repository,
+        parent_node,
+        parent_path,
+        paths,
+        DirtyWalkOptions::from_context(true),
+    )
 }
 
+/// What a dirty walk does with the nodes it meets.
+///
+/// A struct rather than two parameters, so a caller cannot transpose them.
+#[derive(Clone, Copy, Default)]
+struct DirtyWalkOptions {
+    /// Record no path for a node that is also staged.
+    skip_staged: bool,
+    /// Record paths the view/ignore filter excludes.
+    force: bool,
+}
+
+impl DirtyWalkOptions {
+    /// Options for a walk driven from the command line, taking `force` from the
+    /// execution context.
+    ///
+    /// Read where the walk is started rather than inside it, so the context is
+    /// read once per walk. Panics if no execution context is set, which makes
+    /// the caller's task, not the future's poller, the one that has to have one.
+    fn from_context(skip_staged: bool) -> Self {
+        Self {
+            skip_staged,
+            force: execution_context().globals().force(),
+        }
+    }
+}
+
+/// Whether a dirty node carries an action of its own to record.
+///
+/// `skip_staged` drops nodes that are also staged: their action belongs to the
+/// commit being written, and re-applying it would mark the committed content
+/// dirty again.
+fn dirty_path_contributes(child: &Node, skip_staged: bool) -> bool {
+    child.action_bits() != 0 && !(skip_staged && child.is_staged())
+}
+
+/// Whether a dirty node's children must be walked.
+///
+/// A `DirtyDelete` or `DirtyMove` directory carries its whole subtree when it is
+/// re-applied, so its descendants are covered by its own path. A directory that
+/// records no path of its own is still walked: staging a file stages the
+/// directories above it, so a staged directory is where a dirty-only file lives.
+fn dirty_path_descends(child: &Node) -> bool {
+    child.is_directory() && !child.is_dirty_delete() && !child.is_dirty_move()
+}
+
+/// Names `child_id` and joins it onto `parent_path`.
+///
+/// The name is a read lock on the block holding it, moved into the join so it is
+/// released before the caller descends. A walk that took a second shared lock on
+/// that block would deadlock behind a queued writer.
+async fn dirty_child_path(
+    state: &State,
+    repository: Arc<RepositoryContext>,
+    parent_path: &RelativePath,
+    child_id: NodeID,
+) -> Result<RelativePath, StateError> {
+    let child_name = state.node_name_ref(repository, child_id).await?;
+    Ok(parent_path.push_into_buf(child_name).freeze())
+}
+
+/// Walks the children of `parent_node`, recording dirty paths under `parent_path`.
+///
+/// A child is named only once [`dirty_path_contributes`] or [`dirty_path_descends`]
+/// says it is wanted. Naming allocates a path and the ignore filter matches every
+/// one of its lines against it, and under `skip_staged` most of a tree is wanted
+/// for neither: a commit stages what it writes.
+///
+/// `parent_node` is walked only if it is a directory. Nothing below a link is in
+/// this state, and [`Node::child`] means nothing on a file.
 fn collect_dirty_paths_inner(
     state: Arc<State>,
     repository: Arc<RepositoryContext>,
     parent_node: NodeID,
     parent_path: RelativePath,
     paths: &mut Vec<RelativePath>,
-    skip_staged: bool,
+    options: DirtyWalkOptions,
 ) -> Pin<Box<dyn Future<Output = Result<(), StateError>> + Send + '_>> {
     Box::pin(async move {
         let node = state.node(repository.clone(), parent_node).await?;
@@ -4405,48 +4488,52 @@ fn collect_dirty_paths_inner(
         while let Some(child_id) = child_node_opt {
             let child = state.node(repository.clone(), child_id).await?;
             child.walk_step(child_id, parent_node, &mut cycle)?;
+            let next_sibling = child.sibling();
 
             if !child.is_dirty() {
-                child_node_opt = child.sibling();
+                child_node_opt = next_sibling;
                 continue;
             }
 
-            let child_name = state.node_name_clone(repository.clone(), child_id).await?;
-            let child_path = parent_path.push_into_buf(&child_name).freeze();
+            let contributes = dirty_path_contributes(&child, options.skip_staged);
+            let descends = dirty_path_descends(&child);
+            if !contributes && !descends {
+                child_node_opt = next_sibling;
+                continue;
+            }
+
+            let child_path =
+                dirty_child_path(&state, repository.clone(), &parent_path, child_id).await?;
 
             // Don't carry forward dirty paths that the view/ignore filter
             // excludes — they cannot be re-applied against a checkout that
             // never materializes them. --force bypasses the filter.
-            let force = execution_context().globals().force();
-            if !force
+            if !options.force
                 && repository
                     .filter
                     .excludes(&child_path, child.is_directory(), FilterMode::Full)
             {
-                child_node_opt = child.sibling();
+                child_node_opt = next_sibling;
                 continue;
             }
 
-            let action_bits = NodeFlags::from_bits_truncate(child.flags) & NodeFlags::ActionBits;
-            let skip_for_staged = skip_staged && child.is_staged();
-            if !action_bits.is_empty() && !skip_for_staged {
+            if contributes {
                 paths.push(child_path.clone());
             }
 
-            let stop_subtree = child.is_dirty_delete() || child.is_dirty_move();
-            if child.is_directory() && !stop_subtree {
+            if descends {
                 collect_dirty_paths_inner(
                     state.clone(),
                     repository.clone(),
                     child_id,
                     child_path,
                     paths,
-                    skip_staged,
+                    options,
                 )
                 .await?;
             }
 
-            child_node_opt = child.sibling();
+            child_node_opt = next_sibling;
         }
 
         Ok(())
@@ -9177,6 +9264,11 @@ mod tests {
     /// A state with no serialized link list, so the registry lives only in the runtime copy and
     /// every read has to come from there.
     async fn null_repository() -> Arc<RepositoryContext> {
+        null_repository_excluding(&[]).await
+    }
+
+    /// [`null_repository`] whose ignore filter excludes `globs`.
+    async fn null_repository_excluding(globs: &[&str]) -> Arc<RepositoryContext> {
         let immutable_store = lore_storage::local::immutable_store::create(
             None::<&str>,
             lore_storage::local::immutable_store::ImmutableStoreCreateOptions::none(),
@@ -9193,10 +9285,14 @@ mod tests {
         .await
         .expect("in-memory mutable store");
 
-        Arc::new(RepositoryContext::new_null_context(
-            immutable_store,
-            mutable_store,
-        ))
+        let mut filter = crate::filter::Filter::default();
+        for glob in globs {
+            filter.ignore.add_exclusion(glob).expect("filter exclusion");
+        }
+
+        let mut context = RepositoryContext::new_null_context(immutable_store, mutable_store);
+        context.filter = Arc::new(filter);
+        Arc::new(context)
     }
 
     fn link_id(byte: u8) -> RepositoryId {
@@ -9265,5 +9361,307 @@ mod tests {
             Hash::from([2u8; 32]),
             "the untouched link must keep its signature"
         );
+    }
+
+    /// A node carrying `flags`, named for the name table by its hash.
+    fn dirty_node(name: &str, flags: NodeFlags) -> Node {
+        Node {
+            name_hash: lore_storage::hash::hash_string(name),
+            flags: flags.bits(),
+            ..Default::default()
+        }
+    }
+
+    /// Adds `name` under `parent` with `flags` and returns it.
+    async fn add_dirty_node(
+        state: &State,
+        repository: Arc<RepositoryContext>,
+        parent: NodeID,
+        name: &str,
+        flags: NodeFlags,
+    ) -> NodeID {
+        state
+            .node_add(repository, parent, dirty_node(name, flags), name)
+            .await
+            .expect("adding a node to the walked tree")
+    }
+
+    /// The dirty paths of the whole tree, sorted, so the assertions do not depend
+    /// on the order the sibling chain happens to hold.
+    async fn walk_dirty_paths(
+        state: Arc<State>,
+        repository: Arc<RepositoryContext>,
+        options: DirtyWalkOptions,
+    ) -> Vec<String> {
+        let mut paths = Vec::new();
+        collect_dirty_paths_inner(
+            state,
+            repository,
+            ROOT_NODE,
+            RelativePath::new(),
+            &mut paths,
+            options,
+        )
+        .await
+        .expect("walking the tree");
+        let mut collected: Vec<String> = paths.iter().map(|p| p.as_str().to_string()).collect();
+        collected.sort();
+        collected
+    }
+
+    /// A `DirtyDelete` or `DirtyMove` directory is re-applied whole, so the walk
+    /// records it and stops. Descending would collect descendants the parent
+    /// action already covers.
+    ///
+    /// A directory that is merely propagated-dirty is the opposite case and is in
+    /// the same tree: it carries no action of its own, contributes no path, and
+    /// must still be descended to reach the file that made it dirty.
+    #[tokio::test]
+    async fn a_deleted_or_moved_directory_is_recorded_without_descending() {
+        let repository = null_repository().await;
+        let state = Arc::new(State::new());
+
+        let removed = add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "removed",
+            NodeFlags::DirtyDelete,
+        )
+        .await;
+        add_dirty_node(
+            &state,
+            repository.clone(),
+            removed,
+            "inside.txt",
+            NodeFlags::DirtyModify | NodeFlags::File,
+        )
+        .await;
+
+        let moved = add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "moved",
+            NodeFlags::DirtyMove,
+        )
+        .await;
+        add_dirty_node(
+            &state,
+            repository.clone(),
+            moved,
+            "carried.txt",
+            NodeFlags::DirtyModify | NodeFlags::File,
+        )
+        .await;
+
+        let touched = add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "touched",
+            NodeFlags::Dirty,
+        )
+        .await;
+        add_dirty_node(
+            &state,
+            repository.clone(),
+            touched,
+            "edited.txt",
+            NodeFlags::DirtyModify | NodeFlags::File,
+        )
+        .await;
+
+        assert_eq!(
+            walk_dirty_paths(state, repository, DirtyWalkOptions::default()).await,
+            vec!["moved", "removed", "touched/edited.txt"],
+            "a deleted or moved directory is recorded and not descended, \
+             and a propagated-dirty directory is descended and not recorded"
+        );
+    }
+
+    /// The commit walk records nothing for a node that is also staged: its action
+    /// belongs to the revision being written. Every other caller wants both.
+    #[tokio::test]
+    async fn a_staged_node_is_recorded_only_when_staged_nodes_are_wanted() {
+        let repository = null_repository().await;
+        let state = Arc::new(State::new());
+
+        add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "staged.txt",
+            NodeFlags::DirtyModify | NodeFlags::File | NodeFlags::StagedModify,
+        )
+        .await;
+        add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "dirty_only.txt",
+            NodeFlags::DirtyModify | NodeFlags::File,
+        )
+        .await;
+
+        assert_eq!(
+            walk_dirty_paths(
+                state.clone(),
+                repository.clone(),
+                DirtyWalkOptions {
+                    skip_staged: true,
+                    force: false,
+                },
+            )
+            .await,
+            vec!["dirty_only.txt"],
+            "a staged node is already in the commit and must not be re-applied"
+        );
+        assert_eq!(
+            walk_dirty_paths(state, repository, DirtyWalkOptions::default()).await,
+            vec!["dirty_only.txt", "staged.txt"],
+            "without skip_staged both carry an action to record"
+        );
+    }
+
+    /// A path the filter excludes cannot be re-applied against a checkout that
+    /// never materializes it, so it is not recorded. `force` records it anyway.
+    #[tokio::test]
+    async fn a_filtered_path_is_recorded_only_under_force() {
+        let repository = null_repository_excluding(&["ignored.txt"]).await;
+        let state = Arc::new(State::new());
+
+        for name in ["ignored.txt", "kept.txt"] {
+            add_dirty_node(
+                &state,
+                repository.clone(),
+                ROOT_NODE,
+                name,
+                NodeFlags::DirtyModify | NodeFlags::File,
+            )
+            .await;
+        }
+
+        assert_eq!(
+            walk_dirty_paths(
+                state.clone(),
+                repository.clone(),
+                DirtyWalkOptions::default()
+            )
+            .await,
+            vec!["kept.txt"],
+            "an excluded path has no checkout to be re-applied against"
+        );
+        assert_eq!(
+            walk_dirty_paths(
+                state,
+                repository,
+                DirtyWalkOptions {
+                    skip_staged: false,
+                    force: true,
+                },
+            )
+            .await,
+            vec!["ignored.txt", "kept.txt"],
+            "force bypasses the filter"
+        );
+    }
+
+    /// Excluding a directory prunes its subtree: the filter is asked about the
+    /// directory before the walk descends into it, so a path below an excluded
+    /// directory is never reached.
+    #[tokio::test]
+    async fn an_excluded_directory_is_not_descended() {
+        let repository = null_repository_excluding(&["build"]).await;
+        let state = Arc::new(State::new());
+
+        let build = add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "build",
+            NodeFlags::Dirty,
+        )
+        .await;
+        add_dirty_node(
+            &state,
+            repository.clone(),
+            build,
+            "artifact.o",
+            NodeFlags::DirtyModify | NodeFlags::File,
+        )
+        .await;
+        add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "kept.txt",
+            NodeFlags::DirtyModify | NodeFlags::File,
+        )
+        .await;
+
+        assert_eq!(
+            walk_dirty_paths(
+                state.clone(),
+                repository.clone(),
+                DirtyWalkOptions::default()
+            )
+            .await,
+            vec!["kept.txt"],
+            "the subtree of an excluded directory is not walked"
+        );
+        assert_eq!(
+            walk_dirty_paths(
+                state,
+                repository,
+                DirtyWalkOptions {
+                    skip_staged: false,
+                    force: true,
+                },
+            )
+            .await,
+            vec!["build/artifact.o", "kept.txt"],
+            "force reaches what the exclusion pruned"
+        );
+    }
+
+    /// The walk descends only directories. Nothing below a link is in this state,
+    /// and `Node::child` means nothing on a file - it holds a modification time.
+    #[tokio::test]
+    async fn walking_from_anything_but_a_directory_records_nothing() {
+        let repository = null_repository().await;
+        let state = Arc::new(State::new());
+
+        let file = add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "file.txt",
+            NodeFlags::DirtyModify | NodeFlags::File,
+        )
+        .await;
+        let link = add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "link",
+            NodeFlags::Dirty | NodeFlags::Link,
+        )
+        .await;
+
+        for (label, node) in [("a file", file), ("a link", link)] {
+            let mut paths = Vec::new();
+            collect_dirty_paths_inner(
+                state.clone(),
+                repository.clone(),
+                node,
+                RelativePath::new(),
+                &mut paths,
+                DirtyWalkOptions::default(),
+            )
+            .await
+            .expect("walking from a non-directory");
+            assert!(paths.is_empty(), "walking from {label} records nothing");
+        }
     }
 }
