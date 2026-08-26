@@ -573,6 +573,35 @@ fn try_codec_probes(
     None
 }
 
+/// Starts the consumers, each drawing from the one receiver.
+///
+/// The receiver is left held by the consumers alone, so the channel closes as the last of them
+/// stops. Discovery waiting to hand over a hash then fails its send instead of waiting on consumers
+/// that have already gone — which is what an aborted run, and one whose consumers all failed,
+/// leaves behind.
+fn spawn_consumers(
+    migrator: &Arc<MetadataMigrator>,
+    rx: mpsc::Receiver<Hash>,
+    stats: &Arc<RewriteStats>,
+    aborted: &Arc<AtomicBool>,
+    orchestration_config: &OrchestrationConfig,
+) -> JoinSet<Result<(), StoreError>> {
+    let rx = Arc::new(Mutex::new(rx));
+    let mut consumers = JoinSet::new();
+
+    for _ in 0..orchestration_config.num_consumers {
+        // no execution context in migrator runtime
+        #[allow(clippy::disallowed_methods)]
+        consumers.spawn(migrator.clone().fragment_stream_consumer(
+            rx.clone(),
+            stats.clone(),
+            aborted.clone(),
+        ));
+    }
+
+    consumers
+}
+
 pub async fn run_migrator(
     migrator_config: MetadataMigratorConfig,
     orchestration_config: OrchestrationConfig,
@@ -591,7 +620,6 @@ pub async fn run_migrator(
     let migrator = Arc::new(MetadataMigrator::new(migrator_config));
 
     let (tx, rx) = mpsc::channel((orchestration_config.num_consumers * 2) as usize);
-    let rx = Arc::new(Mutex::new(rx));
 
     // no execution context in migrator runtime
     #[allow(clippy::disallowed_methods)]
@@ -601,16 +629,7 @@ pub async fn run_migrator(
         aborted.clone(),
     ));
 
-    let mut consumers: JoinSet<Result<(), StoreError>> = Default::default();
-    for _i in 0..orchestration_config.num_consumers {
-        // no execution context in migrator runtime
-        #[allow(clippy::disallowed_methods)]
-        consumers.spawn(migrator.clone().fragment_stream_consumer(
-            rx.clone(),
-            stats.clone(),
-            aborted.clone(),
-        ));
-    }
+    let mut consumers = spawn_consumers(&migrator, rx, &stats, &aborted, &orchestration_config);
 
     let mut num_consumer_errors = 0;
     while let Some(handle) = consumers.join_next().await {
@@ -633,10 +652,16 @@ pub async fn run_migrator(
         }
     }
 
+    // A scan that gave up short of the end leaves rows nobody looked at, so the segment did not
+    // complete however cleanly its consumers finished.
     let discovery_task_ok = match discover_task.await {
-        Ok(_) => {
+        Ok(Ok(())) => {
             info!("Discovery task completed");
             true
+        }
+        Ok(Err(error)) => {
+            warn!(%error, "Discovery stopped short of the end of the metadata table");
+            false
         }
         Err(error) => {
             warn!(%error, "Discovery task failed");
@@ -1711,6 +1736,86 @@ mod tests {
             );
 
             assert_eq!(stats.errored.load(Ordering::Relaxed), 1);
+        }
+
+        /// A scan that keeps failing leaves most of the table unread, so the segment did not
+        /// complete — however cleanly the consumers that had nothing to do finished.
+        #[tokio::test]
+        async fn a_run_whose_scan_gave_up_reports_the_segment_incomplete() {
+            let fake = Fake::default();
+            let mut dynamodb = MockDynamoDb::default();
+            dynamodb.expect_scan_page().returning(|_, _, _| {
+                Err(crate::store::test_util::throughput_exceeded(
+                    aws_sdk_dynamodb::operation::scan::ScanError::ProvisionedThroughputExceededException(
+                        crate::store::test_util::throttling_exception(),
+                    ),
+                ))
+            });
+
+            let config = make_config(&fake, dynamodb).await;
+
+            assert!(
+                !run_migrator(
+                    config,
+                    OrchestrationConfig { num_consumers: 2 },
+                    Arc::new(RewriteStats::default()),
+                    Arc::new(AtomicBool::new(false)),
+                )
+                .await,
+                "a segment whose scan gave up did not complete"
+            );
+        }
+
+        /// Discovery hands hashes over a bounded channel, so a page wider than that channel leaves
+        /// it waiting to send. Every consumer here fails on its first fragment and stops, which is
+        /// also the shape an interrupted run ends in: the run has to notice they have gone rather
+        /// than wait on them.
+        #[tokio::test]
+        async fn a_run_whose_consumers_have_all_stopped_ends_rather_than_waiting_on_them() {
+            let fake = Fake::default();
+
+            // Metadata rows with no S3 object behind them, so every fragment fails to load.
+            let items: Vec<_> = std::iter::repeat_with(|| {
+                let hash: Hash = rand::random();
+                HashMap::from([(
+                    "hash".to_owned(),
+                    AttributeValue::B(Blob::new(hash.data().to_vec())),
+                )])
+            })
+            .take(64)
+            .collect();
+
+            let mut dynamodb = MockDynamoDb::default();
+            dynamodb
+                .expect_scan_page()
+                .returning(move |_, start_key, _| {
+                    if start_key.is_none() {
+                        Ok(ScanPage {
+                            items: items.clone(),
+                            last_evaluated_key: None,
+                        })
+                    } else {
+                        Ok(ScanPage {
+                            items: vec![],
+                            last_evaluated_key: None,
+                        })
+                    }
+                });
+
+            let config = make_config(&fake, dynamodb).await;
+            let run = run_migrator(
+                config,
+                OrchestrationConfig { num_consumers: 2 },
+                Arc::new(RewriteStats::default()),
+                Arc::new(AtomicBool::new(false)),
+            );
+
+            assert!(
+                !tokio::time::timeout(Duration::from_secs(30), run)
+                    .await
+                    .expect("the run should end rather than wait on a channel nothing drains"),
+                "a run every consumer stopped in did not complete"
+            );
         }
 
         #[tokio::test]

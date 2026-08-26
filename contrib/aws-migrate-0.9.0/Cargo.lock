@@ -2119,12 +2119,17 @@ name = "lore-aws-migrate"
 version = "0.9.0"
 dependencies = [
  "anyhow",
+ "aws-sdk-dynamodb",
+ "bytes",
  "clap",
+ "libc",
  "lore-aws",
  "lore-storage",
+ "rand",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "zerocopy",
 ]
 
 [[package]]
@@ -2212,7 +2217,7 @@ dependencies = [
 
 [[package]]
 name = "lore-proto"
-version = "0.1.61"
+version = "0.1.62"
 dependencies = [
  "lore-base",
  "prost",

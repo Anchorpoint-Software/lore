@@ -11,7 +11,7 @@
 //! unless every segment completed.
 //!
 //! Running it again is safe and is how an interrupted run is finished: a fragment that already has
-//! a state row is skipped.
+//! a state row and an object describing itself is skipped.
 //!
 //! The store must be offline or in maintenance mode for the whole run, so that nothing else
 //! writing to it interferes with the migration. `--dry-run` writes nothing and is safe against a
@@ -60,12 +60,12 @@ use tracing_subscriber::EnvFilter;
 
 The store must not be serving traffic: put every node that reaches it into maintenance mode, or \
 otherwise out of service, for the whole run. A write that arrives while a fragment is being \
-converted can revive an obliterated hash, undoing a takedown silently. --dry-run writes nothing \
-and is safe to run against a live store.
+converted can revive an obliterated hash, undoing the obliteration. --dry-run writes nothing and \
+is safe to run against a live store.
 
 A zero exit status means every segment reached the end of its scan, not that every fragment was \
-migrated: read the unreadable, oversized and obliterated totals before reopening traffic. A \
-nonzero obliterated count means stop and investigate."
+migrated: read the unreadable and oversized totals before reopening traffic. An obliterated \
+fragment is passed over on purpose and needs no state row, so that total may be anything."
 )]
 struct Args {
     /// S3 bucket holding fragment payloads.
@@ -172,9 +172,10 @@ fn init_tracing() {
 /// Migrates the segments this invocation covers, reporting whether all of them completed.
 ///
 /// Completing is per segment, not per fragment: a segment that reached the end of its scan reports
-/// success however many fragments it left without a state row. An unreadable payload, one past the
-/// size threshold, and one whose legacy row says it was obliterated are all skipped and counted, so
-/// the totals rather than this answer are what establish that a store is fully migrated.
+/// success however many fragments it left without a state row. An unreadable payload and one past
+/// the size threshold are both skipped and counted, so the totals rather than this answer are what
+/// establish that a store is fully migrated. An obliterated fragment is skipped too, but that one
+/// is intended — nothing can retrieve it, so it needs no state row.
 ///
 /// Every segment shares one abort flag, so a store that cannot be written stops the whole run
 /// rather than being discovered once per segment.
