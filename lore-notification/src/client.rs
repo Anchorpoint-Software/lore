@@ -110,8 +110,7 @@ impl NotificationClient {
                             auth_url,
                             &identity,
                             repository,
-                            self.remote.identity_token(),
-                            self.remote.access_token(),
+                            self.remote.credentials(),
                         )
                         .await;
                     let client =

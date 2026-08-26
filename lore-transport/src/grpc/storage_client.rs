@@ -1746,8 +1746,7 @@ mod tests {
             client: StorageService::new(connection.clone()),
             auth_url: String::new(),
             identity: String::new(),
-            identity_token: String::new(),
-            access_token: String::new(),
+            credentials: Arc::new(super::super::SuppliedCredentials::default()),
             session_counter: std::sync::atomic::AtomicU32::new(1),
             sessions: DashMap::new(),
         };

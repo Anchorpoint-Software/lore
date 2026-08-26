@@ -8,6 +8,7 @@ use bytes::Bytes;
 use lore_base::types::*;
 
 use crate::connection::Connection;
+use crate::connection::SuppliedCredentials;
 use crate::error::ProtocolError;
 use crate::types::*;
 
@@ -24,8 +25,7 @@ pub trait Protocol: Send + Sync {
         identity: &str,
         partition: Partition,
         index: usize,
-        identity_token: &str,
-        access_token: &str,
+        credentials: &Arc<SuppliedCredentials>,
     ) -> Result<Arc<dyn Storage>, ProtocolError>;
 
     /// Connect to remote revision service
@@ -37,8 +37,7 @@ pub trait Protocol: Send + Sync {
         auth_url: &str,
         identity: &str,
         repository: RepositoryId,
-        identity_token: &str,
-        access_token: &str,
+        credentials: &Arc<SuppliedCredentials>,
     ) -> Result<Arc<dyn Revision>, ProtocolError>;
 
     /// Connect to remote repository service
@@ -48,8 +47,7 @@ pub trait Protocol: Send + Sync {
         remote_url: &str,
         auth_url: &str,
         identity: &str,
-        identity_token: &str,
-        access_token: &str,
+        credentials: &Arc<SuppliedCredentials>,
     ) -> Result<Arc<dyn Repository>, ProtocolError>;
 
     /// Connect to remote admin service
@@ -61,8 +59,7 @@ pub trait Protocol: Send + Sync {
         auth_url: &str,
         identity: &str,
         repository: RepositoryId,
-        identity_token: &str,
-        access_token: &str,
+        credentials: &Arc<SuppliedCredentials>,
     ) -> Result<Arc<dyn Admin>, ProtocolError>;
 
     /// Connect to remote lock service
@@ -74,8 +71,7 @@ pub trait Protocol: Send + Sync {
         auth_url: &str,
         identity: &str,
         repository: RepositoryId,
-        identity_token: &str,
-        access_token: &str,
+        credentials: &Arc<SuppliedCredentials>,
     ) -> Result<Arc<dyn Lock>, ProtocolError>;
 
     /// Connect to remote environment service

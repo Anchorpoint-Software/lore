@@ -48,6 +48,7 @@ use super::super::storage_service::Command;
 use super::super::storage_service::MAX_CHUNK_SIZE;
 use super::super::storage_service::auth::StorageClientAuth;
 use crate::connection::Connection;
+use crate::connection::SuppliedCredentials;
 use crate::error::ProtocolError;
 use crate::quic::client::CongestionAlgorithm;
 use crate::traits::Storage;
@@ -65,8 +66,7 @@ pub struct StorageClient {
     auth_url: String,
     recipient_domain: String,
     identity: String,
-    identity_token: String,
-    access_token: String,
+    credentials: Arc<SuppliedCredentials>,
     partition: Partition,
     counter: AtomicUsize,
     quic: Arc<QuicConnection>,
@@ -99,8 +99,7 @@ impl StorageClient {
         identity: &str,
         partition: Partition,
         quinn: quinn::Connection,
-        identity_token: &str,
-        access_token: &str,
+        credentials: &Arc<SuppliedCredentials>,
     ) -> Self {
         let quic = QuicConnection::with_v4(quinn, MAX_CHUNK_SIZE, true);
         StorageClient {
@@ -111,8 +110,7 @@ impl StorageClient {
             auth_url: auth_url.to_string(),
             recipient_domain: recipient_domain.to_string(),
             identity: identity.to_string(),
-            identity_token: identity_token.to_string(),
-            access_token: access_token.to_string(),
+            credentials: credentials.clone(),
             partition,
             quic: Arc::new(quic),
             connection_establish: Semaphore::new(1),
@@ -130,8 +128,7 @@ impl StorageClient {
         auth_url: &str,
         identity: &str,
         partition: Partition,
-        identity_token: &str,
-        access_token: &str,
+        credentials: &Arc<SuppliedCredentials>,
     ) -> Result<Self, ProtocolError> {
         let auth_adapter = Arc::new(StorageClientAuth {
             recipient_domain: remote_domain.clone(),
@@ -173,8 +170,7 @@ impl StorageClient {
             identity,
             partition,
             quinn,
-            identity_token,
-            access_token,
+            credentials,
         );
 
         lore_trace!(
@@ -283,15 +279,19 @@ impl Storage for StorageClient {
         partition: Partition,
         correlation_id: &str,
     ) -> Result<u32, ProtocolError> {
-        // Fetch auth token via token exchange (cached if already exchanged)
+        // Fetch auth token via token exchange (cached if already exchanged).
+        // The credentials are read here, not at construction: the server checks
+        // storage authorization at each session start, so a session opened later
+        // must present whatever the newest call supplied.
         let token = if !self.auth_url.is_empty() {
+            let (identity_token, access_token) = self.credentials.tokens();
             let (_, authorization_token, _) = crate::auth::exchange::auth_exchange(
                 &self.auth_url,
                 &self.recipient_domain,
                 &self.identity,
                 partition,
-                &self.identity_token,
-                &self.access_token,
+                &identity_token,
+                &access_token,
             )
             .await;
             authorization_token
