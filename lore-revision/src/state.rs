@@ -4329,7 +4329,7 @@ pub async fn rebase_staged_state(
         old_staged_state,
         repository.clone(),
         crate::node::ROOT_NODE,
-        RelativePath::new(),
+        RelativePathBuf::new(),
         &mut dirty_paths,
     )
     .await?;
@@ -4359,21 +4359,22 @@ pub async fn rebase_staged_state(
 /// boundaries (children live in another repository's state) and at
 /// `DirtyDelete`/`DirtyMove` subtrees (the parent action carries the whole
 /// subtree when re-applied).
-pub(crate) fn collect_dirty_paths(
+pub(crate) async fn collect_dirty_paths(
     state: Arc<State>,
     repository: Arc<RepositoryContext>,
     parent_node: NodeID,
-    parent_path: RelativePath,
+    mut parent_path: RelativePathBuf,
     paths: &mut Vec<RelativePath>,
-) -> Pin<Box<dyn Future<Output = Result<(), StateError>> + Send + '_>> {
+) -> Result<(), StateError> {
     collect_dirty_paths_inner(
         state,
         repository,
         parent_node,
-        parent_path,
+        &mut parent_path,
         paths,
         DirtyWalkOptions::from_context(false),
     )
+    .await
 }
 
 /// Like [`collect_dirty_paths`] but skips nodes that are also staged.
@@ -4383,21 +4384,22 @@ pub(crate) fn collect_dirty_paths(
 /// revision — staged paths are already part of the new commit and would be
 /// incorrectly re-marked as `DirtyModify` by `file::dirty::dirty()` if
 /// included.
-pub(crate) fn collect_dirty_only_paths(
+pub(crate) async fn collect_dirty_only_paths(
     state: Arc<State>,
     repository: Arc<RepositoryContext>,
     parent_node: NodeID,
-    parent_path: RelativePath,
+    mut parent_path: RelativePathBuf,
     paths: &mut Vec<RelativePath>,
-) -> Pin<Box<dyn Future<Output = Result<(), StateError>> + Send + '_>> {
+) -> Result<(), StateError> {
     collect_dirty_paths_inner(
         state,
         repository,
         parent_node,
-        parent_path,
+        &mut parent_path,
         paths,
         DirtyWalkOptions::from_context(true),
     )
+    .await
 }
 
 /// What a dirty walk does with the nodes it meets.
@@ -4445,40 +4447,110 @@ fn dirty_path_descends(child: &Node) -> bool {
     child.is_directory() && !child.is_dirty_delete() && !child.is_dirty_move()
 }
 
-/// Names `child_id` and joins it onto `parent_path`.
+/// The node block a sibling chain is being read from.
 ///
-/// The name is a read lock on the block holding it, moved into the join so it is
-/// released before the caller descends. A walk that took a second shared lock on
-/// that block would deadlock behind a queued writer.
-async fn dirty_child_path(
+/// A chain is walked one node at a time, and [`State::node`] resolves each from
+/// its block: a lock on the block table, a bounds check and a weak upgrade, for
+/// what is usually the block just read. Nodes are allocated as a tree is built,
+/// so siblings and their children land together and a chain rarely leaves one
+/// block. Holding it makes the common step an index comparison.
+///
+/// A held block cannot be evicted, so [`State::block`] keeps returning the one
+/// held here and a node read through the cursor is the node [`State::node`]
+/// would return.
+struct BlockCursor {
+    index: usize,
+    block: Arc<NodeBlock>,
+}
+
+impl BlockCursor {
+    /// Opens a cursor on the block holding `node`.
+    async fn open(
+        state: &State,
+        repository: &Arc<RepositoryContext>,
+        node: NodeID,
+    ) -> Result<Self, StateError> {
+        if !node.is_valid_or_root_node_id() {
+            return Err(StateError::internal("Invalid node"));
+        }
+        let index = NodeBlock::index(node);
+        Ok(Self {
+            index,
+            block: state.block(repository.clone(), index).await?,
+        })
+    }
+
+    /// Reads `node`, fetching the block holding it unless that is the one held.
+    ///
+    /// Selecting the block and reading from it are one step, so a node is only
+    /// ever read out of its own block. Split apart they would let a read take a
+    /// node index against whichever block the cursor happened to hold, which
+    /// names an unrelated node rather than failing.
+    async fn node(
+        &mut self,
+        state: &State,
+        repository: &Arc<RepositoryContext>,
+        node: NodeID,
+    ) -> Result<Node, StateError> {
+        if !node.is_valid_or_root_node_id() {
+            return Err(StateError::internal("Invalid node"));
+        }
+        let index = NodeBlock::index(node);
+        if index != self.index {
+            self.block = state.block(repository.clone(), index).await?;
+            self.index = index;
+        }
+        Ok(*self.block.read().node(Node::index(node)))
+    }
+}
+
+/// Appends the name of `child_id` to `path`, reporting whether anything was added.
+///
+/// The name is a read lock on the block holding it, released as this returns and
+/// so before the caller descends. A walk that took a second shared lock on that
+/// block would deadlock behind a queued writer.
+///
+/// An empty name appends nothing, which [`RelativePathBuf::push`] already does and
+/// which the caller must not undo: a pop would take the parent's own last
+/// component off instead.
+async fn push_dirty_child_name(
     state: &State,
     repository: Arc<RepositoryContext>,
-    parent_path: &RelativePath,
+    path: &mut RelativePathBuf,
     child_id: NodeID,
-) -> Result<RelativePath, StateError> {
+) -> Result<bool, StateError> {
     let child_name = state.node_name_ref(repository, child_id).await?;
-    Ok(parent_path.push_into_buf(child_name).freeze())
+    path.push(&*child_name);
+    Ok(!child_name.is_empty())
 }
 
 /// Walks the children of `parent_node`, recording dirty paths under `parent_path`.
 ///
 /// A child is named only once [`dirty_path_contributes`] or [`dirty_path_descends`]
-/// says it is wanted. Naming allocates a path and the ignore filter matches every
-/// one of its lines against it, and under `skip_staged` most of a tree is wanted
-/// for neither: a commit stages what it writes.
+/// says it is wanted. The ignore filter matches every one of its lines against a
+/// name, and under `skip_staged` most of a tree is wanted for neither: a commit
+/// stages what it writes.
 ///
 /// `parent_node` is walked only if it is a directory. Nothing below a link is in
 /// this state, and [`Node::child`] means nothing on a file.
-fn collect_dirty_paths_inner(
+///
+/// `parent_path` is the path of `parent_node` and the buffer every descendant is
+/// named into, so naming costs no allocation and a path is allocated only where one
+/// is recorded. A walk that records nothing allocates nothing. The name a child
+/// appends is taken off at the one place the loop body ends, so the buffer holds
+/// `parent_path` again for the next sibling. An error abandons the walk and the
+/// buffer with it, so it needs no unwinding.
+fn collect_dirty_paths_inner<'a>(
     state: Arc<State>,
     repository: Arc<RepositoryContext>,
     parent_node: NodeID,
-    parent_path: RelativePath,
-    paths: &mut Vec<RelativePath>,
+    parent_path: &'a mut RelativePathBuf,
+    paths: &'a mut Vec<RelativePath>,
     options: DirtyWalkOptions,
-) -> Pin<Box<dyn Future<Output = Result<(), StateError>> + Send + '_>> {
+) -> Pin<Box<dyn Future<Output = Result<(), StateError>> + Send + 'a>> {
     Box::pin(async move {
-        let node = state.node(repository.clone(), parent_node).await?;
+        let mut cursor = BlockCursor::open(&state, &repository, parent_node).await?;
+        let node = cursor.node(&state, &repository, parent_node).await?;
         if node.is_link() || !node.is_directory() {
             return Ok(());
         }
@@ -4486,54 +4558,54 @@ fn collect_dirty_paths_inner(
         let mut child_node_opt = node.child();
         let mut cycle = SiblingCycleGuard::new(parent_node);
         while let Some(child_id) = child_node_opt {
-            let child = state.node(repository.clone(), child_id).await?;
+            let child = cursor.node(&state, &repository, child_id).await?;
             child.walk_step(child_id, parent_node, &mut cycle)?;
-            let next_sibling = child.sibling();
+            child_node_opt = child.sibling();
 
             if !child.is_dirty() {
-                child_node_opt = next_sibling;
                 continue;
             }
 
             let contributes = dirty_path_contributes(&child, options.skip_staged);
             let descends = dirty_path_descends(&child);
             if !contributes && !descends {
-                child_node_opt = next_sibling;
                 continue;
             }
 
-            let child_path =
-                dirty_child_path(&state, repository.clone(), &parent_path, child_id).await?;
+            let appended =
+                push_dirty_child_name(&state, repository.clone(), parent_path, child_id).await?;
 
             // Don't carry forward dirty paths that the view/ignore filter
             // excludes — they cannot be re-applied against a checkout that
             // never materializes them. --force bypasses the filter.
-            if !options.force
-                && repository
-                    .filter
-                    .excludes(&child_path, child.is_directory(), FilterMode::Full)
-            {
-                child_node_opt = next_sibling;
-                continue;
+            let excluded = !options.force
+                && repository.filter.excludes(
+                    &*parent_path,
+                    child.is_directory(),
+                    FilterMode::Full,
+                );
+
+            if !excluded {
+                if contributes {
+                    paths.push(parent_path.clone().freeze());
+                }
+
+                if descends {
+                    collect_dirty_paths_inner(
+                        state.clone(),
+                        repository.clone(),
+                        child_id,
+                        parent_path,
+                        paths,
+                        options,
+                    )
+                    .await?;
+                }
             }
 
-            if contributes {
-                paths.push(child_path.clone());
+            if appended {
+                parent_path.pop();
             }
-
-            if descends {
-                collect_dirty_paths_inner(
-                    state.clone(),
-                    repository.clone(),
-                    child_id,
-                    child_path,
-                    paths,
-                    options,
-                )
-                .await?;
-            }
-
-            child_node_opt = next_sibling;
         }
 
         Ok(())
@@ -9393,20 +9465,111 @@ mod tests {
         repository: Arc<RepositoryContext>,
         options: DirtyWalkOptions,
     ) -> Vec<String> {
+        let mut collected = walk_dirty_paths_in_order(state, repository, options).await;
+        collected.sort();
+        collected
+    }
+
+    /// The dirty paths of the whole tree, in the order the walk records them.
+    async fn walk_dirty_paths_in_order(
+        state: Arc<State>,
+        repository: Arc<RepositoryContext>,
+        options: DirtyWalkOptions,
+    ) -> Vec<String> {
         let mut paths = Vec::new();
         collect_dirty_paths_inner(
             state,
             repository,
             ROOT_NODE,
-            RelativePath::new(),
+            &mut RelativePathBuf::new(),
             &mut paths,
             options,
         )
         .await
         .expect("walking the tree");
-        let mut collected: Vec<String> = paths.iter().map(|p| p.as_str().to_string()).collect();
-        collected.sort();
-        collected
+        paths.iter().map(|p| p.as_str().to_string()).collect()
+    }
+
+    /// `U+0130` folds to two scalars, so the directory is one byte longer in the
+    /// buffer's lowercase form than in its written one. The walk pops the whole
+    /// component off both, or the sibling that follows inherits what is left.
+    #[tokio::test]
+    async fn a_component_whose_fold_is_longer_is_popped_off_both_forms() {
+        let repository = null_repository().await;
+        let state = Arc::new(State::new());
+
+        let folded = add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "MESH_\u{130}",
+            NodeFlags::Dirty,
+        )
+        .await;
+        add_dirty_node(
+            &state,
+            repository.clone(),
+            folded,
+            "inner.txt",
+            NodeFlags::DirtyModify | NodeFlags::File,
+        )
+        .await;
+        add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "after.txt",
+            NodeFlags::DirtyModify | NodeFlags::File,
+        )
+        .await;
+
+        assert_eq!(
+            walk_dirty_paths(state, repository, DirtyWalkOptions::default()).await,
+            vec!["MESH_\u{130}/inner.txt", "after.txt"],
+            "the sibling is named against the root, not against what the fold left"
+        );
+    }
+
+    /// A sibling chain longer than one node block, so the walk crosses a block
+    /// boundary part way along it.
+    ///
+    /// [`BlockCursor`] holds the block it last read and only fetches another when
+    /// the node it is asked for is not in that one. A cursor that never moved
+    /// would read the wrong nodes from the block it opened on, so every chain a
+    /// test walks has to be long enough to leave it.
+    #[tokio::test]
+    async fn a_sibling_chain_spanning_node_blocks_is_walked_whole() {
+        const CHILDREN: usize = crate::node::BLOCK_NODE_COUNT + 200;
+
+        let repository = null_repository().await;
+        let state = Arc::new(State::new());
+        let directory = add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "spanning",
+            NodeFlags::Dirty,
+        )
+        .await;
+        for index in 0..CHILDREN {
+            add_dirty_node(
+                &state,
+                repository.clone(),
+                directory,
+                &format!("file_{index:04}.txt"),
+                NodeFlags::DirtyModify | NodeFlags::File,
+            )
+            .await;
+        }
+
+        let walked = walk_dirty_paths(state, repository, DirtyWalkOptions::default()).await;
+        let expected: Vec<String> = (0..CHILDREN)
+            .map(|index| format!("spanning/file_{index:04}.txt"))
+            .collect();
+        assert_eq!(
+            walked, expected,
+            "every child is recorded once, whichever block it lives in"
+        );
     }
 
     /// A `DirtyDelete` or `DirtyMove` directory is re-applied whole, so the walk
@@ -9477,6 +9640,213 @@ mod tests {
             vec!["moved", "removed", "touched/edited.txt"],
             "a deleted or moved directory is recorded and not descended, \
              and a propagated-dirty directory is descended and not recorded"
+        );
+    }
+
+    /// The buffer the walk names into carries the whole ancestry, and a sibling
+    /// visited after a descent is named against its own parent again.
+    ///
+    /// A child is prepended into the sibling chain, so the subdirectory added
+    /// last at each level is walked first and the file beside it is named once the
+    /// descent has returned.
+    #[tokio::test]
+    async fn a_nested_dirty_file_carries_the_whole_prefix() {
+        let repository = null_repository().await;
+        let state = Arc::new(State::new());
+
+        let file = NodeFlags::DirtyModify | NodeFlags::File;
+        let mut parent = ROOT_NODE;
+        for (directory, name) in [
+            ("assets", "a.txt"),
+            ("meshes", "b.txt"),
+            ("rock", "c.txt"),
+            ("detail", "d.txt"),
+        ] {
+            parent = add_dirty_node(
+                &state,
+                repository.clone(),
+                parent,
+                directory,
+                NodeFlags::Dirty,
+            )
+            .await;
+            add_dirty_node(&state, repository.clone(), parent, name, file).await;
+        }
+        add_dirty_node(&state, repository.clone(), parent, "e.txt", file).await;
+
+        assert_eq!(
+            walk_dirty_paths(state, repository, DirtyWalkOptions::default()).await,
+            vec![
+                "assets/a.txt",
+                "assets/meshes/b.txt",
+                "assets/meshes/rock/c.txt",
+                "assets/meshes/rock/detail/d.txt",
+                "assets/meshes/rock/detail/e.txt",
+            ],
+        );
+    }
+
+    /// Three subtrees under one parent, each of a different depth. Every path is
+    /// named against the parent and not against whatever the subtree walked
+    /// before it left behind.
+    #[tokio::test]
+    async fn sibling_subtrees_at_one_depth_are_named_against_their_parent() {
+        let repository = null_repository().await;
+        let state = Arc::new(State::new());
+
+        let file = NodeFlags::DirtyModify | NodeFlags::File;
+        for (subtree, depth) in [("left", 1usize), ("middle", 2), ("right", 3)] {
+            let mut parent = add_dirty_node(
+                &state,
+                repository.clone(),
+                ROOT_NODE,
+                subtree,
+                NodeFlags::Dirty,
+            )
+            .await;
+            for level in 0..depth {
+                add_dirty_node(&state, repository.clone(), parent, "leaf.txt", file).await;
+                parent = add_dirty_node(
+                    &state,
+                    repository.clone(),
+                    parent,
+                    &format!("level_{level}"),
+                    NodeFlags::Dirty,
+                )
+                .await;
+            }
+            add_dirty_node(&state, repository.clone(), parent, "leaf.txt", file).await;
+        }
+
+        assert_eq!(
+            walk_dirty_paths(state, repository, DirtyWalkOptions::default()).await,
+            vec![
+                "left/leaf.txt",
+                "left/level_0/leaf.txt",
+                "middle/leaf.txt",
+                "middle/level_0/leaf.txt",
+                "middle/level_0/level_1/leaf.txt",
+                "right/leaf.txt",
+                "right/level_0/leaf.txt",
+                "right/level_0/level_1/leaf.txt",
+                "right/level_0/level_1/level_2/leaf.txt",
+            ],
+        );
+    }
+
+    /// A directory carrying an action of its own is recorded and then descended,
+    /// and the path recorded for it is its own however deep its children go.
+    #[tokio::test]
+    async fn a_directory_is_recorded_before_it_is_descended() {
+        let repository = null_repository().await;
+        let state = Arc::new(State::new());
+
+        let file = NodeFlags::DirtyModify | NodeFlags::File;
+        add_dirty_node(&state, repository.clone(), ROOT_NODE, "tail.txt", file).await;
+        let added = add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "added",
+            NodeFlags::DirtyAdd,
+        )
+        .await;
+        add_dirty_node(&state, repository.clone(), added, "leaf.txt", file).await;
+        let deeper = add_dirty_node(
+            &state,
+            repository.clone(),
+            added,
+            "deeper",
+            NodeFlags::DirtyAdd,
+        )
+        .await;
+        add_dirty_node(&state, repository.clone(), deeper, "deep.txt", file).await;
+
+        assert_eq!(
+            walk_dirty_paths_in_order(state, repository, DirtyWalkOptions::default()).await,
+            vec![
+                "added",
+                "added/deeper",
+                "added/deeper/deep.txt",
+                "added/leaf.txt",
+                "tail.txt",
+            ],
+            "a directory is recorded before it is descended, and its own path \
+             is not extended by what its children append"
+        );
+    }
+
+    /// A node the filter excludes is neither recorded nor descended, and the
+    /// siblings walked after it are still named against their own parent.
+    ///
+    /// The excluded node sits in the middle of the chain: children are prepended,
+    /// so `blocked` is walked between `gamma` and `alpha`.
+    #[tokio::test]
+    async fn siblings_after_a_filtered_node_keep_their_own_prefix() {
+        let repository = null_repository_excluding(&["blocked"]).await;
+        let state = Arc::new(State::new());
+
+        let file = NodeFlags::DirtyModify | NodeFlags::File;
+        let alpha = add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "alpha",
+            NodeFlags::Dirty,
+        )
+        .await;
+        add_dirty_node(&state, repository.clone(), alpha, "one.txt", file).await;
+        let blocked = add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "blocked",
+            NodeFlags::DirtyAdd,
+        )
+        .await;
+        add_dirty_node(&state, repository.clone(), blocked, "hidden.txt", file).await;
+        let gamma = add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "gamma",
+            NodeFlags::Dirty,
+        )
+        .await;
+        add_dirty_node(&state, repository.clone(), gamma, "two.txt", file).await;
+
+        assert_eq!(
+            walk_dirty_paths(state, repository, DirtyWalkOptions::default()).await,
+            vec!["alpha/one.txt", "gamma/two.txt"],
+            "the excluded subtree is pruned and the sibling after it is named \
+             against the root"
+        );
+    }
+
+    /// A node whose name is empty names its parent, since
+    /// [`RelativePathBuf::push`] ignores an empty component. The sibling after it
+    /// is still named against the parent, so nothing was taken off for a
+    /// component that was never appended.
+    #[tokio::test]
+    async fn an_empty_node_name_names_its_parent() {
+        let repository = null_repository().await;
+        let state = Arc::new(State::new());
+
+        let file = NodeFlags::DirtyModify | NodeFlags::File;
+        let outer = add_dirty_node(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            "outer",
+            NodeFlags::Dirty,
+        )
+        .await;
+        add_dirty_node(&state, repository.clone(), outer, "x.txt", file).await;
+        add_dirty_node(&state, repository.clone(), outer, "", file).await;
+
+        assert_eq!(
+            walk_dirty_paths(state, repository, DirtyWalkOptions::default()).await,
+            vec!["outer", "outer/x.txt"],
         );
     }
 
@@ -9655,7 +10025,7 @@ mod tests {
                 state.clone(),
                 repository.clone(),
                 node,
-                RelativePath::new(),
+                &mut RelativePathBuf::new(),
                 &mut paths,
                 DirtyWalkOptions::default(),
             )

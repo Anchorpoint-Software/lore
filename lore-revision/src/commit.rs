@@ -80,6 +80,7 @@ use crate::state::StateNodeChildrenIterator;
 use crate::state::StateNodeChildrenWithNameIterator;
 use crate::util;
 use crate::util::path::RelativePath;
+use crate::util::path::RelativePathBuf;
 use crate::util::serde::u8_as_bool;
 
 /// Event data reported at the start of a commit.
@@ -448,7 +449,7 @@ pub async fn commit_impl(
         state_staged.clone(),
         repository.clone(),
         ROOT_NODE,
-        RelativePath::new(),
+        RelativePathBuf::new(),
         &mut dirty_paths,
     )
     .await

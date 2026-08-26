@@ -87,6 +87,36 @@ mod tests {
         assert_eq!(root, "");
     }
 
+    /// `U+0130` folds to two scalars, so an ancestor holding one puts the
+    /// separator below it at a different byte offset in the lowercase form than
+    /// in the written one. A pop that took its offset from one string and applied
+    /// it to the other would cut the wrong place.
+    #[test]
+    fn push_and_pop_below_a_component_whose_fold_is_longer() {
+        let mut buf = RelativePathBuf::new();
+        buf.push("MESH_\u{130}");
+        buf.push("inner");
+        assert_eq!(buf.as_str(), "MESH_\u{130}/inner");
+        assert_eq!(buf.as_lowercase_str(), "mesh_i\u{307}/inner");
+        assert_ne!(
+            buf.as_str().rfind('/'),
+            buf.as_lowercase_str().rfind('/'),
+            "the two forms must disagree on where the separator is, or this proves nothing"
+        );
+
+        buf.pop();
+        assert_eq!(buf.as_str(), "MESH_\u{130}");
+        assert_eq!(buf.as_lowercase_str(), "mesh_i\u{307}");
+
+        buf.push("after");
+        assert_eq!(buf.as_str(), "MESH_\u{130}/after");
+        assert_eq!(
+            buf.as_lowercase_str(),
+            "mesh_i\u{307}/after",
+            "the sibling must not inherit bytes the fold left behind"
+        );
+    }
+
     #[test]
     fn pop_root() {
         let mut buf = RelativePathBuf::new();

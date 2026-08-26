@@ -78,6 +78,7 @@ use crate::state::LinkMergeEntry;
 use crate::state::State;
 use crate::state::StateNodeChildrenWithNameIterator;
 use crate::util::path::RelativePath;
+use crate::util::path::RelativePathBuf;
 use crate::util::serde::u8_as_bool;
 
 /// Data for the event sent when a branch merge starts.
@@ -2350,7 +2351,7 @@ pub(crate) async fn check_and_capture_dirty_for_merge(
         state_staged.clone(),
         repository.clone(),
         crate::node::ROOT_NODE,
-        RelativePath::new(),
+        RelativePathBuf::new(),
         &mut paths,
     )
     .await
