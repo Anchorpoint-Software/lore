@@ -651,7 +651,7 @@ pub async fn read_stream(
         sender
             .send(Ok(buffer.slice(range)))
             .await
-            .map_err(|_err| StorageError::internal("stream send failed"))?;
+            .map_err(|_err| StorageError::internal("read stream closed"))?;
         Ok((fragment, streamed))
     }
 }
@@ -1184,7 +1184,7 @@ pub async fn read_resolved_stream(
         sender
             .send(Ok(root.buffer))
             .await
-            .map_err(|_err| StorageError::internal("stream send failed"))?;
+            .map_err(|_err| StorageError::internal("read stream closed"))?;
     }
 
     Ok((root.resolved, root.fragment.size_content))
