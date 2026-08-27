@@ -1576,18 +1576,30 @@ async fn commit_directory(
         delta_add(delta.clone(), node_id, node.flags);
     }
 
-    let mut tasks = JoinSet::new();
-
     let mut updated = false;
     let mut children =
         StateNodeChildrenWithNameIterator::new(state.clone(), repository.clone(), node_id)
             .await
             .forward::<CommitError>("Failed deserializing state block")?;
-    while let Some((child_node_id, child_node, node_name)) = children
-        .next()
-        .await
-        .forward::<CommitError>("Failed deserializing state block")?
-    {
+
+    let mut tasks = JoinSet::new();
+    let mut walk_failure = None;
+
+    loop {
+        let child = match children
+            .next()
+            .await
+            .forward::<CommitError>("Failed deserializing state block")
+        {
+            Ok(Some(child)) => child,
+            Ok(None) => break,
+            Err(err) => {
+                walk_failure = Some(err);
+                break;
+            }
+        };
+        let (child_node_id, child_node, node_name) = child;
+
         if !child_node.is_staged() {
             continue;
         }
@@ -1673,7 +1685,7 @@ async fn commit_directory(
                     });
                 }
                 Err(_) => {
-                    commit_directory_recurse(
+                    if let Err(err) = commit_directory_recurse(
                         repository.clone(),
                         token.share(),
                         state.clone(),
@@ -1691,7 +1703,11 @@ async fn commit_directory(
                         tracker.clone(),
                         dir_semaphore.clone(),
                     )
-                    .await?;
+                    .await
+                    {
+                        walk_failure = Some(err);
+                        break;
+                    }
                 }
             }
         } else if child_node.is_link() {
@@ -1732,7 +1748,7 @@ async fn commit_directory(
                 }
             });
         } else if child_node.is_file() {
-            collect_file(
+            if let Err(err) = collect_file(
                 child_node_id,
                 absolute_path,
                 relative_path,
@@ -1740,7 +1756,11 @@ async fn commit_directory(
                 &stats,
                 child_node.size,
             )
-            .await?;
+            .await
+            {
+                walk_failure = Some(err);
+                break;
+            }
             updated = true;
         }
     }
@@ -1756,6 +1776,9 @@ async fn commit_directory(
         } else {
             task_failure = Err(task.unwrap_err());
         }
+    }
+    if let Some(err) = walk_failure {
+        return Err(err);
     }
     commit_failure?;
     task_failure.internal("Recursion task failed")?;
@@ -2032,16 +2055,16 @@ async fn commit_execute(
         lore_spawn!(tasks, {
             let repository = repository.clone();
             let state = state.clone();
-            let block_index = NodeBlock::index(file_to_commit.node_id);
-            let node_index = Node::index(file_to_commit.node_id);
-            let block = state
-                .block(repository.clone(), block_index)
-                .await
-                .forward::<CommitError>("Failed deserializing state block")?;
             let delta = delta.clone();
             let stats = stats.clone();
             let tracker = tracker.clone();
             async move {
+                let block_index = NodeBlock::index(file_to_commit.node_id);
+                let node_index = Node::index(file_to_commit.node_id);
+                let block = state
+                    .block(repository.clone(), block_index)
+                    .await
+                    .forward::<CommitError>("Failed deserializing state block")?;
                 commit_file(
                     repository,
                     state,
@@ -2698,18 +2721,31 @@ pub async fn rehash_directory(
     lore_trace!("Rehash directory node {} address {}", node_id, node.address);
     debug_assert!(node.is_directory());
 
-    let mut tasks = JoinSet::new();
     let mut child_data: Vec<NodeHashData> = vec![];
 
     let mut total_size = 0;
     let mut children = StateNodeChildrenIterator::new(state.clone(), repository.clone(), node_id)
         .await
         .forward::<CommitError>("Failed deserializing state block")?;
-    while let Some((child_node_id, child_node)) = children
-        .next()
-        .await
-        .forward::<CommitError>("Failed deserializing state block")?
-    {
+
+    let mut tasks = JoinSet::new();
+    let mut walk_failure = None;
+
+    loop {
+        let child = match children
+            .next()
+            .await
+            .forward::<CommitError>("Failed deserializing state block")
+        {
+            Ok(Some(child)) => child,
+            Ok(None) => break,
+            Err(err) => {
+                walk_failure = Some(err);
+                break;
+            }
+        };
+        let (child_node_id, child_node) = child;
+
         if child_node.is_staged_delete() {
             let node_path = state
                 .node_path(repository.clone(), child_node_id)
@@ -2718,9 +2754,10 @@ pub async fn rehash_directory(
             lore_warn!(
                 "Encountered deleted node {child_node_id} when rehashing directory node {node_id}: {node_path}"
             );
-            return Err(CommitError::internal(
+            walk_failure = Some(CommitError::internal(
                 "Deleted node remains after nodes were committed",
             ));
+            break;
         }
 
         if child_node.is_dirty() {
@@ -2734,9 +2771,10 @@ pub async fn rehash_directory(
                 child_node.flags,
                 child_node.address
             );
-            return Err(CommitError::internal(
+            walk_failure = Some(CommitError::internal(
                 "Dirty node remain after nodes were committed",
             ));
+            break;
         }
 
         if child_node.is_directory() {
@@ -2758,9 +2796,10 @@ pub async fn rehash_directory(
                     child_node.flags,
                     child_node.address
                 );
-                return Err(CommitError::internal(
+                walk_failure = Some(CommitError::internal(
                     "Staged node remain after nodes were committed",
                 ));
+                break;
             } else if child_node.is_link() {
                 // Links are handled explicitly before hashing directories
                 lore_debug!(
@@ -2771,9 +2810,10 @@ pub async fn rehash_directory(
                 && child_node.address.hash.is_zero()
                 && child_node.size > 0
             {
-                return Err(CommitError::internal(
+                walk_failure = Some(CommitError::internal(
                     "Node with zero hash remain after nodes were committed",
                 ));
+                break;
             }
 
             lore_trace!(
@@ -2793,13 +2833,21 @@ pub async fn rehash_directory(
 
     let mut task_failure = Ok(());
     while let Some(task) = tasks.join_next().await {
-        if let Ok(result) = task {
-            let result = result?;
-            total_size += result.size;
-            child_data.push(result);
-        } else {
-            task_failure = Err(task.unwrap_err());
+        match task {
+            Ok(Ok(result)) => {
+                total_size += result.size;
+                child_data.push(result);
+            }
+            Ok(Err(err)) => {
+                if walk_failure.is_none() {
+                    walk_failure = Some(err);
+                }
+            }
+            Err(join_error) => task_failure = Err(join_error),
         }
+    }
+    if let Some(err) = walk_failure {
+        return Err(err);
     }
     task_failure.internal("Recursion task failed")?;
 
