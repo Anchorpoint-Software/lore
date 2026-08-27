@@ -9055,6 +9055,158 @@ def test_push_names_parent_branch_for_parent_revision(new_lore_repo):
     )
 
 
+def _remote_branch_entries(repo: Lore) -> list[dict]:
+    """Remote branch list entries for a repository.
+
+    Archived branches are deliberately not requested. The remote leg reports
+    every entry as unarchived and the client asks for archived branches to be
+    excluded, so an archived branch is absent from this list entirely rather than
+    present with a flag set — its absence is the signal, and asking for archived
+    entries would only cost an extra scan.
+
+    Read from JSON rather than the text parser because the text form drops the
+    branch id, and the id is what branch creation shares between a parent branch
+    and the branch it creates in a linked repository.
+    """
+    output = repo.branch_list(json=True)
+    return [
+        e for e in parse_jsonl(output, "branchListEntry") if e["location"] == "remote"
+    ]
+
+
+@pytest.mark.smoke
+def test_link_branch_archive_leaves_child_branch(new_lore_repo):
+    """Archiving a branch in a parent does not remove the linked repository's.
+
+    Branch create cascades into the linked repository using the same branch ID.
+    Archiving in the parent then touches only the parent.
+    """
+    parent, link_repo = _make_parent_with_link(new_lore_repo)
+
+    # Branch create switches the parent onto the new branch and cascades.
+    parent.branch_create("feature")
+    parent_branch_id = parent.branch_info("feature").id
+
+    cascaded = [
+        e for e in _remote_branch_entries(link_repo) if e["name"] == "feature"
+    ]
+    assert len(cascaded) == 1, (
+        f"Branch create should cascade one 'feature' branch into the linked "
+        f"repository, got {cascaded}"
+    )
+    assert cascaded[0]["id"] == parent_branch_id, (
+        f"Cascaded branch should carry the parent branch ID {parent_branch_id}, "
+        f"got {cascaded[0]['id']}"
+    )
+
+    # The current branch cannot be archived, so step off it first.
+    parent.branch_switch("main")
+    parent.branch_archive("feature")
+
+    assert not parent.has_branch("feature"), (
+        "Archived branch should be gone from the parent's branch list"
+    )
+
+    survivor = [
+        e for e in _remote_branch_entries(link_repo) if e["name"] == "feature"
+    ]
+    assert len(survivor) == 1, (
+        f"The linked repository should keep its branch when the parent "
+        f"archives, got {survivor}"
+    )
+    assert survivor[0]["id"] == parent_branch_id, (
+        "The linked branch should be untouched by the parent archive, ID included"
+    )
+
+
+@pytest.mark.smoke
+def test_link_archived_parent_branch_does_not_disturb_link_resolution(new_lore_repo):
+    """An archived parent branch is inert while the linked branch still exists.
+
+    A link is pinned to a revision in the parent's state, not to a branch name,
+    so switch, sync and link resolution never go through the archived branch.
+    """
+    parent, link_repo = _make_parent_with_link(new_lore_repo)
+
+    # A sibling branch to switch through after the archive, so the switch is a
+    # real branch change rather than a switch onto the current branch.
+    parent.branch_create("sibling")
+    parent.branch_switch("main")
+
+    parent.branch_create("feature")
+    parent.write_commit_push(
+        "Commit inside the link mount on feature",
+        {f"{_DEFAULT_LINK_MOUNT}/on-feature.txt": "written on the feature branch\n"},
+    )
+
+    parent.branch_switch("main")
+    parent.branch_archive("feature")
+
+    assert any(e["name"] == "feature" for e in _remote_branch_entries(link_repo)), (
+        "Precondition: the linked branch outlives the parent's archive"
+    )
+
+    # main is unaffected: the link still resolves and its content is present.
+    parent.sync()
+    assert parent.file_exists(f"{_DEFAULT_LINK_MOUNT}/linked.txt"), (
+        "Linked content should still be present on main after archiving another branch"
+    )
+    assert not parent.file_exists(f"{_DEFAULT_LINK_MOUNT}/on-feature.txt"), (
+        "main should see its own pinned revision of the link, not the archived branch's"
+    )
+
+    links = parent.link_list()
+    assert link_repo.get_id() in links, (
+        f"Link should still resolve after the archive: {links}"
+    )
+    assert "[Error]" not in links, f"link list should not report an error: {links}"
+
+    # Switching away and back still works with the archived branch present.
+    parent.branch_switch("sibling")
+    parent.branch_switch("main")
+    assert parent.branch_list().current_branch == "main", (
+        "Branch switch should work with an archived branch present"
+    )
+
+
+@pytest.mark.smoke
+def test_link_stage_move_on_mount_is_refused(new_lore_repo):
+    """Renaming a link mount is refused, and the link survives the attempt.
+
+    `stage move` does not perform the rename itself, so the on-disk move has to
+    happen first; without it the command fails on the missing destination with a
+    generic os error and never reaches any node checks.
+
+    The refusal is not link-aware: it is the generic non-directory guard, which
+    fires because a mount is not a directory node — the same message a plain
+    tracked file produces when moved onto a directory. So the message is not
+    asserted here, and it will change if renaming a mount is ever implemented. The
+    load-bearing assertions are the link registry checks below: the mount is still
+    registered at its original path, and the rename was not recorded.
+    """
+    parent, link_repo = _make_parent_with_link(new_lore_repo)
+
+    parent.move(_DEFAULT_LINK_MOUNT, "vendor/renamed")
+    output = parent.stage_move(_DEFAULT_LINK_MOUNT, "vendor/renamed", check=False)
+
+    assert "[Error]" in output, (
+        f"Renaming a link mount should not succeed, got: {output}"
+    )
+
+    # The link is intact and still registered at its original path.
+    links = parent.link_list()
+    assert link_repo.get_id() in links, (
+        f"Link should survive a refused stage move: {links}"
+    )
+    assert _DEFAULT_LINK_MOUNT in links or _DEFAULT_LINK_MOUNT.replace("/", "\\") in links, (
+        f"Link path should be unchanged after a refused stage move: {links}"
+    )
+    assert "vendor/renamed" not in links and "vendor\\renamed" not in links, (
+        f"The rename should not be recorded against the link: {links}"
+    )
+
+
+
 # ---------------------------------------------------------------------------
 # Link tracking on the thin-client wire.
 # ---------------------------------------------------------------------------

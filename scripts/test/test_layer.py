@@ -2207,3 +2207,41 @@ def test_layer_config_save_replaces_stale_temporary_file(new_lore_repo):
     assert not os.path.exists(temp_path), (
         "The stale temporary file survived the save that should have consumed it"
     )
+
+
+@pytest.mark.smoke
+def test_layer_source_path_inside_link_is_rejected(new_lore_repo):
+    """A layer source path that belongs to a linked repository is refused.
+
+    Three repositories: `target` wants a layer from `middle`, but the path given
+    belongs to `inner`, which `middle` links in. The guard compares the
+    repository owning the resolved source node against the layer repository.
+    """
+    inner: Lore = new_lore_repo()
+    inner.write_commit_push(
+        "Initial inner", {"inner_data/inner.txt": "inner content\n"}
+    )
+
+    middle: Lore = new_lore_repo()
+    middle.write_commit_push("Initial middle", {"middle.txt": "middle content\n"})
+    middle.link_add("linked", inner.get_id(), "inner_data")
+    middle.commit("Middle links inner")
+    middle.push()
+
+    target: Lore = new_lore_repo()
+    target.write_commit_push("Initial target", {"target.txt": "target content\n"})
+
+    # The path has to reach inside the mount. Resolving "linked" alone returns
+    # middle's own link node, so the repository check passes and the later
+    # "must be a directory" guard fires instead. "linked/inner.txt" resolves
+    # through the link into inner, which is the case under test.
+    output = target.layer_add(
+        "linked/inner.txt", middle, "linked/inner.txt", check=False
+    )
+
+    assert "linked repository" in output, (
+        f"Layer source inside a link should be rejected, got: {output}"
+    )
+    assert middle.get_id() not in target.layer_list(), (
+        "No layer should be added when the source path belongs to a linked repository"
+    )
