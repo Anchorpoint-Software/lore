@@ -60,7 +60,7 @@ use crate::revision::sync::SyncRealizeStats;
 use crate::state;
 use crate::state::State;
 use crate::state::StateNodeChildrenWithNameIterator;
-use crate::state::is_file_modified;
+use crate::state::file_modified_against_node;
 use crate::util;
 use crate::util::path::RelativePath;
 use crate::util::path::RelativePathBuf;
@@ -2129,20 +2129,20 @@ pub(crate) async fn stage_node_from_metadata(
                 lore_debug!("Stage node type change to file for node {}", node_link.node);
                 true
             } else {
-                let no_force_hash_check = false;
                 let node_path = relative_path.join(name.as_str());
 
                 let (mtime, size) = crate::util::fs::file_mtime_and_size(&metadata);
-                is_file_modified(
+                file_modified_against_node(
                     repository.clone(),
                     &node,
                     mtime,
                     size,
                     &node_path,
-                    no_force_hash_check,
+                    !node.is_staged(),
                 )
                 .await
                 .forward::<StageError>("Failed to determine if file is modified")?
+                .is_modified()
             };
 
             if stage_file_node {
@@ -2810,14 +2810,19 @@ pub(crate) async fn stage_from_parent_revision(
             );
 
             if node.is_file() {
+                // Restoring to a merge parent leaves content the current revision does not
+                // hold, so the times it lands with state nothing and are dropped.
+                let restored_times = state::RecordedModifiedTimes::default();
                 sync::realize_file(
                     repository.clone(),
                     relative_path.clone(),
                     node,
                     Arc::new(SyncRealizeStats::default()),
+                    &restored_times,
                 )
                 .await
                 .forward::<StageError>("Unable to restore path to selected state")?;
+                restored_times.discard();
 
                 Box::pin(stage_filesystem_path(
                     repository.clone(),
@@ -3201,14 +3206,17 @@ pub(crate) async fn stage_link_paths_from_parent_revision(
                 // `link_context.path` shares the parent's path and
                 // `mount_path` is parent-relative, so realizing through the
                 // link context writes to `<parent>/<mount>/<file>`.
+                let restored_times = state::RecordedModifiedTimes::default();
                 sync::realize_file(
                     group.link_context.clone(),
                     mount_path.clone(),
                     node_t,
                     Arc::new(SyncRealizeStats::default()),
+                    &restored_times,
                 )
                 .await
                 .forward::<StageError>("Unable to restore link path to selected state")?;
+                restored_times.discard();
 
                 Box::pin(stage_filesystem_path(
                     group.link_context.clone(),

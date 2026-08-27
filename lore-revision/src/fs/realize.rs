@@ -60,6 +60,7 @@ use crate::revision::sync::SyncVerifyArgs;
 use crate::revision::sync::SyncVerifyStats;
 use crate::stage;
 use crate::state;
+use crate::state::NodeComparison;
 use crate::state::State;
 use crate::util;
 use crate::util::path::RelativePath;
@@ -325,8 +326,15 @@ pub async fn verify_filesystem(
     filter_mode: FilterMode,
 ) -> Result<Option<NodeChange>, SyncError> {
     lore_trace!("Verify path: {change:?}");
+    // A recorded modified time speaks for the node the current revision holds, so it can only
+    // answer for the from side of a change that starts there.
+    let from_is_current = change.from.state.revision() == state_current.revision();
     let modifications = operation
-        .is_file_modified(repository.clone(), &change, force_full_check)
+        .is_file_modified(
+            repository.clone(),
+            &change,
+            force_full_check || !from_is_current,
+        )
         .await?;
 
     if !modifications.info.exists {
@@ -435,39 +443,55 @@ pub async fn verify_filesystem(
         // file already differs from the from node, so the same comparison is asked again about
         // the to node: measuring against each node's own fragmentation is the only way to tell,
         // and the answer for one says nothing about the other.
-        let differs_from_target = operation
-            .file_modified_from_node(
+        match operation
+            .compare_file_to_node(
                 change.from.repository.clone(),
                 &node_to,
                 &change.path,
-                modifications.info.mtime,
                 file_size,
-                force_full_check,
             )
-            .await?;
+            .await?
+        {
+            NodeComparison::Differs => {
+                if forward_changes {
+                    lore_info!("Keeping modified file as locally modified: {}", change.path);
+                    return Ok(None);
+                }
 
-        if differs_from_target {
-            if forward_changes {
-                lore_info!("Keeping modified file as locally modified: {}", change.path);
+                lore_error!(
+                    "File has local changes: {} (incoming size {} bytes, file system size {} bytes)",
+                    change.path,
+                    node_to.size,
+                    file_size
+                );
+
+                return Err(LocalModifications.into());
+            }
+            // Neither answer was established, so neither may be acted on: dropping the change
+            // would leave the file behind its revision, and reporting local changes would name
+            // the wrong problem.
+            NodeComparison::Unreadable => {
+                return SyncError::internal(format!(
+                    "Failed to read {} to compare it against the incoming revision",
+                    change.path
+                ))
+                .emit();
+            }
+            NodeComparison::Matches => {
+                lore_trace!(
+                    "File {} already holds the incoming content, nothing to realize",
+                    change.path
+                );
+
+                operation.record_modified_time(
+                    &change.from.repository,
+                    &change.path,
+                    modifications.info.mtime,
+                );
+
                 return Ok(None);
             }
-
-            lore_error!(
-                "File has local changes: {} (incoming size {} bytes, file system size {} bytes)",
-                change.path,
-                node_to.size,
-                file_size
-            );
-
-            return Err(LocalModifications.into());
         }
-
-        lore_trace!(
-            "File {} already holds the incoming content, nothing to realize",
-            change.path
-        );
-
-        return Ok(None);
     }
 
     // At this point the local file system has a directory
@@ -904,6 +928,11 @@ pub async fn realize_scratch_file(
     Ok(())
 }
 
+/// Writes `node`'s content to the path `node` occupies, and records the modified time it
+/// lands with.
+///
+/// Writing the file is what establishes that the path holds the node's content, so this is
+/// where that is recorded rather than anywhere it is merely observed to be true.
 pub async fn realize_file(
     repository: Arc<RepositoryContext>,
     operation: Arc<InstanceOperationImpl>,
@@ -911,12 +940,42 @@ pub async fn realize_file(
     node: Node,
     stats: Arc<SyncRealizeStats>,
 ) -> Result<(), SyncError> {
+    let info = write_node_to_path(&repository, &operation, path, &node, &stats).await?;
+    operation.record_modified_time(&repository, path.relative(), info.mtime);
+    Ok(())
+}
+
+/// Writes `node`'s content to a path beside the file it belongs to, such as the mine, theirs
+/// and base copies a conflicted merge leaves behind.
+///
+/// Records no modified time: the cache states which node a path holds, and these paths hold
+/// none.
+pub async fn realize_sidecar_file(
+    repository: Arc<RepositoryContext>,
+    operation: Arc<InstanceOperationImpl>,
+    path: &RepositoryPath,
+    node: Node,
+    stats: Arc<SyncRealizeStats>,
+) -> Result<(), SyncError> {
+    write_node_to_path(&repository, &operation, path, &node, &stats).await?;
+    Ok(())
+}
+
+/// Writes `node`'s content to `path`, creating the parent directory and applying the node's
+/// mode, and reports what the file looks like once written.
+async fn write_node_to_path(
+    repository: &Arc<RepositoryContext>,
+    operation: &Arc<InstanceOperationImpl>,
+    path: &RepositoryPath,
+    node: &Node,
+    stats: &Arc<SyncRealizeStats>,
+) -> Result<super::filesystem_provider::FileInfo, SyncError> {
     let mut parent_path = path.relative().clone();
     parent_path.pop();
     if parent_path != *path.relative() {
         operation
             .create_dir_all(FilesystemPath::Repository(&RepositoryPath::from_relative(
-                &repository,
+                repository,
                 parent_path,
             )?))
             .await?;
@@ -926,7 +985,7 @@ pub async fn realize_file(
         operation
             .set_file_to_immutable_store_contents(
                 repository.clone(),
-                &node,
+                node,
                 FilesystemPath::Repository(path),
             )
             .await
@@ -961,7 +1020,7 @@ pub async fn realize_file(
         .bytes_update
         .fetch_add(node.size, Ordering::Relaxed);
 
-    Ok(())
+    Ok(info)
 }
 
 fn progress_ticker(stats: Arc<SyncRealizeStats>) -> AbortOnDropHandle<()> {
@@ -1460,6 +1519,7 @@ async fn realize_change_modify_add(
                 operation: link_operation,
                 options: Arc::default(),
                 stats: Arc::default(),
+                modified_times: Arc::new(crate::state::RecordedModifiedTimes::default()),
             };
             clone::clone_node(clone_ctx, link_storage, clone_path, node.child)
                 .await
@@ -1805,7 +1865,7 @@ async fn realize_file_merge(
                 if node_to.is_directory() {
                     lore_trace!("Change from is a directory, no theirs file");
                 } else if node_to.is_file() {
-                    realize_file(
+                    realize_sidecar_file(
                         repository.clone(),
                         operation.clone(),
                         &theirs_path,
@@ -1848,7 +1908,7 @@ async fn realize_file_merge(
                             .await
                             .forward::<SyncError>("Failed deserializing state node block")?
                             .node(Node::index(change_from.from.node));
-                        realize_file(
+                        realize_sidecar_file(
                             repository.clone(),
                             operation.clone(),
                             &base_path,
@@ -1958,7 +2018,7 @@ async fn realize_file_merge(
                             .forward::<SyncError>("Failed deserializing state node block")?
                             .node(Node::index(change_from.from.node));
                         if node_from.is_file() {
-                            realize_file(
+                            realize_sidecar_file(
                                 repository.clone(),
                                 operation.clone(),
                                 &base_path,

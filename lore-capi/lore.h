@@ -2092,6 +2092,10 @@ typedef struct lore_repository_status_summary_event_data_t {
   uint64_t moves;
   // Number of files copied.
   uint64_t copies;
+  // Number of files the answer required reading, including any that could not be read.
+  uint64_t hash_checks;
+  // Number of files a recorded modified time answered for, sparing them a hash check.
+  uint64_t mtime_matches;
 } lore_repository_status_summary_event_data_t;
 
 // Result of a query against the immutable store for a single fragment.

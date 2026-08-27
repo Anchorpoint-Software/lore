@@ -14,7 +14,6 @@ use dashmap::DashMap;
 use dashmap::DashSet;
 use dashmap::Entry;
 use lore_base::lore_spawn;
-use lore_base::lore_spawn_guarded;
 use lore_error_set::prelude::*;
 use serde::Deserialize;
 use serde::Serialize;
@@ -66,9 +65,10 @@ use crate::repository::RepositoryConfig;
 use crate::repository::StoreConfig;
 use crate::revision;
 use crate::state;
+use crate::state::FileModification;
 use crate::state::State;
 use crate::state::StateNodeChildrenWithNameIterator;
-use crate::state::is_file_modified;
+use crate::state::file_modification;
 use crate::util;
 use crate::util::path::RelativePath;
 use crate::util::path::RepositoryPath;
@@ -298,7 +298,6 @@ impl Default for CloneStats {
 
 /// Number of pending mtime writes that triggers a batch flush from
 /// `clone_execute`'s stack-local buffer.
-const CLONE_MTIME_BATCH_SIZE: usize = 256;
 
 #[derive(Default)]
 pub struct CloneOptions {
@@ -630,6 +629,7 @@ async fn process_block_item(
                     operation: dispatcher.operation.clone(),
                     options: dispatcher.options.clone(),
                     stats: dispatcher.stats.clone(),
+                    modified_times: Arc::new(crate::state::RecordedModifiedTimes::default()),
                 };
                 let link_tx = dispatcher.file_tx.clone();
                 lore_spawn!(async move {
@@ -1231,6 +1231,7 @@ pub async fn clone(
             operation: operation.clone(),
             stats: stats.clone(),
             options: Arc::new(options),
+            modified_times: Arc::new(crate::state::RecordedModifiedTimes::default()),
         },
         layers,
         remote.clone(),
@@ -1278,6 +1279,8 @@ pub struct CloneContext {
     pub operation: Arc<InstanceOperationImpl>,
     pub options: Arc<CloneOptions>,
     pub stats: Arc<CloneStats>,
+    /// Times of the files this clone writes, recorded once it has written them all.
+    pub modified_times: Arc<state::RecordedModifiedTimes>,
 }
 
 async fn clone_materialize(
@@ -1610,13 +1613,9 @@ pub async fn clone_execute(
     let stats = ctx.stats.clone();
     // Permit cap grows monotonically with queue depth; unused permits cost nothing. Starts from whatever caller configured (default CLONE_FILE_DISCOVERY).
     let mut current_permits = stats.file_inflight.available_permits();
-    // Stack-local mtime batch: each `clone_file` returns its (key, mtime) pair
-    // (or None for retain/dry-run/zero-byte cases) on completion; we collect
-    // them as we drain the JoinSet and fire-and-forget a batched mutable-store
-    // write when the buffer hits CLONE_MTIME_BATCH_SIZE. No shared lock.
-    let mut mtime_batch: Vec<(Hash, u64)> = Vec::with_capacity(CLONE_MTIME_BATCH_SIZE);
-    let mtime_partition = repository.id;
-    let mtime_store = repository.try_mutable_store_arc();
+    // Each `clone_file` returns its (key, mtime) pair, or None for the retain, dry run and
+    // zero byte cases, and they are collected as the JoinSet drains.
+    let modified_times = ctx.modified_times.clone();
 
     while let Some(item) = rx.recv().await {
         // Target = queue backlog + headroom so the next recv never stalls on acquire; jump to max once discovery is done and no more items will arrive.
@@ -1658,19 +1657,7 @@ pub async fn clone_execute(
                 .map_err(|e| CloneError::internal_with_context(e, "Recursion task failed"))
                 .and_then(|r| r)
             {
-                Ok(Some(entry)) => {
-                    mtime_batch.push(entry);
-                    if mtime_batch.len() >= CLONE_MTIME_BATCH_SIZE
-                        && let Some(store) = mtime_store.clone()
-                    {
-                        let drained = std::mem::take(&mut mtime_batch);
-                        lore_spawn_guarded!(state::file_modified_time_store_batch(
-                            store,
-                            mtime_partition,
-                            drained,
-                        ));
-                    }
-                }
+                Ok(Some(entry)) => modified_times.push(entry),
                 Ok(None) => {}
                 Err(err) => failure = failure.or(Some(err)),
             }
@@ -1685,22 +1672,13 @@ pub async fn clone_execute(
             .map_err(|e| CloneError::internal_with_context(e, "Recursion task failed"))
             .and_then(|r| r)
         {
-            Ok(Some(entry)) => mtime_batch.push(entry),
+            Ok(Some(entry)) => modified_times.push(entry),
             Ok(None) => {}
             Err(err) => failure = failure.or(Some(err)),
         }
     }
 
-    // Flush any remaining mtimes that didn't fill a threshold batch.
-    if !mtime_batch.is_empty()
-        && let Some(store) = mtime_store
-    {
-        lore_spawn_guarded!(state::file_modified_time_store_batch(
-            store,
-            mtime_partition,
-            mtime_batch,
-        ));
-    }
+    modified_times.store(repository.clone()).await;
 
     if let Some(err) = failure {
         execution_context()
@@ -1866,18 +1844,22 @@ async fn clone_file(
             return Ok(None);
         }
 
-        // Check if the existing file matches what we will realize from state
-        if !is_file_modified(
-            repository.clone(),
-            &node,
-            file_info.mtime,
-            file_info.size,
-            repository_path.relative(),
-            force,
-        )
-        .await
-        .unwrap_or(true)
-        {
+        // Check if the existing file matches what we will realize from state. Only an
+        // established match retains the file: a file that cannot be read settles nothing, and
+        // keeping it would leave content nobody compared standing in for the node.
+        let matches_node = matches!(
+            file_modification(
+                repository.clone(),
+                &node,
+                file_info.mtime,
+                file_info.size,
+                repository_path.relative(),
+                force,
+            )
+            .await,
+            Ok(FileModification::UnmodifiedByMtime | FileModification::UnmodifiedByHash)
+        );
+        if matches_node {
             // Existing file is identical, just use it
             let node_executable = node.mode & NodeFileMode::Executable == NodeFileMode::Executable;
             if node_executable != file_info.executable {
@@ -1898,7 +1880,11 @@ async fn clone_file(
             lore_trace!("Retain {}", repository_path.absolute().display());
             stats.complete.file_retain.fetch_add(1, Ordering::Relaxed);
             stats.complete.file_complete.fetch_add(1, Ordering::Relaxed);
-            return Ok(None);
+            return Ok(Some(state::file_modified_time_entry(
+                &repository,
+                repository_path.relative(),
+                file_info.mtime,
+            )));
         }
         if !force {
             lore_error!(
@@ -2018,14 +2004,12 @@ async fn clone_file(
         // (`clone_execute`) collects pairs in a stack-local buffer and
         // fire-and-forgets a batched mutable-store write when the buffer fills,
         // so each `clone_file` task avoids awaiting its own bucket write.
-        let key = state::file_modified_time_key(
-            repository.salt(),
-            repository.instance_id,
-            repository_path.relative(),
-        );
-
         stats.complete.file_complete.fetch_add(1, Ordering::Relaxed);
-        return Ok(Some((key, file_info.mtime)));
+        return Ok(Some(state::file_modified_time_entry(
+            &repository,
+            repository_path.relative(),
+            file_info.mtime,
+        )));
     }
 
     stats.complete.file_complete.fetch_add(1, Ordering::Relaxed);
@@ -2040,15 +2024,12 @@ async fn spawn_clone_file(
     repository_path: RepositoryPath,
 ) {
     let spawn_ctx = ctx.clone();
-    let CloneContext {
-        repository, stats, ..
-    } = ctx;
+    let CloneContext { stats, .. } = ctx;
     let permit = Arc::clone(&stats.file_inflight)
         .acquire_owned()
         .await
         .expect("file_inflight semaphore closed unexpectedly");
-    let mtime_partition = repository.id;
-    let mtime_store = repository.try_mutable_store_arc();
+    let modified_times = spawn_ctx.modified_times.clone();
     lore_spawn!(tasks, async move {
         let _permit = permit;
         stats.complete.file_count.fetch_add(1, Ordering::Relaxed);
@@ -2059,15 +2040,8 @@ async fn spawn_clone_file(
         // workload, so just inline-store the mtime here. Result is squashed
         // back to `()` so the JoinSet shape stays the same as elsewhere.
         match result {
-            Ok(Some((key, mtime))) => {
-                if let Some(store) = mtime_store {
-                    state::file_modified_time_store_batch(
-                        store,
-                        mtime_partition,
-                        vec![(key, mtime)],
-                    )
-                    .await;
-                }
+            Ok(Some(entry)) => {
+                modified_times.push(entry);
                 Ok(())
             }
             Ok(None) => Ok(()),

@@ -5830,6 +5830,10 @@ pub struct FilesystemDiffStats {
     pub file_delete: AtomicU64,
     pub file_retain: AtomicU64,
     pub file_replace: AtomicU64,
+    /// Files the answer required reading, including any that could not be read.
+    pub file_hash: AtomicU64,
+    /// Files a recorded modified time answered for, sparing them a hash check.
+    pub file_mtime_match: AtomicU64,
 }
 
 impl FilesystemDiffStats {
@@ -5844,6 +5848,25 @@ impl FilesystemDiffStats {
             stats.file_replace.load(Ordering::Relaxed),
             Ordering::Relaxed,
         );
+        self.file_hash
+            .fetch_add(stats.file_hash.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.file_mtime_match.fetch_add(
+            stats.file_mtime_match.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Record what settled a file's comparison. A size mismatch counts as neither.
+    pub fn classify(&self, modification: &FileModification) {
+        match modification.answered_by() {
+            ComparisonAnswer::Mtime => {
+                self.file_mtime_match.fetch_add(1, Ordering::Relaxed);
+            }
+            ComparisonAnswer::Hash => {
+                self.file_hash.fetch_add(1, Ordering::Relaxed);
+            }
+            ComparisonAnswer::Size => {}
+        }
     }
 }
 
@@ -6266,6 +6289,7 @@ async fn compare_single_file_against_state(
     current_node: Option<&Node>,
     file_metadata: &std::fs::Metadata,
     file_path: &RelativePath,
+    stats: &FilesystemDiffStats,
 ) -> Result<SingleFileCompareResult, StateError> {
     let Some(from_node) = from_node else {
         // No state node - this is a new file
@@ -6297,17 +6321,18 @@ async fn compare_single_file_against_state(
             current_node.is_none_or(|n| n.address.hash != from_node.address.hash);
 
         let (file_mtime, file_size) = util::fs::file_mtime_and_size(file_metadata);
-        let modified = is_file_modified(
+        let modification = file_modified_against_node(
             repository,
             from_node,
             file_mtime,
             file_size,
             file_path,
-            force_hash_check,
+            !force_hash_check,
         )
         .await?;
+        stats.classify(&modification);
 
-        if modified {
+        if modification.is_modified() {
             return Ok(SingleFileCompareResult::Modified);
         }
     }
@@ -7101,6 +7126,7 @@ async fn diff_filesystem_directory_walk(
                 current_node_ref,
                 &item.metadata,
                 &item_path,
+                stats,
             )
             .await?;
 
@@ -7677,6 +7703,7 @@ async fn diff_filesystem_single_file(
         current_node.as_ref(),
         &file_item.metadata,
         &ctx.filesystem_path,
+        &stats,
     )
     .await?;
 
@@ -7817,31 +7844,139 @@ pub async fn count_staged_files(
 }
 
 // TODO(UCS-13059): Extend with file mode check
-/// Whether the file on disk differs from the content `node` addresses.
+/// Outcome of comparing a file on disk to the content a node addresses.
+pub enum NodeComparison {
+    /// The file holds the node's content.
+    Matches,
+    /// The file differs from the node, or the stored object could not be described or walked
+    /// well enough to tell. Nothing was established in the latter case, and treating it as a
+    /// match would let a real local change be overwritten.
+    Differs,
+    /// The file could not be read, which a scan running alongside a branch switch sees
+    /// whenever one is deleted under it.
+    Unreadable,
+}
+
+/// Whether the file on disk holds the content `node` addresses.
 ///
-/// Size and modification time answer first where they can. Beyond that the file is measured
-/// against the stored object's own fragmentation, which is the only comparison that holds:
-/// a commit may reuse a previous fragmentation, so the stored hash is a function of the
-/// content and of how it came to be chunked, and re-hashing the content from scratch does
-/// not reproduce it.
+/// The file is measured against the stored object's own fragmentation, which is the only
+/// comparison that holds: a commit may reuse a previous fragmentation, so the stored hash is
+/// a function of the content and of how it came to be chunked, and re-hashing the content
+/// from scratch does not reproduce it.
 ///
 /// Fetches fragment metadata but never content payloads, so the cost is bounded by the file
-/// however large the stored object is. When the stored object cannot be described or walked
-/// the file is reported modified: nothing was established, and treating it as unmodified
-/// would let a real local change be overwritten.
-pub async fn is_file_modified(
+/// however large the stored object is. Reads no recorded modification time and records none:
+/// a recorded time speaks for the current revision's node, and this answers about any node.
+pub async fn file_matches_node(
+    repository: Arc<RepositoryContext>,
+    node: &Node,
+    file_size: u64,
+    file_path: &RelativePath,
+) -> Result<NodeComparison, StateError> {
+    if file_size != node.size {
+        lore_trace!("File {file_path} size differs from node, differs");
+        return Ok(NodeComparison::Differs);
+    }
+
+    let absolute_path = file_path.to_absolute_path(repository.require_path()?);
+    let matches = immutable::file_matches(
+        repository,
+        &absolute_path,
+        node.address,
+        Some(node.size as usize),
+    )
+    .await;
+
+    match matches {
+        Ok(lore_storage::FileMatch::Match) => {
+            lore_trace!("File {file_path} matches stored content");
+            Ok(NodeComparison::Matches)
+        }
+        Ok(lore_storage::FileMatch::Differs) => {
+            lore_trace!("File {file_path} differs from stored content");
+            Ok(NodeComparison::Differs)
+        }
+        Ok(lore_storage::FileMatch::Indeterminate) => {
+            lore_trace!("File {file_path} could not be compared, treated as differing");
+            Ok(NodeComparison::Differs)
+        }
+        Err(_) => {
+            lore_trace!("File {file_path} could not be read");
+            Ok(NodeComparison::Unreadable)
+        }
+    }
+}
+
+/// How a file compared to the node it was measured against, and what answered it.
+pub enum FileModification {
+    /// The recorded modified time vouched for the file, which was never read.
+    UnmodifiedByMtime,
+    /// A hash check established that the file holds the node's content.
+    UnmodifiedByHash,
+    /// The file could not be read, which a scan running alongside a branch switch sees
+    /// whenever one is deleted under it. Reported unmodified so a routine deletion does not
+    /// look like a local change, and never recorded: nothing was established.
+    Unreadable,
+    /// The size differs from the node's, which settles it without a hash check.
+    ModifiedBySize,
+    /// A hash check established that the file differs from the node.
+    ModifiedByHash,
+}
+
+/// What settled a file comparison, which is what the size and hash counters report.
+pub enum ComparisonAnswer {
+    /// The size differed from the node's, settling it without reading either the recorded
+    /// time or the file.
+    Size,
+    /// A recorded modified time vouched for the file, which was never read.
+    Mtime,
+    /// The file had to be read to answer, whether or not the read succeeded.
+    Hash,
+}
+
+impl FileModification {
+    /// Whether the file differs from the node.
+    pub fn is_modified(&self) -> bool {
+        matches!(
+            self,
+            FileModification::ModifiedBySize | FileModification::ModifiedByHash
+        )
+    }
+
+    /// What settled the comparison.
+    pub fn answered_by(&self) -> ComparisonAnswer {
+        match self {
+            FileModification::ModifiedBySize => ComparisonAnswer::Size,
+            FileModification::UnmodifiedByMtime => ComparisonAnswer::Mtime,
+            FileModification::UnmodifiedByHash
+            | FileModification::ModifiedByHash
+            | FileModification::Unreadable => ComparisonAnswer::Hash,
+        }
+    }
+}
+
+/// How the file on disk compares to the content `node` addresses.
+///
+/// Size and the recorded modification time answer first where they can, and comparing the
+/// content answers the rest. A recorded time speaks for the node the current revision holds
+/// and no other, so a caller asking about a different node sets `force_check_hash`, or else
+/// knows that no time can have been recorded for the path.
+///
+/// Records nothing. Whether an observed match is worth recording depends on which node was
+/// asked about, which only the caller knows.
+pub async fn file_modification(
     repository: Arc<RepositoryContext>,
     node: &Node,
     file_mtime: u64,
     file_size: u64,
     file_path: &RelativePath,
     force_check_hash: bool,
-) -> Result<bool, StateError> {
+) -> Result<FileModification, StateError> {
     // Assume files are identical if size and timestamp match
     let node_size = node.size;
     if file_size != node_size {
         lore_trace!("File {file_path} size changed, modified");
-        return Ok(true);
+        return Ok(FileModification::ModifiedBySize);
     }
 
     let node_mtime = if !force_check_hash {
@@ -7851,42 +7986,187 @@ pub async fn is_file_modified(
     };
     if file_mtime == node_mtime {
         lore_trace!("File {file_path} unmodified, size {file_size} and mtime {file_mtime} match");
-        return Ok(false);
+        return Ok(FileModification::UnmodifiedByMtime);
     }
 
     lore_trace!(
         "Hash check file {file_path} - file size {file_size} node size {node_size}, file mtime {file_mtime}, node mtime {node_mtime}, force {force_check_hash}"
     );
-    let absolute_path = file_path.to_absolute_path(repository.require_path()?);
-    let matches = immutable::file_matches(
-        repository.clone(),
-        &absolute_path,
-        node.address,
-        Some(node.size as usize),
-    )
-    .await;
 
-    match matches {
-        Ok(lore_storage::FileMatch::Match) => {
-            lore_trace!("File {file_path} unmodified, matches stored content");
-            file_modified_time_store(repository.clone(), file_path, file_mtime).await;
-            Ok(false)
+    Ok(
+        match file_matches_node(repository, node, file_size, file_path).await? {
+            NodeComparison::Matches => FileModification::UnmodifiedByHash,
+            NodeComparison::Differs => FileModification::ModifiedByHash,
+            NodeComparison::Unreadable => FileModification::Unreadable,
+        },
+    )
+}
+
+/// How the file on disk compares to `node`, recording the modified time when a hash check is
+/// what established the match.
+///
+/// `node_is_current` states that `node` is the one the current revision holds at this path,
+/// and gates both halves: a recorded time speaks for that node alone, so it can neither
+/// answer for any other node nor be written from a match against one. Recording here is what
+/// spares the next scan the hash check this one just paid for.
+pub async fn file_modified_against_node(
+    repository: Arc<RepositoryContext>,
+    node: &Node,
+    file_mtime: u64,
+    file_size: u64,
+    file_path: &RelativePath,
+    node_is_current: bool,
+) -> Result<FileModification, StateError> {
+    let modification = file_modification(
+        repository.clone(),
+        node,
+        file_mtime,
+        file_size,
+        file_path,
+        !node_is_current,
+    )
+    .await?;
+
+    if node_is_current && matches!(modification, FileModification::UnmodifiedByHash) {
+        file_modified_time_store(repository, file_path, file_mtime).await;
+    }
+
+    Ok(modification)
+}
+
+/// Modified times collected by an operation, to be recorded once it has completed.
+///
+/// An entry states that a path held the current revision's content at that time. Recording
+/// as each file is handled would publish that before it is true and, worse, would vouch for
+/// a time the next write can still share, so entries are collected and written at the end by
+/// [`store`](Self::store). An operation that leaves the current revision elsewhere calls
+/// [`discard`](Self::discard).
+#[must_use]
+#[derive(Default)]
+pub struct RecordedModifiedTimes(Box<crossbeam::queue::SegQueue<(Hash, u64)>>);
+
+impl RecordedModifiedTimes {
+    /// Collects the entry recording that `path` held `repository`'s current content at
+    /// `mtime`.
+    pub fn record(&self, repository: &RepositoryContext, path: &RelativePath, mtime: u64) {
+        self.0
+            .push(file_modified_time_entry(repository, path, mtime));
+    }
+
+    /// Writes the collected times into `repository`'s mutable store, one task per store group.
+    ///
+    /// The store takes its write lock within the group a key's first byte selects, so
+    /// splitting the times by that byte lets every task run without ever contending with
+    /// another.
+    ///
+    /// Returns only once the filesystem stamps later than every time written, so that none of
+    /// them can be shared by a write that follows. See [`wait_until_settled`].
+    pub async fn store(&self, repository: Arc<RepositoryContext>) {
+        let mut times = Vec::with_capacity(self.0.len());
+        let mut mtime_max = 0;
+        while let Some((key, mtime)) = self.0.pop() {
+            mtime_max = mtime_max.max(mtime);
+            times.push((key, mtime));
         }
-        Ok(lore_storage::FileMatch::Differs) => {
-            lore_trace!("File {file_path} differs from stored content, modified");
-            Ok(true)
+        if times.is_empty() || execution_context().globals().dry_run() {
+            return;
         }
-        Ok(lore_storage::FileMatch::Indeterminate) => {
-            lore_trace!("File {file_path} could not be compared, treated as modified");
-            Ok(true)
+        let Some(store) = repository.try_mutable_store_arc() else {
+            return;
+        };
+
+        let mut groups = vec![Vec::new(); lore_storage::local::mutable_store::GROUP_COUNT];
+        for (key, mtime) in times {
+            groups[key.data()[0] as usize].push((key, mtime));
         }
-        // The file itself could not be read, which a scan running alongside a branch switch
-        // sees whenever one is deleted under it. Reporting it modified would make a routine
-        // race look like local changes, so it is left to the next scan that can read it.
-        Err(_) => {
-            lore_trace!("File {file_path} could not be read, consider unmodified");
-            Ok(false)
+
+        let mut tasks = JoinSet::new();
+        for items in groups {
+            if items.is_empty() {
+                continue;
+            }
+            lore_spawn!(tasks, {
+                let store = store.clone();
+                let partition = repository.id;
+                async move {
+                    file_modified_time_store_group(store, partition, items).await;
+                }
+            });
         }
+        while tasks.join_next().await.is_some() {}
+
+        wait_until_settled(&repository, mtime_max).await;
+    }
+
+    /// Collects an entry built by [`file_modified_time_entry`], for a caller that computed
+    /// the key where it had the path rather than where it records.
+    pub fn push(&self, entry: (Hash, u64)) {
+        self.0.push(entry);
+    }
+
+    /// Moves the times collected by `other` into this collector.
+    pub fn absorb(&self, other: Self) {
+        while let Some(entry) = other.0.pop() {
+            self.0.push(entry);
+        }
+    }
+
+    /// Removes the times collected so far, leaving the collector empty.
+    pub fn take(&self) -> Self {
+        let taken = Self::default();
+        while let Some(entry) = self.0.pop() {
+            taken.0.push(entry);
+        }
+        taken
+    }
+
+    /// Drops the times, for an operation that leaves the current revision elsewhere.
+    pub fn discard(&self) {
+        while self.0.pop().is_some() {}
+    }
+}
+
+/// Name of the file stamped to read the working copy's own clock.
+const MODIFIED_TIME_PROBE: &str = "mtime-probe";
+
+/// The time the working copy's filesystem is currently stamping writes with.
+///
+/// A file's modified time comes from a clock the filesystem advances on its own schedule and
+/// at its own resolution, which the process clock runs ahead of. Comparing a recorded time
+/// against [`std::time::SystemTime::now`] therefore always finds it older, however recently
+/// the file was written. Stamping a file and reading it back asks the filesystem instead, so
+/// the answer is on the scale the comparison needs.
+///
+/// `None` when the working copy cannot be stamped, which leaves a caller no way to tell a
+/// settled time from one a further write can still share.
+pub async fn filesystem_stamp_now(repository: &RepositoryContext) -> Option<u64> {
+    let path = repository
+        .require_path()
+        .ok()?
+        .join(repository.format.dot_dir())
+        .join(MODIFIED_TIME_PROBE);
+    let metadata = lore_io::IoDriver::global()
+        .write_file_bytes(&path, bytes::Bytes::from_static(&[0u8]), false)
+        .await
+        .ok()?;
+    Some(crate::util::fs::file_mtime(&metadata))
+}
+
+/// Waits until the working copy's filesystem stamps later than `mtime_max`.
+///
+/// A file carrying the stamp the filesystem is still handing out can be written again without
+/// that stamp changing, so a time recorded for it cannot tell the two states apart. Holding
+/// the operation open until the filesystem has moved past every time it recorded leaves all
+/// of them able to, at the cost of at most the tick the filesystem is currently in.
+///
+/// Returns without waiting when the working copy cannot be stamped, which leaves no way to
+/// tell whether the times have settled.
+pub async fn wait_until_settled(repository: &RepositoryContext, mtime_max: u64) {
+    while let Some(stamp) = filesystem_stamp_now(repository).await {
+        if mtime_max < stamp {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
     }
 }
 
@@ -7902,6 +8182,19 @@ pub fn file_modified_time_key(salt: &[u8], instance: InstanceId, path: &Relative
         FILE_MTIME,
         instance.data(),
         path.as_lowercase_str().as_bytes(),
+    )
+}
+
+/// The entry recording that `path` held the current revision's content at `mtime`, for a
+/// caller collecting entries to write in one batch rather than one at a time.
+pub fn file_modified_time_entry(
+    repository: &RepositoryContext,
+    path: &RelativePath,
+    mtime: u64,
+) -> (Hash, u64) {
+    (
+        file_modified_time_key(repository.salt(), repository.instance_id, path),
+        mtime,
     )
 }
 
@@ -7924,12 +8217,19 @@ pub async fn file_modified_time(repository: Arc<RepositoryContext>, path: &Relat
     mtime
 }
 
+/// Records that `path` held the current revision's content at `mtime`.
+///
+/// A dry run records nothing: it leaves the current revision where it was, so no time it
+/// takes describes the revision the working copy is on.
 pub async fn file_modified_time_store(
     repository: Arc<RepositoryContext>,
     path: &RelativePath,
     mtime: u64,
 ) {
     lore_trace!("Store mtime {mtime} for {path}");
+    if execution_context().globals().dry_run() {
+        return;
+    }
     let Some(handle) = repository.try_write_mutable_store() else {
         return;
     };
@@ -7939,11 +8239,10 @@ pub async fn file_modified_time_store(
         .await;
 }
 
-/// Batch-write a collection of pre-computed `(mtime_key, mtime)` pairs into the
-/// mutable store. Used by the clone hot path so each `clone_file` task can drop
-/// its mtime into a shared buffer and a single fire-and-forget task issues the
-/// store calls instead of every task awaiting its own bucket lock inline.
-pub async fn file_modified_time_store_batch(
+/// Writes one store group's worth of pre-computed `(mtime_key, mtime)` pairs.
+///
+/// Every entry belongs to the same group, so the calls contend with no other group's task.
+async fn file_modified_time_store_group(
     store: Arc<dyn crate::store::MutableStore>,
     partition: RepositoryId,
     items: Vec<(Hash, u64)>,

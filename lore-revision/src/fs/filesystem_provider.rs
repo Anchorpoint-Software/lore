@@ -24,6 +24,8 @@ use crate::node::Node;
 use crate::node::NodeID;
 use crate::repository::RepositoryContext;
 use crate::state::FilesystemDiffStats;
+use crate::state::NodeComparison;
+use crate::state::RecordedModifiedTimes;
 use crate::state::State;
 use crate::util::path::RelativePath;
 use crate::util::path::RepositoryPath;
@@ -208,19 +210,21 @@ pub trait InstanceOperation: Send + Sync {
         node_hint: Option<&Node>,
     ) -> impl Future<Output = Result<Hash, FsError>> + Send;
 
-    /// Whether the file at `path` differs from the content `node` addresses.
+    /// How the file at `path` compares to the content `node` addresses.
     ///
     /// Takes the node to compare against rather than deriving it from a change, so a caller
-    /// holding both sides of a change can ask about either.
-    fn file_modified_from_node(
+    /// holding both sides of a change can ask about either. Compares content rather than
+    /// consulting a recorded modification time, which speaks only for the current revision's
+    /// node and so cannot answer for the other side of a change. A file that cannot be read
+    /// is reported as such rather than as either answer, so a caller does not act on a
+    /// comparison that never happened.
+    fn compare_file_to_node(
         &self,
         repository: Arc<RepositoryContext>,
         node: &Node,
         path: &RelativePath,
-        file_mtime: u64,
         file_size: u64,
-        force_full_check: bool,
-    ) -> impl Future<Output = Result<bool, FsError>> + Send;
+    ) -> impl Future<Output = Result<NodeComparison, FsError>> + Send;
 
     /// Make a file executable (Unix) or set executable bit equivalent.
     ///
@@ -321,6 +325,7 @@ type AssociatedOperation = (Arc<RepositoryContext>, Arc<InstanceOperationImpl>);
 pub struct InstanceOperationImpl {
     dispatch: StaticDispatchInstanceOperation,
     associated_operations: RwLock<Option<Vec<AssociatedOperation>>>,
+    modified_times: RecordedModifiedTimes,
 }
 
 impl InstanceOperationImpl {
@@ -328,7 +333,25 @@ impl InstanceOperationImpl {
         Self {
             dispatch,
             associated_operations: RwLock::new(Some(Vec::new())),
+            modified_times: RecordedModifiedTimes::default(),
         }
+    }
+
+    /// Collects that `path` holds the content of the node written there, for a caller that
+    /// knows which revision the operation leaves current.
+    pub fn record_modified_time(
+        &self,
+        repository: &RepositoryContext,
+        path: &RelativePath,
+        mtime: u64,
+    ) {
+        self.modified_times.record(repository, path, mtime);
+    }
+
+    /// Takes the times collected so far. Times left behind are dropped with the operation,
+    /// which is what an operation that does not know its resulting revision wants.
+    pub fn take_modified_times(&self) -> RecordedModifiedTimes {
+        self.modified_times.take()
     }
 
     pub async fn associated_operation(
@@ -445,28 +468,19 @@ impl InstanceOperation for InstanceOperationImpl {
         }
     }
 
-    async fn file_modified_from_node(
+    async fn compare_file_to_node(
         &self,
         repository: Arc<RepositoryContext>,
         node: &Node,
         path: &RelativePath,
-        file_mtime: u64,
         file_size: u64,
-        force_full_check: bool,
-    ) -> Result<bool, FsError> {
+    ) -> Result<NodeComparison, FsError> {
         match &self.dispatch {
             #[cfg(test)]
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
             StaticDispatchInstanceOperation::Os(this) => {
-                this.file_modified_from_node(
-                    repository,
-                    node,
-                    path,
-                    file_mtime,
-                    file_size,
-                    force_full_check,
-                )
-                .await
+                this.compare_file_to_node(repository, node, path, file_size)
+                    .await
             }
         }
     }
@@ -618,6 +632,7 @@ pub mod tests {
     use crate::repository::test_helpers::RepositoryContextCreationArgsExt;
     use crate::repository::test_helpers::default_repository_creation_args;
     use crate::state::FilesystemDiffStats;
+    use crate::state::NodeComparison;
     use crate::state::State;
     use crate::util::path::RelativePath;
 
@@ -693,15 +708,13 @@ pub mod tests {
             panic!("Test operation unimplemented except finalize")
         }
 
-        async fn file_modified_from_node(
+        async fn compare_file_to_node(
             &self,
             _repository: Arc<RepositoryContext>,
             _node: &Node,
             _path: &RelativePath,
-            _file_mtime: u64,
             _file_size: u64,
-            _force_full_check: bool,
-        ) -> Result<bool, FsError> {
+        ) -> Result<NodeComparison, FsError> {
             panic!("Test operation unimplemented except finalize")
         }
 

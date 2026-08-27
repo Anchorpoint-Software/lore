@@ -433,6 +433,7 @@ pub async fn add(
         operation: operation.clone(),
         options: Arc::default(),
         stats: stats.clone(),
+        modified_times: Arc::new(crate::state::RecordedModifiedTimes::default()),
     };
 
     clone::clone_node(clone_ctx, storage, clone_path, link_node_link.node)

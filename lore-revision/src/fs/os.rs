@@ -34,6 +34,7 @@ use crate::node::NodeID;
 use crate::node::NodeIDExt;
 use crate::repository::RepositoryContext;
 use crate::state::FilesystemDiffStats;
+use crate::state::NodeComparison;
 use crate::state::State;
 use crate::util;
 use crate::util::path::RelativePath;
@@ -154,7 +155,7 @@ impl InstanceOperation for OsOperation {
                 info.size
             );
             if from_node.is_file() {
-                let modified = crate::state::is_file_modified(
+                let modified = crate::state::file_modification(
                     repository,
                     from_node,
                     info.mtime,
@@ -163,7 +164,8 @@ impl InstanceOperation for OsOperation {
                     force_full_check,
                 )
                 .await
-                .internal("Failed to check file modification")?;
+                .internal("Failed to check file modification")?
+                .is_modified();
                 Some(FileDifferenceFromNode { modified })
             } else {
                 None
@@ -207,25 +209,18 @@ impl InstanceOperation for OsOperation {
         .unwrap_or_default())
     }
 
-    async fn file_modified_from_node(
+    async fn compare_file_to_node(
         &self,
         repository: Arc<RepositoryContext>,
         node: &Node,
         path: &RelativePath,
-        file_mtime: u64,
         file_size: u64,
-        force_full_check: bool,
-    ) -> Result<bool, FsError> {
-        Ok(crate::state::is_file_modified(
-            repository,
-            node,
-            file_mtime,
-            file_size,
-            path,
-            force_full_check,
+    ) -> Result<NodeComparison, FsError> {
+        Ok(
+            crate::state::file_matches_node(repository, node, file_size, path)
+                .await
+                .internal("Failed to compare file to node")?,
         )
-        .await
-        .internal("Failed to check file modification")?)
     }
 
     async fn make_executable(

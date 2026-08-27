@@ -450,6 +450,7 @@ pub async fn add(
             ..Default::default()
         }),
         stats: Arc::default(),
+        modified_times: Arc::new(crate::state::RecordedModifiedTimes::default()),
     };
     clone::clone_node(clone_ctx, layer_storage, target_path, layer_node_link.node)
         .await
@@ -696,7 +697,7 @@ fn walk_layer_subtree<'a>(
                         let (file_mtime, file_size) =
                             crate::util::fs::file_mtime_and_size(&metadata);
                         if !child_node.is_staged() {
-                            let is_modified = state::is_file_modified(
+                            let is_modified = state::file_modification(
                                 layer_repository.clone(),
                                 &child_node,
                                 file_mtime,
@@ -705,7 +706,7 @@ fn walk_layer_subtree<'a>(
                                 true,
                             )
                             .await
-                            .unwrap_or(true);
+                            .map_or(true, |modification| modification.is_modified());
                             if is_modified {
                                 modified.push(child_path.as_str().to_string());
                             }

@@ -58,6 +58,7 @@ mod tests {
             state: Arc::default(),
             options: Arc::default(),
             stats: Arc::default(),
+            modified_times: Arc::default(),
         }
     }
 

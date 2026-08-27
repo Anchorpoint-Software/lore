@@ -3908,6 +3908,7 @@ async fn merge_into_link(
     // propagating the rehash result so no spawned leader outlives the
     // function holding references to local state.
     let rehash_tracker = std::sync::Arc::new(lore_storage::write_tracker::WriteTracker::new());
+    let modified_times = std::sync::Arc::new(crate::state::RecordedModifiedTimes::default());
     let rehash_result = commit::commit_files_and_rehash(
         repository.clone(),
         token.share(),
@@ -3918,10 +3919,12 @@ async fn merge_into_link(
         std::sync::Arc::new(std::collections::HashMap::new()),
         target_branch,
         rehash_tracker.clone(),
+        modified_times.clone(),
     )
     .await;
     let drain_result = rehash_tracker.await_all().await;
     rehash_result.forward::<MergeError>("rehashing commit")?;
+    modified_times.discard();
     drain_result.forward::<MergeError>("draining rehash tracker")?;
 
     let state_new = state_staged;
@@ -4258,6 +4261,7 @@ pub async fn merge_into(
     // propagating the rehash result so no spawned leader outlives the
     // function holding references to local state.
     let rehash_tracker = std::sync::Arc::new(lore_storage::write_tracker::WriteTracker::new());
+    let modified_times = std::sync::Arc::new(crate::state::RecordedModifiedTimes::default());
     let rehash_result = commit::commit_files_and_rehash(
         repository.clone(),
         token.share(),
@@ -4268,10 +4272,12 @@ pub async fn merge_into(
         std::sync::Arc::new(std::collections::HashMap::new()),
         current_branch,
         rehash_tracker.clone(),
+        modified_times.clone(),
     )
     .await;
     let drain_result = rehash_tracker.await_all().await;
     rehash_result.forward::<MergeError>("rehashing commit")?;
+    modified_times.discard();
     drain_result.forward::<MergeError>("draining rehash tracker")?;
     lore_debug!("Rehashed state");
 

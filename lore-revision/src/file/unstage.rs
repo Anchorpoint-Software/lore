@@ -886,7 +886,7 @@ async fn unstage_node(
                         .forward::<UnstageError>("Invalid path")?;
                         let (file_mtime, file_size) =
                             crate::util::fs::file_mtime_and_size(&file_metadata);
-                        let file_modified = crate::state::is_file_modified(
+                        let file_modified = crate::state::file_modification(
                             current_repository.clone(),
                             &current_node,
                             file_mtime,
@@ -895,7 +895,8 @@ async fn unstage_node(
                             true, /* Force hash check */
                         )
                         .await
-                        .forward::<UnstageError>("Failed to check if file was modified")?;
+                        .forward::<UnstageError>("Failed to check if file was modified")?
+                        .is_modified();
 
                         if !file_modified {
                             // File matches current revision — clear Dirty
