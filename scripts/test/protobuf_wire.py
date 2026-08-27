@@ -96,6 +96,17 @@ def field_bool(fields: Fields, field_number: int) -> bool:
     return field_int(fields, field_number) != 0
 
 
+def field_bytes(fields: Fields, field_number: int) -> bytes:
+    """Value of a `bytes` field; absent reads back as empty."""
+    values = fields.get(field_number)
+    if not values:
+        return b""
+    value = values[-1]
+    if not isinstance(value, bytes):
+        raise TypeError(f"Field {field_number} is a varint, not bytes")
+    return value
+
+
 def field_string(fields: Fields, field_number: int) -> str:
     """Value of a `string` field; absent reads back as the empty string."""
     strings = field_strings(fields, field_number)

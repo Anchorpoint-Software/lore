@@ -9220,6 +9220,15 @@ def _wire_identity(repo: Lore) -> tuple[bytes, bytes]:
     return bytes.fromhex(repo.get_id()), bytes.fromhex(latest)
 
 
+def _mount_changes(changes: list, link_path: str) -> list:
+    """Every diff entry describing the link node at `link_path`."""
+    return [
+        change
+        for change in changes
+        if change.path == link_path and change.node_type == NODE_TYPE_LINK
+    ]
+
+
 @pytest.mark.smoke
 def test_thin_client_tree_discriminates_tracking_from_pinned(
     new_lore_repo, lore_grpc_target
@@ -9289,11 +9298,7 @@ def test_thin_client_diff_reports_tracking_on_added_link(
     _, after = _wire_identity(repo)
     changes = revision_diff(lore_grpc_target, repository_id, before, after)
 
-    mount_changes = [
-        change
-        for change in changes
-        if change.path == link_path and change.node_type == NODE_TYPE_LINK
-    ]
+    mount_changes = _mount_changes(changes, link_path)
     assert mount_changes, f"Mount path must be reported as a link entry, got {changes}"
     assert all(change.action == ACTION_ADD for change in mount_changes), (
         f"A newly mounted link must be reported as an add, got {mount_changes}"
@@ -9327,11 +9332,7 @@ def test_thin_client_diff_reports_tracking_on_removed_link(
     _, after = _wire_identity(repo)
     changes = revision_diff(lore_grpc_target, repository_id, before, after)
 
-    mount_changes = [
-        change
-        for change in changes
-        if change.path == link_path and change.node_type == NODE_TYPE_LINK
-    ]
+    mount_changes = _mount_changes(changes, link_path)
     assert mount_changes, f"Mount path must be reported as a link entry, got {changes}"
     assert all(change.action == ACTION_DELETE for change in mount_changes), (
         f"A removed link must be reported as a delete, got {mount_changes}"
@@ -9370,11 +9371,7 @@ def test_thin_client_diff_reports_tracking_on_moved_pin(
     _, after = _wire_identity(repo)
     changes = revision_diff(lore_grpc_target, repository_id, before, after)
 
-    mount_changes = [
-        change
-        for change in changes
-        if change.path == link_path and change.node_type == NODE_TYPE_LINK
-    ]
+    mount_changes = _mount_changes(changes, link_path)
     assert mount_changes, (
         f"Moved pin must be reported as a link entry for the mount path, got {changes}"
     )
@@ -9389,6 +9386,157 @@ def test_thin_client_diff_reports_tracking_on_moved_pin(
         f"Tracking is a link property, so a file change must report False, "
         f"got {own_changes}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Link partitions on the thin-client wire.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.smoke
+def test_thin_client_diff_partitions_added_link_under_linked_repository(
+    new_lore_repo, lore_grpc_target
+):
+    """A newly mounted link is the only diff entry for its mount path, and the
+    content it names is a revision of the linked repository, so the entry must
+    be partitioned there for a consumer to find that revision."""
+    link_repo = _commit_initial_main(new_lore_repo, "inner.txt")
+    repo = _commit_initial_main(new_lore_repo, "own.txt")
+
+    repository_id, before = _wire_identity(repo)
+
+    link_path = "linked"
+    repo.link_add(link_path, link_repo.get_id(), "/")
+    repo.commit()
+    repo.push()
+
+    _, after = _wire_identity(repo)
+    changes = revision_diff(lore_grpc_target, repository_id, before, after)
+
+    mount_changes = _mount_changes(changes, link_path)
+    assert mount_changes, f"Mount path must be reported as a link entry, got {changes}"
+    assert all(change.action == ACTION_ADD for change in mount_changes), (
+        f"A newly mounted link must be reported as an add, got {mount_changes}"
+    )
+    assert all(change.partition == link_repo.get_id() for change in mount_changes), (
+        f"A link entry's content is a revision of the linked repository "
+        f"{link_repo.get_id()}, so it must be partitioned there, got {mount_changes}"
+    )
+
+
+@pytest.mark.smoke
+def test_thin_client_diff_partitions_removed_link_under_linked_repository(
+    new_lore_repo, lore_grpc_target
+):
+    """A removed link names the revision it was pinned to, which still lives in
+    the linked repository, so the delete entry must be partitioned there. A
+    delete resolves against the "from" side, the only action that does."""
+    link_repo = _commit_initial_main(new_lore_repo, "inner.txt")
+    repo = _commit_initial_main(new_lore_repo, "own.txt")
+
+    link_path = "linked"
+    repo.link_add(link_path, link_repo.get_id(), "/")
+    repo.commit()
+    repo.push()
+
+    repository_id, before = _wire_identity(repo)
+
+    repo.link_remove(link_path)
+    repo.commit()
+    repo.push()
+
+    _, after = _wire_identity(repo)
+    changes = revision_diff(lore_grpc_target, repository_id, before, after)
+
+    mount_changes = _mount_changes(changes, link_path)
+    assert mount_changes, f"Mount path must be reported as a link entry, got {changes}"
+    assert all(change.action == ACTION_DELETE for change in mount_changes), (
+        f"A removed link must be reported as a delete, got {mount_changes}"
+    )
+    assert all(change.partition == link_repo.get_id() for change in mount_changes), (
+        f"A removed link's content is the revision of the linked repository "
+        f"{link_repo.get_id()} it was pinned to, so it must be partitioned there, "
+        f"got {mount_changes}"
+    )
+
+
+@pytest.mark.smoke
+def test_thin_client_diff_partitions_moved_pin_under_linked_repository(
+    new_lore_repo, lore_grpc_target
+):
+    """Committing through a link moves its pin, and every entry the diff reports
+    for the mount path must agree on the linked repository as its partition,
+    while the parent's own file stays in the parent's."""
+    link_repo = _commit_initial_main(new_lore_repo, "inner.txt")
+    repo = _commit_initial_main(new_lore_repo, "own.txt")
+
+    link_path = "linked"
+    repo.link_add(link_path, link_repo.get_id(), "/")
+    repo.commit()
+    repo.push()
+
+    repository_id, before = _wire_identity(repo)
+
+    with repo.open_file(os.path.join(link_path, "inner.txt"), "w+") as output_file:
+        output_file.writelines(["linked content, revised\n"])
+    with repo.open_file("own.txt", "w+") as output_file:
+        output_file.writelines(["parent content, revised\n"])
+    repo.stage(scan=True)
+    repo.commit()
+    repo.push()
+
+    _, after = _wire_identity(repo)
+    changes = revision_diff(lore_grpc_target, repository_id, before, after)
+
+    mount_changes = _mount_changes(changes, link_path)
+    assert mount_changes, (
+        f"Moved pin must be reported as a link entry for the mount path, got {changes}"
+    )
+    assert all(change.partition == link_repo.get_id() for change in mount_changes), (
+        f"A moved pin names revisions of the linked repository "
+        f"{link_repo.get_id()}, so every entry for the mount path must be "
+        f"partitioned there, got {mount_changes}"
+    )
+
+    own_changes = [change for change in changes if change.path == "own.txt"]
+    assert own_changes, f"Parent's own file change missing from diff: {changes}"
+    assert all(change.partition == repo.get_id() for change in own_changes), (
+        f"The parent's own file lives in {repo.get_id()}, so its change must be "
+        f"partitioned there, got {own_changes}"
+    )
+
+
+@pytest.mark.smoke
+def test_thin_client_diff_partitions_each_link_under_its_own_repository(
+    new_lore_repo, lore_grpc_target
+):
+    """Two links added in one commit take separate partition indices, and each
+    mount entry resolves to the repository it mounts."""
+    first_repo = _commit_initial_main(new_lore_repo, "first.txt")
+    second_repo = _commit_initial_main(new_lore_repo, "second.txt")
+    repo = _commit_initial_main(new_lore_repo, "own.txt")
+
+    repository_id, before = _wire_identity(repo)
+
+    repo.link_add("first", first_repo.get_id(), "/")
+    repo.link_add("second", second_repo.get_id(), "/")
+    repo.commit()
+    repo.push()
+
+    _, after = _wire_identity(repo)
+    changes = revision_diff(lore_grpc_target, repository_id, before, after)
+
+    for link_path, link_repo in (("first", first_repo), ("second", second_repo)):
+        mount_changes = _mount_changes(changes, link_path)
+        assert mount_changes, (
+            f"Mount path {link_path} must be reported as a link entry, got {changes}"
+        )
+        assert all(
+            change.partition == link_repo.get_id() for change in mount_changes
+        ), (
+            f"Mount path {link_path} mounts {link_repo.get_id()}, so its entries "
+            f"must be partitioned there, got {mount_changes}"
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -15,6 +15,7 @@ import grpc
 from protobuf_wire import (
     encode_bytes_field,
     field_bool,
+    field_bytes,
     field_int,
     field_string,
     parse_fields,
@@ -42,6 +43,7 @@ _DIFF_REQUEST_SIGNATURE_TO = 4
 
 _TREE_RESPONSE_NODE = 2
 _DIFF_RESPONSE_CHANGE = 2
+_DIFF_RESPONSE_PARTITION = 4
 
 _TREE_NODE_PATH = 1
 _TREE_NODE_NODE_TYPE = 2
@@ -50,7 +52,11 @@ _TREE_NODE_TRACKING = 6
 _DIFF_CHANGE_PATH = 1
 _DIFF_CHANGE_ACTION = 3
 _DIFF_CHANGE_NODE_TYPE = 4
+_DIFF_CHANGE_LINK_REPOSITORY_INDEX = 8
 _DIFF_CHANGE_TRACKING = 9
+
+_DIFF_PARTITION_INDEX = 1
+_DIFF_PARTITION_LINK_PARTITION = 2
 
 
 @dataclass(frozen=True)
@@ -70,6 +76,25 @@ class DiffChange:
     action: int
     node_type: int
     tracking: bool
+    partition: str
+
+
+class _PartitionTable:
+    """Resolves a `DiffChange.link_repository_index` to the hex repository id its
+    content lives in, from the `DiffPartition` payloads the stream announces
+    ahead of it. Index 0 is the request's own repository and is never
+    announced."""
+
+    def __init__(self, repository_id: bytes):
+        self._by_index = {0: repository_id.hex()}
+
+    def announce(self, partition: dict) -> None:
+        index = field_int(partition, _DIFF_PARTITION_INDEX)
+        raw = field_bytes(partition, _DIFF_PARTITION_LINK_PARTITION)
+        self._by_index[index] = raw.hex()
+
+    def resolve(self, index: int) -> str:
+        return self._by_index.get(index, f"unannounced-index-{index}")
 
 
 def _payloads(response: bytes, payload_field: int) -> list[dict]:
@@ -94,13 +119,18 @@ def _tree_nodes(response: bytes) -> list[TreeNode]:
     ]
 
 
-def _diff_changes(response: bytes) -> list[DiffChange]:
+def _diff_changes(response: bytes, partitions: _PartitionTable) -> list[DiffChange]:
+    for partition in _payloads(response, _DIFF_RESPONSE_PARTITION):
+        partitions.announce(partition)
     return [
         DiffChange(
             path=field_string(change, _DIFF_CHANGE_PATH),
             action=field_int(change, _DIFF_CHANGE_ACTION),
             node_type=field_int(change, _DIFF_CHANGE_NODE_TYPE),
             tracking=field_bool(change, _DIFF_CHANGE_TRACKING),
+            partition=partitions.resolve(
+                field_int(change, _DIFF_CHANGE_LINK_REPOSITORY_INDEX)
+            ),
         )
         for change in _payloads(response, _DIFF_RESPONSE_CHANGE)
     ]
@@ -164,12 +194,13 @@ def revision_diff(
     request = encode_bytes_field(
         _DIFF_REQUEST_SIGNATURE_FROM, signature_from
     ) + encode_bytes_field(_DIFF_REQUEST_SIGNATURE_TO, signature_to)
+    partitions = _PartitionTable(repository_id)
     changes = _collect_stream(
         grpc_target,
         _REVISION_DIFF_METHOD,
         request,
         repository_id,
-        _diff_changes,
+        lambda response: _diff_changes(response, partitions),
         timeout,
     )
     logger.info(
