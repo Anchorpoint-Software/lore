@@ -1127,6 +1127,10 @@ pub struct LoreBranchArchiveArgs {
 
 /// Archives a branch locally and, unless running in local mode, on the remote.
 ///
+/// Archiving a remote branch that was never pushed or that another client already
+/// archived is not an error. Any other remote failure, such as a missing
+/// authorization, fails the call.
+///
 /// # Events
 ///
 /// ## Standard Events
@@ -1207,14 +1211,26 @@ async fn archive_impl(
         }
     }
 
-    if !local_current
-        && !execution_context().globals().local()
-        && let Ok(remote) = repository.remote().await
-    {
+    let mut remote_fail = None;
+
+    if !local_current && !execution_context().globals().local() {
         // Archive remote branch
         lore_debug!("Attempt archive of remote branch");
-        if let Err(err) = branch::delete_remote(remote.clone(), repository.id, branch.id).await {
-            execution.dispatcher.send_error(err);
+        let remote_archive = match repository
+            .remote()
+            .await
+            .forward::<BranchError>("Failed to connect to remote")
+        {
+            Ok(remote) => branch::delete_remote(remote, repository.id, branch.id).await,
+            Err(err) => Err(err),
+        };
+
+        match remote_archive {
+            Ok(()) => (),
+            Err(err) if err.is_no_remote() || err.is_branch_not_found() => {
+                lore_debug!("No remote branch to archive: {err}");
+            }
+            Err(err) => remote_fail = Some(err),
         }
     }
 
@@ -1229,6 +1245,10 @@ async fn archive_impl(
         return Err(BranchError::from(lore_base::error::BranchNotFound {
             branch: branch.id.to_string(),
         }));
+    }
+
+    if let Some(err) = remote_fail {
+        return Err(err);
     }
 
     Ok(())
