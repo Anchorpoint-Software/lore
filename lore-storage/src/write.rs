@@ -2132,6 +2132,16 @@ mod tests {
         (partition, address, fragment, Bytes::from(payload))
     }
 
+    /// [`make_input`] rehomed under `partition`.
+    ///
+    /// [`STORE_IN_FLIGHT`] is keyed on partition and address alone and carries no store identity,
+    /// so every test deriving its partition from the same seeds shares in-flight entries with the
+    /// rest of the process. A partition of its own keeps a test's leaders and followers to itself.
+    fn make_input_in(partition: Partition, seed: u8) -> (Partition, Address, Fragment, Bytes) {
+        let (_, address, fragment, buffer) = make_input(seed);
+        (partition, address, fragment, buffer)
+    }
+
     #[tokio::test]
     async fn store_fragment_no_tracker_writes_synchronously() {
         let (_dir, store) = make_test_store().await;
@@ -2571,14 +2581,19 @@ mod tests {
         assert_eq!(query.match_made, StoreMatch::MatchFull);
     }
 
-    /// Wrapper that delegates to an inner `ImmutableStore` but sleeps for a
-    /// configured duration inside `put` — simulates a slow backing store (or,
-    /// by analogy, a high-RTT remote). Used to measure the parallelism win
-    /// from dispatching leader tasks through the tracker vs. running them
-    /// inline on the caller's await chain.
+    /// Wrapper that delegates to an inner `ImmutableStore`, holding `put` back
+    /// so a test can say when one finishes, and counting the ones that have.
+    ///
+    /// `delay` sleeps inside `put`, simulating a slow backing store or, by
+    /// analogy, a high-RTT remote. `gate` instead parks `put` until the test
+    /// hands out a permit, which makes "no put has finished" a fact a counter
+    /// reports rather than a wall-clock comparison: on a loaded machine the
+    /// time a call takes says more about the machine than about the code.
     struct DelayingPutStore {
         inner: Arc<dyn ImmutableStore>,
         delay: std::time::Duration,
+        gate: Option<Arc<tokio::sync::Semaphore>>,
+        completed: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     #[async_trait::async_trait]
@@ -2624,10 +2639,17 @@ mod tests {
             force: bool,
         ) -> Result<(), StoreError> {
             tokio::time::sleep(self.delay).await;
-            self.inner
+            if let Some(gate) = self.gate.clone() {
+                gate.acquire().await.expect("gate closed").forget();
+            }
+            let result = self
+                .inner
                 .clone()
                 .put(partition, address, fragment, payload, force)
-                .await
+                .await;
+            self.completed
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            result
         }
 
         async fn obliterate(
@@ -2708,34 +2730,54 @@ mod tests {
         }
     }
 
+    /// The tracker's win is that `store_fragment` hands the write to a leader
+    /// task instead of awaiting it, so a caller's cost stops scaling with the
+    /// store's latency.
+    ///
+    /// The inline half pays that latency and is measured: `put` really sleeps,
+    /// and a loaded machine only makes the wait longer, so the lower bound
+    /// holds however busy the machine is.
+    ///
+    /// The deferred half is not measured. Every `put` parks on a gate holding
+    /// no permits, so the run asserts that all `N` calls returned while nothing
+    /// had been written — true whatever the machine does with the tasks in the
+    /// meantime — and then releases the gate and drains. Comparing the two
+    /// wall-clock times instead would assert a ratio between a path that waits
+    /// on timers and one that waits on the scheduler, which contention moves
+    /// by two orders of magnitude in opposite directions.
+    ///
+    /// Both halves write under a partition of this test's own, so a gated
+    /// leader parked here can neither be joined by another test's write nor
+    /// stand in for one.
+    ///
+    /// `GATE_GUARD` bounds the parked half so a regression that put inline
+    /// under a tracker fails rather than hanging. It is not a latency
+    /// assertion: the calls it covers await no timer, and the budget is orders
+    /// of magnitude above what they take.
     #[tokio::test(flavor = "multi_thread")]
     async fn tracker_parallelises_writes_vs_inline_serialisation() {
-        // Compare wall-clock time of N=100 store_fragment calls against a
-        // store whose put() sleeps 10 ms (simulating a slow backing store or,
-        // by analogy, a high-RTT remote).
-        //
-        // Inline (tracker=None): each call waits 10 ms before returning, so
-        // N calls take ~N*10 ms = ~1 s.
-        //
-        // Deferred (tracker=Some): each call returns immediately, leader
-        // tasks run in parallel on the runtime, and tracker.await_all()
-        // joins them. Expected total ~10-50 ms (bounded by the single slow
-        // put plus tokio scheduling overhead, not by N).
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
         use std::time::Duration;
 
         const N: usize = 100;
         const PUT_DELAY: Duration = Duration::from_millis(10);
+        const GATE_GUARD: Duration = Duration::from_secs(120);
+
+        let test_partition = Partition::from([0xB4u8; 16]);
 
         let (_dir, inner) = make_test_store().await;
+        let inline_completed = Arc::new(AtomicUsize::new(0));
         let store: Arc<dyn ImmutableStore> = Arc::new(DelayingPutStore {
             inner,
             delay: PUT_DELAY,
+            gate: None,
+            completed: inline_completed.clone(),
         });
 
-        // Inline baseline.
         let inline_start = tokio::time::Instant::now();
         for i in 0..N {
-            let (partition, address, fragment, buffer) = make_input(i as u8);
+            let (partition, address, fragment, buffer) = make_input_in(test_partition, i as u8);
             store_fragment(
                 store.clone(),
                 partition,
@@ -2752,64 +2794,70 @@ mod tests {
         }
         let inline_elapsed = inline_start.elapsed();
 
-        // Deferred via tracker. Use distinct addresses from the inline run so
-        // STORE_IN_FLIGHT / already-durable short-circuits don't skew the
-        // measurement.
-        let (_dir2, inner2) = make_test_store().await;
-        let store2: Arc<dyn ImmutableStore> = Arc::new(DelayingPutStore {
-            inner: inner2,
-            delay: PUT_DELAY,
-        });
-        let tracker = Arc::new(WriteTracker::new());
-        let deferred_start = tokio::time::Instant::now();
-        for i in 0..N {
-            let (partition, address, fragment, buffer) = make_input(i as u8);
-            store_fragment(
-                store2.clone(),
-                partition,
-                address,
-                fragment,
-                buffer,
-                true,
-                None,
-                Some(tracker.clone()),
-                None,
-            )
-            .await
-            .expect("deferred store_fragment sync return");
-        }
-        let sync_return_elapsed = deferred_start.elapsed();
-        tracker.await_all().await.expect("tracker await_all");
-        let deferred_total_elapsed = deferred_start.elapsed();
-
-        eprintln!(
-            "latency bench N={N} delay={PUT_DELAY:?}: inline={inline_elapsed:?} \
-             deferred_sync_return={sync_return_elapsed:?} deferred_total={deferred_total_elapsed:?}"
+        assert_eq!(
+            inline_completed.load(Ordering::SeqCst),
+            N,
+            "inline store_fragment must return with its put finished"
         );
-
-        // Inline path MUST wait through each 10 ms put, so at minimum ~N*delay.
         assert!(
             inline_elapsed >= PUT_DELAY * N as u32 / 2,
             "inline baseline too fast; got {inline_elapsed:?}, expected at least ~{:?}",
             PUT_DELAY * N as u32 / 2
         );
 
-        // Deferred total must be at least 5× faster than inline — the plan's
-        // commit-latency acceptance criterion, applied at the store_fragment
-        // layer where the tracker is already fully integrated.
-        assert!(
-            deferred_total_elapsed * 5 <= inline_elapsed,
-            "deferred path not 5x faster than inline: inline={inline_elapsed:?}, \
-             deferred_total={deferred_total_elapsed:?}"
+        let (_dir2, inner2) = make_test_store().await;
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let deferred_completed = Arc::new(AtomicUsize::new(0));
+        let store2: Arc<dyn ImmutableStore> = Arc::new(DelayingPutStore {
+            inner: inner2,
+            delay: Duration::ZERO,
+            gate: Some(gate.clone()),
+            completed: deferred_completed.clone(),
+        });
+        let tracker = Arc::new(WriteTracker::new());
+
+        let deferred_start = tokio::time::Instant::now();
+        tokio::time::timeout(GATE_GUARD, async {
+            for i in 0..N {
+                let (partition, address, fragment, buffer) = make_input_in(test_partition, i as u8);
+                store_fragment(
+                    store2.clone(),
+                    partition,
+                    address,
+                    fragment,
+                    buffer,
+                    true,
+                    None,
+                    Some(tracker.clone()),
+                    None,
+                )
+                .await
+                .expect("deferred store_fragment sync return");
+            }
+        })
+        .await
+        .expect("deferred store_fragment blocked on a put that cannot finish");
+        let sync_return_elapsed = deferred_start.elapsed();
+
+        assert_eq!(
+            deferred_completed.load(Ordering::SeqCst),
+            0,
+            "deferred store_fragment must return before the store has written anything"
         );
 
-        // The sync-return latency is the architectural win visible to the
-        // commit caller: time until store_fragment returns. It should be
-        // orders of magnitude below the inline baseline.
-        assert!(
-            sync_return_elapsed * 10 <= inline_elapsed,
-            "deferred sync-return not 10x faster than inline: \
-             inline={inline_elapsed:?}, sync_return={sync_return_elapsed:?}"
+        gate.add_permits(N);
+        tracker.await_all().await.expect("tracker await_all");
+        let deferred_total_elapsed = deferred_start.elapsed();
+
+        assert_eq!(
+            deferred_completed.load(Ordering::SeqCst),
+            N,
+            "await_all must drain every leader the tracker took on"
+        );
+
+        eprintln!(
+            "latency bench N={N} delay={PUT_DELAY:?}: inline={inline_elapsed:?} \
+             deferred_sync_return={sync_return_elapsed:?} deferred_total={deferred_total_elapsed:?}"
         );
     }
 

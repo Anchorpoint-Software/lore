@@ -1963,6 +1963,24 @@ mod tests {
             );
         }
 
+        /// Waits until the pool has taken every leaf, where `capacity` is the channel's whole
+        /// capacity and so holding all of it means the channel is empty.
+        ///
+        /// Awaited rather than sampled. The pool runs on the runtime `lore_spawn!` selects, so
+        /// nothing this task does gives it time, and its one blocking step is a budget acquire
+        /// against a semaphore the whole process shares. Reserving the capacity parks on the
+        /// channel's own wakeup, which the pool triggers as it takes each leaf, so the wait
+        /// lasts as long as the pool needs rather than as long as a fixed number of polls.
+        async fn drain_leaf_channel(leaf_tx: &Sender<LeafReference>, capacity: usize) {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                leaf_tx.reserve_many(capacity),
+            )
+            .await
+            .expect("the pool must take every queued leaf before the sink goes")
+            .expect("the leaf channel must stay open while the pool runs");
+        }
+
         /// The file pool stops asking for leaves once its sink has gone, and reports nothing.
         ///
         /// [`write_to_file`] reads to the end of the channel unless it has already failed,
@@ -2014,17 +2032,7 @@ mod tests {
             }
 
             drop(data_rx.recv().await.expect("first payload"));
-            for _ in 0..10_000 {
-                if leaf_tx.capacity() == LEAVES {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-            assert_eq!(
-                leaf_tx.capacity(),
-                LEAVES,
-                "the pool must take every queued leaf before the sink goes"
-            );
+            drain_leaf_channel(&leaf_tx, LEAVES).await;
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             drop(data_rx);
 
