@@ -1711,7 +1711,6 @@ pub async fn create_client_immutable_store(
         create_options,
         false, /* Don't deserialize all buckets on load */
         ImmutableStoreSettings {
-            allow_partial_fragment: true, /* Client store can have partial fragments */
             protect_local_fragment: true, /* Protect local fragments from eviction */
             verify_write,
             ..Default::default()
@@ -1806,7 +1805,6 @@ pub async fn create_client_memory_stores()
         ImmutableStoreCreateOptions::none(),
         false, /* Client does not deserialize all buckets on startup */
         ImmutableStoreSettings {
-            allow_partial_fragment: true, /* Client store can have partial fragments */
             protect_local_fragment: true, /* Protect local fragments from eviction */
             ..Default::default()
         },

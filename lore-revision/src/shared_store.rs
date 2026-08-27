@@ -190,7 +190,6 @@ async fn create_shared_store_at(
         options,
         false,
         ImmutableStoreSettings {
-            allow_partial_fragment: true, /* Client store can have partial fragments */
             protect_local_fragment: true, /* Protect local fragments from eviction */
             verify_write: shared_store_config
                 .store_config

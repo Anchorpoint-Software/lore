@@ -1108,7 +1108,6 @@ async fn create_local_store(
         options,
         true,  /* Server mode, deserialize all buckets immediately */
         lore_storage::local::immutable_store::ImmutableStoreSettings {
-            allow_partial_fragment: false, /* Server mode, partial fragments not allowed */
             protect_local_fragment: false, /* Server mode, no need to try protect local fragments from eviction */
             implicit_durable_stored: true, /* Server mode, consider all fragments as durably stored */
             isolate_partitions: true, /* Server mode, one process holds content for every tenant */

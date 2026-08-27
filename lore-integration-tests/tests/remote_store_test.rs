@@ -58,7 +58,6 @@ mod remote_store_tests {
             ImmutableStoreCreateOptions::none(),
             false,
             ImmutableStoreSettings {
-                allow_partial_fragment: false,
                 protect_local_fragment: false,
                 implicit_durable_stored: true,
                 // As a real server runs it. One process holds content for every tenant, so it

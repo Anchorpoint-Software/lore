@@ -284,8 +284,6 @@ pub struct LocalImmutableStore {
 }
 
 pub struct ImmutableStoreSettings {
-    /// Allow partial fragments (true for clients, false for server)
-    pub allow_partial_fragment: bool,
     /// Protect local fragments during eviction/compaction (true for clients, false for server)
     pub protect_local_fragment: bool,
     /// Consider all fragments durably stored (false for clients, generally true for server)
@@ -320,7 +318,6 @@ pub struct ImmutableStoreSettings {
 impl Default for ImmutableStoreSettings {
     fn default() -> Self {
         Self {
-            allow_partial_fragment: true,
             protect_local_fragment: true,
             implicit_durable_stored: false,
             isolate_partitions: false,
@@ -1679,12 +1676,6 @@ impl LocalImmutableStore {
                     pack_offset = packref.offset;
                 }
             } else {
-                if !self.settings.allow_partial_fragment {
-                    lore_base::lore_error!(
-                        "Partial deduplication not allowed without payload proof for {address}"
-                    );
-                    return Err(LocalImmutableStoreError::internal("Payload is required"));
-                }
                 lore_base::lore_trace!("Storing partial fragment {address}");
             }
         }

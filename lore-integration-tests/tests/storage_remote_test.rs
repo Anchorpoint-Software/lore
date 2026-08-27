@@ -361,7 +361,6 @@ mod storage_remote_tests {
             ImmutableStoreCreateOptions::none(),
             false,
             ImmutableStoreSettings {
-                allow_partial_fragment: false,
                 protect_local_fragment: false,
                 implicit_durable_stored: true,
                 ..Default::default()
@@ -424,7 +423,6 @@ mod storage_remote_tests {
             ImmutableStoreCreateOptions::none(),
             false,
             ImmutableStoreSettings {
-                allow_partial_fragment: false,
                 protect_local_fragment: false,
                 implicit_durable_stored: true,
                 ..Default::default()
@@ -480,7 +478,6 @@ mod storage_remote_tests {
             ImmutableStoreCreateOptions::none(),
             false,
             ImmutableStoreSettings {
-                allow_partial_fragment: false,
                 protect_local_fragment: false,
                 implicit_durable_stored: true,
                 ..Default::default()
