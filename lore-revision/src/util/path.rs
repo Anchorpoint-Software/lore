@@ -233,6 +233,12 @@ fn reduce_parent_segments(path: &mut String) {
     *path = reduced;
 }
 
+/// Checks if the path contains any ".." segments. For example "..", "subdir/.." matches.
+/// A legitimate file name starting with dots does not match, e.g. "..hidden.txt"
+fn contains_directory_step_up(path: &str) -> bool {
+    path.contains("..") && path.split('/').any(|component| component == "..")
+}
+
 /// `path` in the form the repository names paths in: forward separators, none of
 /// them repeated, and no `.` or `..` left to resolve.
 pub fn clean(mut path: String) -> String {
@@ -1017,14 +1023,14 @@ impl RelativePathBuf {
     }
 
     /// Construct from an initial path string.
-    /// Validates that the path is not absolute and cleans it.
+    /// Validates that the path is not absolute, holds no step up, and cleans it.
     ///
     /// Only a path carrying a separator it does not keep is rewritten. Trimming
     /// and the canonical separator are what nearly every path already holds, and
     /// establishing that costs no string of its own.
     pub fn new_from_initial_path(name: impl AsRef<str>) -> Result<RelativePathBuf, PathError> {
         let name = name.as_ref();
-        if name.starts_with("..") || (name.len() >= 2 && name.as_bytes()[1] == b':') {
+        if name.len() >= 2 && name.as_bytes()[1] == b':' {
             return Err(InvalidPath {
                 path: name.to_string(),
             }
@@ -1039,6 +1045,12 @@ impl RelativePathBuf {
             Cow::Borrowed(name)
         };
         let name = name.trim_start_matches("./");
+        if contains_directory_step_up(name) {
+            return Err(InvalidPath {
+                path: name.to_string(),
+            }
+            .into());
+        }
         let mut initial_path = RelativePathBuf::with_capacity(name.len());
         if name != "." && !name.is_empty() {
             initial_path.push(name);

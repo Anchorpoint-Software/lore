@@ -1173,6 +1173,125 @@ mod tests {
         assert!(RelativePathBuf::new_from_initial_path("../foo").is_err());
     }
 
+    /// A step up is a step up wherever in the path it stands. A path that walks
+    /// into a subdirectory first reaches just as far above the repository as one
+    /// that starts with the steps, so the front of the path is not where this can
+    /// be decided.
+    #[test]
+    fn new_from_initial_path_rejects_a_step_up_below_the_front() {
+        for name in [
+            "subdir/..",
+            "subdir/../foo",
+            "subdir/../../foo",
+            "subdir/../foo/../..",
+            "subdir/../../../something",
+            "a/b/../../..",
+            "a/b/c/../../../../outside",
+            "subdir/./../../outside",
+            "subdir/dir/..",
+        ] {
+            assert!(
+                RelativePath::new_from_initial_path(name).is_err(),
+                "{name:?} steps above the repository"
+            );
+            assert!(
+                RelativePathBuf::new_from_initial_path(name).is_err(),
+                "{name:?} steps above the repository"
+            );
+        }
+    }
+
+    /// The separator a step up is written with does not decide whether it is one,
+    /// and neither does a leading separator or a repeated one. Each is brought
+    /// onto the canonical form before the path is judged.
+    #[test]
+    fn new_from_initial_path_rejects_a_step_up_however_it_is_written() {
+        for name in [
+            r"..\foo",
+            r"subdir\..\..\outside",
+            r"\..\..\outside",
+            r"subdir\\..\\..\\outside",
+            "subdir//..//..//outside",
+            "/../outside",
+            "/subdir/../../outside",
+            "./../outside",
+            "././../outside",
+        ] {
+            assert!(
+                RelativePath::new_from_initial_path(name).is_err(),
+                "{name:?} steps above the repository"
+            );
+            assert!(
+                RelativePathBuf::new_from_initial_path(name).is_err(),
+                "{name:?} steps above the repository"
+            );
+        }
+    }
+
+    /// Only a component that is `..` entirely is a step up. A name that merely
+    /// begins with two periods, or is made of them, is a name a repository can
+    /// hold, and it is kept as it is at any depth.
+    #[test]
+    fn new_from_initial_path_keeps_a_name_beginning_with_two_periods() {
+        for name in [
+            "..filename",
+            "..hidden.txt",
+            "...",
+            "....",
+            "...filename",
+            "..config/settings.ini",
+            "subdir/..filename",
+            "subdir/nested/..filename",
+            "..a/..b/..c",
+            "name..",
+            "a../b..",
+        ] {
+            let path = RelativePath::new_from_initial_path(name)
+                .unwrap_or_else(|_| panic!("{name:?} is a name, not a step up"));
+            assert_eq!(path.as_str(), name);
+
+            let buf = RelativePathBuf::new_from_initial_path(name)
+                .unwrap_or_else(|_| panic!("{name:?} is a name, not a step up"));
+            assert_eq!(buf.as_str(), name);
+        }
+    }
+
+    /// A name beginning with two periods is not a step up even where the path also
+    /// holds one, so the two are told apart within a single path rather than the
+    /// whole path being judged by what it contains.
+    #[test]
+    fn new_from_initial_path_tells_a_step_up_from_a_name_in_one_path() {
+        assert!(RelativePath::new_from_initial_path("..filename/../outside").is_err());
+        assert!(RelativePath::new_from_initial_path("subdir/../..filename").is_err());
+
+        let path = RelativePath::new_from_initial_path("..dir/..sub/..file")
+            .expect("no component is a step up");
+        assert_eq!(path.as_str(), "..dir/..sub/..file");
+    }
+
+    /// Nothing a constructed path holds is a step up, so no path handed to the
+    /// filesystem reaches outside the repository by being resolved there.
+    #[test]
+    fn new_from_initial_path_leaves_no_step_up_in_the_path() {
+        for name in [
+            "..filename",
+            "subdir/..filename",
+            "...",
+            "a/b/c",
+            r"a\b\..c",
+            "/a//b/",
+            "./a/b",
+        ] {
+            let path = RelativePath::new_from_initial_path(name)
+                .unwrap_or_else(|_| panic!("{name:?} is a path the repository can hold"));
+            assert!(
+                !path.as_str().split('/').any(|component| component == ".."),
+                "{name:?} kept a step up as {:?}",
+                path.as_str()
+            );
+        }
+    }
+
     #[test]
     fn new_from_initial_path_rejects_drive_letter() {
         assert!(RelativePath::new_from_initial_path("C:").is_err());
