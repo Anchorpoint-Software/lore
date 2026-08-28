@@ -5,6 +5,12 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ## Nightly
 
+### Features
+
+### Fixes & Improvements
+
+## v0.9.0 (Aug 28th 2026) [#782]
+
 ### Breaking changes
 
 - `lore-credential`: auth tokens move to `tokenstore.toml` under a `tokenstore_encryption_key` key, with nothing migrated from `tokens.toml`; old and new clients keep entirely separate credentials, so expect one `lore login` per generation. An unmigrated store reads as `Not authenticated` and `--remote` reads answer empty rather than failing, so scripts gating on `lore status` should check the exit code
@@ -14,6 +20,7 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 - `lore.model.v1` and `lore.thin_client.v1`: `Repository.created`, `Branch.created` and `Revision.timestamp` now carry Unix epoch milliseconds instead of seconds
 - C API: `LoreMetadataType` discriminants are now stable integers shared between `lore.h` and the on-disk metadata buffer, and `lore_revision_tree_metadata_set` takes typed `(key, LoreMetadata)` batches instead of text plus a format tag; callers using the enum names need a recompile, and callers hard-coding the old numeric values must update them
 - `lore-server` (replication protocol): `ExistsBatch` is replaced by a batch `Query`, and `Get` / `GetMetadata` responses carry the full `StoreGetData` including the partition. Retired opcodes are reserved rather than reassigned, so a peer on the previous protocol is rejected instead of misreading a response — roll replicas and their upstream together
+- C API: failures that previously reported `-1` (internal) now carry the specific code where one applies, because an error crossing an internal boundary keeps its variant instead of collapsing. `lore_revision_tree_metadata_set` and its file equivalent can now return `SlowDown` (5), `NotAuthorized` (7), `Maintenance` (11), `NotAuthenticated` (12), `NoRemote` (14), `NotConnected` (17) and `NotSupported` (18); remote store reads and writes add `Disconnected` (6); and connecting with no stored credential reports `NotAuthenticated` rather than an internal fault. A caller treating every non-zero status alike is unaffected; one that branches on `-1`, or reads `-1` as `retrying will not help`, now sees retryable and re-authenticable codes on paths that previously only ever produced `-1`, and should handle them before upgrading
 
 ### Features
 
