@@ -7,6 +7,7 @@ use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
 use tokio::task::JoinSet;
 
+use crate::MAX_CONCURRENT_TREE_TASKS;
 use crate::event;
 use crate::filter::FilterMode;
 use crate::hash::hash_string;
@@ -42,18 +43,6 @@ use crate::util::path::RelativePath;
 use crate::util::path::RelativePathBuf;
 use crate::util::path::path_depth;
 use crate::util::path::shared_component_depth;
-
-/// Shared ancestors created at once within one depth level. Each is a path
-/// resolution and a node lookup, so this only has to be deep enough to keep the
-/// syscall pool fed; a level can hold a hundred thousand directories and their
-/// task state is not free.
-const MAX_PRECREATE_TASKS: usize = 1000;
-
-/// Targets resolved at once. A targets file can name a million paths, and
-/// spawning one task each before any of them runs costs the task state for all
-/// of them up front. Above the block permits the resolutions contend for, so the
-/// permits and not this bound are what limit concurrent block loads.
-const MAX_RESOLVE_TASKS: usize = 1000;
 
 /// The node of each shared ancestor already created, borrowed from the list they
 /// are created from.
@@ -462,7 +451,7 @@ pub async fn stage(
             while let Some(joined) = level_tasks.try_join_next() {
                 collect_precreate(joined, level, &mut ancestor_nodes, &mut precreate_failure);
             }
-            while level_tasks.len() >= MAX_PRECREATE_TASKS
+            while level_tasks.len() >= MAX_CONCURRENT_TREE_TASKS
                 && let Some(joined) = level_tasks.join_next().await
             {
                 collect_precreate(joined, level, &mut ancestor_nodes, &mut precreate_failure);
@@ -483,13 +472,6 @@ pub async fn stage(
     // with an atomic CAS prepend. Layer jobs run against their own separate states.
     let mut failure = None;
     let mut tasks: JoinSet<Result<crate::node::NodeLink, StageError>> = JoinSet::new();
-
-    /// Targets walked at once. Each in-flight target is a walk in progress
-    /// holding around 8 KiB, and a targets file can name a million paths, so
-    /// spawning one per target before any of them runs costs gigabytes of task
-    /// state before any work happens. This still offers the syscall pool the walk
-    /// waits on far more work than it has threads.
-    const MAX_TASKS: usize = 1000;
 
     for target in antichain {
         let base = walk_base(
@@ -519,7 +501,7 @@ pub async fn stage(
         );
         if let Err(err) = lore_limit_drain_tasks!(
             tasks,
-            MAX_TASKS,
+            MAX_CONCURRENT_TREE_TASKS,
             StageError::internal("Failed to join task")
         ) {
             failure = failure.or(Some(err));
@@ -555,7 +537,7 @@ pub async fn stage(
             }
             if let Err(err) = lore_limit_drain_tasks!(
                 tasks,
-                MAX_TASKS,
+                MAX_CONCURRENT_TREE_TASKS,
                 StageError::internal("Failed to join task")
             ) {
                 failure = failure.or(Some(err));
@@ -730,7 +712,7 @@ struct RoutedTargets {
 /// well. A path disjoint from every layer only resolves.
 ///
 /// Resolving one is a tree lookup per component with no shared state, so the
-/// whole list resolves at once, bounded by [`MAX_RESOLVE_TASKS`]. Routing stays
+/// whole list resolves at once, bounded by [`MAX_CONCURRENT_TREE_TASKS`]. Routing stays
 /// in the loop instead: it is string work against the layer mounts, and it
 /// appends to lists a task would need a lock to reach. The resolved paths need
 /// no order, since the caller collapses them into a sorted antichain, and their
@@ -785,7 +767,7 @@ async fn route_and_resolve_targets(
         while let Some(joined) = resolve_tasks.try_join_next() {
             collect_resolved(joined, &mut routed.current_repository_paths, &mut failure);
         }
-        while resolve_tasks.len() >= MAX_RESOLVE_TASKS
+        while resolve_tasks.len() >= MAX_CONCURRENT_TREE_TASKS
             && let Some(joined) = resolve_tasks.join_next().await
         {
             collect_resolved(joined, &mut routed.current_repository_paths, &mut failure);

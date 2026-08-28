@@ -12,6 +12,7 @@ use tokio::task::JoinSet;
 use tokio_util::task::AbortOnDropHandle;
 use zerocopy::FromZeros;
 
+use crate::MAX_CONCURRENT_TREE_TASKS;
 use crate::branch::merge::MergeType;
 use crate::change;
 use crate::change::NodeChange;
@@ -230,9 +231,7 @@ pub async fn realize_state(
 pub async fn verify_filesystem_for_changes(
     args: Arc<SyncVerifyArgs>,
 ) -> Result<Arc<Vec<NodeChange>>, SyncError> {
-    // Queue up to a given number of parallel tasks to verify filesystem
     let mut failure = None;
-    const MAX_TASK_COUNT: usize = 1000;
     let mut tasks = JoinSet::new();
     let mut changes = Vec::with_capacity(args.changes.len());
     let stats = Arc::new(SyncVerifyStats::default());
@@ -260,7 +259,7 @@ pub async fn verify_filesystem_for_changes(
                 .await
             }
         });
-        while tasks.len() > MAX_TASK_COUNT
+        while tasks.len() > MAX_CONCURRENT_TREE_TASKS
             && let Some(result) = tasks.join_next().await
         {
             match result
@@ -1727,7 +1726,6 @@ async fn realize_changes_merge(
     stats: Arc<SyncRealizeStats>,
     merge_type: MergeType,
 ) -> Result<(), SyncError> {
-    const MAX_TASK_COUNT: usize = 1000;
     let mut tasks = JoinSet::new();
     let mut failure = None;
     for (change_from, change_to) in merges.as_ref().iter() {
@@ -1761,7 +1759,7 @@ async fn realize_changes_merge(
             }
         });
 
-        while tasks.len() > MAX_TASK_COUNT
+        while tasks.len() > MAX_CONCURRENT_TREE_TASKS
             && let Some(result) = tasks.join_next().await
         {
             failure = failure.or(result

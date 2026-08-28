@@ -34,17 +34,6 @@ pub fn max_concurrent_stage_directory_tasks() -> usize {
     lore_base::runtime::processor_count()
 }
 
-/// Ceiling on concurrently-spawned subtree tasks during a filesystem diff walk,
-/// the walk behind `status --unstaged`, `diff` and `stage --scan`.
-///
-/// Twice the core count: a task waiting on the `lore-io` syscall pool or on the
-/// network holds no core, so the second half keeps work ready behind it. As with
-/// the ceilings above, overflow recurses inline rather than blocking on a
-/// permit, so any value >= 1 is correct.
-pub fn max_concurrent_diff_directory_tasks() -> usize {
-    lore_base::runtime::processor_count() * 2
-}
-
 /// Statistics accumulated by the discovery (producer) side.
 /// When the producer finishes and the channel drains, these are the final totals.
 #[derive(Default)]

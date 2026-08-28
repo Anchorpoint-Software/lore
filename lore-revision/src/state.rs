@@ -34,6 +34,7 @@ use tokio::task::JoinSet;
 use zerocopy::FromZeros;
 use zerocopy::Immutable;
 
+use crate::MAX_CONCURRENT_TREE_TASKS;
 use crate::bitflagsops;
 use crate::branch;
 use crate::change;
@@ -70,7 +71,6 @@ use crate::metadata::MetadataType;
 use crate::nametable::NameTable;
 use crate::node;
 use crate::node::*;
-use crate::progress::max_concurrent_diff_directory_tasks;
 use crate::repository::DOT_LORE;
 use crate::repository::DOT_URC;
 use crate::repository::RepositoryContext;
@@ -7645,7 +7645,7 @@ static DIFF_FILESYSTEM_TASK_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new(
 
 fn diff_filesystem_task_semaphore() -> &'static Arc<Semaphore> {
     DIFF_FILESYSTEM_TASK_SEMAPHORE
-        .get_or_init(|| Arc::new(Semaphore::new(max_concurrent_diff_directory_tasks())))
+        .get_or_init(|| Arc::new(Semaphore::new(MAX_CONCURRENT_TREE_TASKS)))
 }
 
 /// Diffs one subtree, spawned while the budget allows and inline once it does not, then folds

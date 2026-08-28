@@ -24,6 +24,7 @@ use super::path::DepthPath;
 use super::path::RelativePath;
 use super::path::RelativePathBuf;
 use super::path::path_depth;
+use crate::MAX_CONCURRENT_TREE_TASKS;
 use crate::hash::hash_string;
 use crate::lore_debug;
 use crate::lore_trace;
@@ -319,10 +320,6 @@ pub(crate) async fn resolve_prefixes(
     base_path: impl AsRef<Path>,
     paths: &[DepthPath],
 ) -> ResolvedPrefixes {
-    /// Prefixes resolved at once. Each is one or two syscalls, so this only has
-    /// to be deep enough to keep the pool fed.
-    const MAX_TASKS: usize = 1000;
-
     /// The parent a run of siblings shares, resolved once for the run.
     struct ParentRun<'a> {
         parent: &'a str,
@@ -413,7 +410,7 @@ pub(crate) async fn resolve_prefixes(
             while let Some(joined) = tasks.try_join_next() {
                 collect(joined, &mut resolved);
             }
-            while tasks.len() >= MAX_TASKS
+            while tasks.len() >= MAX_CONCURRENT_TREE_TASKS
                 && let Some(joined) = tasks.join_next().await
             {
                 collect(joined, &mut resolved);
