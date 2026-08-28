@@ -11,6 +11,7 @@ use std::mem::size_of;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::Weak;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -26,6 +27,8 @@ use serde::Serialize;
 pub use sink::ChangeSink;
 pub use sink::OwnedChangeSink;
 use tokio::join;
+use tokio::sync::Semaphore;
+use tokio::task::JoinError;
 use tokio::task::JoinHandle;
 use tokio::task::JoinSet;
 use zerocopy::FromZeros;
@@ -67,6 +70,7 @@ use crate::metadata::MetadataType;
 use crate::nametable::NameTable;
 use crate::node;
 use crate::node::*;
+use crate::progress::max_concurrent_diff_directory_tasks;
 use crate::repository::DOT_LORE;
 use crate::repository::DOT_URC;
 use crate::repository::RepositoryContext;
@@ -7171,11 +7175,8 @@ async fn diff_filesystem_directory_walk(
                 (link_from.clone(), state_from.clone(), subnode_from)
             };
             let subpath = item_path.clone();
-            let layer_mounts_recurse = ctx.layer_mounts.clone();
-            let filter_mode = ctx.filter_mode;
-            let scan_dirty = ctx.scan_dirty;
-            lore_spawn!(tasks, async move {
-                diff_filesystem_subtree_recurse(DiffFilesystemContext {
+            diff_filesystem_subtree_dispatch(
+                DiffFilesystemContext {
                     from: FilesystemTraversal {
                         repository: link_from,
                         state: state_from,
@@ -7189,15 +7190,18 @@ async fn diff_filesystem_directory_walk(
                         root_node: subnode_current,
                     },
                     filesystem_path: subpath,
-                    filter_mode,
-                    scan_dirty,
-                    layer_mounts: layer_mounts_recurse,
+                    filter_mode: ctx.filter_mode,
+                    scan_dirty: ctx.scan_dirty,
+                    layer_mounts: ctx.layer_mounts.clone(),
                     // Crossing into the linked state; parent's link mounts
                     // are paths in the parent tree and do not apply here.
                     link_mounts: Arc::new(vec![]),
-                })
-                .await
-            });
+                },
+                tasks,
+                changes,
+                stats,
+            )
+            .await?;
         } else if was_directory && is_directory {
             if ctx.scan_dirty && !current_node_id.is_valid_node_id() {
                 // Re-emit a staged dirty-add directory (in staged, absent from
@@ -7252,7 +7256,6 @@ async fn diff_filesystem_directory_walk(
             } else {
                 (repository_current, state_current.clone(), current_node_id)
             };
-            let layer_mounts_recurse = ctx.layer_mounts.clone();
             // Stay in the parent's link mounts when recursing into a normal
             // sub-directory; reset when crossing into a linked state because
             // those mount paths are in the parent tree, not the linked tree.
@@ -7261,10 +7264,8 @@ async fn diff_filesystem_directory_walk(
             } else {
                 ctx.link_mounts.clone()
             };
-            let filter_mode = ctx.filter_mode;
-            let scan_dirty = ctx.scan_dirty;
-            lore_spawn!(tasks, async move {
-                diff_filesystem_subtree_recurse(DiffFilesystemContext {
+            diff_filesystem_subtree_dispatch(
+                DiffFilesystemContext {
                     from: FilesystemTraversal {
                         repository: repository_from,
                         state: state_from,
@@ -7278,13 +7279,16 @@ async fn diff_filesystem_directory_walk(
                         root_node: subnode_current,
                     },
                     filesystem_path: subpath,
-                    filter_mode,
-                    scan_dirty,
-                    layer_mounts: layer_mounts_recurse,
+                    filter_mode: ctx.filter_mode,
+                    scan_dirty: ctx.scan_dirty,
+                    layer_mounts: ctx.layer_mounts.clone(),
                     link_mounts: link_mounts_recurse,
-                })
-                .await
-            });
+                },
+                tasks,
+                changes,
+                stats,
+            )
+            .await?;
         } else {
             // Type change: file <-> directory
             let file_ctx = FileDiffContext {
@@ -7483,9 +7487,8 @@ async fn diff_filesystem_directory_walk(
                 let layer_state = mount.state.clone();
                 let subpath = child_file_path.clone();
                 let layer_source_node = mount.source_node;
-                lore_spawn!(
-                    tasks,
-                    diff_filesystem_subtree_recurse(DiffFilesystemContext {
+                diff_filesystem_subtree_dispatch(
+                    DiffFilesystemContext {
                         from: FilesystemTraversal {
                             repository: layer_repository.clone(),
                             state: layer_state.clone(),
@@ -7506,8 +7509,12 @@ async fn diff_filesystem_directory_walk(
                         // Crossing into the layer state; parent's link mounts
                         // are paths in the parent tree and do not apply here.
                         link_mounts: Arc::new(vec![]),
-                    },)
-                );
+                    },
+                    tasks,
+                    changes,
+                    stats,
+                )
+                .await?;
                 continue 'new_file_iter;
             }
             lore_trace!("Filesystem has new directory in path {child_file_path}, recursing");
@@ -7567,9 +7574,8 @@ async fn diff_filesystem_directory_walk(
             let repository_current = ctx.current.repository.clone();
             let state_current = ctx.current.state.clone();
             let subpath = child_file_path.clone();
-            lore_spawn!(
-                tasks,
-                diff_filesystem_subtree_recurse(DiffFilesystemContext {
+            diff_filesystem_subtree_dispatch(
+                DiffFilesystemContext {
                     from: FilesystemTraversal {
                         repository: repository_from,
                         state: state_from,
@@ -7588,8 +7594,12 @@ async fn diff_filesystem_directory_walk(
                     layer_mounts: ctx.layer_mounts.clone(),
                     // Same parent state; deeper paths may still match a link.
                     link_mounts: ctx.link_mounts.clone(),
-                })
-            );
+                },
+                tasks,
+                changes,
+                stats,
+            )
+            .await?;
 
             // The single Dirty+Add directory node emitted above is the scan's
             // report for this new directory; skip the transient change below.
@@ -7622,16 +7632,77 @@ async fn diff_filesystem_directory_walk(
         .await?;
     }
 
-    while let Some(task_result) = tasks.join_next().await {
-        let (mut task_changes, task_stats) = task_result
-            .internal("Task failure")
-            .map_err(StateError::from)
-            .flatten()?;
-        changes.append(&mut task_changes);
-        stats.append(task_stats);
+    while let Some(joined) = tasks.join_next().await {
+        diff_filesystem_subtree_merge_task(joined, changes, stats)?;
     }
 
     Ok(())
+}
+
+/// Budget for subtree tasks live at once. Process-wide because every directory in the walk
+/// owns its own [`JoinSet`].
+static DIFF_FILESYSTEM_TASK_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+fn diff_filesystem_task_semaphore() -> &'static Arc<Semaphore> {
+    DIFF_FILESYSTEM_TASK_SEMAPHORE
+        .get_or_init(|| Arc::new(Semaphore::new(max_concurrent_diff_directory_tasks())))
+}
+
+/// Diffs one subtree, spawned while the budget allows and inline once it does not, then folds
+/// back whatever has finished.
+///
+/// Inline rather than a blocking acquire: a parent holds its permit until its children finish,
+/// so waiting on one would wait on a descendant that cannot start.
+async fn diff_filesystem_subtree_dispatch(
+    subtree: DiffFilesystemContext,
+    tasks: &mut JoinSet<Result<(Vec<NodeChange>, FilesystemDiffStats), StateError>>,
+    changes: &mut Vec<NodeChange>,
+    stats: &mut FilesystemDiffStats,
+) -> Result<(), StateError> {
+    if let Ok(permit) = diff_filesystem_task_semaphore().clone().try_acquire_owned() {
+        lore_spawn!(tasks, async move {
+            let _permit = permit;
+            diff_filesystem_subtree_recurse(subtree).await
+        });
+    } else {
+        diff_filesystem_subtree_merge(
+            diff_filesystem_subtree_recurse(subtree).await?,
+            changes,
+            stats,
+        );
+    }
+    while let Some(joined) = tasks.try_join_next() {
+        diff_filesystem_subtree_merge_task(joined, changes, stats)?;
+    }
+    Ok(())
+}
+
+/// Folds a joined subtree task into the parent directory's changes and stats.
+fn diff_filesystem_subtree_merge_task(
+    joined: Result<Result<(Vec<NodeChange>, FilesystemDiffStats), StateError>, JoinError>,
+    changes: &mut Vec<NodeChange>,
+    stats: &mut FilesystemDiffStats,
+) -> Result<(), StateError> {
+    diff_filesystem_subtree_merge(
+        joined
+            .internal("Task failure")
+            .map_err(StateError::from)
+            .flatten()?,
+        changes,
+        stats,
+    );
+    Ok(())
+}
+
+/// Folds a finished subtree's changes and stats into the parent directory's.
+fn diff_filesystem_subtree_merge(
+    subtree: (Vec<NodeChange>, FilesystemDiffStats),
+    changes: &mut Vec<NodeChange>,
+    stats: &mut FilesystemDiffStats,
+) {
+    let (mut subtree_changes, subtree_stats) = subtree;
+    changes.append(&mut subtree_changes);
+    stats.append(subtree_stats);
 }
 
 /// Handle diff for a single file path.
