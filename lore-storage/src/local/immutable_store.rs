@@ -230,6 +230,25 @@ pub struct ImmutableStoreGroup {
     /// two-phase commit (`level.pending` deleted), so a mismatch with `bucket_count` indicates a
     /// pending level transition that needs the two-phase commit on the next flush.
     pub committed_level: std::sync::atomic::AtomicUsize,
+    /// Forces the bucket-file writes for this group to be serial.
+    ///
+    /// `flush_all` holds it for a whole group flush so that the fan-out check, the
+    /// `committed_level` read that selects the commit path, and the writes are one
+    /// atomic unit. Every other writer (the delayed flush, the evictor, the
+    /// compactor, the packfile upgrade) takes it only around its own bucket write.
+    ///
+    /// Without it, an overlapping flush can observe a half-finished level transition
+    /// and take the regular in-place path while a two-phase commit is still pending.
+    /// The commit's later `rename` of `index_<bb>.new` then publishes its older
+    /// snapshot over the newer in-place write, discarding it. The losing write still
+    /// returns `Ok`, and the clobbered file inherits the `.new` file's older mtime.
+    /// Locking the rename alone would not help: the snapshot it publishes is taken
+    /// before the rename, so the two paths must not interleave at all.
+    ///
+    /// Scope is deliberately narrow outside `flush_all` because
+    /// `compact_group_packfiles` calls `evict_group_sized`, and a `tokio::sync::Mutex`
+    /// is not reentrant - a per-function guard would self-deadlock.
+    pub flush_lock: Arc<Mutex<()>>,
     pub packstore: crate::PackStore,
     pub flush: Mutex<JoinSet<()>>,
 }
@@ -924,6 +943,18 @@ impl ImmutableStoreGroup {
                 let Some(bucket) = group.try_bucket(bucket_index).cloned() else {
                     continue;
                 };
+                // Guard this bucket write against a concurrent two-phase commit's
+                // rename. Taken before the bucket guard to keep the lock order
+                // flush_lock -> bucket RwLock -> serialize_lock uniform with `flush_all`.
+                let _flush_guard = group.flush_lock.clone().lock_owned().await;
+
+                // Re-check under the lock: a flush that ran while we waited may already
+                // have written this bucket. The dirty read above happened before the
+                // lock, so it is stale.
+                if !group.dirty[bucket_index].load(atomic::Ordering::Relaxed) {
+                    continue;
+                }
+
                 let bucket = bucket.read_owned().await;
                 let _ = ImmutableStoreBucket::serialize(
                     bucket,
@@ -1131,6 +1162,7 @@ impl LocalImmutableStore {
                 serialize_version: std::sync::atomic::AtomicU32::new(serialize_version),
                 fan_out_threshold: store.settings.fan_out_threshold,
                 committed_level: std::sync::atomic::AtomicUsize::new(committed),
+                flush_lock: Arc::new(Mutex::new(())),
                 packstore: crate::PackStore::new(
                     packpath,
                     MIN_PACKFILE_COUNT,
@@ -1258,6 +1290,7 @@ impl LocalImmutableStore {
                     group.dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
                     drop(bucket);
 
+                    let _flush_guard = group.flush_lock.clone().lock_owned().await;
                     let bucket = bucket_ref.read_owned().await;
                     let _ = ImmutableStoreBucket::serialize(
                         bucket,
@@ -2244,6 +2277,7 @@ impl LocalImmutableStore {
                 lore_base::lore_spawn!(serialize_tasks, async move {
                     let group = store.group[group_index].clone();
                     let bucket = group.bucket(bucket_index).clone();
+                    let _flush_guard = group.flush_lock.clone().lock_owned().await;
                     let bucket = bucket.read_owned().await;
                     let _ = ImmutableStoreBucket::serialize(
                         bucket,
@@ -2679,6 +2713,9 @@ impl LocalImmutableStore {
                     );
                     let path = Arc::new(path.as_ref().clone());
                     let bucket = group.bucket(bucket_index).clone();
+                    // Narrow scope on purpose: this fn already called
+                    // evict_group_sized above, which takes the same lock.
+                    let _flush_guard = group.flush_lock.clone().lock_owned().await;
                     let bucket = bucket.read_owned().await;
                     let _ = ImmutableStoreBucket::serialize(
                         bucket,
@@ -3058,6 +3095,32 @@ impl LocalImmutableStore {
             let path = path.clone();
             lore_base::lore_spawn!(tasks, async move {
                 let mut first_err: Option<LocalImmutableStoreError> = None;
+
+                // One flusher per group at a time, held for the whole group flush so an
+                // overlapping flush cannot observe a half-finished level transition and
+                // take the other commit path. See `ImmutableStoreGroup::flush_lock`.
+                let _flush_guard = group.flush_lock.clone().lock_owned().await;
+
+                // Re-check under the lock: another flusher may have drained this group
+                // while we waited. The scan that got us here is lock-free and stale by
+                // now, so skip the redundant fan-out check, path selection and - in the
+                // two-phase branch - the needless level-marker write. A pending level
+                // transition (`committed_level != active_buckets`) still has to be
+                // completed even with no dirty bucket, so it is never skipped.
+                if !group
+                    .dirty
+                    .iter()
+                    .any(|flag| flag.load(atomic::Ordering::Relaxed))
+                    && group.committed_level.load(atomic::Ordering::Relaxed)
+                        == group.bucket_count.load(atomic::Ordering::Relaxed)
+                {
+                    // The packstore flush below is unconditional for `sync_data`, so it
+                    // still has to run on this path.
+                    if sync_data {
+                        group.flush_packstore(sync_data).await;
+                    }
+                    return Ok(());
+                }
 
                 // Fan-out trigger: if any dirty bucket exceeds threshold and we're below max level, redistribute entries before serializing.
                 if let Err(err) =

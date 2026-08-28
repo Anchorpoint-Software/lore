@@ -153,6 +153,22 @@ pub struct MutableStoreGroup {
     /// two-phase commit (`level.pending` deleted), so a mismatch with `bucket_count` indicates a
     /// pending level transition that needs the two-phase commit on the next flush.
     pub committed_level: std::sync::atomic::AtomicUsize,
+    /// Makes the whole-group flushes serial: both `flush_all` and the delayed per-bucket
+    /// flush hold it, so at most one flusher per group is ever in flight.
+    ///
+    /// Without it, two overlapping flushes each read `committed_level` before either
+    /// has finished and can take *different* paths — one the two-phase commit (write
+    /// `index_<bb>.new`, then rename it over the live file), the other the regular
+    /// in-place write. The rename then publishes its older `.new` snapshot over the
+    /// newer in-place write, silently discarding it: the losing write still returns
+    /// `Ok`, and the clobbered file even inherits the `.new` file's older mtime.
+    /// Note that locking the rename alone would not be enough — the
+    /// published snapshot is taken before the rename, so the two paths have to be
+    /// prevented from interleaving at all.
+    ///
+    /// Contention is per group, and only between concurrent flushes of the *same*
+    /// group; the 256 groups still flush in parallel.
+    pub flush_lock: Arc<Mutex<()>>,
 }
 
 impl MutableStoreGroup {
@@ -870,6 +886,7 @@ impl LocalMutableStore {
                 serialize_version: std::sync::atomic::AtomicU32::new(serialize_version),
                 fan_out_threshold: settings.fan_out_threshold,
                 committed_level: std::sync::atomic::AtomicUsize::new(committed),
+                flush_lock: Arc::new(Mutex::new(())),
             }));
         }
 
@@ -927,6 +944,20 @@ impl LocalMutableStore {
                     return;
                 };
 
+                // Same group lock as `flush_all`, so a delayed bucket write cannot be
+                // clobbered by a concurrent two-phase commit's rename. Acquired before
+                // the bucket guard to keep the lock order
+                // flush_lock -> bucket RwLock -> serialize_lock uniform with
+                // `flush_all`, which would otherwise be an inversion.
+                let _flush_guard = group.flush_lock.clone().lock_owned().await;
+
+                // Re-check under the lock: a flush that ran while we waited may already
+                // have written this bucket. `serialize` would claim the dirty flag and
+                // bail out anyway, but only after taking the bucket guard.
+                if !group.dirty[bucket_index].load(atomic::Ordering::Relaxed) {
+                    return;
+                }
+
                 let bucket = bucket.read_owned().await;
                 let _ = MutableStoreBucket::serialize(
                     bucket,
@@ -969,6 +1000,29 @@ impl LocalMutableStore {
             let path = path.clone();
             lore_base::lore_spawn!(tasks, async move {
                 let mut first_err: Option<LocalMutableStoreError> = None;
+
+                // One flusher per group at a time. Held for the whole group flush so
+                // that the fan-out check, the `committed_level` read that picks the
+                // commit path, and the writes themselves are one atomic unit: an
+                // overlapping flush must not observe a half-finished level transition
+                // and take the other path. See `MutableStoreGroup::flush_lock`.
+                let _flush_guard = group.flush_lock.clone().lock_owned().await;
+
+                // Re-check under the lock: another flusher may have drained this group
+                // while we waited. The scan that got us here is lock-free and stale by
+                // now, so skip the redundant fan-out check, path selection and - in the
+                // two-phase branch - the needless level-marker write. A pending level
+                // transition (`committed_level != active_buckets`) still has to be
+                // completed even with no dirty bucket, so it is never skipped.
+                if !group
+                    .dirty
+                    .iter()
+                    .any(|flag| flag.load(atomic::Ordering::Relaxed))
+                    && group.committed_level.load(atomic::Ordering::Relaxed)
+                        == group.bucket_count.load(atomic::Ordering::Relaxed)
+                {
+                    return Ok(());
+                }
 
                 // Fan-out trigger: if any dirty bucket exceeds the threshold and we're below max level, redistribute entries before serializing.
                 if let Err(err) =
