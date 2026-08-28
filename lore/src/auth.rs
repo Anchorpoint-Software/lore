@@ -736,7 +736,7 @@ mod resolve_auth_endpoint_tests {
     }
 
     // With no explicit endpoint and no resolvable repository remote, the
-    // operation is `NotSupported` (code 18) — there is no URL to key a token
+    // operation is `NotSupported` (code 9) — there is no URL to key a token
     // lookup on — rather than an opaque internal error.
     #[tokio::test]
     async fn missing_endpoint_is_not_supported() {

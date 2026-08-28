@@ -64,7 +64,9 @@ def test_auth_user_info_not_supported_without_auth_endpoint(
     assert result != NOT_AUTHENTICATED, (
         "the authless failure must not be masked as NotAuthenticated"
     )
-    assert result == NOT_SUPPORTED, f"expected NotSupported (18), got FFI code {result}"
+    assert result == NOT_SUPPORTED, (
+        f"expected NotSupported ({NOT_SUPPORTED}), got FFI code {result}"
+    )
 
 
 @pytest.mark.smoke
@@ -112,7 +114,7 @@ def test_auth_user_info_not_authenticated_with_auth_endpoint(
         result = repo.auth_user_info_capi(lore_library_path, "some-other-user")
 
         assert result == NOT_AUTHENTICATED, (
-            f"expected NotAuthenticated (12), got FFI code {result}"
+            f"expected NotAuthenticated ({NOT_AUTHENTICATED}), got FFI code {result}"
         )
     finally:
         _kill_server_by_pid(server_proc.pid, server_log_path, label="auth-url server")

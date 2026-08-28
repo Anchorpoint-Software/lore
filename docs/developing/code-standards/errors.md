@@ -66,15 +66,17 @@ Defined in `lore-revision/src/interface.rs`. `LoreError` is the public error cod
 
 | Variant | Value | Meaning |
 | --- | --- | --- |
-| `InvalidArguments` | 1 | The arguments supplied to the operation were invalid. |
-| `AddressNotFound` | 2 | A content-addressable object wasn't found in any store. |
-| `FileNotFound` | 3 | A file path couldn't be resolved to a tracked node or found on disk. |
-| `PayloadNotFound` | 4 | A payload blob wasn't found for the associated hash. |
-| `SlowDown` | 5 | The backing store is overloaded; the caller should retry later. |
-| `Oversized` | 26 | A blob exceeded a size limit enforced by the caller or the protocol. |
+| `InvalidArguments` | 3 | The arguments supplied to the operation were invalid. |
+| `SlowDown` | 31 | The backing store is overloaded; the caller should retry later. |
+| `AddressNotFound` | 80 | A content-addressable object wasn't found in any store. |
+| `PayloadNotFound` | 81 | A payload blob wasn't found for the associated hash. |
+| `FileNotFound` | 82 | A file path couldn't be resolved to a tracked node or found on disk. |
+| `Oversized` | 118 | A blob exceeded a size limit enforced by the caller or the protocol. |
 | `Internal` | -1 | All other errors. |
 
-The `NotFound` (101), `AlreadyExists` (102), and `Connection` (103) variants are legacy categories kept for transition and will be removed.
+Each value matches the `#[ffi_code(..)]` of the same-named struct in `lore-base/src/error.rs`, so the two agree for any code a caller reads. See [Error code allocation](#error-code-allocation) for how those codes are assigned.
+
+The `NotFound` (101), `AlreadyExists` (102), and `Connection` (103) variants are legacy categories kept for transition and will be removed. They sit in the 100–109 range that `lore-base` reserves for them, so no discrete error type is allocated a code that collides with one of them.
 
 ---
 
@@ -134,6 +136,38 @@ Each `LoreTraceLocation` holds a `file`, a `line`, a `column`, and a per-locatio
 ### No mid-stream `Error` event on a terminal failure
 
 The library no longer emits a mid-stream `LORE_EVENT_ERROR` event on a terminal failure. The full error detail arrives on the `Complete` event instead. A failing operation delivers exactly one error-bearing event: the enriched `Complete`.
+
+### Error code allocation
+
+Every discrete error type carries an `#[ffi_code(N)]`, and all of them are declared in `lore-base/src/error.rs`. The codes are allocated in blocks by the kind of failure they report, so a consumer can branch on a range when it only cares about the category and on the exact value when it cares about the specific error.
+
+Every code is also a process exit status. The CLI returns the failing error's code from `main` as `ExitCode::from(code as u8)` (`lore-client/src/cli/client_main.rs`). That fixes two things: every code must fit in a `u8`, and no code may land on a value the shell or the OS already spends on something else. A `lore` command that exited 130 would be indistinguishable from one the user killed with Ctrl-C. The reserved rows below are those values, and no group block overlaps one.
+
+| Range | Group | Meaning |
+| --- | --- | --- |
+| 0 | *reserved* | Success. |
+| 1 | *reserved* | The CLI's own general failure (`ExitCode::FAILURE`), and the shell's generic error. |
+| 2 | *reserved* | The CLI's usage exit, and the shell's "misuse of a builtin". |
+| 3–15 | Input and validation | The request itself was malformed or names the wrong kind of thing. |
+| 16–27 | Authentication and authorization | The caller isn't known, or is known and not permitted. |
+| 28–39 | Connectivity and availability | The remote couldn't be reached or isn't currently serving. |
+| 40–55 | Repository state | The repository is in a state that refuses the operation. |
+| 56–63 | Already exists | Creating a resource that is already there. |
+| 64–78 | *reserved* | The BSD `sysexits.h` codes (`EX_USAGE` through `EX_CONFIG`). |
+| 79–99 | Not found | A named resource doesn't exist. |
+| 100–109 | *reserved* | The legacy `LoreError` categories (101, 102, 103). |
+| 110–117 | Configuration | Something the operation needs was never configured. |
+| 118–125 | Resource limits | A size, depth, or efficiency bound was hit. |
+| 126–128 | *reserved* | The shell's "found but not executable", "not found", and "bad argument to exit". |
+| 129–192 | *reserved* | `128 + signal`, i.e. killed by a signal. 130 is Ctrl-C, 137 is `SIGKILL`, 143 is `SIGTERM`. |
+| 193–254 | *reserved* | Free for future groups. |
+| 255 | *reserved* | `Internal`, which is `-1` truncated to a `u8`. |
+
+The trait carries a code as `i32` rather than a `u8` because `Internal` is `-1`, which isn't a code allocated here. A caller reading the library's `int32` return value or `Complete.status` sees `-1`; a caller reading the CLI's exit status sees 255.
+
+**Adding an error type:** put it in the block that matches its group and take the next free code in that block. Never renumber an existing code to close a gap — the gaps are the headroom that keeps a group contiguous, and the tests hold every block clear of the reserved values, so anything taken from that headroom is a usable exit status. New groups come out of 193–254. A type whose name ends in `NotFound` goes in the not-found block even when it belongs to a subsystem with errors elsewhere: `PluginNotFound` sits with the other not-found codes, not with the other plugin codes. The tests at the bottom of `lore-base/src/error.rs` hold these invariants: register the new type in `registry()` there, and they check its code against its group's block, against every other code, and against the reserved ranges.
+
+Codes can only be allocated in that file. `#[derive(FfiError)]` expands to a reference to `__ffi_code_registry_marker`, resolved where the derive is written, and only `lore-base/src/error.rs` declares it — so a `#[ffi_code(N)]` anywhere else fails to compile with `cannot find value __ffi_code_registry_marker in this scope`. An error type that never crosses the FFI boundary should not carry a code at all: use a plain `thiserror` enum rather than an `#[error_set]`, which would demand one for every variant type.
 
 ### Memory lifetime
 

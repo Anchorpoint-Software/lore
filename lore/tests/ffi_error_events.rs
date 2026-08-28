@@ -332,7 +332,11 @@ mod tests {
         );
 
         let expected_code = repository_not_found_code(&path);
-        assert_eq!(expected_code, 45, "the missing-repository code is 45");
+        assert_eq!(
+            expected_code,
+            RepositoryNotFound::FFI_CODE,
+            "the set must forward the discrete type's code, not collapse it"
+        );
         assert_ne!(expected_code, 1, "the code must be real, not the flat 1");
         // The code arrives only through the event status on the async path.
         assert_eq!(captured.status, expected_code);

@@ -92,14 +92,15 @@ mod mutable_local_tests {
 
     fn assert_rejected(status: i32, capture: &Arc<Mutex<RejectCapture>>, op: &str) {
         assert_eq!(
-            status, 1,
+            status,
+            lore_base::error::InvalidArguments::FFI_CODE,
             "{op}: remote op on a local-only handle must fail the call"
         );
         let capture = capture.lock().unwrap();
         assert_eq!(
             capture.complete_status,
-            Some(1),
-            "{op}: expected Complete(1)"
+            Some(lore_base::error::InvalidArguments::FFI_CODE),
+            "{op}: expected a failing Complete"
         );
         assert!(
             !capture.saw_item_event,
@@ -579,7 +580,7 @@ mod mutable_local_tests {
             }],
         )
         .await;
-        assert_eq!(status, 1);
+        assert_eq!(status, lore_base::error::InvalidArguments::FFI_CODE);
         assert_eq!(completes, vec![(1, LoreErrorCode::InvalidArguments)]);
     }
 
@@ -615,8 +616,11 @@ mod mutable_local_tests {
             callback,
         )
         .await;
-        assert_eq!(status, 1);
-        assert_eq!(*saw_complete.lock().unwrap(), Some(1));
+        assert_eq!(status, lore_base::error::InvalidArguments::FFI_CODE);
+        assert_eq!(
+            *saw_complete.lock().unwrap(),
+            Some(lore_base::error::InvalidArguments::FFI_CODE)
+        );
         assert!(
             !*saw_item.lock().unwrap(),
             "no per-item events on handle rejection"
@@ -649,7 +653,11 @@ mod mutable_local_tests {
             ],
         )
         .await;
-        assert_eq!(status, 1, "one failed item fails the call");
+        assert_eq!(
+            status,
+            lore_base::error::InvalidArguments::FFI_CODE,
+            "one failed item fails the call"
+        );
         completes.sort_by_key(|(id, _)| *id);
         assert_eq!(
             completes,
@@ -663,7 +671,7 @@ mod mutable_local_tests {
     #[tokio::test]
     async fn remote_op_on_local_only_handle_rejects_invalid_arguments() {
         // A handle with no remote configured, asked to act remotely (`globals.remote=1`), rejects
-        // the whole call up front (status 1 + Error + Complete(1)) and emits no per-item events —
+        // the whole call up front (a failing status + Error + Complete) and emits no per-item events —
         // mirroring `lore_storage_upload` on a remote-less handle.
         let handle_id = open_in_memory().await;
         let partition = Partition::from([0x80u8; 16]);

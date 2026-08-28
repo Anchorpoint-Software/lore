@@ -378,7 +378,11 @@ mod tests {
         )
         .await;
 
-        assert_eq!(status, 1, "an unknown handle must fail");
+        assert_eq!(
+            status,
+            InvalidArguments::FFI_CODE,
+            "an unknown handle must fail"
+        );
         let events = sink.lock().unwrap().clone();
         let data = info_event(&events)
             .expect("a handle miss must still emit the info terminal carrying the id");
@@ -388,6 +392,6 @@ mod tests {
             LoreErrorCode::InvalidArguments,
             "got {events:?}"
         );
-        assert!(events.contains(&CapturedEvent::Complete(1)));
+        assert!(events.contains(&CapturedEvent::Complete(InvalidArguments::FFI_CODE)));
     }
 }

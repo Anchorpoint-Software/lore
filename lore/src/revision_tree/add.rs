@@ -1233,7 +1233,11 @@ mod tests {
         )
         .await;
 
-        assert_eq!(status, 1, "a batch with an invalid entry must fail");
+        assert_eq!(
+            status,
+            InvalidArguments::FFI_CODE,
+            "a batch with an invalid entry must fail"
+        );
         assert_eq!(
             add_outcome(&events, 2)
                 .expect("the offending entry must report")
@@ -1266,7 +1270,8 @@ mod tests {
         .await;
 
         assert_eq!(
-            status, 1,
+            status,
+            InvalidArguments::FFI_CODE,
             "a case-variant duplicate within a batch must fail"
         );
         assert_eq!(
@@ -1290,7 +1295,11 @@ mod tests {
 
         let (status, events) =
             run_add(handle, vec![entry(2, ROOT_NODE, "dup", LoreNodeType::File)]).await;
-        assert_eq!(status, 1, "colliding with an existing child must fail");
+        assert_eq!(
+            status,
+            InvalidArguments::FFI_CODE,
+            "colliding with an existing child must fail"
+        );
         assert_eq!(
             add_outcome(&events, 2).expect("AddComplete must fire").1,
             LoreErrorCode::InvalidArguments,
@@ -1313,7 +1322,11 @@ mod tests {
             ],
         )
         .await;
-        assert_eq!(forward.0, 1, "a forward parent reference must fail");
+        assert_eq!(
+            forward.0,
+            InvalidArguments::FFI_CODE,
+            "a forward parent reference must fail"
+        );
         assert_eq!(
             add_outcome(&forward.1, 1).expect("AddComplete must fire").1,
             LoreErrorCode::InvalidArguments
@@ -1327,7 +1340,11 @@ mod tests {
             ],
         )
         .await;
-        assert_eq!(leaf_parent.0, 1, "parenting onto a file entry must fail");
+        assert_eq!(
+            leaf_parent.0,
+            InvalidArguments::FFI_CODE,
+            "parenting onto a file entry must fail"
+        );
         assert_eq!(
             add_outcome(&leaf_parent.1, 4)
                 .expect("AddComplete must fire")
@@ -1351,7 +1368,11 @@ mod tests {
             }],
         )
         .await;
-        assert_eq!(bad_kind.0, 1, "an unsupported kind must fail");
+        assert_eq!(
+            bad_kind.0,
+            InvalidArguments::FFI_CODE,
+            "an unsupported kind must fail"
+        );
         assert_eq!(
             add_outcome(&bad_kind.1, 1)
                 .expect("AddComplete must fire")
@@ -1364,7 +1385,11 @@ mod tests {
             vec![entry(2, 1_000_000, "orphan", LoreNodeType::File)],
         )
         .await;
-        assert_eq!(unknown.0, 1, "an unknown parent must fail");
+        assert_eq!(
+            unknown.0,
+            InvalidArguments::FFI_CODE,
+            "an unknown parent must fail"
+        );
         assert_eq!(
             add_outcome(&unknown.1, 2).expect("AddComplete must fire").1,
             LoreErrorCode::InvalidArguments
@@ -1439,7 +1464,11 @@ mod tests {
             ],
         )
         .await;
-        assert_eq!(shared_id.0, 1, "two entries sharing a caller id must fail");
+        assert_eq!(
+            shared_id.0,
+            InvalidArguments::FFI_CODE,
+            "two entries sharing a caller id must fail"
+        );
         assert_eq!(
             add_outcome(&shared_id.1, 2)
                 .expect("AddComplete must fire")
@@ -1566,7 +1595,8 @@ mod tests {
         let (status, events) =
             run_add(handle, vec![entry(2, doomed, "child", LoreNodeType::File)]).await;
         assert_eq!(
-            status, 1,
+            status,
+            InvalidArguments::FFI_CODE,
             "a deleted parent must be rejected, got {events:?}"
         );
         assert_eq!(
@@ -1610,7 +1640,8 @@ mod tests {
             )
             .await;
             assert_eq!(
-                status, 1,
+                status,
+                InvalidArguments::FFI_CODE,
                 "colliding with existing child {index} must fail, got {events:?}"
             );
             assert_eq!(
@@ -1656,7 +1687,11 @@ mod tests {
         )
         .await;
 
-        assert_eq!(status, 1, "an unknown handle must fail");
+        assert_eq!(
+            status,
+            InvalidArguments::FFI_CODE,
+            "an unknown handle must fail"
+        );
         for id in [7u64, 8] {
             assert!(
                 add_outcome(&events, id).is_none(),
@@ -1670,7 +1705,7 @@ mod tests {
             )),
             "the batch terminal must carry the call id, got {events:?}"
         );
-        assert!(events.contains(&CapturedEvent::Complete(1)));
+        assert!(events.contains(&CapturedEvent::Complete(InvalidArguments::FFI_CODE)));
     }
 
     /// The batch terminal fires once on every path, so a caller can wait on it
@@ -1691,7 +1726,7 @@ mod tests {
 
         let (status, events) =
             run_add(handle, vec![entry(2, ROOT_NODE, "", LoreNodeType::File)]).await;
-        assert_eq!(status, 1, "got {events:?}");
+        assert_eq!(status, InvalidArguments::FFI_CODE, "got {events:?}");
         assert_eq!(
             batch_outcomes(&events),
             vec![(CALL_ID, LoreErrorCode::InvalidArguments)],

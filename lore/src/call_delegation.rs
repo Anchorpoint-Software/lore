@@ -154,7 +154,7 @@ mod tests {
     use super::*;
     use crate::interface::LoreString;
 
-    // A concrete error whose `NotFound` variant carries error code 13, so the
+    // A concrete error whose `NotFound` variant carries error code 79, so the
     // async failure path has a known non-`1` code to assert against.
     #[error_set]
     enum SampleError {

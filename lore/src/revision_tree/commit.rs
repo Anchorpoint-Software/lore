@@ -790,7 +790,11 @@ mod tests {
     async fn commit_on_unknown_handle_emits_commit_complete_with_invalid_arguments() {
         let (status, events) = run_commit(LoreRevisionTree::INVALID, 6).await;
 
-        assert_eq!(status, 1, "committing an unknown handle must fail");
+        assert_eq!(
+            status,
+            InvalidArguments::FFI_CODE,
+            "committing an unknown handle must fail"
+        );
         let (revision, new_tip, code) = commit_outcome(&events, 6);
         assert_eq!(code, LoreErrorCode::InvalidArguments, "got {events:?}");
         assert!(revision.is_zero() && new_tip.is_zero(), "got {events:?}");
@@ -843,7 +847,8 @@ mod tests {
         let (status, events) = run_commit(handle, 10).await;
 
         assert_eq!(
-            status, 1,
+            status,
+            InvalidArguments::FFI_CODE,
             "an initial revision needs a branch, got {events:?}"
         );
         let (_revision, _new_tip, code) = commit_outcome(&events, 10);
@@ -1124,7 +1129,8 @@ mod tests {
         .await;
 
         assert_eq!(
-            status, 1,
+            status,
+            InvalidArguments::FFI_CODE,
             "local=1 with remote=1 must reject the commit, got {events:?}"
         );
         let (revision, new_tip, code) = commit_outcome(&events, 17);

@@ -408,10 +408,16 @@ impl<'de> serde::Deserialize<'de> for LoreBytes {
 /// common cases cheaply without parsing the companion `LORE_EVENT_ERROR`
 /// detail.
 ///
-/// Numbered independently of the general library error code that a `Complete`
-/// event's status carries: `NONE`, `INVALID_ARGUMENTS` and `ADDRESS_NOT_FOUND`
-/// happen to share its values, `INTERNAL` (3 against -1) and `SLOW_DOWN`
-/// (4 against 5) do not. Compare a code from an event only against this enum.
+/// The values are the error codes themselves, taken from the registry in
+/// `lore_base::error`, so a code read from a per-item event means the same
+/// thing as the code on `Complete.status`. This enum names the subset a
+/// per-item event can carry; it is not a second numbering.
+///
+/// The variant order is the serialized wire format, not the numbering. Serde
+/// encodes a variant by its declaration index in a non-self-describing format,
+/// and `LoreEvent` crosses the service boundary in one, so reordering these
+/// would silently redecode old payloads as different errors. Add new variants
+/// at the end and change discriminants in place.
 ///
 /// cbindgen:prefix-with-name
 /// cbindgen:rename-all=ScreamingSnakeCase
@@ -422,14 +428,26 @@ pub enum LoreErrorCode {
     #[default]
     None = 0,
     /// The arguments supplied to the operation were invalid.
-    InvalidArguments = 1,
+    InvalidArguments = 3,
     /// A content-addressable object could not be found in any store.
-    AddressNotFound = 2,
+    AddressNotFound = 80,
     /// An internal error occurred.
-    Internal = 3,
+    Internal = -1,
     /// The backing store is overloaded; the caller should retry later.
-    SlowDown = 4,
+    SlowDown = 31,
 }
+
+// cbindgen cannot evaluate a const in a discriminant position — it drops the
+// enum and emits an incomplete type — so the codes above are written out.
+// These tie them back to the registry at compile time: a code that moves in
+// `lore-base` fails the build here rather than silently leaving this enum
+// describing the old numbering.
+const _: () = assert!(LoreErrorCode::Internal as i32 == lore_error_set::Internal::FFI_CODE);
+const _: () =
+    assert!(LoreErrorCode::InvalidArguments as i32 == lore_base::error::InvalidArguments::FFI_CODE);
+const _: () = assert!(LoreErrorCode::SlowDown as i32 == lore_base::error::SlowDown::FFI_CODE);
+const _: () =
+    assert!(LoreErrorCode::AddressNotFound as i32 == lore_base::error::AddressNotFound::FFI_CODE);
 
 /// Data for an error event.
 #[repr(C)]
@@ -1319,7 +1337,7 @@ mod error_detail_tests {
 
     // A concrete `#[error_set]` error used to exercise the constructor. Its
     // `NotFound` variant wraps `lore_base::error::NotFound`, which carries FFI
-    // code 13, so the detail's `error_code` has a known, non-internal value to
+    // code 79, so the detail's `error_code` has a known, non-internal value to
     // assert against.
     #[error_set]
     enum SampleError {
@@ -1553,5 +1571,36 @@ mod metadata_event_tests {
             decoded.value,
             LoreMetadata::String(crate::interface::LoreString::from("text"))
         );
+    }
+}
+
+#[cfg(test)]
+mod wire_format_tests {
+    use super::LoreErrorCode;
+
+    /// Serde encodes an enum variant by its declaration index, not by its
+    /// explicit discriminant, and `LoreEvent` crosses the service boundary in
+    /// bitcode — a non-self-describing format. These bytes are the wire
+    /// contract: reorder the variants and a peer on an older build has its
+    /// payloads decode as different errors, silently. The discriminants are
+    /// free to change; the order is not. New variants go at the end.
+    #[test]
+    fn variant_order_is_pinned_to_the_wire_format() {
+        for (variant, encoded) in [
+            (LoreErrorCode::None, [0u8]),
+            (LoreErrorCode::InvalidArguments, [1]),
+            (LoreErrorCode::AddressNotFound, [2]),
+            (LoreErrorCode::Internal, [3]),
+            (LoreErrorCode::SlowDown, [4]),
+        ] {
+            assert_eq!(
+                bitcode::serialize(&variant).expect("serialize"),
+                encoded,
+                "{variant:?} moved in declaration order; a payload from an \
+                 older peer would decode as a different error"
+            );
+            let decoded: LoreErrorCode = bitcode::deserialize(&encoded).expect("deserialize");
+            assert_eq!(decoded, variant, "decoding {encoded:?} must be stable");
+        }
     }
 }

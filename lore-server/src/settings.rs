@@ -205,13 +205,11 @@ fn validate_feature_config(settings: &Settings) -> Result<(), config::ConfigErro
 }
 
 fn trace_config_error_to_config(err: TraceConfigError) -> config::ConfigError {
-    if let Some(out_of_range) = err.as_out_of_range() {
-        return config::ConfigError::Message(format!(
-            "telemetry.traces.{} value {} is outside [0.0, 1.0]",
-            out_of_range.field, out_of_range.value
-        ));
+    match err {
+        TraceConfigError::OutOfRange { field, value } => config::ConfigError::Message(format!(
+            "telemetry.traces.{field} value {value} is outside [0.0, 1.0]"
+        )),
     }
-    config::ConfigError::Message(format!("telemetry.traces validation failed: {err}"))
 }
 
 ///

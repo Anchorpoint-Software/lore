@@ -470,7 +470,11 @@ mod tests {
         )
         .await;
 
-        assert_eq!(status, 1, "an invalid node id must fail");
+        assert_eq!(
+            status,
+            InvalidArguments::FFI_CODE,
+            "an invalid node id must fail"
+        );
         let events = sink.lock().unwrap().clone();
         let data = node_info_event(&events)
             .expect("a failure must still emit the node info terminal carrying the id");
@@ -481,7 +485,7 @@ mod tests {
             "got {events:?}"
         );
         assert_eq!(data.node_id, INVALID_NODE);
-        assert!(events.contains(&CapturedEvent::Complete(1)));
+        assert!(events.contains(&CapturedEvent::Complete(InvalidArguments::FFI_CODE)));
 
         release(handle, store_handle_id);
     }
@@ -501,7 +505,11 @@ mod tests {
         )
         .await;
 
-        assert_eq!(status, 1, "an unknown handle must fail");
+        assert_eq!(
+            status,
+            InvalidArguments::FFI_CODE,
+            "an unknown handle must fail"
+        );
         let events = sink.lock().unwrap().clone();
         let data = node_info_event(&events)
             .expect("a handle miss must still emit the node info terminal carrying the id");
@@ -511,7 +519,7 @@ mod tests {
             LoreErrorCode::InvalidArguments,
             "got {events:?}"
         );
-        assert!(events.contains(&CapturedEvent::Complete(1)));
+        assert!(events.contains(&CapturedEvent::Complete(InvalidArguments::FFI_CODE)));
     }
 
     #[tokio::test]
@@ -531,7 +539,11 @@ mod tests {
         )
         .await;
 
-        assert_eq!(status, 1, "a node id past any allocated block must fail");
+        assert_eq!(
+            status,
+            InvalidArguments::FFI_CODE,
+            "a node id past any allocated block must fail"
+        );
         let events = sink.lock().unwrap().clone();
         let data = node_info_event(&events)
             .expect("a failure must still emit the node info terminal carrying the id");
@@ -541,7 +553,7 @@ mod tests {
             LoreErrorCode::InvalidArguments,
             "an unreadable node id must report InvalidArguments, got {events:?}"
         );
-        assert!(events.contains(&CapturedEvent::Complete(1)));
+        assert!(events.contains(&CapturedEvent::Complete(InvalidArguments::FFI_CODE)));
 
         release(handle, store_handle_id);
     }
@@ -565,7 +577,11 @@ mod tests {
         )
         .await;
 
-        assert_eq!(status, 1, "an unallocated node id must fail");
+        assert_eq!(
+            status,
+            InvalidArguments::FFI_CODE,
+            "an unallocated node id must fail"
+        );
         let events = sink.lock().unwrap().clone();
         let data = node_info_event(&events)
             .expect("a failure must still emit the node info terminal carrying the id");
@@ -575,7 +591,7 @@ mod tests {
             LoreErrorCode::InvalidArguments,
             "a non-root node with an empty name must report InvalidArguments, got {events:?}"
         );
-        assert!(events.contains(&CapturedEvent::Complete(1)));
+        assert!(events.contains(&CapturedEvent::Complete(InvalidArguments::FFI_CODE)));
 
         release(handle, store_handle_id);
     }

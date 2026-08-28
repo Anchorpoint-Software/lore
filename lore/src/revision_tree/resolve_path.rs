@@ -535,7 +535,11 @@ mod tests {
         )
         .await;
 
-        assert_eq!(status, 1, "descending through a file must fail");
+        assert_eq!(
+            status,
+            InvalidArguments::FFI_CODE,
+            "descending through a file must fail"
+        );
         let events = sink.lock().unwrap().clone();
         let (node_id, _repository, _revision, error_code) =
             resolve_outcome(&events, 23).expect("ResolvePathComplete must fire");
@@ -566,7 +570,11 @@ mod tests {
         )
         .await;
 
-        assert_eq!(status, 1, "resolving a missing path must fail");
+        assert_eq!(
+            status,
+            InvalidArguments::FFI_CODE,
+            "resolving a missing path must fail"
+        );
         let events = sink.lock().unwrap().clone();
         let (node_id, _repository, _revision, error_code) =
             resolve_outcome(&events, 8).expect("ResolvePathComplete must fire for the caller id");
@@ -580,8 +588,8 @@ mod tests {
             "a failed resolve must report the invalid-node sentinel, got {events:?}"
         );
         assert!(
-            events.contains(&CapturedEvent::Complete(1)),
-            "missing path must complete with status=1, got {events:?}"
+            events.contains(&CapturedEvent::Complete(InvalidArguments::FFI_CODE)),
+            "missing path must complete with status=InvalidArguments, got {events:?}"
         );
 
         release(handle, store_handle_id);
@@ -602,7 +610,11 @@ mod tests {
         )
         .await;
 
-        assert_eq!(status, 1, "resolving against an unknown handle must fail");
+        assert_eq!(
+            status,
+            InvalidArguments::FFI_CODE,
+            "resolving against an unknown handle must fail"
+        );
         let events = sink.lock().unwrap().clone();
         let (node_id, _repository, _revision, error_code) = resolve_outcome(&events, 10)
             .expect("a handle miss must still emit ResolvePathComplete carrying the caller id");
@@ -616,8 +628,8 @@ mod tests {
             "a handle miss must report the invalid-node sentinel, got {events:?}"
         );
         assert!(
-            events.contains(&CapturedEvent::Complete(1)),
-            "a handle miss must complete with status=1, got {events:?}"
+            events.contains(&CapturedEvent::Complete(InvalidArguments::FFI_CODE)),
+            "a handle miss must complete with status=InvalidArguments, got {events:?}"
         );
     }
 

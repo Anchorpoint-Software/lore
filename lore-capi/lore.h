@@ -28,7 +28,7 @@
 // inside an event is valid only while the callback runs; copy its bytes to keep
 // them after the callback returns. A string the caller passes in must be valid
 // UTF-8: the library checks every string an operation carries before it starts
-// the call, and fails the whole call with error code 1 (invalid arguments)
+// the call, and fails the whole call with error code 3 (invalid arguments)
 // naming the offending field if any of them is not. The library copies the
 // bytes, so the caller may free the string once the call returns. See
 // lore_string_t for the layout of the type.
@@ -145,22 +145,28 @@ typedef enum lore_node_type_t {
 // common cases cheaply without parsing the companion `LORE_EVENT_ERROR`
 // detail.
 //
-// Numbered independently of the general library error code that a `Complete`
-// event's status carries: `NONE`, `INVALID_ARGUMENTS` and `ADDRESS_NOT_FOUND`
-// happen to share its values, `INTERNAL` (3 against -1) and `SLOW_DOWN`
-// (4 against 5) do not. Compare a code from an event only against this enum.
+// The values are the error codes themselves, taken from the registry in
+// `lore_base::error`, so a code read from a per-item event means the same
+// thing as the code on `Complete.status`. This enum names the subset a
+// per-item event can carry; it is not a second numbering.
+//
+// The variant order is the serialized wire format, not the numbering. Serde
+// encodes a variant by its declaration index in a non-self-describing format,
+// and `LoreEvent` crosses the service boundary in one, so reordering these
+// would silently redecode old payloads as different errors. Add new variants
+// at the end and change discriminants in place.
 //
 typedef enum lore_error_code_t {
   // No error; the operation succeeded.
   LORE_ERROR_CODE_NONE = 0,
   // The arguments supplied to the operation were invalid.
-  LORE_ERROR_CODE_INVALID_ARGUMENTS = 1,
+  LORE_ERROR_CODE_INVALID_ARGUMENTS = 3,
   // A content-addressable object could not be found in any store.
-  LORE_ERROR_CODE_ADDRESS_NOT_FOUND = 2,
+  LORE_ERROR_CODE_ADDRESS_NOT_FOUND = 80,
   // An internal error occurred.
-  LORE_ERROR_CODE_INTERNAL = 3,
+  LORE_ERROR_CODE_INTERNAL = -1,
   // The backing store is overloaded; the caller should retry later.
-  LORE_ERROR_CODE_SLOW_DOWN = 4,
+  LORE_ERROR_CODE_SLOW_DOWN = 31,
 } lore_error_code_t;
 
 // Whether a repository being created or cloned should be backed by a shared store.

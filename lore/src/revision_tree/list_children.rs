@@ -167,7 +167,7 @@ async fn resolve_listing_target(
 ///
 /// The header is the only id-carrying terminal: a failure that surfaces after a
 /// successful header has fired — a tree-block read error mid-iteration — is
-/// reported on the trailing `Complete{status:1}`, which carries no `id`. Such a
+/// reported on the trailing `Complete{status:InvalidArguments}`, which carries no `id`. Such a
 /// mid-stream failure is therefore not attributable to this call on a
 /// multiplexed transport; callers treat a non-zero `Complete` after a successful
 /// header as "the listing was truncated".
@@ -702,7 +702,11 @@ mod tests {
         )
         .await;
 
-        assert_eq!(status, 1, "listing a leaf node must fail");
+        assert_eq!(
+            status,
+            InvalidArguments::FFI_CODE,
+            "listing a leaf node must fail"
+        );
         let events = sink.lock().unwrap().clone();
         let (begin_id, _begin_repository, _begin_revision, begin_error) =
             begin(&events).expect("begin event must fire");
@@ -716,7 +720,7 @@ mod tests {
             children(&events).is_empty(),
             "a failed listing must emit no children, got {events:?}"
         );
-        assert!(events.contains(&CapturedEvent::Complete(1)));
+        assert!(events.contains(&CapturedEvent::Complete(InvalidArguments::FFI_CODE)));
 
         release(handle, store_handle_id);
     }
@@ -738,7 +742,11 @@ mod tests {
         )
         .await;
 
-        assert_eq!(status, 1, "listing an unknown node must fail");
+        assert_eq!(
+            status,
+            InvalidArguments::FFI_CODE,
+            "listing an unknown node must fail"
+        );
         let events = sink.lock().unwrap().clone();
         let (begin_id, _begin_repository, _begin_revision, begin_error) =
             begin(&events).expect("begin event must fire");
@@ -749,7 +757,7 @@ mod tests {
             "an unknown parent must report InvalidArguments on the begin event, got {events:?}"
         );
         assert!(children(&events).is_empty());
-        assert!(events.contains(&CapturedEvent::Complete(1)));
+        assert!(events.contains(&CapturedEvent::Complete(InvalidArguments::FFI_CODE)));
 
         release(handle, store_handle_id);
     }
@@ -949,7 +957,11 @@ mod tests {
         )
         .await;
 
-        assert_eq!(status, 1, "listing against an unknown handle must fail");
+        assert_eq!(
+            status,
+            InvalidArguments::FFI_CODE,
+            "listing against an unknown handle must fail"
+        );
         let events = sink.lock().unwrap().clone();
         let (begin_id, _begin_repository, _begin_revision, begin_error) =
             begin(&events).expect("a handle miss must still emit the begin header carrying the id");
@@ -960,7 +972,7 @@ mod tests {
             "a handle miss must report InvalidArguments on the begin event, got {events:?}"
         );
         assert!(children(&events).is_empty());
-        assert!(events.contains(&CapturedEvent::Complete(1)));
+        assert!(events.contains(&CapturedEvent::Complete(InvalidArguments::FFI_CODE)));
     }
 
     #[tokio::test]
@@ -983,7 +995,11 @@ mod tests {
         )
         .await;
 
-        assert_eq!(status, 1, "a link resolving to a leaf must fail");
+        assert_eq!(
+            status,
+            InvalidArguments::FFI_CODE,
+            "a link resolving to a leaf must fail"
+        );
         let events = sink.lock().unwrap().clone();
         let (_, _begin_repository, _begin_revision, begin_error) =
             begin(&events).expect("begin event must fire");
@@ -1016,7 +1032,11 @@ mod tests {
         )
         .await;
 
-        assert_eq!(status, 1, "a link to a missing node must fail");
+        assert_eq!(
+            status,
+            InvalidArguments::FFI_CODE,
+            "a link to a missing node must fail"
+        );
         let events = sink.lock().unwrap().clone();
         let (_, _begin_repository, _begin_revision, begin_error) =
             begin(&events).expect("begin event must fire");

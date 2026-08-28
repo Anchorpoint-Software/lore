@@ -42,9 +42,11 @@ from ctypes import (
 from pathlib import Path
 
 # FFI codes from lore-base/src/error.rs (`#[ffi_code(...)]`), which the
-# header does not export as constants.
-NOT_AUTHENTICATED = 12
-NOT_SUPPORTED = 18
+# header does not export as constants. That module allocates codes in blocks
+# by error group: 16-27 is authentication and authorization, 3-15 is input and
+# validation.
+NOT_AUTHENTICATED = 16
+NOT_SUPPORTED = 9
 
 
 def library_filename() -> str:

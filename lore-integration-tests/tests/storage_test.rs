@@ -176,7 +176,7 @@ mod open_tests {
             events
                 .iter()
                 .any(|e| matches!(e, Captured::Complete(s) if *s != 0)),
-            "expected Complete(1), got {events:?}",
+            "expected a failing Complete, got {events:?}",
         );
         assert!(
             take_opened(&events).is_none(),
@@ -663,7 +663,7 @@ mod open_tests {
     #[tokio::test]
     async fn put_every_item_failing_still_emits_per_item_events() {
         // All-items-fail variant of All items failing case: with every input invalid,
-        // the call returns status=1 but each item still gets its own
+        // the call returns a failing status but each item still gets its own
         // PUT_ITEM_COMPLETE event with its own error code.
         use lore_base::types::Context;
         use lore_base::types::Partition;
@@ -738,7 +738,7 @@ mod open_tests {
     #[tokio::test]
     async fn disk_backed_open_on_nonexistent_path_errors() {
         // Non-existent path: non-existent / invalid path errors with Error +
-        // Complete(status=1) and no OPENED.
+        // a failing Complete and no OPENED.
         let (_guard, missing) = temp_file_path("open-missing");
         let (sink, callback) = make_sink();
         let status = open::open(
@@ -942,7 +942,7 @@ mod open_tests {
             callback,
         )
         .await;
-        // One item failed → call status 1 .
+        // One item failed → the call fails.
         assert_ne!(status, 0);
 
         let events = sink.lock().unwrap().clone();
@@ -1110,7 +1110,7 @@ mod open_tests {
     #[tokio::test]
     async fn get_on_invalid_handle_returns_invalid_arguments() {
         // On unknown handle: the return value is 1 and a single enriched
-        // Complete carries the handle-miss code (FFI code 1 for the dispatch
+        // Complete carries the handle-miss code (FFI code 3 for the dispatch
         // InvalidArguments).
         let (sink, callback) = make_get_sink();
         let status = lore::storage::get::get(
@@ -1806,7 +1806,7 @@ mod open_tests {
     async fn aggregate_call_error_uses_invalid_arguments_when_any_item_invalid() {
         // Severity ordering: a single InvalidArguments per-item code wins over
         // AddressNotFound at the call level. The enriched Complete carries the
-        // aggregated error's FFI code (1 for InvalidArguments).
+        // aggregated error's FFI code (3 for InvalidArguments).
         use lore_base::types::Address;
         use lore_base::types::Context;
         use lore_base::types::Hash;
@@ -1871,7 +1871,7 @@ mod open_tests {
                 _ => None,
             })
             .expect("expected Complete event");
-        // InvalidArguments carries FFI code 1; it wins the aggregate.
+        // InvalidArguments carries FFI code 3; it wins the aggregate.
         assert_ne!(complete.status, 0);
         assert_ne!(complete.error.error_code, 0);
     }
@@ -2124,7 +2124,7 @@ mod open_tests {
     #[tokio::test]
     async fn flush_on_invalid_handle_returns_invalid_arguments() {
         // On unknown handle: the return value is 1 and a single enriched
-        // Complete carries the handle-miss code (FFI code 1 for the dispatch
+        // Complete carries the handle-miss code (FFI code 3 for the dispatch
         // InvalidArguments).
         let (sink, callback) = make_sink();
         let status = lore::storage::flush::flush(
@@ -4897,7 +4897,7 @@ mod open_tests {
             events
                 .iter()
                 .any(|e| matches!(e, Captured::Complete(s) if *s != 0)),
-            "expected Complete(1), got {events:?}",
+            "expected a failing Complete, got {events:?}",
         );
         // No Opened event must fire on a rejected open.
         assert!(

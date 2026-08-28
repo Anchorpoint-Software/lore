@@ -1118,27 +1118,34 @@ fn install_crypto_provider() -> Result<(), String> {
 }
 
 /// Error codes returned across the FFI boundary.
+///
+/// Every discriminant except the legacy categories and `Internal` matches the
+/// `#[ffi_code(..)]` of the same-named struct in [`lore_base::error`], so a
+/// caller comparing a `status` against one of these names gets the same answer
+/// as a caller comparing it against the discrete type's code. The grouped
+/// allocation those codes come from is documented on that module.
+///
 /// cbindgen:prefix-with-name
 /// cbindgen:rename-all=ScreamingSnakeCase
 #[repr(i32)]
 #[derive(Eq, PartialEq)]
 pub enum LoreError {
     /// The arguments supplied to the operation were invalid.
-    InvalidArguments = 1,
-    /// A content-addressable object could not be found in any store.
-    AddressNotFound = 2,
-    /// A file path could not be resolved to a tracked node or found in the file system.
-    FileNotFound = 3,
-    /// A payload blob could not be found with the associated hash.
-    PayloadNotFound = 4,
+    InvalidArguments = 3,
     /// The backing store is overloaded; the caller should retry later.
-    SlowDown = 5,
+    SlowDown = 31,
+    /// A content-addressable object could not be found in any store.
+    AddressNotFound = 80,
+    /// A payload blob could not be found with the associated hash.
+    PayloadNotFound = 81,
+    /// A file path could not be resolved to a tracked node or found in the file system.
+    FileNotFound = 82,
     /// A blob exceeded a size limit enforced by the caller or the protocol.
-    /// Discriminant matches the error code of the underlying `Oversized` struct
-    /// in `lore-base` so callers see a single consistent code.
-    Oversized = 26,
+    Oversized = 118,
 
-    // Legacy error categories (transitional, will be removed)
+    // Legacy error categories (transitional, will be removed). They sit in the
+    // 100–109 range that `lore_base::error` reserves for them, so no discrete
+    // error type is ever allocated a code that collides with one of these.
     /// A requested item was not found.
     NotFound = 101,
     /// An item that was being created already exists.
