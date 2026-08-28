@@ -20,10 +20,17 @@ use crate::errors::Disconnected;
 use crate::errors::FileNotFound;
 use crate::errors::InvalidPath;
 use crate::errors::LinkNotFound;
+use crate::errors::Maintenance;
+use crate::errors::NoRemote;
 use crate::errors::NodeNotFound;
+use crate::errors::NotAuthenticated;
+use crate::errors::NotAuthorized;
+use crate::errors::NotConnected;
 use crate::errors::NotFound;
+use crate::errors::NotSupported;
 use crate::errors::Oversized;
 use crate::errors::PayloadNotFound;
+use crate::errors::SlowDown;
 use crate::errors::WriteRequired;
 use crate::event::EventError;
 use crate::hash;
@@ -143,25 +150,25 @@ pub async fn register_instance(
     let mut metadata = Metadata::new();
     metadata
         .set_string(INSTANCE_ID, hex::encode(instance_id.data()).as_str())
-        .internal("failed to set instance ID in metadata")?;
+        .forward_any::<InstanceError>("failed to set instance ID in metadata")?;
     metadata
         .set_string(PATH, normalized_path.as_str())
-        .internal("failed to set path in metadata")?;
+        .forward_any::<InstanceError>("failed to set path in metadata")?;
     metadata
         .set_u64(CREATED, crate::util::time::timestamp())
-        .internal("failed to set created in metadata")?;
+        .forward_any::<InstanceError>("failed to set created in metadata")?;
 
     let metadata_hash = metadata
         .serialize_local(repository.clone())
         .await
-        .internal("failed to serialize instance metadata")?;
+        .forward_any::<InstanceError>("failed to serialize instance metadata")?;
 
     let (key, key_type) = instance_key(repository.salt(), instance_id);
     let handle = repository.try_write_mutable_store().ok_or(WriteRequired)?;
     handle
         .store(repository.id, key, metadata_hash, key_type)
         .await
-        .internal("failed to store instance registration")?;
+        .forward::<InstanceError>("failed to store instance registration")?;
 
     lore_debug!("Registered instance {instance_id} with metadata hash {metadata_hash}");
     Ok(())
@@ -174,7 +181,7 @@ pub async fn load_instance_metadata(
 ) -> Result<InstanceMetadata, InstanceError> {
     let metadata = Metadata::deserialize(repository.clone(), metadata_hash)
         .await
-        .internal("failed to deserialize instance metadata")?;
+        .forward_any::<InstanceError>("failed to deserialize instance metadata")?;
 
     // Missing or corrupt fields are non-fatal — instance metadata is advisory
     // (used for branch checkout warnings and stale instance detection), not
@@ -272,7 +279,7 @@ pub async fn list_instances(
         .read_mutable_store()
         .list(repository.id, KeyType::Instance)
         .await
-        .internal("failed to list instances")?;
+        .forward::<InstanceError>("failed to list instances")?;
 
     let mut instances = Vec::new();
     while let Some((_key, metadata_hash)) = stream.next().await {
@@ -469,7 +476,7 @@ pub async fn store_current_anchor(
     handle
         .store(repository.id, key, revision, key_type)
         .await
-        .internal("failed to store current anchor")?;
+        .forward_any::<AnchorError>("failed to store current anchor")?;
     Ok(())
 }
 
@@ -490,7 +497,7 @@ pub async fn store_current_anchor_branch(
     handle
         .store(repository.id, key, Hash::from_context(branch), key_type)
         .await
-        .internal("failed to store current anchor branch")?;
+        .forward_any::<AnchorError>("failed to store current anchor branch")?;
     Ok(())
 }
 
@@ -504,7 +511,7 @@ pub async fn store_staged_anchor(
     handle
         .store(repository.id, key, revision, key_type)
         .await
-        .internal("failed to store staged anchor")?;
+        .forward_any::<AnchorError>("failed to store staged anchor")?;
     Ok(())
 }
 
@@ -525,6 +532,13 @@ pub enum InstanceError {
     AddressNotFound,
     PayloadNotFound,
     Disconnected,
+    SlowDown,
+    Maintenance,
+    NotConnected,
+    NoRemote,
+    NotAuthenticated,
+    NotAuthorized,
+    NotSupported,
 }
 
 impl EventError for InstanceError {

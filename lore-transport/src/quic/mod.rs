@@ -109,7 +109,7 @@ pub async fn storage(
         credentials,
     )
     .await
-    .internal_with(|| format!("connecting to {remote_url}"))?;
+    .forward_with::<ProtocolError, _>(|| format!("connecting to {remote_url}"))?;
 
     Ok(Arc::new(storage))
 }

@@ -1402,16 +1402,17 @@ pub fn parse_url(url: &str, offline: bool) -> Result<(String, String), Repositor
 /// remote URL, so defaulting past a read failure presents a repository that merely could not be
 /// opened as one with no remote, and the next save writes that back.
 fn load_config(config_path: impl AsRef<Path>) -> Result<RepositoryConfig, RepositoryError> {
-    Ok(util::config::load_blocking(config_path).internal("Failed to load config file")?)
+    util::config::load_blocking(config_path)
+        .forward::<RepositoryError>("Failed to load config file")
 }
 
 async fn save_config(
     config_path: impl AsRef<Path>,
     config: &RepositoryConfig,
 ) -> Result<(), RepositoryError> {
-    Ok(util::config::save(config, config_path)
+    util::config::save(config, config_path)
         .await
-        .internal("Failed to save config file")?)
+        .forward::<RepositoryError>("Failed to save config file")
 }
 
 pub fn load_repository_config(path: impl AsRef<Path>) -> Result<RepositoryConfig, RepositoryError> {

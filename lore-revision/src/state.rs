@@ -601,7 +601,7 @@ impl State {
     ) -> Result<(Arc<Self>, BranchId), StateError> {
         let (current_revision, branch) = crate::instance::load_current_anchor(&repository)
             .await
-            .internal("Failed to deserialize anchor")?;
+            .forward::<StateError>("Failed to deserialize anchor")?;
         Ok((
             State::deserialize(repository.clone(), current_revision).await?,
             branch,
@@ -617,7 +617,7 @@ impl State {
     ) -> Result<(Arc<Self>, Option<Arc<Self>>, BranchId), StateError> {
         let (current_revision, branch) = crate::instance::load_current_anchor(&repository)
             .await
-            .internal("Failed to deserialize anchor")?;
+            .forward::<StateError>("Failed to deserialize anchor")?;
         let state_current = State::deserialize(repository.clone(), current_revision).await?;
 
         let state_staged = match crate::instance::load_staged_revision(&repository)
@@ -798,7 +798,7 @@ impl State {
                                         .with_max_size_chunk(),
                                 )
                                 .await
-                                .internal("Failed to serialize node block")?
+                                .forward::<StateError>("Failed to serialize node block")?
                             } else {
                                 Address::default()
                             };
@@ -819,7 +819,7 @@ impl State {
                                 .with_max_size_chunk(),
                         )
                         .await
-                        .internal("Failed to serialize node block")?;
+                        .forward::<StateError>("Failed to serialize node block")?;
                     Ok((address, block_index))
                 });
             }
@@ -864,7 +864,7 @@ impl State {
                     .with_max_size_chunk(),
             )
             .await
-            .internal("Failed to serialize node block list")?;
+            .forward::<StateError>("Failed to serialize node block list")?;
 
             // Update the tree node block list address
             {
@@ -911,7 +911,7 @@ impl State {
                                 .with_max_size_chunk(),
                         )
                         .await
-                        .internal("Failed to serialize file metadata block")?;
+                        .forward::<StateError>("Failed to serialize file metadata block")?;
                     Ok((address, block_index))
                 });
             }
@@ -956,7 +956,7 @@ impl State {
                     .with_max_size_chunk(),
             )
             .await
-            .internal("Failed to serialize file metadata block list")?;
+            .forward::<StateError>("Failed to serialize file metadata block list")?;
 
             // Update the tree file metadata node block list address
             {
@@ -993,7 +993,7 @@ impl State {
                             .with_max_size_chunk(),
                     )
                     .await
-                    .internal("Failed to serialize link list")?;
+                    .forward::<StateError>("Failed to serialize link list")?;
 
                     address.hash
                 };
@@ -1018,7 +1018,7 @@ impl State {
                         .with_max_size_chunk(),
                 )
                 .await
-                .internal("Failed to serialize tree")?;
+                .forward::<StateError>("Failed to serialize tree")?;
             {
                 lore_trace!("Serialized tree to {}", address.hash);
                 lore_trace!("  node block {}", tree.hash_node);
@@ -1050,7 +1050,7 @@ impl State {
                     .with_max_size_chunk(),
             )
             .await
-            .internal("Failed to serialize state")?
+            .forward::<StateError>("Failed to serialize state")?
         };
 
         {
@@ -1183,7 +1183,6 @@ impl State {
         let metadata = self.metadata_hash();
         let metadata = metadata::Metadata::deserialize(repository, metadata)
             .await
-            .internal("Failed to deserialize metadata")
             .unwrap_or_default();
         metadata.get_branch().unwrap_or_default()
     }
@@ -1217,14 +1216,14 @@ impl State {
         let options = immutable::read_options_from_repository(&repository)
             .with_cache()
             .with_priority();
-        Ok(immutable::read(
+        immutable::read(
             repository,
             Address::zero_context_hash(tree.hash_delta),
             None, /* Full range */
             options,
         )
         .await
-        .internal("Failed to deserialize delta block")?)
+        .forward::<StateError>("Failed to deserialize delta block")
     }
 
     pub async fn node_delta(
@@ -1765,7 +1764,7 @@ impl State {
                 true,
             )
             .await
-            .internal("Failed to deserialize file metadata block")?;
+            .forward::<StateError>("Failed to deserialize file metadata block")?;
             NodeFileMetadataBlock::new(block_data)
         });
 
@@ -2697,8 +2696,7 @@ impl State {
         let renamed = node.name_hash != name_hash
             || block
                 .node_name_clone(node_index)
-                .internal("Node name")
-                .map_err(StateError::from)?
+                .forward::<StateError>("Node name")?
                 != dst_name;
         let source_parent_id = node.parent;
         if !renamed && source_parent_id == destination_parent_id {
@@ -3055,8 +3053,7 @@ impl State {
             .await?;
         block
             .node_name_clone(Node::index(node))
-            .internal("Node name")
-            .map_err(StateError::from)
+            .forward::<StateError>("Node name")
     }
 
     pub async fn node_name_ref(
@@ -3069,8 +3066,7 @@ impl State {
             .await?;
         block
             .node_name_ref(Node::index(node))
-            .internal("Node name")
-            .map_err(StateError::from)
+            .forward::<StateError>("Node name")
     }
 
     pub async fn node_mark(
@@ -3149,13 +3145,13 @@ impl State {
         let children = self
             .node_children(repository.clone(), parent_node)
             .await
-            .internal("Node not found")?;
+            .forward::<StateError>("Node not found")?;
 
         for &child in &children {
             if self
                 .node(repository.clone(), child)
                 .await
-                .internal("Node not found")?
+                .forward::<StateError>("Node not found")?
                 .is_staged()
             {
                 lore_trace!("Child node {child} is staged");
@@ -3245,13 +3241,13 @@ impl State {
         let children = self
             .node_children(repository.clone(), parent_node)
             .await
-            .internal("Node not found")?;
+            .forward::<StateError>("Node not found")?;
 
         for &child in &children {
             if self
                 .node(repository.clone(), child)
                 .await
-                .internal("Node not found")?
+                .forward::<StateError>("Node not found")?
                 .is_dirty()
             {
                 lore_trace!("Child node {child} is dirty");
@@ -3343,7 +3339,7 @@ impl State {
             let children = self
                 .node_children(repository.clone(), node_id)
                 .await
-                .internal("Failed to get children for dirty path collection")?;
+                .forward::<StateError>("Failed to get children for dirty path collection")?;
 
             if node_id == root_node && children.is_empty() && !path.is_empty() {
                 let node = self.node(repository.clone(), node_id).await?;
@@ -3622,7 +3618,7 @@ impl State {
             let name = self
                 .node_name_ref(repository.clone(), *node)
                 .await
-                .internal("Node name")?;
+                .forward::<StateError>("Node name")?;
             path.push(name);
         }
 
@@ -3670,7 +3666,7 @@ impl State {
             let linked_repository = Arc::new(repository.to_link_context(linked_repository).await);
             let link_state = State::deserialize(linked_repository.clone(), signature)
                 .await
-                .internal("Link error")?;
+                .forward::<StateError>("Link error")?;
 
             let result = Box::pin(link_state.collect_children_unsorted(
                 linked_repository.clone(),
@@ -3742,7 +3738,7 @@ impl State {
             let linked_repository = Arc::new(repository.to_link_context(linked_repository).await);
             let link_state = State::deserialize(linked_repository.clone(), signature)
                 .await
-                .internal("Link error")?;
+                .forward::<StateError>("Link error")?;
 
             let result = Box::pin(link_state.collect_named_children_unsorted(
                 linked_repository.clone(),
@@ -3909,7 +3905,7 @@ impl State {
     ) -> Result<RevisionMetadata, StateError> {
         let metadata = Metadata::deserialize(repository, self.metadata_hash())
             .await
-            .internal("Failed to deserialize metadata")?;
+            .forward::<StateError>("Failed to deserialize metadata")?;
 
         Ok(RevisionMetadata::from_metadata(metadata))
     }
@@ -3958,7 +3954,7 @@ impl State {
                 .with_max_size_chunk(),
         )
         .await
-        .internal("Failed to serialize link merge state")?;
+        .forward::<StateError>("Failed to serialize link merge state")?;
 
         self.set_link_merge_hash(address.hash);
         Ok(address.hash)
@@ -3981,7 +3977,7 @@ impl State {
             options,
         )
         .await
-        .internal("Failed to read link merge state")?;
+        .forward::<StateError>("Failed to read link merge state")?;
 
         let raw = data.as_ref();
         let header_size = std::mem::size_of::<LinkMergeState>();
@@ -4029,7 +4025,7 @@ impl State {
                 .with_priority(),
         )
         .await
-        .internal("Failed to read state data")?
+        .forward::<StateError>("Failed to read state data")?
         .to_aligned::<LinkReference>();
 
         Ok(data.as_type_slice::<LinkReference>().to_vec())
@@ -4104,7 +4100,7 @@ impl State {
                         .with_priority(),
                 )
                 .await
-                .internal("Failed to read state data")?
+                .forward::<StateError>("Failed to read state data")?
                 .to_aligned::<LinkReference>();
                 data.as_type_slice::<LinkReference>().to_vec()
             } else {
@@ -4233,7 +4229,7 @@ impl State {
             Arc::new(if !tree.hash_nametable_deprecated.is_zero() {
                 NameTable::deserialize(repository, tree.hash_nametable_deprecated)
                     .await
-                    .internal("Failed to deserialize name table")?
+                    .forward::<StateError>("Failed to deserialize name table")?
             } else {
                 NameTable::default()
             })
@@ -4806,7 +4802,9 @@ async fn gather_tree_paths_node(
     let node = block.node(node_index);
     node.walk_step(node_id, expected_parent, cycle)?;
 
-    let node_name = block.node_name_ref(node_index).internal("Node name")?;
+    let node_name = block
+        .node_name_ref(node_index)
+        .forward::<StateError>("Node name")?;
     let node_path = if parent_path.is_empty() {
         RelativePath::new_from_initial_path(node_name).unwrap_or_default()
     } else {
@@ -8411,7 +8409,7 @@ async fn verify_node_name_case_impl(
                 None, // No link tracking in state verification
             )
             .await
-            .internal("Verify delete")?;
+            .forward::<StateError>("Verify delete")?;
 
             if delete_node.node == current_named_node.node {
                 break;
@@ -8546,7 +8544,7 @@ async fn collect_name_fragments(
                     let _block_data =
                         NodeBlockDataV0::read_box_from_immutable(repository.clone(), address, true)
                             .await
-                            .internal("Failed to deserialize node block")?;
+                            .forward::<StateError>("Failed to deserialize node block")?;
                     Ok(Hash::default())
                 }
             }
@@ -9108,7 +9106,7 @@ async fn collect_new_node_metadata_fragments(
     let metadata_block_from = if let Some(address) = block_address_from {
         NodeFileMetadataBlockData::read_box_from_immutable_compat(repository.clone(), address, true)
             .await
-            .internal("Failed to deserialize metadata")?
+            .forward::<StateError>("Failed to deserialize metadata")?
     } else {
         NodeFileMetadataBlockData::new_from_heap_zeroed()
     };
@@ -9119,7 +9117,7 @@ async fn collect_new_node_metadata_fragments(
         true,
     )
     .await
-    .internal("Failed to deserialize metadata")?;
+    .forward::<StateError>("Failed to deserialize metadata")?;
 
     let mut metadata_blobs = vec![];
     {
@@ -9146,7 +9144,7 @@ async fn collect_new_node_metadata_fragments(
     for metadata_blob in metadata_blobs.iter() {
         let metadata = Metadata::deserialize(repository.clone(), metadata_blob.hash)
             .await
-            .internal("Failed to deserialize metadata")?;
+            .forward::<StateError>("Failed to deserialize metadata")?;
 
         metadata.walk(
             |_key_slice: &[u8], value_slice: &[u8], value_type: MetadataType| {
@@ -9328,7 +9326,7 @@ pub async fn apply_tree_changes(
                 None,
             )
             .await
-            .internal("Node not found")?;
+            .forward::<StateError>("Node not found")?;
         }
     }
 
@@ -9361,7 +9359,7 @@ pub async fn apply_tree_changes(
                     None,
                 )
                 .await
-                .internal("Node not found")?;
+                .forward::<StateError>("Node not found")?;
             }
         }
 
@@ -9387,7 +9385,7 @@ pub async fn apply_tree_changes(
             crate::filter::FilterMode::Full,
         )
         .await
-        .internal("Node not found")?;
+        .forward::<StateError>("Node not found")?;
     }
 
     Ok(())

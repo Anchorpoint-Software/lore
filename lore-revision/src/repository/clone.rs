@@ -492,10 +492,7 @@ impl BlockDiscoverDispatcher {
             if self.inner.shutdown.load(Ordering::Acquire) {
                 let error = self.inner.error.lock();
                 return match &*error {
-                    Some(err) => {
-                        execution_context().failure.store(true, Ordering::Relaxed);
-                        Err(err.clone())
-                    }
+                    Some(err) => Err(err.clone()),
                     None => Ok(()),
                 };
             }
@@ -545,7 +542,9 @@ async fn create_empty_directory(
     operation
         .create_dir_all(FilesystemPath::Repository(path))
         .await
-        .internal_with(|| format!("Failed to create directory {}", path.absolute().display()))?;
+        .forward_with::<CloneError, _>(|| {
+            format!("Failed to create directory {}", path.absolute().display())
+        })?;
     Ok(())
 }
 
@@ -1376,12 +1375,6 @@ async fn clone_materialize(
     })
     .send();
 
-    if clone_result.is_err() {
-        execution_context()
-            .failure
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-    }
-
     if let Some(task) = cache_task {
         let _ = task.await;
     }
@@ -1503,20 +1496,8 @@ async fn clone_in_path(ctx: CloneContext) -> Result<(), CloneError> {
     let consumer = lore_spawn!(async move { clone_execute(file_rx, ctx).await });
 
     let (producer_result, consumer_result) = tokio::join!(producer, consumer);
-    producer_result
-        .internal("Recursion task failed")?
-        .inspect_err(|_| {
-            execution_context()
-                .failure
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-        })?;
-    consumer_result
-        .internal("Recursion task failed")?
-        .inspect_err(|_| {
-            execution_context()
-                .failure
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-        })?;
+    producer_result.internal("Recursion task failed")??;
+    consumer_result.internal("Recursion task failed")??;
 
     Ok(())
 }
@@ -1557,7 +1538,7 @@ async fn clone_discover_link(
                 ctx.operation
                     .create_dir_all(FilesystemPath::Repository(&link_path))
                     .await
-                    .internal_with(|| {
+                    .forward_with::<CloneError, _>(|| {
                         format!(
                             "Failed to create directory {}",
                             link_path.absolute().display()
@@ -1681,9 +1662,6 @@ pub async fn clone_execute(
     modified_times.store(repository.clone()).await;
 
     if let Some(err) = failure {
-        execution_context()
-            .failure
-            .store(true, std::sync::atomic::Ordering::Relaxed);
         Err(err)
     } else {
         Ok(())
@@ -1758,9 +1736,6 @@ pub(crate) async fn clone_node(
     }
 
     if let Some(err) = failure {
-        execution_context()
-            .failure
-            .store(true, std::sync::atomic::Ordering::Relaxed);
         Err(err)
     } else {
         Ok(())
@@ -1869,7 +1844,7 @@ async fn clone_file(
                         node_executable,
                     )
                     .await
-                    .internal_with(|| {
+                    .forward_with::<CloneError, _>(|| {
                         format!(
                             "Failed to clone file {}",
                             repository_path.absolute().display()
@@ -1945,11 +1920,6 @@ async fn clone_file(
                         "Failed to clone file {}",
                         repository_path.absolute().display()
                     )
-                })
-                .inspect_err(|_| {
-                    execution_context()
-                        .failure
-                        .store(true, std::sync::atomic::Ordering::Relaxed);
                 })?;
             stats
                 .complete
@@ -1961,7 +1931,7 @@ async fn clone_file(
             operation
                 .create_file(FilesystemPath::Repository(&repository_path))
                 .await
-                .internal_with(|| {
+                .forward_with::<CloneError, _>(|| {
                     format!(
                         "Failed to clone file {}",
                         repository_path.absolute().display()
@@ -1976,7 +1946,7 @@ async fn clone_file(
             operation
                 .file_info(FilesystemPath::Repository(&repository_path))
                 .await
-                .internal_with(|| {
+                .forward_with::<CloneError, _>(|| {
                     format!(
                         "Failed to clone file {}",
                         repository_path.absolute().display()
@@ -1992,7 +1962,7 @@ async fn clone_file(
                     node_executable,
                 )
                 .await
-                .internal_with(|| {
+                .forward_with::<CloneError, _>(|| {
                     format!(
                         "Failed to clone file {}",
                         repository_path.absolute().display()
@@ -2083,7 +2053,7 @@ fn spawn_clone_link(
                 ctx.operation
                     .create_dir_all(FilesystemPath::Repository(&repository_path))
                     .await
-                    .internal_with(|| {
+                    .forward_with::<CloneError, _>(|| {
                         format!(
                             "Failed to create directory {}",
                             repository_path.absolute().display()

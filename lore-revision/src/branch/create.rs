@@ -7,7 +7,6 @@ use lore_error_set::prelude::*;
 
 use super::execution_context;
 use crate::branch;
-use crate::error::LoreResultExt;
 use crate::errors::*;
 use crate::event::EventError;
 use crate::interface::LoreError;
@@ -149,11 +148,9 @@ pub async fn create(
             if force {
                 match branch::resolve(repository.clone(), branch.as_str()).await {
                     Ok(resolved) => {
-                        let _ = branch::delete(repository.clone(), resolved.id)
-                            .await
-                            .debug_map_err(CreateError::internal(
-                                "Failed to delete existing local branch",
-                            ));
+                        if let Err(err) = branch::delete(repository.clone(), resolved.id).await {
+                            lore_debug!("Failed to delete existing local branch: {err}");
+                        }
                         if let Ok(remote) = repository.remote().await {
                             let _ =
                                 branch::delete_remote(remote.clone(), repository.id, resolved.id)

@@ -1912,8 +1912,8 @@ mod tests {
     }
 
     // Note: reset_staged_file_refuses test is in smoke tests (Task 17)
-    // because the error handling path goes through task spawn + emit_map_err
-    // which makes integration testing complex
+    // because the error handling path goes through task spawn + error
+    // forwarding which makes integration testing complex
 
     #[tokio::test]
     #[ignore] // Tested via smoke tests

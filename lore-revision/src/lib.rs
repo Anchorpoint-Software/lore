@@ -9,7 +9,6 @@ pub mod commit;
 pub mod dependency;
 pub mod diff;
 pub mod environment;
-pub mod error;
 pub mod errors;
 pub mod event;
 pub mod file;

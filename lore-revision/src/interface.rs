@@ -8,7 +8,6 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Once;
-use std::sync::atomic::AtomicBool;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -1009,7 +1008,6 @@ pub struct ExecutionContext {
     pub dispatcher: EventDispatcher,
     pub log_level: LoreLogLevel,
     user_id: Mutex<String>,
-    pub failure: AtomicBool,
     mode: ExecutionMode,
     caller_state: Option<Arc<dyn Any + Send + Sync>>,
 }
@@ -1096,7 +1094,6 @@ impl Default for ExecutionContext {
             dispatcher: EventDispatcher::default(),
             log_level: LoreLogLevel::Error,
             user_id: Mutex::default(),
-            failure: AtomicBool::default(),
             mode: ExecutionMode::Client,
             caller_state: None,
         }

@@ -10,7 +10,6 @@ use std::sync::Arc;
 use lore_base::error::InvalidArguments;
 use lore_error_set::prelude::*;
 
-use crate::error::LoreResultExt;
 use crate::errors::InvalidPath;
 use crate::repository::RepositoryContext;
 
@@ -49,18 +48,17 @@ pub fn make_absolute_from(
 ) -> Result<PathBuf, PathError> {
     let path = path.as_ref();
     let cleanpath = clean(path.to_owned());
-    let pathbuf = PathBuf::from_str(cleanpath.as_str()).emit_map_err(InvalidPath {
-        path: path.to_string(),
-    })?;
+    // `PathBuf: FromStr` has `Err = Infallible`, so the old error arm here was
+    // unreachable. Construct it directly rather than mapping an error that
+    // cannot occur.
+    let pathbuf = PathBuf::from(cleanpath.as_str());
     if pathbuf.is_absolute() {
         return Ok(pathbuf);
     }
     match base {
         Some(base) => Ok(base.join(pathbuf)),
         None => Ok(std::env::current_dir()
-            .emit_map_err(PathError::internal(
-                "failed to get current working directory",
-            ))?
+            .internal("getting the current working directory")?
             .join(pathbuf)),
     }
 }

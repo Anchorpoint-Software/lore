@@ -371,7 +371,7 @@ async fn file_diff3(
         false,
     ))
     .await
-    .internal("Failed to calculate diff")?;
+    .forward::<DiffError>("Failed to calculate diff")?;
 
     let state_base = State::deserialize(repository.clone(), diff_result.base)
         .await

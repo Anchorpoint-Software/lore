@@ -507,7 +507,7 @@ pub async fn reset_to_last_merged(
 
     let metadata = branch::metadata(repository.clone(), branch_current)
         .await
-        .internal("Failed to load branch metadata")?;
+        .forward::<ResetError>("Failed to load branch metadata")?;
     let stack = branch::stack(&metadata);
 
     let mut branch_point = Hash::default();
@@ -1769,7 +1769,7 @@ async fn reset_file_realize(
         &modified_times,
     )
     .await
-    .internal("Unable to restore path to selected state")?;
+    .forward::<ResetError>("Unable to restore path to selected state")?;
 
     Ok(())
 }

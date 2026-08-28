@@ -245,7 +245,8 @@ pub fn parse(remote_url: &str) -> Result<(Url, Arc<dyn Protocol>), ProtocolError
         .internal_with(|| format!("remote {remote_url} is invalid"))?;
 
     let protocol = parsed_url.scheme();
-    let protocol = find(protocol).internal_with(|| format!("remote {remote_url} is invalid"))?;
+    let protocol = find(protocol)
+        .forward_with::<ProtocolError, _>(|| format!("remote {remote_url} is invalid"))?;
 
     Ok((parsed_url, protocol))
 }

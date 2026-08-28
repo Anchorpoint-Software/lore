@@ -4,6 +4,35 @@
 //!
 //! These tests verify that incorrect usage of the error set API produces
 //! helpful compile errors.
+//!
+//! # These snapshots are pinned to CI's exact rustc
+//!
+//! The `.stderr` files capture rustc diagnostics verbatim, so they break on any
+//! toolchain whose output differs — and both axes bite:
+//!
+//! - **Channel.** Where a trait is reachable by more than one public path,
+//!   which one rustc names differs between stable and nightly:
+//!   `lore_error_set::WrapInternal` on one, `lore_error_set::prelude::WrapInternal`
+//!   on the other.
+//! - **Version.** Wording changes between stable releases. rustc 1.95 emits
+//!   `help: the following other types implement trait `Has<V>``; later stables
+//!   emit `help: `NarrowTarget` implements trait `Has<V>``.
+//!
+//! CI installs the *latest* stable (`dtolnay/rust-toolchain@stable`), so a local
+//! stable that has not been updated recently will disagree with it, and a
+//! snapshot blessed against nightly or an older stable passes locally and fails
+//! in CI.
+//!
+//! Regenerate with an up-to-date stable:
+//!
+//! ```sh
+//! rustup update stable
+//! TRYBUILD=overwrite cargo +stable test -p lore-error-set --test compile_fail
+//! ```
+//!
+//! If a mismatch is only the diagnostic's wording and the assertion still holds,
+//! CI's "ACTUAL OUTPUT" block is authoritative — it is the exact text of the
+//! toolchain that gates the build.
 
 #[test]
 fn compile_fail_tests() {

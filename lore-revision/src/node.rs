@@ -1376,7 +1376,7 @@ impl NodeBlock {
                 .with_max_content_size(NODE_NAME_MAX_SIZE as u64),
         )
         .await
-        .internal("Deserialize deprecated name table failed")?;
+        .forward::<StateError>("Deserialize deprecated name table failed")?;
 
         let nametable = HeapBuf::from_slice_in(&bytes, node_block_allocator());
 
@@ -1442,9 +1442,7 @@ impl NodeBlock {
             match NodeBlockDataV2::read_box_from_immutable(repository.clone(), address, true).await
             {
                 Ok(data) => Ok(data),
-                Err(err) => Err(err)
-                    .internal("Deserialize node block failed")
-                    .map_err(StateError::from),
+                Err(err) => Err(err).forward::<StateError>("Deserialize node block failed"),
             }?;
 
         lore_debug!("Converting v2 block data format when deserializing block");

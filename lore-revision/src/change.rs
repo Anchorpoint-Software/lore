@@ -155,12 +155,7 @@ impl NodeChangeState {
     }
 
     pub async fn subtree(&self, node_id: NodeID) -> Self {
-        let Ok(node) = self
-            .state
-            .node(self.repository.clone(), node_id)
-            .await
-            .internal("Node not found")
-        else {
+        let Ok(node) = self.state.node(self.repository.clone(), node_id).await else {
             return self.invalid();
         };
         NodeChangeState {

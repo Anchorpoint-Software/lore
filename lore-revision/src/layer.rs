@@ -193,9 +193,9 @@ struct LayerConfig {
 }
 
 async fn load_config(config_path: impl AsRef<Path>) -> Result<LayerConfig, LayerError> {
-    Ok(crate::util::config::load(config_path)
+    crate::util::config::load(config_path)
         .await
-        .internal("Failed to load configuration")?)
+        .forward::<LayerError>("Failed to load configuration")
 }
 
 async fn save_config(
@@ -203,9 +203,9 @@ async fn save_config(
     config_path: impl AsRef<Path>,
     config: &LayerConfig,
 ) -> Result<(), LayerError> {
-    Ok(crate::util::config::save(config, config_path)
+    crate::util::config::save(config, config_path)
         .await
-        .internal("Failed to save configuration")?)
+        .forward::<LayerError>("Failed to save configuration")
 }
 
 pub fn layer_config_path(repository_path: impl AsRef<Path>) -> PathBuf {

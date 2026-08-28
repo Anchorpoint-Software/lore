@@ -12,7 +12,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use lore_base::types::Fragment;
 use lore_base::types::Hash;
-use lore_error_set::WrapInternal;
+use lore_error_set::prelude::*;
 
 use super::filesystem_provider::FileDifferenceFromNode;
 use super::filesystem_provider::FileInfo;
@@ -87,7 +87,7 @@ impl InstanceOperation for OsOperation {
         root_node_to: NodeID,
         filter_mode: FilterMode,
     ) -> Result<(Vec<NodeChange>, FilesystemDiffStats), FsError> {
-        Ok(crate::state::diff_filesystem_subtree(
+        crate::state::diff_filesystem_subtree(
             repository_from,
             state_from,
             repository_current,
@@ -99,7 +99,7 @@ impl InstanceOperation for OsOperation {
             std::sync::Arc::new(Vec::new()),
         )
         .await
-        .internal("Failed to diff filesystem")?)
+        .forward_any::<FsError>("Failed to diff filesystem")
     }
 
     async fn file_info(&self, path: FilesystemPath<'_>) -> Result<FileInfo, FsError> {
@@ -136,7 +136,7 @@ impl InstanceOperation for OsOperation {
                     .from
                     .get_node()
                     .await
-                    .internal("Failed to find node")?,
+                    .forward_any::<FsError>("Failed to find node")?,
             )
         } else {
             None
@@ -164,7 +164,7 @@ impl InstanceOperation for OsOperation {
                     force_full_check,
                 )
                 .await
-                .internal("Failed to check file modification")?
+                .forward_any::<FsError>("Failed to check file modification")?
                 .is_modified();
                 Some(FileDifferenceFromNode { modified })
             } else {
@@ -216,11 +216,9 @@ impl InstanceOperation for OsOperation {
         path: &RelativePath,
         file_size: u64,
     ) -> Result<NodeComparison, FsError> {
-        Ok(
-            crate::state::file_matches_node(repository, node, file_size, path)
-                .await
-                .internal("Failed to compare file to node")?,
-        )
+        crate::state::file_matches_node(repository, node, file_size, path)
+            .await
+            .forward_any::<FsError>("Failed to compare file to node")
     }
 
     async fn make_executable(
@@ -304,7 +302,7 @@ impl InstanceOperation for OsOperation {
             options,
         )
         .await
-        .internal("Failed to read file")?;
+        .forward_any::<FsError>("Failed to read file")?;
         Ok((fragment, metadata.map(FileInfo::from_metadata)))
     }
 

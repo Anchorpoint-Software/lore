@@ -27,7 +27,6 @@ use crate::branch;
 use crate::branch::BranchLatestStatus;
 use crate::change;
 use crate::change::FileAction;
-use crate::error::LoreResultExt;
 use crate::errors::*;
 use crate::event;
 use crate::event::EventError;
@@ -856,8 +855,13 @@ async fn commit_link_only(
     let resolved_current =
         link::resolve_link_at_path(&state_parent_current, repository.clone(), &link_path)
             .await
-            .debug_map_err(LinkPathNotFound {
-                path: link_path.clone(),
+            .map_err(|err| {
+                CommitError::LinkPathNotFound(
+                    LinkPathNotFound {
+                        path: link_path.clone(),
+                    }
+                    .chain_err_from(err, "resolving link at path"),
+                )
             })?;
 
     let link_staged_revision = resolved_staged.link_node.linked_node().revision;

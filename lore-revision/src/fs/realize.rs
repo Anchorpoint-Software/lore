@@ -16,7 +16,6 @@ use crate::branch::merge::MergeType;
 use crate::change;
 use crate::change::NodeChange;
 use crate::dependency;
-use crate::error::LoreErrorExt;
 use crate::errors::LocalModifications;
 use crate::errors::WriteRequired;
 use crate::event;
@@ -471,11 +470,10 @@ pub async fn verify_filesystem(
             // would leave the file behind its revision, and reporting local changes would name
             // the wrong problem.
             NodeComparison::Unreadable => {
-                return SyncError::internal(format!(
+                return Err(SyncError::internal(format!(
                     "Failed to read {} to compare it against the incoming revision",
                     change.path
-                ))
-                .emit();
+                )));
             }
             NodeComparison::Matches => {
                 lore_trace!(
@@ -778,14 +776,8 @@ pub async fn realize_changes(
 
     let producer_result = producer_result.internal("Recursion task failed")?;
     let consumer_result = consumer_result.internal("Recursion task failed")?;
-    if let Err(err) = consumer_result {
-        execution_context().failure.store(true, Ordering::Relaxed);
-        return Err(err);
-    }
-    if let Err(err) = producer_result {
-        execution_context().failure.store(true, Ordering::Relaxed);
-        return Err(err);
-    }
+    consumer_result?;
+    producer_result?;
 
     Ok(())
 }
@@ -1110,11 +1102,10 @@ async fn realize_changes_delete(
                             retry.limit()
                         );
                         if !retry.wait().await {
-                            return SyncError::internal(format!(
+                            return Err(SyncError::internal(format!(
                                 "Failed to remove file or directory from local file system {}",
                                 change_path.as_absolute_path().display(),
-                            ))
-                            .emit();
+                            )));
                         }
                     } else {
                         break;
@@ -1130,11 +1121,10 @@ async fn realize_changes_delete(
                             retry.limit()
                         );
                         if !retry.wait().await {
-                            return SyncError::internal(format!(
+                            return Err(SyncError::internal(format!(
                                 "Failed to remove file or directory from local file system {}",
                                 change_path.as_absolute_path().display(),
-                            ))
-                            .emit();
+                            )));
                         }
                     } else {
                         // Directory unlink failed, keep it and the locally added/modified files
@@ -1241,7 +1231,7 @@ async fn sync_discover_modify_add(
             .is_err()
         {
             // Receiver dropped, consumer encountered an error
-            return SyncError::internal("Recursion task failed").emit();
+            return Err(SyncError::internal("Recursion task failed"));
         }
     }
     Ok(())
@@ -1480,7 +1470,9 @@ async fn realize_change_modify_add(
                 .await
                 .is_ok_and(|info| !info.is_dir)
         {
-            return SyncError::internal(format!("Failed to create directory {path}")).emit();
+            return Err(SyncError::internal(format!(
+                "Failed to create directory {path}"
+            )));
         }
 
         // When a link is added, the linked contents are not marked
@@ -2217,7 +2209,7 @@ async fn realize_file_merge(
                     .forward::<SyncError>("Failed to resolve node in merge revisions")?
             } else {
                 lore_debug!("Divergent move conflict with no valid source node");
-                return SyncError::internal("Invalid change data").emit();
+                return Err(SyncError::internal("Invalid change data"));
             };
 
             let change_from_path =

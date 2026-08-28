@@ -175,7 +175,7 @@ async fn find_start_revision(
     if let Some(target_branch) = options.branch {
         let branch = branch::load_name_to_id(repository.clone(), target_branch)
             .await
-            .internal("loading branch name")?;
+            .forward::<RevisionHistoryError>("loading branch name")?;
 
         if execution_context().globals().remote() {
             return Ok((load_remote_latest(repository, branch).await, Some(branch)));
@@ -290,12 +290,12 @@ pub async fn history(
                     options.branch.as_deref().unwrap_or_default(),
                 )
                 .await
-                .internal("loading branch name")?
+                .forward::<RevisionHistoryError>("loading branch name")?
             } else {
                 // Take branch from top revision.
                 metadata
                     .get_branch()
-                    .internal("getting branch from metadata")?
+                    .forward::<RevisionHistoryError>("getting branch from metadata")?
             };
 
             event::LoreEvent::RevisionHistory(LoreRevisionHistoryEventData::new(

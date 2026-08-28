@@ -122,7 +122,7 @@ impl NotificationClient {
                 }
                 Err(err) => {
                     if !retry.wait().await {
-                        return Err(err).internal("connecting to notification service")?;
+                        return Err(err).forward_any("connecting to notification service");
                     }
                     retry_attempt += 1;
                 }

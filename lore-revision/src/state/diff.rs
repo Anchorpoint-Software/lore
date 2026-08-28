@@ -602,7 +602,7 @@ async fn add_change_for_paired_nodes(
                         let linked_state =
                             State::deserialize(linked_repository.clone(), to_node.address.hash)
                                 .await
-                                .internal("Link error")?;
+                                .forward::<StateError>("Link error")?;
 
                         let has_staged_children = linked_state
                             .node_has_staged_children(linked_repository.clone(), to_node.child)

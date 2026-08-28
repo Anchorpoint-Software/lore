@@ -7,7 +7,6 @@ use lore_error_set::prelude::*;
 use serde::Deserialize;
 use serde::Serialize;
 
-use crate::error::LoreErrorExt;
 use crate::errors::*;
 use crate::event::EventError;
 use crate::event::LoreEvent;
@@ -114,14 +113,16 @@ pub async fn create_shared_store(
         let identity = global_cli_args.identity().unwrap_or_default();
         protocol::connect(&remote_url, identity, RepositoryId::default())
             .await
-            .internal_with(|| format!("Failed to connect to remote URL {remote_url}"))?;
+            .forward_with::<SharedStoreError, _>(|| {
+                format!("Failed to connect to remote URL {remote_url}")
+            })?;
     }
 
     let directory_containing_shared_store = if let Some(path) = path {
         path.join(GlobalConfig::shared_store_subdir_for_remote(&remote_url))
     } else {
         GlobalConfig::suggested_path_for_remote_url(&remote_url)
-            .internal("failed to make default shared store path")?
+            .forward::<SharedStoreError>("failed to make default shared store path")?
     };
     let shared_store_path = directory_containing_shared_store.join(SHARED_STORE_DIR);
 
@@ -134,11 +135,10 @@ pub async fn create_shared_store(
                     format!("removing shared store at {}", shared_store_path.display())
                 })?;
         } else {
-            return SharedStoreError::internal(format!(
+            return Err(SharedStoreError::internal(format!(
                 "Found existing shared store at {}",
                 shared_store_path.display()
-            ))
-            .emit();
+            )));
         }
     }
 
@@ -147,7 +147,7 @@ pub async fn create_shared_store(
     if make_default {
         let (mut global_config, lock) = GlobalConfig::load_locked()
             .await
-            .internal("loading global config")?;
+            .forward::<SharedStoreError>("loading global config")?;
         global_config
             .set_default_path_for_remote_url(
                 &remote_url,
@@ -155,11 +155,11 @@ pub async fn create_shared_store(
                     .to_str()
                     .ok_or_else(|| SharedStoreError::internal("bad path"))?,
             )
-            .internal("setting default shared store path")?;
+            .forward::<SharedStoreError>("setting default shared store path")?;
         global_config
             .save(lock)
             .await
-            .internal("saving global config")?;
+            .forward::<SharedStoreError>("saving global config")?;
     }
 
     Ok(())
@@ -222,7 +222,7 @@ async fn create_shared_store_at(
         &shared_store_path.join(SHARED_STORE_CONFIG),
     )
     .await
-    .internal("saving shared store config")?;
+    .forward::<SharedStoreError>("saving shared store config")?;
 
     Ok(())
 }
@@ -260,14 +260,14 @@ async fn resolve_shared_store_dir(
     } else {
         let global_config = GlobalConfig::load()
             .await
-            .internal("loading global config")?;
+            .forward::<SharedStoreError>("loading global config")?;
         Ok(global_config
             .default_shared_store_directory_for_remote(
                 remote_url
                     .as_ref()
                     .ok_or(SharedStoreError::internal("no remote url"))?,
             )
-            .internal("getting shared store path")?)
+            .forward::<SharedStoreError>("getting shared store path")?)
     }
 }
 
@@ -358,14 +358,14 @@ pub async fn ensure_shared_store_for_repo(
     {
         let (mut global_config, lock) = GlobalConfig::load_locked()
             .await
-            .internal("loading global config")?;
+            .forward::<SharedStoreError>("loading global config")?;
         global_config
             .set_default_path_for_remote_url(remote_url, directory)
-            .internal("setting default shared store path")?;
+            .forward::<SharedStoreError>("setting default shared store path")?;
         global_config
             .save(lock)
             .await
-            .internal("saving global config")?;
+            .forward::<SharedStoreError>("saving global config")?;
     }
 
     Ok(())

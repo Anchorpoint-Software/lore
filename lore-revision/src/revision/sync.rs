@@ -16,7 +16,6 @@ use crate::branch::BranchLatestStatus;
 use crate::branch::merge;
 use crate::branch::merge::MergeType;
 use crate::change::NodeChange;
-use crate::error::LoreErrorExt;
 use crate::errors::*;
 use crate::event::EventError;
 use crate::event::LoreEvent;
@@ -259,10 +258,10 @@ pub async fn sync(
     let branch_id = if current_branch.is_zero() {
         let repository_metadata = repository::metadata_hash(repository.clone())
             .await
-            .internal("Failed to load repository metadata")?;
+            .forward::<SyncError>("Failed to load repository metadata")?;
         let repository_metadata = repository::metadata(repository.clone(), repository_metadata)
             .await
-            .internal("Failed to load repository metadata")?;
+            .forward::<SyncError>("Failed to load repository metadata")?;
         lore_debug!(
             "Currently not on a branch, default to {} {}",
             repository_metadata.default_branch_name,
@@ -420,7 +419,7 @@ pub async fn sync(
             revision = remote_latest;
             location = LoreBranchLocation::Remote;
         } else {
-            return SyncError::from(NoRemote).emit();
+            return Err(SyncError::from(NoRemote));
         }
     }
 
@@ -543,7 +542,9 @@ pub async fn sync(
                 merge_options,
             ))
             .await
-            .internal("Synchronizing with local changes failed to merge with remote revision")?;
+            .forward::<SyncError>(
+                "Synchronizing with local changes failed to merge with remote revision",
+            )?;
 
             let state_staged = State::deserialize(repository.clone(), revision_staged)
                 .await
@@ -650,7 +651,7 @@ pub async fn sync(
                 BranchLatestStatus::Convergent,
             )
             .await
-            .internal("Failed to store revision as current branch latest")?;
+            .forward::<SyncError>("Failed to store revision as current branch latest")?;
 
             branch::store_last_sync(repository, branch_id, revision).await;
         }
@@ -718,10 +719,9 @@ async fn sync_load_layer_list(
                 if let Some(nearest_revision) = nearest_revision
                     && main_revision != nearest_revision
                 {
-                    return SyncError::internal(
+                    return Err(SyncError::internal(
                         "Layers have diverging matching main repository revisions",
-                    )
-                    .emit();
+                    ));
                 }
                 nearest_revision.replace(main_revision);
             }

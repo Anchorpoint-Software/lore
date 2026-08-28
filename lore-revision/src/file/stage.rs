@@ -335,7 +335,7 @@ pub async fn stage(
             let layer_state = layer
                 .deserialize_current_and_staged(repository.clone())
                 .await
-                .internal("Failed to deserialize layer state")?;
+                .forward::<StageError>("Failed to deserialize layer state")?;
 
             layers.push((layer, layer_state));
         }
@@ -690,7 +690,7 @@ pub async fn stage(
                 signature,
             )
             .await
-            .internal("Failed to serialize new layer state")?;
+            .forward::<StageError>("Failed to serialize new layer state")?;
         }
 
         lore_debug!(
