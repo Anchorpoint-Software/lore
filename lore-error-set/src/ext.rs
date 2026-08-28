@@ -317,29 +317,34 @@ impl<T, E: ErrorSet> ResultExt<T, E> for Result<T, E> {
         Target: ErrorSet,
         F: FnOnce(E::Matched) -> Target,
     {
-        let caller = ::std::panic::Location::caller();
-        let loc = Location::with_context(
-            caller.file(),
-            caller.line(),
-            caller.column(),
-            Arc::from(context),
-        );
         match self {
             Ok(val) => Ok(val),
-            Err(err) => match err.into_matched(context, loc) {
-                Ok(matched) => Err(f(matched)),
-                Err(traced_internal) => {
-                    let (internal, trace) = traced_internal.into_parts();
-                    Err(Target::wrap_internal(
-                        crate::set::TracedBox::new(
-                            Box::new(internal)
-                                as Box<dyn std::error::Error + Send + Sync + 'static>,
-                            trace,
-                        ),
-                        context,
-                    ))
+            Err(err) => {
+                // Built here rather than above the match: `Arc::from(context)`
+                // copies the string onto the heap, and the success path has no
+                // trace to put it on.
+                let caller = ::std::panic::Location::caller();
+                let loc = Location::with_context(
+                    caller.file(),
+                    caller.line(),
+                    caller.column(),
+                    Arc::from(context),
+                );
+                match err.into_matched(context, loc) {
+                    Ok(matched) => Err(f(matched)),
+                    Err(traced_internal) => {
+                        let (internal, trace) = traced_internal.into_parts();
+                        Err(Target::wrap_internal(
+                            crate::set::TracedBox::new(
+                                Box::new(internal)
+                                    as Box<dyn std::error::Error + Send + Sync + 'static>,
+                                trace,
+                            ),
+                            context,
+                        ))
+                    }
                 }
-            },
+            }
         }
     }
 }
