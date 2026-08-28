@@ -8128,8 +8128,10 @@ impl RecordedModifiedTimes {
     /// splitting the times by that byte lets every task run without ever contending with
     /// another.
     ///
-    /// Returns only once the filesystem stamps later than every time written, so that none of
-    /// them can be shared by a write that follows. See [`wait_until_settled`].
+    /// Waits for the filesystem to stamp later than every time written, so that none of them
+    /// can be shared by a write that follows — bounded, so a filesystem that does not appear to
+    /// move on is left with times a following write can still share rather than being waited on
+    /// forever. See [`wait_until_settled`].
     pub async fn store(&self, repository: Arc<RepositoryContext>) {
         let mut times = Vec::with_capacity(self.0.len());
         let mut mtime_max = 0;
@@ -8198,6 +8200,46 @@ impl RecordedModifiedTimes {
 /// Name of the file stamped to read the working copy's own clock.
 const MODIFIED_TIME_PROBE: &str = "mtime-probe";
 
+/// The whole time [`wait_until_settled`] may spend on the filesystem's clock.
+///
+/// A filesystem whose stamps do not advance — one keeping a clock coarser than the tick the
+/// wait assumes, one handing out a single time for the whole run, or one failing every probe —
+/// would otherwise hold the operation open indefinitely. Giving up leaves the recorded times
+/// unable to tell a following write apart, the same position a working copy that cannot be
+/// stamped at all is in.
+const MODIFIED_TIME_SETTLE_LIMIT: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// The path of the file stamped to read the working copy's clock, `None` when the working copy
+/// has no path to stamp.
+fn modified_time_probe_path(repository: &RepositoryContext) -> Option<std::path::PathBuf> {
+    Some(
+        repository
+            .require_path()
+            .ok()?
+            .join(repository.format.dot_dir())
+            .join(MODIFIED_TIME_PROBE),
+    )
+}
+
+/// Stamps the probe at `path` and reads back the time the filesystem gave it.
+///
+/// The metadata a write returns is taken while the file is still open, which on a filesystem
+/// that settles the stamp when the handle closes is not the time the file ends up carrying.
+/// The write closes the file before it completes, so reading the time back in a call of its
+/// own asks about the state a later scan will see.
+///
+/// `None` when either call fails: a probe that could not be written or read says nothing about
+/// the filesystem's clock, which is the same answer as a working copy that cannot be stamped.
+async fn stamp_probe(path: &std::path::Path) -> Option<u64> {
+    let driver = lore_io::IoDriver::global();
+    driver
+        .write_file_bytes(path, bytes::Bytes::from_static(&[0u8]), false)
+        .await
+        .ok()?;
+    let metadata = driver.metadata(path).await.ok()?;
+    Some(crate::util::fs::file_mtime(&metadata))
+}
+
 /// The time the working copy's filesystem is currently stamping writes with.
 ///
 /// A file's modified time comes from a clock the filesystem advances on its own schedule and
@@ -8209,16 +8251,7 @@ const MODIFIED_TIME_PROBE: &str = "mtime-probe";
 /// `None` when the working copy cannot be stamped, which leaves a caller no way to tell a
 /// settled time from one a further write can still share.
 pub async fn filesystem_stamp_now(repository: &RepositoryContext) -> Option<u64> {
-    let path = repository
-        .require_path()
-        .ok()?
-        .join(repository.format.dot_dir())
-        .join(MODIFIED_TIME_PROBE);
-    let metadata = lore_io::IoDriver::global()
-        .write_file_bytes(&path, bytes::Bytes::from_static(&[0u8]), false)
-        .await
-        .ok()?;
-    Some(crate::util::fs::file_mtime(&metadata))
+    stamp_probe(&modified_time_probe_path(repository)?).await
 }
 
 /// Waits until the working copy's filesystem stamps later than `mtime_max`.
@@ -8226,17 +8259,33 @@ pub async fn filesystem_stamp_now(repository: &RepositoryContext) -> Option<u64>
 /// A file carrying the stamp the filesystem is still handing out can be written again without
 /// that stamp changing, so a time recorded for it cannot tell the two states apart. Holding
 /// the operation open until the filesystem has moved past every time it recorded leaves all
-/// of them able to, at the cost of at most the tick the filesystem is currently in.
+/// of them able to, at the cost of at most the tick the filesystem is currently in — and never
+/// more than [`MODIFIED_TIME_SETTLE_LIMIT`], which is the ceiling on the whole wait rather than
+/// on the sleeps alone, so a probe that hangs cannot hold the operation either.
+///
+/// A probe that failed says nothing about the clock — least of all that it has moved on — so
+/// the wait asks again rather than reading the failure as settled, and the limit is what ends a
+/// wait that cannot get an answer.
+///
+/// The probe is removed on the way out however the wait ended, so a stamp file is not left
+/// behind in the dot directory.
 ///
 /// Returns without waiting when the working copy cannot be stamped, which leaves no way to
 /// tell whether the times have settled.
 pub async fn wait_until_settled(repository: &RepositoryContext, mtime_max: u64) {
-    while let Some(stamp) = filesystem_stamp_now(repository).await {
-        if mtime_max < stamp {
-            return;
+    let Some(path) = modified_time_probe_path(repository) else {
+        return;
+    };
+    let _ = tokio::time::timeout(MODIFIED_TIME_SETTLE_LIMIT, async {
+        while !stamp_probe(&path)
+            .await
+            .is_some_and(|stamp| mtime_max < stamp)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-    }
+    })
+    .await;
+    let _ = lore_io::IoDriver::global().remove_file(&path).await;
 }
 
 /// The key a file's modification time is stored under.
