@@ -483,8 +483,14 @@ pub trait ImmutableStore: Any + Send + Sync {
     /// Return the current resume point for compaction
     async fn compact_resume_at(self: Arc<Self>) -> Option<usize>;
 
-    /// Stop any ongoing compaction gracefully
-    async fn compact_stop(self: Arc<Self>);
+    /// Stop eviction and compaction, returning once the passes in flight have given up.
+    /// With `terminate` the stop stays raised and the store never collects again; without
+    /// it the stop is lifted before returning, since a store is shared by path and a caller
+    /// quiescing it must not disable collection for the others. Stores that do not collect
+    /// need no implementation.
+    async fn stop_gc(self: Arc<Self>, terminate: bool) {
+        let _ = terminate;
+    }
 
     /// Get maximum supported query batch size, if any
     fn max_query_batch(&self) -> Option<usize>;

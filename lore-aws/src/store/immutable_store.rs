@@ -2164,8 +2164,6 @@ impl ImmutableStoreTrait for AwsImmutableStore {
         None
     }
 
-    async fn compact_stop(self: Arc<Self>) {}
-
     async fn verify(self: Arc<Self>, _heal: bool) -> Result<(), StoreError> {
         Ok(())
     }

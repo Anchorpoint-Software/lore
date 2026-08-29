@@ -4992,7 +4992,7 @@ mod open_tests {
     /// from being arbitrarily small, so this test is structural — verify that the handle
     /// accepts the fields, the spawn does not panic, the handle survives an op cycle, and the
     /// close path tears the spawned tasks down cleanly (proves the spawn happened — without
-    /// spawn, `compact_stop` would have no counterpart to stop)
+    /// spawn, `stop_gc` would have no counterpart to stop)
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn open_with_gc_and_cache_target_round_trips_an_op_cycle() {
         use lore_base::types::Context;

@@ -9,6 +9,8 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Fixes & Improvements
 
+- `lore-storage`: a stopped garbage collection pass gives up within one packfile instead of after a whole compaction step, so process exit waits at most one packfile rewrite; the stop at the end of every repository command is gone, so background eviction and compaction continue across commands
+
 ## v0.9.0 (Aug 28th 2026) [#782]
 
 ### Breaking changes

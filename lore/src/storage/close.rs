@@ -47,7 +47,7 @@ pub(crate) fn spawn_flush_stores(
         Arc::new(ExecutionContext::default()) as Arc<dyn std::any::Any + Send + Sync>,
         || {
             lore_spawn_guarded!(async move {
-                immutable_store.clone().compact_stop().await;
+                immutable_store.clone().stop_gc(false).await;
                 let _ = immutable_store.flush(sync_data).await;
                 let _ = mutable_store.flush(sync_data).await;
             });

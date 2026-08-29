@@ -264,8 +264,6 @@ mod tests {
             None
         }
 
-        async fn compact_stop(self: Arc<Self>) {}
-
         fn max_query_batch(&self) -> Option<usize> {
             None
         }
@@ -366,8 +364,6 @@ mod tests {
         async fn compact_resume_at(self: Arc<Self>) -> Option<usize> {
             None
         }
-
-        async fn compact_stop(self: Arc<Self>) {}
 
         fn max_query_batch(&self) -> Option<usize> {
             None

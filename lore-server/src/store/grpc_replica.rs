@@ -630,8 +630,6 @@ impl ImmutableStore for GrpcReplica {
         None
     }
 
-    async fn compact_stop(self: Arc<Self>) {}
-
     fn max_query_batch(&self) -> Option<usize> {
         None
     }

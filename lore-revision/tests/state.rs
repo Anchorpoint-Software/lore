@@ -2158,10 +2158,6 @@ mod block_single_flight {
             self.inner.clone().compact_resume_at().await
         }
 
-        async fn compact_stop(self: Arc<Self>) {
-            self.inner.clone().compact_stop().await;
-        }
-
         fn max_query_batch(&self) -> Option<usize> {
             self.inner.max_query_batch()
         }

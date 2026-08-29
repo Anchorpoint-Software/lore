@@ -488,8 +488,6 @@ where
         None
     }
 
-    async fn compact_stop(self: Arc<Self>) {}
-
     fn max_query_batch(&self) -> Option<usize> {
         // todo(UCS-18195) - configure the max query size to be whatever the QUIC Server says is the max_query_batch
         Some(query::MAX_ADDRESSES)

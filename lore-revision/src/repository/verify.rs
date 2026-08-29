@@ -305,8 +305,6 @@ pub async fn verify(
 
     lore_debug!("Verifying local immutable store");
 
-    repository.immutable_store().compact_stop().await;
-
     repository
         .immutable_store()
         .verify(heal)

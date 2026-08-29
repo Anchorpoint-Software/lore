@@ -159,8 +159,6 @@ mod aws_store_tests {
             None
         }
 
-        async fn compact_stop(self: Arc<Self>) {}
-
         async fn flush(self: Arc<Self>, _sync_data: bool) -> Result<(), StoreError> {
             Ok(())
         }
@@ -482,10 +480,6 @@ mod aws_store_tests {
 
         async fn compact_resume_at(self: Arc<Self>) -> Option<usize> {
             self.inner.clone().compact_resume_at().await
-        }
-
-        async fn compact_stop(self: Arc<Self>) {
-            self.inner.clone().compact_stop().await;
         }
 
         fn max_query_batch(&self) -> Option<usize> {

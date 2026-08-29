@@ -1254,8 +1254,27 @@ impl ImmutableStore for CompositeStore {
         self.local.store().compact_resume_at().await
     }
 
-    async fn compact_stop(self: Arc<Self>) {
-        self.local.store().compact_stop().await;
+    async fn stop_gc(self: Arc<Self>, terminate: bool) {
+        // Collected before awaiting so no replica lock is held across the drain, then driven
+        // together so every target is asked to stop on the first poll rather than each
+        // waiting out the one before it.
+        let mut stores = vec![self.local.store(), self.durable.store()];
+        stores.extend(
+            self.read_replicas
+                .read()
+                .await
+                .iter()
+                .map(ReplicationTarget::store),
+        );
+        stores.extend(
+            self.write_replicas
+                .read()
+                .await
+                .iter()
+                .map(ReplicationTarget::store),
+        );
+
+        futures::future::join_all(stores.into_iter().map(|store| store.stop_gc(terminate))).await;
     }
 
     fn max_query_batch(&self) -> Option<usize> {

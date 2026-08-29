@@ -19,6 +19,7 @@ use std::sync::Weak;
 use std::sync::atomic;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
+use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 use std::time::SystemTime;
 
@@ -275,15 +276,42 @@ pub struct LocalImmutableStoreFailureGenerator {
     miss_fragment_writes: HashSet<Hash>,
 }
 
+/// Holds a store's garbage collection stop raised while it lives. A terminating request
+/// stays raised once dropped; any other lowers, so a drain that is cancelled rather than
+/// completed — a shutdown timing out, say — cannot leave collection stopped by accident.
+struct GcStopRequest<'a> {
+    requests: &'a AtomicUsize,
+    terminate: bool,
+}
+
+impl<'a> GcStopRequest<'a> {
+    fn raise(requests: &'a AtomicUsize, terminate: bool) -> Self {
+        requests.fetch_add(1, atomic::Ordering::Relaxed);
+        Self {
+            requests,
+            terminate,
+        }
+    }
+}
+
+impl Drop for GcStopRequest<'_> {
+    fn drop(&mut self) {
+        if !self.terminate {
+            self.requests.fetch_sub(1, atomic::Ordering::Relaxed);
+        }
+    }
+}
+
 pub struct LocalImmutableStore {
     path: Option<Arc<PathBuf>>,
     pub group: Vec<Arc<ImmutableStoreGroup>>,
     eviction: Semaphore,
     compaction: Semaphore,
-    stop_gc: AtomicBool,
-    /// Bytes reclaimed by the current compaction pass, accumulated across its
-    /// stepped `compact` calls and reset at the start of each pass. Reported in
-    /// the compaction-end progress callback.
+    /// Stop requests outstanding; callers overlap, so the stop stays raised until the last
+    /// of them has drained.
+    stop_requests: AtomicUsize,
+    /// Bytes reclaimed by the compaction step in progress, accumulated across its groups
+    /// and reset as the step starts. Reported in the compaction-end callback.
     compaction_reclaimed: AtomicU64,
     deserialize_all: Semaphore,
     deserialized_all: AtomicBool,
@@ -1044,7 +1072,7 @@ impl LocalImmutableStore {
             settings,
             eviction: Semaphore::new(1),
             compaction: Semaphore::new(1),
-            stop_gc: AtomicBool::new(false),
+            stop_requests: AtomicUsize::new(0),
             compaction_reclaimed: AtomicU64::new(0),
             deserialize_all: Semaphore::new(1),
             deserialized_all: AtomicBool::new(false),
@@ -2092,6 +2120,22 @@ impl LocalImmutableStore {
         Ok(data)
     }
 
+    /// Whether garbage collection has been asked to stop. Eviction and compaction check
+    /// this inside their group work, so a stop lands within one packfile sweep.
+    #[inline]
+    fn gc_stop_requested(&self) -> bool {
+        self.stop_requests.load(atomic::Ordering::Relaxed) > 0
+    }
+
+    /// Report the end of a compaction pass and what it reclaimed. Called from every exit
+    /// past the `compaction_begin`, including the stopped and failed ones, so a sink that
+    /// saw a pass start always sees it finish.
+    fn report_compaction_end(&self, sink: Option<&crate::gc_event::GcEventSinkRef>) {
+        if let Some(sink) = sink {
+            sink.compaction_end(self.compaction_reclaimed.load(atomic::Ordering::Relaxed));
+        }
+    }
+
     async fn evict_group_sized(
         self: Arc<Self>,
         group_index: usize,
@@ -2107,6 +2151,9 @@ impl LocalImmutableStore {
         let bucket_count = group.bucket_count.load(atomic::Ordering::Relaxed);
         let mut bucket_stored_size = Vec::with_capacity(bucket_count);
         for bucket_index in 0..bucket_count {
+            if self.gc_stop_requested() {
+                return (0, 0);
+            }
             // Uninit slot is empty: push 0 to keep `bucket_stored_size` indexed by
             // bucket_index for the second pass below.
             let Some(bucket_ref) = group.try_bucket(bucket_index) else {
@@ -2165,6 +2212,13 @@ impl LocalImmutableStore {
         let bucket_count = group.bucket_count.load(atomic::Ordering::Relaxed);
         for bucket_index in 0..bucket_count {
             while serialize_tasks.try_join_next().is_some() {}
+
+            if self.gc_stop_requested() {
+                lore_base::lore_debug!(
+                    "Size eviction for group {group_index} stopping at bucket {bucket_index}"
+                );
+                break;
+            }
 
             let Some(bucket) = group.try_bucket(bucket_index).cloned() else {
                 continue;
@@ -2314,14 +2368,14 @@ impl LocalImmutableStore {
         let mut evict_count = 0;
         let mut began = false;
 
-        if self.stop_gc.load(atomic::Ordering::Relaxed) {
+        if self.gc_stop_requested() {
             return 0;
         }
         let Ok(_permit) = self.eviction.acquire().await else {
             lore_base::lore_warn!("Evict oldest failed to get permit");
             return 0;
         };
-        if self.stop_gc.load(atomic::Ordering::Relaxed) {
+        if self.gc_stop_requested() {
             return 0;
         }
 
@@ -2338,6 +2392,10 @@ impl LocalImmutableStore {
         let mut group_count = 0;
         let mut bucket_count = 0;
         for group in self.group.iter() {
+            if self.gc_stop_requested() {
+                break;
+            }
+
             buckets.clear();
             let active_buckets = group.bucket_count.load(atomic::Ordering::Relaxed);
             // Per-group target divides by this group's bucket_count, not the constant 256, so groups at level 1 still get a meaningful target rather than max_capacity / 65536.
@@ -2507,7 +2565,8 @@ impl LocalImmutableStore {
             .record(target_size as u64, &[]);
 
         let mut group_index = at.unwrap_or(GROUP_COUNT);
-        if group_index >= GROUP_COUNT {
+        let starting_pass = group_index >= GROUP_COUNT;
+        if starting_pass {
             let total_size = self.clone().packstore_total_size().await;
             self.instruments
                 .compaction
@@ -2522,16 +2581,11 @@ impl LocalImmutableStore {
             lore_base::lore_debug!(
                 "Packstore compactor running, current size {total_size} is above threshold {max_size} - targeting {target_size} bytes ({target_percentage}% of max size)"
             );
-            self.compaction_reclaimed
-                .store(0, atomic::Ordering::Relaxed);
-            if let Some(sink) = &sink {
-                sink.compaction_begin(max_size as u64);
-            }
         }
 
         let _ = self.deserialize_all_buckets().await;
 
-        if self.stop_gc.load(atomic::Ordering::Relaxed) {
+        if self.gc_stop_requested() {
             return Ok(None);
         }
         let Ok(_permit) = self.compaction.acquire().await else {
@@ -2539,7 +2593,11 @@ impl LocalImmutableStore {
             return Ok(None);
         };
 
-        if group_index >= GROUP_COUNT {
+        if self.gc_stop_requested() {
+            return Ok(None);
+        }
+
+        if starting_pass {
             lore_base::lore_debug!("Packstore compactor starting fresh");
 
             group_index = 0;
@@ -2549,8 +2607,12 @@ impl LocalImmutableStore {
             );
         }
 
-        if self.stop_gc.load(atomic::Ordering::Relaxed) {
-            return Ok(None);
+        // Committed to a step from here, so the begin is owed exactly one end on every exit
+        // below, carrying what this step reclaimed.
+        self.compaction_reclaimed
+            .store(0, atomic::Ordering::Relaxed);
+        if let Some(sink) = &sink {
+            sink.compaction_begin(max_size as u64);
         }
 
         let target_size = target_size / GROUP_COUNT;
@@ -2587,13 +2649,27 @@ impl LocalImmutableStore {
         }
 
         let mut final_result = Ok(());
+        let mut completed = true;
         while let Some(result) = tasks.join_next().await {
-            final_result = final_result.and(
-                result
-                    .map_err(|_err| Internal::msg("Task failure"))
-                    .map_err(StoreError::from)
-                    .flatten(),
+            let group_result = result
+                .map_err(|_err| Internal::msg("Task failure"))
+                .map_err(StoreError::from)
+                .flatten();
+            if let Ok(group_completed) = &group_result {
+                completed &= *group_completed;
+            }
+            final_result = final_result.and(group_result.map(|_| ()));
+        }
+
+        // A group that stopped still has packfiles to rewrite, so `group_index` is where a
+        // later pass picks up rather than what this step reached.
+        if !completed {
+            lore_base::lore_debug!(
+                "Packstore compactor stopped during group {group_index}, leaving resume point"
             );
+            self.report_compaction_end(sink.as_ref());
+            final_result?;
+            return Ok(Some(group_index));
         }
 
         group_index += parallel_group_count;
@@ -2614,7 +2690,9 @@ impl LocalImmutableStore {
         }
 
         // Error out if any operation failed
-        final_result?;
+        final_result.inspect_err(|_| self.report_compaction_end(sink.as_ref()))?;
+
+        self.report_compaction_end(sink.as_ref());
 
         if group_index < GROUP_COUNT {
             let total_size = self.packstore_total_size().await;
@@ -2625,13 +2703,15 @@ impl LocalImmutableStore {
                 .record(total_size as u64, &[]);
             Ok(Some(group_index))
         } else {
-            if let Some(sink) = &sink {
-                sink.compaction_end(self.compaction_reclaimed.load(atomic::Ordering::Relaxed));
-            }
             Ok(None)
         }
     }
 
+    /// Rewrite the group's packfiles into fewer, denser ones, one packfile at a time.
+    ///
+    /// Returns whether the group was left complete. `false` means a stop request ended
+    /// the pass with packfiles still to rewrite, and the caller must hold the compaction
+    /// resume point so a later pass repeats this group.
     #[allow(clippy::too_many_arguments)]
     async fn compact_group_packfiles(
         self: Arc<Self>,
@@ -2642,7 +2722,7 @@ impl LocalImmutableStore {
         sync_data: bool,
         instruments: CompactionInstruments,
         sink: Option<crate::gc_event::GcEventSinkRef>,
-    ) -> Result<(), StoreError> {
+    ) -> Result<bool, StoreError> {
         let (evicted_count, evicted_size) = self
             .clone()
             .evict_group_sized(
@@ -2673,7 +2753,20 @@ impl LocalImmutableStore {
 
         let mut packfile = 1;
         let mut group_reclaimed: u64 = 0;
+        let mut completed = true;
         loop {
+            // A packfile is the unit of compaction work. Its bucket sweep must reach the
+            // truncate below: buckets already rewritten point at the new packfile while
+            // the rest still point at this one, so abandoning a sweep part way would
+            // leave payloads that are still referenced in a packfile about to be dropped.
+            if self.gc_stop_requested() {
+                lore_base::lore_debug!(
+                    "Packstore compactor stopping group {group_index} before packfile {packfile}"
+                );
+                completed = false;
+                break;
+            }
+
             let group = &self.group[group_index];
             if let Ok(current_size) = group.packstore.total_size().await
                 && current_size < target_size
@@ -2763,7 +2856,7 @@ impl LocalImmutableStore {
                 .fetch_add(group_reclaimed, atomic::Ordering::Relaxed);
         }
 
-        Ok(())
+        Ok(completed)
     }
 
     pub async fn group_verify_store(
@@ -3854,17 +3947,20 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
         }
     }
 
-    async fn compact_stop(self: Arc<Self>) {
-        self.stop_gc.store(true, atomic::Ordering::Relaxed);
-        {
-            let _evict = self.eviction.acquire().await;
-        }
-        {
-            let _compact = self.compaction.acquire().await;
-        }
+    async fn stop_gc(self: Arc<Self>, terminate: bool) {
+        let _request = GcStopRequest::raise(&self.stop_requests, terminate);
+        // Taking both permits is what waits for the passes in flight to give up.
+        let _evict = self.eviction.acquire().await;
+        let _compact = self.compaction.acquire().await;
     }
 
     async fn verify(self: Arc<Self>, heal: bool) -> Result<(), StoreError> {
+        // Held for the whole walk: eviction and compaction rewrite the very entries and
+        // packfiles being read, so a pass running alongside reports failures that are only
+        // the store moving underneath it.
+        let evict_permit = self.eviction.acquire().await;
+        let compact_permit = self.compaction.acquire().await;
+
         let _ = self.deserialize_all_buckets().await;
 
         let mut failed = vec![];
@@ -4060,6 +4156,8 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
             }
 
             if heal {
+                drop(evict_permit);
+                drop(compact_permit);
                 let _ = crate::immutable_store::ImmutableStore::flush(self, false).await;
 
                 lore_base::lore_debug!("Store healing complete");
@@ -5087,6 +5185,246 @@ mod tests {
                 crate::local::fan_out::FAN_OUT_LEVEL_MAX
             );
         }
+    }
+
+    /// The compaction resume point is decided by what the group work reports, not by the
+    /// stop flag read after it: a group that gave up has packfiles left to rewrite, and
+    /// advancing past it would leave them for a pass that never comes. Both answers are
+    /// driven through a real sweep, so a stray report inside the packfile loop is caught.
+    #[tokio::test]
+    async fn group_compaction_reports_whether_it_finished() {
+        use crate::immutable_store::ImmutableStore;
+
+        let dir = crate::test_util::TempDir::new("is_stop_report_");
+        let store =
+            LocalImmutableStore::new(Some(dir.to_path_buf()), ImmutableStoreSettings::default())
+                .await
+                .unwrap();
+
+        let partition = Partition::from([0x0cu8; 16]);
+        for index in 0u8..8 {
+            let payload = vec![index; 4096];
+            let address = Address {
+                hash: crate::hash::hash_slice(&payload),
+                context: Context::from([index; 16]),
+            };
+            let fragment = Fragment {
+                // Non-durable, so eviction is forbidden to reclaim it and the packfile
+                // sweep has payloads to move.
+                flags: 0,
+                size_payload: payload.len() as u32,
+                size_content: payload.len() as u64,
+            };
+            store
+                .clone()
+                .put(
+                    partition,
+                    address,
+                    fragment,
+                    Some(Bytes::from(payload)),
+                    false,
+                )
+                .await
+                .unwrap();
+        }
+        store.clone().flush(true).await.unwrap();
+
+        // Compaction runs per group and the hash decides which one the payloads landed in.
+        let mut populated = None;
+        for (index, group) in store.group.iter().enumerate() {
+            for cell in group.bucket.iter() {
+                if let Some(bucket) = cell.get()
+                    && !bucket.read().await.entry.is_empty()
+                {
+                    populated = Some(index);
+                    break;
+                }
+            }
+            if populated.is_some() {
+                break;
+            }
+        }
+        let group_index = populated.expect("a put must populate a group");
+
+        // A target below what the group holds drives the sweep and the truncate, rather
+        // than breaking on the size check before either runs.
+        let completed = store
+            .clone()
+            .compact_group_packfiles(
+                group_index,
+                store.path.clone(),
+                1,
+                true,
+                false,
+                CompactionInstruments::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            completed,
+            "a group that ran to the end must report complete"
+        );
+
+        let _stopped = GcStopRequest::raise(&store.stop_requests, false);
+
+        let completed = store
+            .clone()
+            .compact_group_packfiles(
+                group_index,
+                store.path.clone(),
+                1,
+                true,
+                false,
+                CompactionInstruments::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !completed,
+            "a stopped group must report incomplete so the caller holds the resume point"
+        );
+    }
+
+    /// A step that commits to work reports one begin and owes exactly one end; a call that
+    /// gives up before committing reports neither, and does no work from the resume point.
+    #[tokio::test]
+    async fn compaction_reports_one_end_for_every_begin() {
+        use crate::immutable_store::ImmutableStore;
+
+        #[derive(Default)]
+        struct CountingSink {
+            begins: AtomicUsize,
+            ends: AtomicUsize,
+        }
+
+        impl crate::gc_event::GcEventSink for CountingSink {
+            fn eviction_begin(&self, _target_fragments: u64) {}
+            fn eviction_progress(&self, _evicted: u64) {}
+            fn eviction_end(&self, _total_evicted: u64) {}
+            fn compaction_begin(&self, _target_bytes: u64) {
+                self.begins.fetch_add(1, atomic::Ordering::Relaxed);
+            }
+            fn compaction_progress(&self, _compacted_bytes: u64) {}
+            fn compaction_end(&self, _total_compacted_bytes: u64) {
+                self.ends.fetch_add(1, atomic::Ordering::Relaxed);
+            }
+        }
+
+        let dir = crate::test_util::TempDir::new("is_sink_pairing_");
+        let store =
+            LocalImmutableStore::new(Some(dir.to_path_buf()), ImmutableStoreSettings::default())
+                .await
+                .unwrap();
+
+        // Content, so the pass finds itself above the limit and announces a begin.
+        let payload = vec![0x5au8; 4096];
+        store
+            .clone()
+            .put(
+                Partition::from([0x0du8; 16]),
+                Address {
+                    hash: crate::hash::hash_slice(&payload),
+                    context: Context::default(),
+                },
+                Fragment {
+                    flags: 0,
+                    size_payload: payload.len() as u32,
+                    size_content: payload.len() as u64,
+                },
+                Some(Bytes::from(payload)),
+                false,
+            )
+            .await
+            .unwrap();
+        store.clone().flush(true).await.unwrap();
+
+        let sink = Arc::new(CountingSink::default());
+
+        let resume = store
+            .clone()
+            .compact_packfiles(1, None, false, Some(sink.clone()))
+            .await
+            .unwrap()
+            .expect("a step over a 256 group store leaves groups to come");
+
+        assert_eq!(
+            sink.begins.load(atomic::Ordering::Relaxed),
+            1,
+            "a committed step announces exactly one begin"
+        );
+        assert_eq!(
+            sink.ends.load(atomic::Ordering::Relaxed),
+            1,
+            "a committed step owes an end for the begin it reported"
+        );
+
+        let _stopped = GcStopRequest::raise(&store.stop_requests, false);
+
+        assert_eq!(
+            store
+                .clone()
+                .compact_packfiles(1, Some(resume), false, Some(sink.clone()))
+                .await
+                .unwrap(),
+            None,
+            "a stopped call must not take another round from the resume point"
+        );
+        assert_eq!(
+            sink.begins.load(atomic::Ordering::Relaxed),
+            1,
+            "a call that gives up before committing must not announce a begin"
+        );
+        assert_eq!(
+            sink.ends.load(atomic::Ordering::Relaxed),
+            1,
+            "a call that gives up before committing reports neither begin nor end"
+        );
+    }
+
+    /// A stop asks the passes in flight to give up; it is not a switch that stays off. The
+    /// store is shared by path, so a caller quiescing it leaves the others collecting.
+    #[tokio::test]
+    async fn a_stop_lifts_once_it_has_drained() {
+        use crate::immutable_store::ImmutableStore;
+
+        let store = LocalImmutableStore::new(None, ImmutableStoreSettings::default())
+            .await
+            .unwrap();
+
+        store.clone().stop_gc(false).await;
+
+        assert!(
+            !store.gc_stop_requested(),
+            "a stop that is not terminating must lift so a shared store keeps collecting"
+        );
+    }
+
+    /// Two callers overlap whenever handles closing on one path race each other or a
+    /// shutdown. The first to drain must not lift the second's request, or the second waits
+    /// out a whole pass instead of the pass giving up at its next packfile.
+    #[tokio::test]
+    async fn a_stop_stays_raised_while_another_is_outstanding() {
+        use crate::immutable_store::ImmutableStore;
+
+        let store = LocalImmutableStore::new(None, ImmutableStoreSettings::default())
+            .await
+            .unwrap();
+
+        {
+            let _outstanding = GcStopRequest::raise(&store.stop_requests, false);
+            store.clone().stop_gc(false).await;
+            assert!(
+                store.gc_stop_requested(),
+                "a drain that completes must leave another caller's request raised"
+            );
+        }
+
+        assert!(
+            !store.gc_stop_requested(),
+            "the outstanding request going away leaves the store collecting again"
+        );
     }
 
     fn payload_data(pack_file: u32, encoding: u32, storage: u32) -> ImmutableData {
