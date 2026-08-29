@@ -1048,9 +1048,9 @@ pub const RETRY_MAX_ATTEMPTS: usize = 10;
 /// What the peer answered about the fragments a push is about to send, split by what it takes to
 /// register each one.
 ///
-/// A full match needs nothing and appears in neither list. The rest divide by whether the peer
-/// already holds the bytes: it either has to be sent them, or it has an association for the same
-/// hash and can duplicate that instead.
+/// A full match needs no transfer, but it is still an answer worth keeping. The rest divide by
+/// whether the peer already holds the bytes: it either has to be sent them, or it has an
+/// association for the same hash and can duplicate that instead.
 #[derive(Debug, Default)]
 pub(crate) struct PushQueryResult {
     /// The peer holds nothing for these, so their payloads have to be transferred.
@@ -1058,15 +1058,16 @@ pub(crate) struct PushQueryResult {
     /// The partition already holds these hashes under another context, so an association can be
     /// duplicated rather than the payload sent again.
     pub copyable: Vec<Address>,
+    /// The peer already holds these exactly. Nothing is transferred, but the local entries still
+    /// have to be marked durable — see [`mark_present_durable`].
+    pub present: Vec<Address>,
 }
 
 impl PushQueryResult {
+    /// Counts only what has to be transferred. `present` is deliberately excluded. Drives the
+    /// fragment total in the push progress events.
     pub fn len(&self) -> usize {
         self.absent.len() + self.copyable.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.absent.is_empty() && self.copyable.is_empty()
     }
 }
 
@@ -1076,7 +1077,7 @@ impl PushQueryResult {
 fn classify_query_batch(batch: &[Address], statuses: &Bytes, queried: &mut PushQueryResult) {
     for (address, status) in batch.iter().zip(statuses.iter()) {
         match QueryStatus::from(*status) {
-            QueryStatus::ExistFullMatch => {}
+            QueryStatus::ExistFullMatch => queried.present.push(*address),
             QueryStatus::ExistPartitionMatch => queried.copyable.push(*address),
             QueryStatus::NotFound => queried.absent.push(*address),
         }
@@ -1174,12 +1175,15 @@ pub(crate) async fn push_query(
     queried.absent.dedup();
     queried.copyable.sort_unstable();
     queried.copyable.dedup();
+    queried.present.sort_unstable();
+    queried.present.dedup();
 
     lore_debug!(
-        "Queried {} fragments, {} to upload, {} the peer can duplicate an association for",
+        "Queried {} fragments, {} to upload, {} the peer can duplicate an association for, {} the peer already holds",
         address_count,
         queried.absent.len(),
-        queried.copyable.len()
+        queried.copyable.len(),
+        queried.present.len()
     );
 
     Ok(queried)
@@ -1222,6 +1226,17 @@ async fn duplicate_association(
         return false;
     }
 
+    mark_stored_durable(repository, address).await;
+    true
+}
+
+/// Mark the local entry for `address` durable, looking up the fragment it needs to write back.
+///
+/// Shared by every path that learns the peer holds the address without having uploaded a payload
+/// for it in this call — a duplicated association, and a query that answered `ExistFullMatch`.
+/// Only metadata is read: the payload is already local and does not need loading to set a flag on
+/// its entry.
+async fn mark_stored_durable(repository: &Arc<RepositoryContext>, address: Address) {
     if let Ok(data) = repository
         .immutable_store()
         .get_metadata(repository.id, address)
@@ -1230,22 +1245,53 @@ async fn duplicate_association(
     {
         mark_durable(repository, address, data.fragment).await;
     }
-    true
+}
+
+/// Mark the local entries for addresses the peer already holds durable.
+///
+/// `ExistFullMatch` establishes the same fact an upload does. An entry that never records it is
+/// pinned against eviction, excluded from the store's size and capacity totals, and re-queried on
+/// every subsequent push.
+async fn mark_present_durable(repository: &Arc<RepositoryContext>, present: Vec<Address>) {
+    const MAX_PARALLEL_MARK: usize = 1000;
+
+    let mut tasks: JoinSet<()> = JoinSet::new();
+    for address in present {
+        if address.hash.is_zero() {
+            continue;
+        }
+
+        while tasks.len() >= MAX_PARALLEL_MARK {
+            let _ = tasks.join_next().await;
+        }
+
+        let repository = repository.clone();
+        lore_spawn!(tasks, async move {
+            mark_stored_durable(&repository, address).await;
+        });
+    }
+    while tasks.join_next().await.is_some() {}
 }
 
 /// Register every fragment the peer is missing, transferring a payload only where it has no
-/// association to duplicate.
+/// association to duplicate. Addresses the peer already holds are marked durable alongside.
 pub(crate) async fn push_fragments(
     repository: Arc<RepositoryContext>,
     storage: Arc<StorageSession>,
     fragments: PushQueryResult,
     stats: Arc<PushStatistics>,
 ) -> Result<(), PushError> {
-    if fragments.is_empty() {
-        return Ok(());
-    }
-
     let fragment_count = fragments.len();
+    let PushQueryResult {
+        absent,
+        copyable,
+        present,
+    } = fragments;
+
+    let marking = {
+        let repository = repository.clone();
+        lore_spawn!(async move { mark_present_durable(&repository, present).await })
+    };
 
     stats
         .fragment_count
@@ -1253,7 +1299,6 @@ pub(crate) async fn push_fragments(
 
     const MAX_PARALLEL_PUT: usize = 10000;
 
-    let PushQueryResult { absent, copyable } = fragments;
     let mut tasks: JoinSet<Result<(), PushError>> = JoinSet::new();
     let mut failure = None;
     for (address, duplicable) in copyable
@@ -1336,6 +1381,8 @@ pub(crate) async fn push_fragments(
             .err());
     }
 
+    let _ = marking.await;
+
     if let Some(err) = failure {
         return Err(err);
     }
@@ -1349,17 +1396,17 @@ pub(crate) async fn push_fragments(
 mod tests {
     use super::*;
 
+    fn address(seed: u8) -> Address {
+        Address {
+            hash: Hash::from([seed; 32]),
+            context: crate::lore::Context::from([seed; 16]),
+        }
+    }
+
     /// What the push does with a fragment is decided entirely by the status byte the peer answered
     /// with, so this is where the copy path is chosen or missed.
     mod classify {
         use super::*;
-
-        fn address(seed: u8) -> Address {
-            Address {
-                hash: Hash::from([seed; 32]),
-                context: crate::lore::Context::from([seed; 16]),
-            }
-        }
 
         fn classify(statuses: &[u8]) -> PushQueryResult {
             let batch: Vec<Address> = (0..statuses.len() as u8).map(address).collect();
@@ -1368,10 +1415,14 @@ mod tests {
             queried
         }
 
+        /// A full match transfers nothing, but the answer still has to be kept: it is what tells
+        /// the local store the payload is safe elsewhere, and an entry that never learns that is
+        /// pinned against eviction and invisible to both store caps for the rest of its life.
         #[test]
-        fn an_association_the_peer_holds_needs_nothing() {
+        fn an_association_the_peer_holds_transfers_nothing_but_is_recorded() {
             let queried = classify(&[QueryStatus::ExistFullMatch as u8]);
-            assert!(queried.is_empty());
+            assert_eq!(queried.len(), 0, "nothing to transfer");
+            assert_eq!(queried.present, vec![address(0)]);
         }
 
         /// The change this path exists for: the partition holds the hash, so the peer is asked to
@@ -1410,7 +1461,8 @@ mod tests {
             ]);
             assert_eq!(queried.absent, vec![address(0), address(3)]);
             assert_eq!(queried.copyable, vec![address(2), address(4)]);
-            assert_eq!(queried.len(), 4);
+            assert_eq!(queried.present, vec![address(1)]);
+            assert_eq!(queried.len(), 4, "len counts only what is transferred");
         }
 
         /// Each status answers the address at its own position, so a batch where only some entries
@@ -1423,7 +1475,101 @@ mod tests {
                 QueryStatus::NotFound as u8,
             ]);
             assert_eq!(queried.copyable, vec![address(0)]);
+            assert_eq!(queried.present, vec![address(1)]);
             assert_eq!(queried.absent, vec![address(2)]);
+        }
+    }
+
+    /// Recording a full match is what takes the fragment off the local store's protected list, so
+    /// this is where a push stops re-offering content the peer already holds.
+    mod mark {
+        use super::*;
+
+        const DURABLE: u32 = fragment::FragmentFlags::PayloadStoredDurable.bits();
+
+        /// A repository over in-memory stores, holding only what the test puts in it.
+        async fn null_repository() -> Arc<RepositoryContext> {
+            let immutable_store = lore_storage::local::immutable_store::create(
+                None::<&str>,
+                lore_storage::local::immutable_store::ImmutableStoreCreateOptions::none(),
+                false,
+                lore_storage::ImmutableStoreSettings::default(),
+            )
+            .await
+            .expect("in-memory immutable store");
+            let mutable_store = lore_storage::local::mutable_store::create(
+                None::<&str>,
+                lore_storage::MutableStoreSettings::default(),
+                immutable_store.clone(),
+            )
+            .await
+            .expect("in-memory mutable store");
+
+            Arc::new(RepositoryContext::new_null_context(
+                immutable_store,
+                mutable_store,
+            ))
+        }
+
+        /// Store a payload under `address` carrying no durability, as a local commit leaves it.
+        async fn store_local(repository: &Arc<RepositoryContext>, address: Address) {
+            let payload = Bytes::from_static(b"payload");
+            let fragment = Fragment {
+                flags: 0,
+                size_payload: payload.len() as u32,
+                size_content: payload.len() as u64,
+            };
+            repository
+                .immutable_store()
+                .put(repository.id, address, fragment, Some(payload), false)
+                .await
+                .expect("storing a local payload");
+        }
+
+        /// The flags the store holds for `address`.
+        async fn stored_flags(repository: &Arc<RepositoryContext>, address: Address) -> u32 {
+            repository
+                .immutable_store()
+                .get_metadata(repository.id, address)
+                .await
+                .expect("the store holds the address")
+                .fragment
+                .flags
+        }
+
+        /// The fact a full match establishes: the payload is safe on the peer, so the local entry
+        /// is no longer the only copy.
+        #[tokio::test]
+        async fn a_present_address_becomes_durable() {
+            let repository = null_repository().await;
+            let present = address(1);
+            store_local(&repository, present).await;
+            assert_eq!(
+                stored_flags(&repository, present).await & DURABLE,
+                0,
+                "a locally stored payload starts out non-durable"
+            );
+
+            mark_present_durable(&repository, vec![present]).await;
+
+            assert_eq!(stored_flags(&repository, present).await & DURABLE, DURABLE);
+        }
+
+        /// An address the store cannot describe answers nothing to write back, and must not cost
+        /// the addresses it can describe their record.
+        #[tokio::test]
+        async fn a_batch_marks_what_it_can_and_skips_the_rest() {
+            let repository = null_repository().await;
+            let present = address(2);
+            store_local(&repository, present).await;
+
+            mark_present_durable(&repository, vec![address(0), address(3), present]).await;
+
+            assert_eq!(
+                stored_flags(&repository, present).await & DURABLE,
+                DURABLE,
+                "a zero hash and an address the store never held are skipped, not fatal"
+            );
         }
     }
 }
