@@ -5,9 +5,14 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ## Nightly
 
+### Breaking changes
+
+- C API: `LoreGlobalArgs.no_atime` is removed. Nothing set it and nothing read it — the accessor it gated was never wired to the store settings, so the flag named a behavior that did not exist. Rebuild against the new `lore.h`; a caller that zero-initializes the struct needs no other change
+
 ### Features
 
 - `lore commit --stats` / `lore push --stats` report what the operation cost: files by the action each was staged with, and fragments by what became of them — already stored, compressed, written to the local store, duplicated as an association by the peer or uploaded. Reported once when the operation finishes, on the path that fails as on the one that succeeds, through the `RevisionCommitStats` and `BranchPushStats` events; `--stats=2` adds the per-fragment `FragmentWrite` stream. `--event-interval <milliseconds>` paces the progress events
+- `lore-storage`: the local store records when an entry was last read, so eviction and compaction rank by what commands actually read rather than by when content was written. An entry is serialized inside its whole bucket, so the read stamp marks a bucket for rewrite only once the time it holds moves by an hour or more: a burst of reads costs at most one index write per bucket instead of one per read, a smaller move rides to disk with whatever writes the bucket next, and marking never schedules a flush of its own
 
 ### Fixes & Improvements
 

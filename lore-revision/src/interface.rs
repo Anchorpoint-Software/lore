@@ -735,8 +735,6 @@ pub struct LoreGlobalArgs {
     pub remote: u8,
     /// Dry run mode, only report what would have been changed and perform no changes to local file system
     pub dry_run: u8,
-    /// Avoid recording last access timestamps in the data stores
-    pub no_atime: u8,
     /// Maximum number of parallel connections for bulk data transfer
     pub max_connections: u32,
     /// Search limit when iterating revisions
@@ -883,10 +881,6 @@ impl LoreGlobalArgs {
 
     pub fn dry_run(&self) -> bool {
         self.dry_run != 0
-    }
-
-    pub fn atime(&self) -> bool {
-        self.no_atime == 0
     }
 
     pub fn search_limit(&self) -> Option<usize> {

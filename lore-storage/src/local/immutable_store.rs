@@ -330,6 +330,9 @@ pub struct LocalImmutableStore {
     lock: Option<FSLock>,
 }
 
+/// How far a last-access stamp has to move before the bucket holding it is marked for rewrite.
+const ATIME_GRANULARITY_SECONDS: u64 = 60 * 60;
+
 pub struct ImmutableStoreSettings {
     /// Protect local fragments during eviction/compaction (true for clients, false for server)
     pub protect_local_fragment: bool,
@@ -351,7 +354,8 @@ pub struct ImmutableStoreSettings {
     pub compaction_parallel_groups: usize,
     /// Verify writes by read back and rehash data
     pub verify_write: bool,
-    /// Update last access timestamps on reads
+    /// Record the last access time of an entry on reads. Eviction and compaction rank by that
+    /// time, so a store that reclaims needs it on.
     pub atime: bool,
     /// Number of buckets per group at store creation. Must be a value from
     /// `lore_storage::local::fan_out::LEVEL_LADDER`. Defaults to `1` (client). Server processes
@@ -374,7 +378,7 @@ impl Default for ImmutableStoreSettings {
             target_size_percentage: 70,
             compaction_parallel_groups: 8,
             verify_write: false,
-            atime: false,
+            atime: true,
             initial_fan_out_level: 1,
             fan_out_threshold: crate::local::fan_out::FAN_OUT_THRESHOLD_DEFAULT,
         }
@@ -906,7 +910,7 @@ impl ImmutableStoreBucket {
 
         // Atomically flip dirty from true to false; if it was already false another flush
         // task has already claimed this bucket.
-        if !group.dirty[bucket_index].swap(false, atomic::Ordering::Relaxed) {
+        if !group.dirty[bucket_index].swap(false, atomic::Ordering::Acquire) {
             return Ok(());
         }
 
@@ -923,10 +927,11 @@ impl ImmutableStoreBucket {
     /// `serialize` path in two ways: (1) bypasses the `count == 0` early-exit and the
     /// `dirty.swap(false) → skip-if-was-false` short-circuit, because every `[0..committed_level]`
     /// bucket must be rewritten at the new layout to overwrite stale level-N files even if it's
-    /// empty post-redistribute; (2) always clears dirty after claiming ownership. The clear is
-    /// safe because the caller holds the bucket's read lock — no concurrent writer can set
-    /// dirty=true while we hold it, so any post-release write will correctly re-set dirty and
-    /// be picked up by the next flush, matching the regular `serialize` path's semantics.
+    /// empty post-redistribute; (2) always clears dirty after claiming ownership. A write to the
+    /// bucket takes its write lock, which the caller's read lock excludes, so such a write lands
+    /// after the release, re-sets dirty and is picked up by the next flush — matching the regular
+    /// `serialize` path's semantics. A last-access stamp is the exception, written under the read
+    /// lock, which is why the claim acquires.
     pub async fn serialize_to_new(
         bucket: OwnedRwLockReadGuard<ImmutableStoreBucket, ImmutableStoreBucket>,
         group: Arc<ImmutableStoreGroup>,
@@ -937,8 +942,7 @@ impl ImmutableStoreBucket {
     ) -> Result<(), LocalImmutableStoreError> {
         let _lock = bucket.serialize_lock.clone().lock_owned().await;
 
-        // Claim ownership of the bucket's current content. We hold the bucket's read lock so no concurrent writer can have set dirty between the time we decided to serialize and now.
-        group.dirty[bucket_index].swap(false, atomic::Ordering::Relaxed);
+        group.dirty[bucket_index].swap(false, atomic::Ordering::Acquire);
 
         let final_path = format_bucket_path(path, group_index, bucket_index);
         let new_path = {
@@ -1959,15 +1963,8 @@ impl LocalImmutableStore {
                     ..Default::default()
                 }
             } else {
-                // Record the last access timestamp unless disabled
                 if self.settings.atime {
-                    // SAFETY: Treat the u64 as an atomic, it is guaranteed to exist from the read lock
-                    // and stomping the value is safe and expected (contention is irrelevant)
-                    unsafe {
-                        AtomicU64::from_ptr(&data.last_access as *const u64 as *mut u64)
-                            .store(Self::last_access(), atomic::Ordering::Release);
-                    }
-                    group.dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
+                    Self::stamp_last_access(data, &group.dirty[bucket_index]);
                 }
 
                 *data
@@ -2244,10 +2241,11 @@ impl LocalImmutableStore {
                     }
 
                     let key = (entry.data.pack_file, entry.data.pack_offset);
+                    let last_access = Self::load_last_access(&entry.data);
                     stored_payloads
                         .entry(key)
-                        .and_modify(|item: &mut (u32, u64)| item.1 = entry.data.last_access)
-                        .or_insert((entry.data.size_payload, entry.data.last_access));
+                        .and_modify(|item: &mut (u32, u64)| item.1 = last_access)
+                        .or_insert((entry.data.size_payload, last_access));
                 }
                 stored_payloads.drain().collect()
             };
@@ -2506,7 +2504,7 @@ impl LocalImmutableStore {
                 {
                     continue;
                 }
-                let key = entry.data.last_access;
+                let key = Self::load_last_access(&entry.data);
                 if heap.len() < to_evict {
                     heap.push(key);
                 } else if key < *heap.peek().unwrap() {
@@ -3161,6 +3159,45 @@ impl LocalImmutableStore {
             .as_secs()
     }
 
+    /// Read an entry's last-access stamp.
+    ///
+    /// This is the only field written while its bucket is read-locked, so a read of it alone goes
+    /// through the atomic. A bulk copy of the entry takes it with the rest and may see the
+    /// previous stamp; both are times the entry was read.
+    fn load_last_access(data: &ImmutableData) -> u64 {
+        // SAFETY: the entry outlives the bucket lock its reader holds, and every write to this
+        // field is an atomic store through the same cast.
+        unsafe { AtomicU64::from_ptr(&data.last_access as *const u64 as *mut u64) }
+            .load(atomic::Ordering::Relaxed)
+    }
+
+    /// Move an entry's last-access stamp to now, marking `dirty` only when the move reaches
+    /// [`ATIME_GRANULARITY_SECONDS`].
+    ///
+    /// An entry serializes inside its whole bucket, so dirtying on every read would have each
+    /// read rewrite the bucket it touched. The stamp advances regardless, so a bucket written for
+    /// any other reason carries the current time.
+    ///
+    /// Dirtying here schedules no flush of its own.
+    ///
+    /// The stamp is swapped rather than loaded and stored, so that two resolves racing cannot both
+    /// read the old stamp and both dirty the bucket. It carries no ordering of its own; `dirty` is
+    /// released, and claimed with an acquire in [`ImmutableStoreBucket::serialize`] and
+    /// [`ImmutableStoreBucket::serialize_to_new`], which is what orders the stamp before the bytes
+    /// a flusher writes. Every other mutation of an entry takes the bucket write lock, whose
+    /// release a flusher's read lock already synchronizes with; this one holds a read lock, so the
+    /// flag has to carry the edge.
+    fn stamp_last_access(data: &ImmutableData, dirty: &AtomicBool) {
+        // SAFETY: as `load_last_access`.
+        let stamp = unsafe { AtomicU64::from_ptr(&data.last_access as *const u64 as *mut u64) };
+        let now = Self::last_access();
+
+        let previous = stamp.swap(now, atomic::Ordering::Relaxed);
+        if now.saturating_sub(previous) >= ATIME_GRANULARITY_SECONDS {
+            dirty.store(true, atomic::Ordering::Release);
+        }
+    }
+
     /// Immediate flush of all dirty buckets. Parallel across groups, sequential within a group.
     async fn flush_all(
         self: Arc<Self>,
@@ -3450,7 +3487,7 @@ impl LocalImmutableStore {
                     if address.hash.cmp(&previous_address.hash).is_lt() {
                         panic!("Immutable store integrity failed, entries not sorted");
                     }
-                    let last_access = bucket.entry[*index as usize].data.last_access;
+                    let last_access = Self::load_last_access(&bucket.entry[*index as usize].data);
                     if last_access > current_time {
                         panic!("Immutable store entry has last access in the future");
                     }
@@ -5230,21 +5267,7 @@ mod tests {
         store.clone().flush(true).await.unwrap();
 
         // Compaction runs per group and the hash decides which one the payloads landed in.
-        let mut populated = None;
-        for (index, group) in store.group.iter().enumerate() {
-            for cell in group.bucket.iter() {
-                if let Some(bucket) = cell.get()
-                    && !bucket.read().await.entry.is_empty()
-                {
-                    populated = Some(index);
-                    break;
-                }
-            }
-            if populated.is_some() {
-                break;
-            }
-        }
-        let group_index = populated.expect("a put must populate a group");
+        let (group_index, _bucket_index) = populated_bucket(&store).await;
 
         // A target below what the group holds drives the sweep and the truncate, rather
         // than breaking on the size check before either runs.
@@ -5424,6 +5447,169 @@ mod tests {
         assert!(
             !store.gc_stop_requested(),
             "the outstanding request going away leaves the store collecting again"
+        );
+    }
+
+    /// A last-access stamp far enough in the past that a resolve marks the bucket for rewrite.
+    const STALE_ACCESS: u64 = 1;
+
+    /// Answer the group and bucket index of the first bucket in `store` holding an entry. The
+    /// hash decides where a put lands, so a test that has to reach the entry it stored searches
+    /// rather than derives.
+    async fn populated_bucket(store: &Arc<LocalImmutableStore>) -> (usize, usize) {
+        for (group_index, group) in store.group.iter().enumerate() {
+            for (bucket_index, cell) in group.bucket.iter().enumerate() {
+                if let Some(bucket) = cell.get()
+                    && !bucket.read().await.entry.is_empty()
+                {
+                    return (group_index, bucket_index);
+                }
+            }
+        }
+        panic!("a put must populate a bucket");
+    }
+
+    /// Store one fragment in `store`, set its last-access stamp to `stamp`, and clear the dirty
+    /// flag of the bucket it landed in. Answers that bucket and the address naming the entry.
+    async fn backdated_fragment(
+        store: &Arc<LocalImmutableStore>,
+        stamp: u64,
+    ) -> ((usize, usize), Partition, Address) {
+        use crate::immutable_store::ImmutableStore;
+
+        let partition = Partition::from([0x11u8; 16]);
+        let payload = vec![0x22u8; 128];
+        let address = Address {
+            hash: crate::hash::hash_slice(&payload),
+            context: Context::from([0x33u8; 16]),
+        };
+        let fragment = Fragment {
+            flags: 0,
+            size_payload: payload.len() as u32,
+            size_content: payload.len() as u64,
+        };
+        store
+            .clone()
+            .put(
+                partition,
+                address,
+                fragment,
+                Some(Bytes::from(payload)),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let (group_index, bucket_index) = populated_bucket(store).await;
+        let group = &store.group[group_index];
+        group.bucket(bucket_index).write().await.entry[0]
+            .data
+            .last_access = stamp;
+        group.dirty[bucket_index].store(false, atomic::Ordering::Relaxed);
+
+        ((group_index, bucket_index), partition, address)
+    }
+
+    /// Resolve one backdated fragment in an in-memory store. Answers the stamp its entry carries
+    /// afterward and whether the resolve marked the bucket for rewrite.
+    async fn resolve_one_fragment(atime: bool, stamp: u64) -> (u64, bool) {
+        use crate::immutable_store::ImmutableStore;
+
+        let store = LocalImmutableStore::new(
+            None,
+            ImmutableStoreSettings {
+                atime,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let ((group_index, bucket_index), partition, address) =
+            backdated_fragment(&store, stamp).await;
+
+        let mut results = [StoreMatchResult::default(); 1];
+        store
+            .clone()
+            .query(partition, &[address], &mut results)
+            .await
+            .unwrap();
+
+        let group = &store.group[group_index];
+        (
+            group.bucket(bucket_index).read().await.entry[0]
+                .data
+                .last_access,
+            group.dirty[bucket_index].load(atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// Eviction and compaction rank entries by last access, so a resolve moves the stamp to now
+    /// whatever its age — ranking by write time reclaims a fragment every command reads ahead of
+    /// one nothing has touched since it landed. A move this small rides along with whatever
+    /// writes the bucket next rather than rewriting it on its own.
+    #[tokio::test]
+    async fn a_small_move_advances_the_stamp_without_dirtying_the_bucket() {
+        let recent = LocalImmutableStore::last_access().saturating_sub(10);
+
+        let (last_access, dirty) = resolve_one_fragment(true, recent).await;
+
+        assert!(last_access > recent, "a resolve always advances the stamp");
+        assert!(!dirty, "a small move must not schedule a rewrite");
+    }
+
+    /// A stamp that moved past the window is worth a bucket rewrite of its own.
+    #[tokio::test]
+    async fn a_stale_stamp_dirties_the_bucket_holding_it() {
+        let (_last_access, dirty) = resolve_one_fragment(true, STALE_ACCESS).await;
+
+        assert!(dirty, "a stamp this far behind has to reach disk");
+    }
+
+    /// A store that never reclaims records no access, so a resolve neither moves the stamp nor
+    /// dirties the bucket holding it.
+    #[tokio::test]
+    async fn a_resolve_records_nothing_without_atime() {
+        let (last_access, dirty) = resolve_one_fragment(false, STALE_ACCESS).await;
+
+        assert_eq!(last_access, STALE_ACCESS);
+        assert!(!dirty);
+    }
+
+    /// Ranking by access is only worth anything if a stamp outlives the process that made it, so
+    /// this reads the bucket back off disk rather than out of the store that wrote it.
+    #[tokio::test]
+    async fn a_stamp_reaches_the_bucket_file() {
+        use crate::immutable_store::ImmutableStore;
+
+        let dir = crate::test_util::TempDir::new("is_atime_persist_");
+        let store =
+            LocalImmutableStore::new(Some(dir.to_path_buf()), ImmutableStoreSettings::default())
+                .await
+                .unwrap();
+
+        let ((group_index, bucket_index), partition, address) =
+            backdated_fragment(&store, STALE_ACCESS).await;
+
+        let mut results = [StoreMatchResult::default(); 1];
+        store
+            .clone()
+            .query(partition, &[address], &mut results)
+            .await
+            .unwrap();
+        store.clone().flush(true).await.unwrap();
+
+        let root = store.path.clone().expect("a disk-backed store has a path");
+        let (_sorted_index, entry, _upgrade, _dirty) = ImmutableStoreBucket::deserialize_files(
+            format_bucket_path(&root, group_index, bucket_index),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(entry.len(), 1, "the stamp must have dirtied the bucket");
+        assert!(
+            entry[0].data.last_access > STALE_ACCESS,
+            "the stamp a resolve made must survive the flush"
         );
     }
 

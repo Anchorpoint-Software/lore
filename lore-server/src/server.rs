@@ -1117,7 +1117,7 @@ async fn create_local_store(
             target_size_percentage: settings.target_size_percentage.unwrap_or(default_settings.target_size_percentage),
             compaction_parallel_groups: settings.compaction_parallel_groups.unwrap_or(default_settings.compaction_parallel_groups),
             verify_write: false,
-            atime: false,
+            atime: true,
             initial_fan_out_level: lore_storage::local::fan_out::FAN_OUT_LEVEL_MAX, /* Server mode, full 256-bucket layout from the start */
             fan_out_threshold: lore_storage::local::fan_out::FAN_OUT_THRESHOLD_DEFAULT,
         },

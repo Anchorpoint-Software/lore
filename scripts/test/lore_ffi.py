@@ -82,7 +82,6 @@ class LoreGlobalArgs(Structure):
         ("local", c_uint8),
         ("remote", c_uint8),
         ("dry_run", c_uint8),
-        ("no_atime", c_uint8),
         ("max_connections", c_uint32),
         ("search_limit", c_uint32),
         ("search_nearest", c_uint8),
@@ -97,6 +96,8 @@ class LoreGlobalArgs(Structure):
         ("cache", c_uint8),
         ("identity_token", LoreString),
         ("access_token", LoreString),
+        ("stats", c_uint32),
+        ("event_interval_ms", c_uint64),
     ]
 
 

@@ -242,8 +242,8 @@ impl StoreConfig {
 ///
 /// Incremental GC is the default on write operations (`!read_only`). It is
 /// suppressed by `--no-gc` and on dry-run commands (`suppress_incremental`, which
-/// the caller folds together), since a dry run persists nothing and its background
-/// tasks would otherwise race the dry run's own teardown. Read-only opens never
+/// the caller folds together), since a dry run adds no content to collect and its
+/// background tasks would otherwise race its own teardown. Read-only opens never
 /// spawn it. When enabled but the repository has no `[store]` config, the built-in
 /// [`StoreConfig::client_default`] caps apply.
 fn incremental_gc_options(

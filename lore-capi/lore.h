@@ -3896,8 +3896,6 @@ typedef struct lore_global_args_t {
   uint8_t remote;
   // Dry run mode, only report what would have been changed and perform no changes to local file system
   uint8_t dry_run;
-  // Avoid recording last access timestamps in the data stores
-  uint8_t no_atime;
   // Maximum number of parallel connections for bulk data transfer
   uint32_t max_connections;
   // Search limit when iterating revisions

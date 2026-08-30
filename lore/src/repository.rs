@@ -879,12 +879,6 @@ async fn status_local(
     args: LoreRepositoryStatusArgs,
     callback: LoreEventCallback,
 ) -> i32 {
-    // Avoid store updates during status, which is effectively read only
-    // State fragments are still prioritized in local store, so prioritize
-    // less file system writes of store files over accuracy in eviction/compaction
-    let mut globals = globals;
-    globals.no_atime = 1;
-
     if args.scan != 0 || args.check_dirty != 0 || args.reset != 0 {
         // Scan and check_dirty persist refreshed dirty flags in the staged
         // state and reset drops the staged anchor; all require write capability
