@@ -50,6 +50,7 @@ use crate::println;
 use crate::progress_bar::ProgressBar;
 use crate::progress_bar::progress_debug;
 use crate::progress_bar::sync::apply_sync_progress_to_bar;
+use crate::stats_display;
 use crate::styling::BranchStyles;
 use crate::styling::CommonStyles;
 use crate::styling::FileActionStyle;
@@ -431,13 +432,13 @@ pub enum BranchCommands {
 
 #[derive(Args)]
 pub struct BranchLatestArgs {
-    /// List previous latest pointers of a branch
     #[command(subcommand)]
     subcommand: BranchLatestCommands,
 }
 
 #[derive(Subcommand)]
 pub enum BranchLatestCommands {
+    /// List previous latest pointers of a branch
     List(BranchLatestListArgs),
 }
 
@@ -886,6 +887,9 @@ pub fn handle_branch_push(globals: LoreGlobalArgs, args: &BranchPushArgs) -> u8 
                         println!("Pushed {} fragment(s)", data.fragments);
                     }
                 }
+            LoreEvent::BranchPushStats(data) => {
+                stats_display::print_push_totals(data);
+            }
             LoreEvent::BranchPushBranchCreateBegin(data) => {
                 println!(
                     "Creating branch {} at {}",

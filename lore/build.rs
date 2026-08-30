@@ -21,18 +21,24 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let crate_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
 
-    // list all .rs files in `lore` so that we run this script to update the c header
-    for entry in glob("src/**/*.rs").expect("glob syntax error") {
-        match entry {
-            Ok(path) => println!("cargo:rerun-if-changed={}", path.display()),
-            Err(err) => println!("Glob error: {err}"),
+    // Watch every source cbindgen reads, so the checked-in header cannot go stale: this crate's
+    // own, and the crates `cbindgen.toml` names under `parse.include`, which define C-API types
+    // of their own. Cargo does not re-run a build script when only a dependency crate changes.
+    for pattern in [
+        "src/**/*.rs",
+        "../lore-base/src/**/*.rs",
+        "../lore-notification/src/**/*.rs",
+        "../lore-revision/src/**/*.rs",
+        "../lore-storage/src/**/*.rs",
+        "../lore-transport/src/**/*.rs",
+    ] {
+        for entry in glob(pattern).expect("glob syntax error") {
+            match entry {
+                Ok(path) => println!("cargo:rerun-if-changed={}", path.display()),
+                Err(err) => println!("Glob error: {err}"),
+            }
         }
     }
-
-    // `LoreEvent` is a cbindgen-exported C-API type defined in lore-revision, not in `lore`.
-    // Cargo does not re-run this build script when only a dependency crate changes, so watch the
-    // event source explicitly to keep the generated header in sync with the event enum.
-    println!("cargo:rerun-if-changed=../lore-revision/src/event.rs");
 
     // list input configuration files so that we run this script to update the c header
     println!("cargo:rerun-if-changed=cbindgen.toml");

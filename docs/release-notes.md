@@ -7,6 +7,8 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Features
 
+- `lore commit --stats` / `lore push --stats` report what the operation cost: files by the action each was staged with, and fragments by what became of them — already stored, compressed, written to the local store, duplicated as an association by the peer or uploaded. Reported once when the operation finishes, on the path that fails as on the one that succeeds, through the `RevisionCommitStats` and `BranchPushStats` events; `--stats=2` adds the per-fragment `FragmentWrite` stream. `--event-interval <milliseconds>` paces the progress events
+
 ### Fixes & Improvements
 
 - `lore-storage`: a stopped garbage collection pass gives up within one packfile instead of after a whole compaction step, so process exit waits at most one packfile rewrite; the stop at the end of every repository command is gone, so background eviction and compaction continue across commands

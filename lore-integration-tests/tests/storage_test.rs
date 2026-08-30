@@ -4791,7 +4791,7 @@ mod open_tests {
                         payload,
                         WriteOptions::default(),
                         None,
-                        None,
+                        lore_storage::WriteContext::none(),
                         None,
                     )
                     .await

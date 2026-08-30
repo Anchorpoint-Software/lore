@@ -255,6 +255,7 @@ async fn store_and_publish(
             bytes,
             write_options,
             remote_session,
+            lore_revision::immutable::counted_write_context(),
         )
         .await,
     )

@@ -59,6 +59,10 @@ pub type LoreRevisionInfoDeltaEventData =
     lore_revision::revision::info::LoreRevisionInfoDeltaEventData;
 pub type LoreRevisionCommitRevisionEventData =
     lore_revision::commit::LoreRevisionCommitRevisionEventData;
+pub type LoreRevisionCommitStatsEventData = lore_revision::commit::LoreRevisionCommitStatsEventData;
+pub type LoreCommitFileStatsData = lore_revision::commit::LoreCommitFileStatsData;
+pub type LoreBranchPushStatsEventData = lore_revision::branch::push::LoreBranchPushStatsEventData;
+pub type LoreFragmentStatsData = lore_storage::FragmentWriteCounts;
 pub type LoreRevisionSyncProgressEventData =
     lore_revision::revision::sync::LoreRevisionSyncProgressEventData;
 pub type LoreRevisionSyncFileEventData =

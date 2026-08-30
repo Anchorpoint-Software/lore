@@ -31,6 +31,7 @@ pub(crate) mod test_util;
 pub(crate) mod typed_bytes;
 pub(crate) mod types;
 pub mod write;
+pub mod write_stats;
 pub mod write_tracker;
 
 use std::time::Duration;
@@ -165,6 +166,10 @@ pub use write::write_content;
 pub use write::write_from_file;
 pub use write::write_raw;
 pub use write::write_resolved;
+pub use write_stats::FragmentWriteCounts;
+pub use write_stats::FragmentWriteStats;
+pub use write_tracker::WriteContext;
+pub use write_tracker::WriteTracker;
 
 /// Retry waiter with exponential backoff and jitter.
 pub struct Retry {

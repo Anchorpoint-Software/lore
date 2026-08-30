@@ -17,7 +17,7 @@ from error_types import (
     PathExistChildrenLinkError,
     PathExistLinkError,
 )
-from lore_parsers import parse_jsonl, parse_status_json
+from lore_parsers import parse_commit_stats_json, parse_jsonl, parse_status_json
 from thin_client import (
     ACTION_ADD,
     ACTION_DELETE,
@@ -5159,9 +5159,9 @@ def test_link_branching_and_pinning(new_lore_repo):
     )
 
 
-@pytest.mark.smoke
-def test_link_scoped_commit(new_lore_repo):
-    """Test committing a single link independently and verifying parent pin is staged."""
+def link_scoped_repository(new_lore_repo) -> tuple[Lore, str]:
+    """A pushed repository holding one file of its own, with a pushed link mounted
+    at the returned path holding one file of its own."""
     repo: Lore = new_lore_repo()
 
     with repo.open_file("parent-file.txt", "w+") as f:
@@ -5184,6 +5184,14 @@ def test_link_scoped_commit(new_lore_repo):
     repo.link_add(link_path, link_repo.get_id(), "/")
     repo.commit("Add link")
     repo.push()
+
+    return repo, link_path
+
+
+@pytest.mark.smoke
+def test_link_scoped_commit(new_lore_repo):
+    """Test committing a single link independently and verifying parent pin is staged."""
+    repo, link_path = link_scoped_repository(new_lore_repo)
 
     # Modify a file inside the link
     linked_file = f"{link_path}/link-file.txt"
@@ -5206,30 +5214,37 @@ def test_link_scoped_commit(new_lore_repo):
 
 
 @pytest.mark.smoke
+def test_link_scoped_commit_reports_statistics(new_lore_repo):
+    """A commit scoped to a link is a commit, and has to report what it cost. The
+    scoped paths return before the one every other commit takes, so a report bound
+    to that path alone would leave every link and layer commit silent."""
+    repo, link_path = link_scoped_repository(new_lore_repo)
+
+    linked_file = f"{link_path}/link-file.txt"
+    with repo.open_file(linked_file, "w+") as f:
+        f.writelines(["modified link content\n"])
+    repo.stage(linked_file)
+
+    stats = parse_commit_stats_json(
+        repo.commit("Link-scoped commit", link=link_path, json=True, stats=1)
+    )
+    assert stats is not None, "a link-scoped commit must emit its statistics event"
+
+    files = stats["files"]
+    assert files["modified"] == 1, (
+        f"the one file changed inside the link was committed as a modification, "
+        f"got {files}"
+    )
+    assert files["files"] == 1, f"and it is the only file committed, got {files}"
+    assert stats["fragments"]["fragmentsProduced"] > 0, (
+        f"the commit wrote fragments, got {stats['fragments']}"
+    )
+
+
+@pytest.mark.smoke
 def test_link_scoped_commit_no_parent_change(new_lore_repo):
     """Test that link-scoped commit preserves parent's own staged changes."""
-    repo: Lore = new_lore_repo()
-
-    with repo.open_file("parent-file.txt", "w+") as f:
-        f.writelines(["parent content\n"])
-
-    repo.stage(scan=True)
-    repo.commit("Initial parent")
-    repo.push()
-
-    link_repo = new_lore_repo()
-
-    with link_repo.open_file("link-file.txt", "w+") as f:
-        f.writelines(["initial link content\n"])
-
-    link_repo.stage(scan=True)
-    link_repo.commit("Initial link")
-    link_repo.push()
-
-    link_path = "linked"
-    repo.link_add(link_path, link_repo.get_id(), "/")
-    repo.commit("Add link")
-    repo.push()
+    repo, link_path = link_scoped_repository(new_lore_repo)
 
     # Stage a parent file change
     with repo.open_file("parent-file.txt", "w+") as f:
@@ -5313,28 +5328,7 @@ def test_link_scoped_commit_nothing_staged(new_lore_repo):
 @pytest.mark.smoke
 def test_link_scoped_commit_consecutive(new_lore_repo):
     """Test two consecutive --link commits without committing the parent in between."""
-    repo: Lore = new_lore_repo()
-
-    with repo.open_file("parent-file.txt", "w+") as f:
-        f.writelines(["parent content\n"])
-
-    repo.stage(scan=True)
-    repo.commit("Initial parent")
-    repo.push()
-
-    link_repo = new_lore_repo()
-
-    with link_repo.open_file("link-file.txt", "w+") as f:
-        f.writelines(["initial link content\n"])
-
-    link_repo.stage(scan=True)
-    link_repo.commit("Initial link")
-    link_repo.push()
-
-    link_path = "linked"
-    repo.link_add(link_path, link_repo.get_id(), "/")
-    repo.commit("Add link")
-    repo.push()
+    repo, link_path = link_scoped_repository(new_lore_repo)
 
     # First file change inside the link
     with repo.open_file(f"{link_path}/first.txt", "w+") as f:

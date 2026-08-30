@@ -67,11 +67,13 @@ pub struct LoreFragmentWriteEventData {
     pub deduplicated: u8,
 }
 
-/// Build a `WriteTracker`. When `stats` is set the tracker emits a
-/// `FragmentWrite` event per fragment; otherwise it carries no observer so the
-/// common commit path avoids the per-fragment overhead.
-pub fn commit_write_tracker(stats: bool) -> Arc<lore_storage::write_tracker::WriteTracker> {
-    if !stats {
+/// Build a `WriteTracker`. When `per_fragment` is set the tracker emits a
+/// `FragmentWrite` event per fragment; otherwise it carries no observer.
+///
+/// Aggregate counters live on the execution context rather than the tracker, so
+/// this flag governs only the per-fragment events.
+pub fn commit_write_tracker(per_fragment: bool) -> Arc<lore_storage::write_tracker::WriteTracker> {
+    if !per_fragment {
         return Arc::new(lore_storage::write_tracker::WriteTracker::new());
     }
     Arc::new(lore_storage::write_tracker::WriteTracker::with_observer(
@@ -83,6 +85,34 @@ pub fn commit_write_tracker(stats: bool) -> Arc<lore_storage::write_tracker::Wri
             .send();
         }),
     ))
+}
+
+/// The counters this call's writes report into, or `None` where nothing counts
+/// them: statistics level zero, or outside a call.
+///
+/// Read at each write rather than threaded through the callers, so that a write
+/// carrying no tracker still lands in the operation's totals. At level zero the
+/// whole `lore-storage` write pipeline holds no counters and takes no atomic add
+/// per fragment.
+fn ambient_fragment_stats() -> Option<Arc<lore_storage::FragmentWriteStats>> {
+    let context = crate::runtime::try_execution_context()?;
+    if !context.globals().stats() {
+        return None;
+    }
+    Some(context.fragment_stats().clone())
+}
+
+/// The write context for a call that dispatches background writes into `tracker`.
+pub fn write_context(
+    tracker: Option<Arc<lore_storage::write_tracker::WriteTracker>>,
+) -> lore_storage::WriteContext {
+    lore_storage::WriteContext::tracked(tracker, ambient_fragment_stats())
+}
+
+/// The write context for a call that has no tracker, so its writes run inline
+/// but still land in this call's totals.
+pub fn counted_write_context() -> lore_storage::WriteContext {
+    lore_storage::WriteContext::counted(ambient_fragment_stats())
 }
 
 /// Construct [`WriteOptions`] from a repository context.
@@ -369,7 +399,7 @@ pub async fn store_raw_with_tracker(
         buffer,
         cache_local,
         session,
-        tracker,
+        write_context(tracker),
         None,
     )
     .await
@@ -411,7 +441,7 @@ pub async fn write_with_tracker(
         buffer,
         flags,
         session,
-        tracker,
+        write_context(tracker),
         None,
     )
     .await
@@ -450,7 +480,7 @@ pub async fn write_from_file_with_tracker(
         context,
         flags,
         session,
-        tracker,
+        write_context(tracker),
     )
     .await
     .map(|written| (written.address, written.size_content))

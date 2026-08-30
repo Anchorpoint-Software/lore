@@ -232,7 +232,7 @@ async fn resolve_put_item(
             bytes,
             write_options,
             remote_session,
-            None,
+            lore_revision::immutable::counted_write_context(),
             None,
         )
         .await,

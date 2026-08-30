@@ -236,20 +236,24 @@ pub fn handle_path_ignore_event(event: &LorePathIgnoreEventData) {
     println!("Ignoring invalid path: {}", event.path);
 }
 
+/// A byte count in the largest unit that leaves it above one.
+///
+/// A raw byte count renders as an integer, a fraction of a byte saying nothing.
+/// Only the scaled units carry decimals, the remainder there distinguishing
+/// 1.02 MiB from 1.98 MiB.
 pub fn format_bytes_to_string(bytes: u64) -> String {
-    let mut unit = "bytes";
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
+    const GIB: u64 = 1024 * MIB;
 
-    let converted = if bytes > 1024 * 1024 * 1024 {
-        unit = "GiB";
-        (bytes / (1024 * 1024)) as f64 / 1024.0
-    } else if bytes > 1024 * 1024 {
-        unit = "MiB";
-        (bytes / 1024) as f64 / 1024.0
-    } else if bytes > 1024 {
-        unit = "KiB";
-        bytes as f64 / 1024.0
+    let (converted, unit) = if bytes > GIB {
+        ((bytes / MIB) as f64 / 1024.0, "GiB")
+    } else if bytes > MIB {
+        ((bytes / KIB) as f64 / 1024.0, "MiB")
+    } else if bytes > KIB {
+        (bytes as f64 / 1024.0, "KiB")
     } else {
-        bytes as f64
+        return format!("{bytes} bytes");
     };
 
     format!("{converted:.2} {unit}")
@@ -383,5 +387,32 @@ pub fn read_line_with_editing(buf: &mut String) -> std::io::Result<usize> {
     #[cfg(not(unix))]
     {
         std::io::stdin().read_line(buf)
+    }
+}
+
+#[cfg(test)]
+mod format_bytes_tests {
+    use super::format_bytes_to_string;
+
+    /// A count of bytes is exact, so a decimal on it is noise at best and
+    /// misleading at worst — "600.00 bytes" reads as a measurement that was
+    /// rounded when it was not.
+    #[test]
+    fn a_raw_byte_count_carries_no_decimals() {
+        assert_eq!(format_bytes_to_string(0), "0 bytes");
+        assert_eq!(format_bytes_to_string(1), "1 bytes");
+        assert_eq!(format_bytes_to_string(600), "600 bytes");
+        assert_eq!(format_bytes_to_string(1024), "1024 bytes");
+    }
+
+    #[test]
+    fn a_scaled_unit_carries_decimals_because_the_remainder_means_something() {
+        assert_eq!(format_bytes_to_string(1025), "1.00 KiB");
+        assert_eq!(format_bytes_to_string(1536), "1.50 KiB");
+        assert_eq!(format_bytes_to_string(3 * 1024 * 1024 / 2), "1.50 MiB");
+        assert_eq!(
+            format_bytes_to_string(3 * 1024 * 1024 * 1024 / 2),
+            "1.50 GiB"
+        );
     }
 }

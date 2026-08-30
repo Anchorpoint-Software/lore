@@ -5052,7 +5052,7 @@ mod tests {
                 payload.clone(),
                 WriteOptions::default(),
                 None,
-                None,
+                crate::write_tracker::WriteContext::none(),
                 None,
             )
             .await
@@ -5120,7 +5120,7 @@ mod tests {
             payload.clone(),
             WriteOptions::default(),
             None,
-            None,
+            crate::write_tracker::WriteContext::none(),
             None,
         )
         .await
@@ -5547,7 +5547,7 @@ mod tests {
             Bytes::from(payload.clone()),
             WriteOptions::default(),
             None,
-            None,
+            crate::write_tracker::WriteContext::none(),
             None,
         )
         .await
@@ -5565,7 +5565,7 @@ mod tests {
             Bytes::from(payload.clone()),
             WriteOptions::default(),
             None,
-            None,
+            crate::write_tracker::WriteContext::none(),
             None,
         )
         .await
@@ -5644,7 +5644,7 @@ mod tests {
             Bytes::from(payload.clone()),
             WriteOptions::default(),
             None,
-            None,
+            crate::write_tracker::WriteContext::none(),
             None,
         )
         .await

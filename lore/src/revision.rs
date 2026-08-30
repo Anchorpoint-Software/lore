@@ -65,9 +65,6 @@ pub struct LoreRevisionCommitArgs {
     /// Array of messages corresponding to each layer path (parallel array with `layer_paths`)
     #[serde(default)]
     pub layer_messages: LoreArray<LoreString>,
-    /// Emit per-fragment write stats during the commit
-    #[serde(default)]
-    pub stats: u8,
 }
 
 /// Commits all staged changes to the current branch as a new revision.
@@ -94,7 +91,8 @@ pub struct LoreRevisionCommitArgs {
 /// | [`LoreEvent::RevisionCommitEnd`](crate::interface::LoreEvent::RevisionCommitEnd) | Emitted when commit file processing completes |
 /// | [`LoreEvent::RevisionCommitRevision`](crate::interface::LoreEvent::RevisionCommitRevision) | Emitted with the committed revision details (hash, branch, parents) |
 /// | [`LoreEvent::Metadata`](crate::interface::LoreEvent::Metadata) | Emitted for each metadata entry of the committed revision |
-/// | [`LoreEvent::FragmentWrite`](crate::interface::LoreEvent::FragmentWrite) | Emitted for each file fragment written or deduplicated |
+/// | [`LoreEvent::RevisionCommitStats`](crate::interface::LoreEvent::RevisionCommitStats) | Emitted once when the commit finishes, with per-action file counts and fragment write/dedup/upload totals. Requires `stats >= 1` on the global arguments |
+/// | [`LoreEvent::FragmentWrite`](crate::interface::LoreEvent::FragmentWrite) | Emitted for each file fragment written or deduplicated. Requires `stats >= 2` on the global arguments |
 pub async fn commit(
     globals: LoreGlobalArgs,
     args: LoreRevisionCommitArgs,
@@ -161,7 +159,6 @@ async fn commit_local(
                 link_messages,
                 layer,
                 layer_messages,
-                stats: args.stats != 0,
             };
 
             // Enable upload to remote during commit unless offline or local

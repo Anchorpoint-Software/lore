@@ -43,6 +43,8 @@ use crate::types::Fragment;
 use crate::types::FragmentReference;
 use crate::types::Hash;
 use crate::types::Partition;
+use crate::write_stats::FragmentWriteStats;
+use crate::write_tracker::WriteContext;
 use crate::write_tracker::WriteTracker;
 
 fn store_retry() -> crate::Retry {
@@ -241,6 +243,7 @@ pub async fn write_resolved(
     buffer: Bytes,
     flags: WriteOptions,
     remote_session: Option<Arc<StorageSession>>,
+    writes: WriteContext,
 ) -> Result<StoreResult, StorageError> {
     if key.is_zero() {
         return Err(StorageError::internal(
@@ -288,6 +291,7 @@ pub async fn write_resolved(
             buffer,
             flags,
             remote_session.clone(),
+            writes,
             None,
             key,
         )
@@ -300,7 +304,7 @@ pub async fn write_resolved(
             buffer,
             flags,
             remote_session.clone(),
-            None,
+            writes,
             None,
         )
         .await?
@@ -401,14 +405,15 @@ async fn remote_put_retry(
 ///
 /// For local-only storage, pass `None` for `remote_session`.
 ///
-/// When `tracker` is `Some`, the work after the synchronous dedup/pre-check is
-/// handed off to a background leader task owned by the tracker; the call
+/// When `writes` carries a tracker, the work after the synchronous dedup/pre-check
+/// is handed off to a background leader task owned by that tracker; the call
 /// returns as soon as the address and input fragment are known. If another
 /// task is already writing the same address, this call registers a lightweight
 /// follower future on the tracker that resolves once the leader finishes.
 ///
-/// When `tracker` is `None`, the work runs inline (backward-compatible
-/// synchronous behavior).
+/// Without a tracker the work runs inline (backward-compatible synchronous
+/// behavior). Counters on `writes` are reported into either way, including from
+/// the leader task, where compression and placement become known.
 ///
 /// `permit` is the caller-held memory permit associated with `buffer`. If a
 /// leader is spawned, the permit moves into the leader task; if the call
@@ -422,7 +427,7 @@ pub async fn store_fragment(
     buffer: Bytes,
     cache_local: bool,
     remote_session: Option<Arc<StorageSession>>,
-    tracker: Option<Arc<WriteTracker>>,
+    writes: WriteContext,
     permit: Option<OwnedSemaphorePermit>,
 ) -> Result<StoreResult, StorageError> {
     if address.hash.is_zero() || buffer.is_empty() || fragment.size_payload == 0 {
@@ -447,8 +452,9 @@ pub async fn store_fragment(
         )));
     }
 
-    let observer = tracker.clone();
-    let result = match tracker {
+    writes.count(|stats| stats.fragment_produced(&fragment));
+
+    let result = match writes.tracker().cloned() {
         None => {
             store_fragment_inline(
                 store,
@@ -458,6 +464,7 @@ pub async fn store_fragment(
                 buffer,
                 cache_local,
                 remote_session,
+                &writes,
                 permit,
                 None,
             )
@@ -473,13 +480,14 @@ pub async fn store_fragment(
                 cache_local,
                 remote_session,
                 &tracker,
+                &writes,
                 permit,
             )
             .await
         }
     };
 
-    if let (Some(tracker), Ok(result)) = (observer, &result) {
+    if let (Some(tracker), Ok(result)) = (writes.tracker(), &result) {
         tracker.notify_fragment(&observed_fragment(fragment, result), result.deduplicated);
     }
     result
@@ -520,6 +528,7 @@ async fn store_fragment_inline(
     buffer: Bytes,
     cache_local: bool,
     remote_session: Option<Arc<StorageSession>>,
+    writes: &WriteContext,
     permit: Option<OwnedSemaphorePermit>,
     publish: Option<Hash>,
 ) -> Result<StoreResult, StorageError> {
@@ -534,6 +543,7 @@ async fn store_fragment_inline(
         &remote_session,
         stored_durable,
     ) {
+        writes.count(|stats| stats.fragment_deduplicated(&fragment));
         return Ok(StoreResult {
             address,
             size_content: fragment.size_content,
@@ -557,6 +567,7 @@ async fn store_fragment_inline(
             remote_session,
             query,
             None,
+            writes.stats(),
             permit,
             publish,
         )
@@ -579,6 +590,7 @@ async fn store_fragment_inline(
         // preconditions (e.g., they wrote durable but we want local).
         // Preserve legacy behaviour by returning the current store state.
         drop(permit);
+        writes.count(|stats| stats.fragment_deduplicated(&fragment));
         return Ok(StoreResult {
             address,
             size_content: fragment.size_content,
@@ -599,6 +611,7 @@ async fn store_fragment_inline(
         remote_session,
         query,
         Some(guard),
+        writes.stats(),
         permit,
         None,
     )
@@ -625,6 +638,7 @@ async fn store_fragment_dispatched(
     cache_local: bool,
     remote_session: Option<Arc<StorageSession>>,
     tracker: &WriteTracker,
+    writes: &WriteContext,
     permit: Option<OwnedSemaphorePermit>,
 ) -> Result<StoreResult, StorageError> {
     let guard = match try_acquire_in_flight(partition, address) {
@@ -634,6 +648,7 @@ async fn store_fragment_dispatched(
             drop(buffer);
             drop(permit);
             tracker.register_follower(follower_future(store.clone(), partition, address, token));
+            writes.count(|stats| stats.fragment_deduplicated(&fragment));
             return Ok(StoreResult {
                 address,
                 size_content: fragment.size_content,
@@ -658,6 +673,7 @@ async fn store_fragment_dispatched(
         drop(guard);
         drop(buffer);
         drop(permit);
+        writes.count(|stats| stats.fragment_deduplicated(&fragment));
         return Ok(StoreResult {
             address,
             size_content: fragment.size_content,
@@ -670,6 +686,9 @@ async fn store_fragment_dispatched(
 
     let deduplicated = query.match_made != StoreMatch::MatchNone;
     let store_clone = store.clone();
+    // The leader takes the counters alone, never the tracker: the tracker is what
+    // awaits this task, and `await_all` requires its handle to be the only one.
+    let stats = writes.stats();
     tracker.spawn_leader(async move {
         leader_body(
             store_clone,
@@ -681,6 +700,7 @@ async fn store_fragment_dispatched(
             remote_session,
             query,
             Some(guard),
+            stats,
             permit,
             None,
         )
@@ -844,11 +864,18 @@ async fn leader_body(
     remote_session: Option<Arc<StorageSession>>,
     query: StoreMatchResult,
     guard: Option<StoreInFlightGuard>,
+    stats: Option<Arc<FragmentWriteStats>>,
     permit: Option<OwnedSemaphorePermit>,
     publish: Option<Hash>,
 ) -> Result<Placement, StorageError> {
     let (mut stored_local, mut stored_durable) = stored_flags(&query);
     let mut published = false;
+    let stats = stats.as_deref();
+    let mut registered_remotely = false;
+
+    if let Some(stats) = stats {
+        stats.fragment_processed(&fragment);
+    }
 
     // Before the payload is prepared: succeeding means neither the load nor the compression below
     // is work this fragment has to pay for.
@@ -857,6 +884,12 @@ async fn leader_body(
         && let Some(source) = copy_source(&query, address)
     {
         stored_durable = copy_association(session, source, address).await;
+        if stored_durable {
+            registered_remotely = true;
+            if let Some(stats) = stats {
+                stats.remote_copy();
+            }
+        }
     }
 
     let payload_wanted = !stored_durable || cache_local;
@@ -905,6 +938,14 @@ async fn leader_body(
         }
     }
 
+    if let Some(stats) = stats {
+        if payload_wanted {
+            stats.payload_prepared(&fragment);
+        } else {
+            stats.payload_not_prepared(&fragment);
+        }
+    }
+
     // Remote upload if session provided and not already durable
     if !stored_durable && let Some(session) = remote_session.clone() {
         stored_durable = match publish {
@@ -924,6 +965,24 @@ async fn leader_body(
                 .await
                 .is_ok(),
         };
+        if stored_durable {
+            registered_remotely = true;
+            if let Some(stats) = stats {
+                stats.remote_put(u64::from(fragment.size_payload));
+            }
+        }
+    }
+
+    if let Some(stats) = stats
+        && !registered_remotely
+    {
+        if remote_session.is_none() {
+            stats.local_only_write();
+        } else if stored_durable {
+            stats.remote_already_durable();
+        } else {
+            stats.remote_upload_failed();
+        }
     }
 
     if stored_durable {
@@ -941,7 +1000,11 @@ async fn leader_body(
     };
     stored_local |= payload.is_some();
 
+    let payload_bytes = payload.as_ref().map(|payload| payload.len() as u64);
     write_raw(store, partition, address, fragment, payload).await?;
+    if let Some(stats) = stats {
+        stats.local_write(payload_bytes);
+    }
 
     drop(permit);
     drop(guard);
@@ -970,7 +1033,7 @@ pub async fn store_raw_local(
         buffer,
         cache_local,
         None,
-        None,
+        WriteContext::none(),
         None,
     )
     .await?;
@@ -1057,6 +1120,7 @@ pub async fn write_content_publishing(
     buffer: Bytes,
     flags: WriteOptions,
     remote_session: Option<Arc<StorageSession>>,
+    writes: WriteContext,
     permit: Option<OwnedSemaphorePermit>,
     key: Hash,
 ) -> Result<StoreResult, StorageError> {
@@ -1070,6 +1134,7 @@ pub async fn write_content_publishing(
         Some(permit) => Some(permit),
         None => crate::concurrency::acquire_fragment_memory_permit(buffer.len()).await,
     };
+    writes.count(|stats| stats.fragment_produced(&fragment));
     store_fragment_inline(
         store,
         partition,
@@ -1078,6 +1143,7 @@ pub async fn write_content_publishing(
         buffer,
         flags.local_cache_priority,
         remote_session,
+        &writes,
         permit,
         Some(key),
     )
@@ -1102,7 +1168,7 @@ pub async fn write_content(
     buffer: Bytes,
     flags: WriteOptions,
     remote_session: Option<Arc<StorageSession>>,
-    tracker: Option<Arc<WriteTracker>>,
+    writes: WriteContext,
     permit: Option<OwnedSemaphorePermit>,
 ) -> Result<StoreResult, StorageError> {
     let _in_flight = ContentWriteGuard::new();
@@ -1122,7 +1188,7 @@ pub async fn write_content(
             buffer,
             flags.local_cache_priority,
             remote_session,
-            tracker,
+            writes,
             permit,
         )
         .await?;
@@ -1137,7 +1203,7 @@ pub async fn write_content(
             flags,
             false,
             remote_session,
-            tracker,
+            writes,
             permit,
         )
         .await?;
@@ -1168,7 +1234,7 @@ pub async fn write_from_file(
     context: Context,
     flags: WriteOptions,
     remote_session: Option<Arc<StorageSession>>,
-    tracker: Option<Arc<WriteTracker>>,
+    writes: WriteContext,
 ) -> Result<StoreResult, StorageError> {
     let _in_flight = ContentWriteGuard::new();
     let _count_permit = file_count_limit_acquire()
@@ -1222,7 +1288,7 @@ pub async fn write_from_file(
             buffer,
             flags,
             remote_session,
-            tracker,
+            writes,
             read_permit,
         )
         .await?;
@@ -1242,7 +1308,7 @@ pub async fn write_from_file(
             flags,
             false,
             remote_session,
-            tracker,
+            writes,
         )
         .await?;
     Ok(StoreResult {
@@ -1424,7 +1490,7 @@ async fn hashed_under_current_chunking(
         WriteOptions::default().no_remote_write(),
         true,
         None,
-        None,
+        WriteContext::none(),
     )
     .await?;
 
@@ -1546,7 +1612,7 @@ pub async fn hash_file(
         WriteOptions::default().no_remote_write(),
         true,
         None,
-        None,
+        WriteContext::none(),
     )
     .await?;
 
@@ -2155,7 +2221,7 @@ mod tests {
             buffer,
             true,
             None,
-            None,
+            WriteContext::none(),
             None,
         )
         .await
@@ -2203,7 +2269,7 @@ mod tests {
             buffer.clone(),
             false,
             None,
-            Some(tracker.clone()),
+            WriteContext::tracked(Some(tracker.clone()), None),
             None,
         )
         .await
@@ -2236,7 +2302,7 @@ mod tests {
             buffer,
             false,
             None,
-            Some(tracker.clone()),
+            WriteContext::tracked(Some(tracker.clone()), None),
             None,
         )
         .await
@@ -2270,7 +2336,7 @@ mod tests {
             buffer,
             true,
             None,
-            Some(tracker.clone()),
+            WriteContext::tracked(Some(tracker.clone()), None),
             None,
         )
         .await
@@ -2437,7 +2503,7 @@ mod tests {
             buffer,
             true,
             None,
-            Some(tracker.clone()),
+            WriteContext::tracked(Some(tracker.clone()), None),
             None,
         )
         .await
@@ -2486,7 +2552,7 @@ mod tests {
                     buffer,
                     cache_local,
                     None,
-                    Some(tracker),
+                    WriteContext::tracked(Some(tracker), None),
                     None,
                 )
                 .await
@@ -2553,7 +2619,7 @@ mod tests {
                     buffer,
                     true,
                     None,
-                    Some(tracker),
+                    WriteContext::tracked(Some(tracker), None),
                     None,
                 )
                 .await
@@ -2778,7 +2844,7 @@ mod tests {
                 buffer,
                 true,
                 None,
-                None, // tracker: None → inline path awaits the slow put.
+                WriteContext::none(), // no tracker → inline path awaits the slow put.
                 None,
             )
             .await
@@ -2820,7 +2886,7 @@ mod tests {
                     buffer,
                     true,
                     None,
-                    Some(tracker.clone()),
+                    WriteContext::tracked(Some(tracker.clone()), None),
                     None,
                 )
                 .await
@@ -3078,7 +3144,7 @@ mod tests {
                     buffer,
                     true,
                     None,
-                    Some(tracker),
+                    WriteContext::tracked(Some(tracker), None),
                     Some(permit),
                 )
                 .await
@@ -3358,7 +3424,7 @@ mod tests {
             payload,
             true,
             None,
-            None,
+            WriteContext::none(),
             None,
         )
         .await

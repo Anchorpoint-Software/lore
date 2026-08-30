@@ -139,6 +139,27 @@ pub struct LoreBranchPushFragmentEndEventData {
     pub bytes_transferred: u64,
 }
 
+/// Data for the event reporting what a push cost.
+///
+/// Emitted once, when the push finishes, at statistics level one and above. A
+/// push that failed reports what it had done by then. The counts are cumulative
+/// across every revision, link and layer the push registers, where
+/// [`LoreBranchPushFragmentProgressEventData`] reports the revision in flight.
+///
+/// A push stores no payload of its own: a fragment the peer was asked about is
+/// deduplicated, copied or put, unless the push ended before it was reached.
+#[repr(C)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoreBranchPushStatsEventData {
+    /// Fragments the peer already held, so nothing was registered for them.
+    pub deduplicated: u64,
+    /// Fragments the peer duplicated an association for, sending no payload.
+    pub copied: u64,
+    /// Fragments whose payload was uploaded.
+    pub put: u64,
+}
+
 /// Data for the event sent before a branch is created on the remote.
 #[repr(C)]
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -259,7 +280,7 @@ pub enum PushError {
     MissingIdentity,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct PushOptions {
     /// Branch to push, default to current branch if not set
     pub branch: Option<String>,
@@ -291,12 +312,165 @@ impl EventError for PushError {
     }
 }
 
-#[derive(Default)]
-pub(crate) struct PushStatistics {
-    pub fragment_count: AtomicUsize,
-    pub fragment_complete: AtomicUsize,
-    pub bytes_transferred: AtomicU64,
-    pub bytes_total: AtomicU64,
+/// What a push does with the fragments the peer was asked about.
+///
+/// A push stores no payload of its own: the peer either already holds the
+/// fragment, duplicates an association it holds under another context, or is sent
+/// the payload. Shared behind an [`Arc`](std::sync::Arc) by every task the push
+/// spawns, and cumulative across every revision, link and layer it registers.
+pub(crate) struct PushStats {
+    deduplicated: AtomicU64,
+    copied: AtomicU64,
+    put: AtomicU64,
+    /// Payload bytes the uploads carried, which the per-revision progress event
+    /// reports rather than the statistics one.
+    put_bytes: AtomicU64,
+    /// Whether to keep the count the statistics event alone reports. `copied` and
+    /// `put` sum to the fragments a progress event reports as registered, so those
+    /// two are kept whatever the level.
+    statistics: bool,
+}
+
+impl PushStats {
+    /// Counters for one push, keeping what the call's statistics level reports.
+    pub(crate) fn new(statistics: bool) -> Self {
+        Self {
+            deduplicated: AtomicU64::new(0),
+            copied: AtomicU64::new(0),
+            put: AtomicU64::new(0),
+            put_bytes: AtomicU64::new(0),
+            statistics,
+        }
+    }
+
+    /// `count` fragments the peer already held, so nothing was registered.
+    fn deduplicated(&self, count: u64) {
+        if self.statistics {
+            self.deduplicated.fetch_add(count, Ordering::Relaxed);
+        }
+    }
+
+    /// The peer duplicated an association it already held, sending no payload.
+    fn copied(&self) {
+        self.copied.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A payload was uploaded to the peer.
+    fn put(&self, payload_bytes: u64) {
+        self.put.fetch_add(1, Ordering::Relaxed);
+        self.put_bytes.fetch_add(payload_bytes, Ordering::Relaxed);
+    }
+
+    /// Fragments registered with the peer, by copy or upload.
+    fn registered(&self) -> u64 {
+        self.copied.load(Ordering::Relaxed) + self.put.load(Ordering::Relaxed)
+    }
+
+    /// Payload bytes uploaded.
+    fn put_bytes(&self) -> u64 {
+        self.put_bytes.load(Ordering::Relaxed)
+    }
+
+    /// The counts, as an event payload.
+    fn snapshot(&self) -> LoreBranchPushStatsEventData {
+        LoreBranchPushStatsEventData {
+            deduplicated: self.deduplicated.load(Ordering::Relaxed),
+            copied: self.copied.load(Ordering::Relaxed),
+            put: self.put.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// The in-flight revision's share of the push, for the per-revision progress
+/// event.
+///
+/// Fragments registered and bytes uploaded are read out of the push-wide
+/// [`PushStats`] as a delta against the baseline this revision started from, so
+/// those facts are recorded in one place whichever event reports them.
+/// `fragment_count` and `bytes_queued` are this revision's alone: the fragments it
+/// has to register, and the payload bytes it has loaded to send.
+pub(crate) struct PushProgress {
+    fragment_count: AtomicUsize,
+    bytes_queued: AtomicU64,
+    registered_baseline: u64,
+    put_bytes_baseline: u64,
+    stats: Arc<PushStats>,
+}
+
+impl PushProgress {
+    /// Start a revision's progress from where the push-wide counters stand now.
+    pub(crate) fn new(stats: Arc<PushStats>) -> Self {
+        Self {
+            fragment_count: AtomicUsize::new(0),
+            bytes_queued: AtomicU64::new(0),
+            registered_baseline: stats.registered(),
+            put_bytes_baseline: stats.put_bytes(),
+            stats,
+        }
+    }
+
+    fn set_fragment_count(&self, count: usize) {
+        self.fragment_count.store(count, Ordering::Relaxed);
+    }
+
+    /// A payload was loaded and is about to be uploaded.
+    fn payload_queued(&self, bytes: u64) {
+        self.bytes_queued.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Fragments this revision has registered with the peer, by copy or upload.
+    pub(crate) fn complete(&self) -> u64 {
+        self.stats
+            .registered()
+            .saturating_sub(self.registered_baseline)
+    }
+
+    /// Fragments this revision has to register.
+    pub(crate) fn count(&self) -> u64 {
+        self.fragment_count.load(Ordering::Relaxed) as u64
+    }
+
+    fn event(&self) -> LoreBranchPushFragmentProgressEventData {
+        LoreBranchPushFragmentProgressEventData {
+            complete: self.complete(),
+            count: self.fragment_count.load(Ordering::Relaxed) as u64,
+            bytes_transferred: self
+                .stats
+                .put_bytes()
+                .saturating_sub(self.put_bytes_baseline),
+            bytes_total: self.bytes_queued.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Emits what the push cost when dropped.
+struct PushStatsReport;
+
+impl PushStatsReport {
+    /// A guard that emits the statistics event when dropped, so the push that
+    /// fails reports as the one that succeeds does. Reporting turned off yields
+    /// `None`.
+    fn start() -> Option<Self> {
+        execution_context().globals().stats().then_some(Self)
+    }
+}
+
+impl Drop for PushStatsReport {
+    fn drop(&mut self) {
+        if let Some(snapshot) = push_stats_event() {
+            event::LoreEvent::BranchPushStats(snapshot).send();
+        }
+    }
+}
+
+/// The push-wide counts, as an event payload, or `None` outside an execution
+/// context — which is also no context to send an event through.
+fn push_stats_event() -> Option<LoreBranchPushStatsEventData> {
+    Some(
+        crate::runtime::try_execution_context()?
+            .push_stats()
+            .snapshot(),
+    )
 }
 
 pub async fn push(
@@ -304,6 +478,8 @@ pub async fn push(
     token: &RepositoryWriteToken,
     options: PushOptions,
 ) -> Result<(), PushError> {
+    let _stats_report = PushStatsReport::start();
+
     let branch;
     let local_latest;
     if let Some(branch_identifier) = &options.branch {
@@ -788,11 +964,13 @@ async fn collect_fragments_and_push(
             fragments.push(Address::zero_context_hash(state.parent_other()));
         }
 
-        let stats = Arc::new(PushStatistics::default());
+        let push_stats = execution_context().push_stats().clone();
+        let progress = Arc::new(PushProgress::new(push_stats.clone()));
         let fragments = push_query(
             storage_protocol.clone(),
             fragments,
             remote.environment.max_query_batch(),
+            &push_stats,
         )
         .await?;
 
@@ -802,20 +980,13 @@ async fn collect_fragments_and_push(
         })
         .send();
 
-        let ticker_stats = stats.clone();
+        let ticker_progress = progress.clone();
+        let progress_interval = execution_context().globals().event_interval();
         let ticker = AbortOnDropHandle::new(lore_spawn!(async move {
-            let mut ticker = tokio::time::interval(std::time::Duration::from_millis(100));
+            let mut ticker = tokio::time::interval(progress_interval);
             loop {
                 ticker.tick().await;
-                event::LoreEvent::BranchPushFragmentProgress(
-                    LoreBranchPushFragmentProgressEventData {
-                        complete: ticker_stats.fragment_complete.load(Ordering::Relaxed) as u64,
-                        count: ticker_stats.fragment_count.load(Ordering::Relaxed) as u64,
-                        bytes_transferred: ticker_stats.bytes_transferred.load(Ordering::Relaxed),
-                        bytes_total: ticker_stats.bytes_total.load(Ordering::Relaxed),
-                    },
-                )
-                .send();
+                event::LoreEvent::BranchPushFragmentProgress(ticker_progress.event()).send();
             }
         }));
 
@@ -824,7 +995,7 @@ async fn collect_fragments_and_push(
                 repository.clone(),
                 storage_protocol.clone(),
                 fragments,
-                stats.clone(),
+                progress.clone(),
             )
             .await?;
         }
@@ -833,17 +1004,12 @@ async fn collect_fragments_and_push(
 
         // Emit a final progress event with the completed values now that the
         // ticker has been dropped and push_fragments has finished.
-        event::LoreEvent::BranchPushFragmentProgress(LoreBranchPushFragmentProgressEventData {
-            complete: stats.fragment_complete.load(Ordering::Relaxed) as u64,
-            count: stats.fragment_count.load(Ordering::Relaxed) as u64,
-            bytes_transferred: stats.bytes_transferred.load(Ordering::Relaxed),
-            bytes_total: stats.bytes_total.load(Ordering::Relaxed),
-        })
-        .send();
+        let final_progress = progress.event();
+        event::LoreEvent::BranchPushFragmentProgress(final_progress.clone()).send();
 
         event::LoreEvent::BranchPushFragmentEnd(LoreBranchPushFragmentEndEventData {
-            fragments: stats.fragment_complete.load(Ordering::Relaxed) as u64,
-            bytes_transferred: stats.bytes_transferred.load(Ordering::Relaxed),
+            fragments: final_progress.complete,
+            bytes_transferred: final_progress.bytes_transferred,
         })
         .send();
 
@@ -1088,6 +1254,7 @@ pub(crate) async fn push_query(
     storage: Arc<StorageSession>,
     addresses: Vec<Address>,
     max_batch_size: Option<usize>,
+    stats: &PushStats,
 ) -> Result<PushQueryResult, PushError> {
     if addresses.is_empty() {
         return Ok(PushQueryResult::default());
@@ -1178,6 +1345,8 @@ pub(crate) async fn push_query(
     queried.present.sort_unstable();
     queried.present.dedup();
 
+    stats.deduplicated(queried.present.len() as u64);
+
     lore_debug!(
         "Queried {} fragments, {} to upload, {} the peer can duplicate an association for, {} the peer already holds",
         address_count,
@@ -1191,6 +1360,8 @@ pub(crate) async fn push_query(
 
 /// Record locally that the peer holds this address, which is what keeps the next push from
 /// offering it again.
+///
+/// The payload stays where it is, so this writes the header alone.
 async fn mark_durable(repository: &Arc<RepositoryContext>, address: Address, fragment: Fragment) {
     let mut fragment = fragment;
     fragment.flags |= fragment::FragmentFlags::PayloadStoredDurable;
@@ -1210,6 +1381,7 @@ async fn duplicate_association(
     repository: &Arc<RepositoryContext>,
     storage: &Arc<StorageSession>,
     address: Address,
+    stats: &PushStats,
 ) -> bool {
     if !storage.can_copy_from(repository.id).await {
         return false;
@@ -1226,6 +1398,7 @@ async fn duplicate_association(
         return false;
     }
 
+    stats.copied();
     mark_stored_durable(repository, address).await;
     true
 }
@@ -1279,7 +1452,7 @@ pub(crate) async fn push_fragments(
     repository: Arc<RepositoryContext>,
     storage: Arc<StorageSession>,
     fragments: PushQueryResult,
-    stats: Arc<PushStatistics>,
+    progress: Arc<PushProgress>,
 ) -> Result<(), PushError> {
     let fragment_count = fragments.len();
     let PushQueryResult {
@@ -1288,14 +1461,13 @@ pub(crate) async fn push_fragments(
         present,
     } = fragments;
 
+    progress.set_fragment_count(fragment_count);
+
+    let stats = execution_context().push_stats().clone();
     let marking = {
         let repository = repository.clone();
         lore_spawn!(async move { mark_present_durable(&repository, present).await })
     };
-
-    stats
-        .fragment_count
-        .store(fragment_count, Ordering::Relaxed);
 
     const MAX_PARALLEL_PUT: usize = 10000;
 
@@ -1317,9 +1489,9 @@ pub(crate) async fn push_fragments(
         let repository = repository.clone();
         let storage = storage.clone();
         let stats = stats.clone();
+        let progress = progress.clone();
         lore_spawn!(tasks, async move {
-            if duplicable && duplicate_association(&repository, &storage, address).await {
-                stats.fragment_complete.fetch_add(1, Ordering::Relaxed);
+            if duplicable && duplicate_association(&repository, &storage, address, &stats).await {
                 return Ok(());
             }
 
@@ -1332,7 +1504,7 @@ pub(crate) async fn push_fragments(
             .forward::<PushError>("loading fragment payload")?;
 
             let payload_size = payload.len() as u64;
-            stats.bytes_total.fetch_add(payload_size, Ordering::Relaxed);
+            progress.payload_queued(payload_size);
 
             immutable::store_raw_remote_retry(storage.clone(), address, fragment, Some(payload))
                 .await
@@ -1344,13 +1516,9 @@ pub(crate) async fn push_fragments(
                     }
                 })?;
 
-            stats
-                .bytes_transferred
-                .fetch_add(payload_size, Ordering::Relaxed);
+            stats.put(payload_size);
 
             mark_durable(&repository, address, fragment).await;
-
-            stats.fragment_complete.fetch_add(1, Ordering::Relaxed);
 
             Ok(())
         });
@@ -1400,6 +1568,26 @@ mod tests {
         Address {
             hash: Hash::from([seed; 32]),
             context: crate::lore::Context::from([seed; 16]),
+        }
+    }
+
+    /// Statistics level zero reports nothing, so it keeps nothing beyond what a
+    /// progress event reads: the fragments registered, which `copied` and `put`
+    /// sum to, and the bytes uploaded.
+    #[test]
+    fn a_count_is_kept_only_where_something_reports_it() {
+        for (statistics, deduplicated) in [(false, 0), (true, 3)] {
+            let stats = PushStats::new(statistics);
+            stats.deduplicated(3);
+            stats.copied();
+            stats.put(64);
+
+            let counts = stats.snapshot();
+            assert_eq!(counts.deduplicated, deduplicated, "statistics {statistics}");
+            assert_eq!(counts.copied, 1, "statistics {statistics}");
+            assert_eq!(counts.put, 1, "statistics {statistics}");
+            assert_eq!(stats.registered(), 2, "statistics {statistics}");
+            assert_eq!(stats.put_bytes(), 64, "statistics {statistics}");
         }
     }
 

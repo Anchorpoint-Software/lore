@@ -3013,6 +3013,156 @@ typedef struct lore_revision_tree_metadata_clear_complete_event_data_t {
   enum lore_error_code_t error_code;
 } lore_revision_tree_metadata_clear_complete_event_data_t;
 
+// How many files a commit wrote, split by the action each was staged with.
+//
+// The actions are exclusive: a file is counted once, under the action its staged
+// node flags name.
+typedef struct lore_commit_file_stats_data_t {
+  // Files staged as new additions.
+  uint64_t added;
+  // Files whose content or mode changed.
+  uint64_t modified;
+  // Files staged for deletion.
+  uint64_t deleted;
+  // Files staged as moves.
+  uint64_t moved;
+  // Files staged as copies.
+  uint64_t copied;
+  // Directories staged for deletion.
+  uint64_t directories_deleted;
+  // Files the commit read off disk and fragmented. A different set from
+  // `files`: a staged file whose content turns out to match the revision it is
+  // committed against is read and committed as nothing, a view-excluded path is
+  // committed from its staged node without being read, and an in-memory commit
+  // reads none at all.
+  uint64_t files_read;
+  // Uncompressed content bytes of `files_read`. The same number the progress
+  // event reports as `bytesTransferred`.
+  uint64_t bytes_transferred;
+  // Files whose content the commit wrote: `added + modified + moved + copied`.
+  uint64_t files;
+  // Uncompressed content size of exactly the `files` above, so the two are a
+  // pair. A delete contributes none.
+  //
+  // Distinct from [`FragmentWriteCounts::data_content_bytes`], which counts
+  // fragments rather than files and excludes every fragment that needed no
+  // payload.
+  uint64_t file_bytes;
+} lore_commit_file_stats_data_t;
+
+// A snapshot of [`FragmentWriteStats`], as plain numbers, and the payload an
+// operation reports them in.
+//
+// Only the `data_*` and `fragmentlist_*` fields split by what a payload is. Every
+// other count covers a fragment whatever its payload, content or a fragment list.
+// The content totals take a fragment list as zero, its `size_content` being the
+// content of its leaves.
+//
+// For a drained operation, unless a fragment failed part-way through the
+// pipeline:
+//
+// - `fragments_produced == fragments_deduplicated + fragments_processed`.
+// - `fragment_content_bytes == deduplicated_content_bytes + processed_content_bytes`.
+// - `local_writes == local_metadata_writes + local_payload_writes`.
+// - `remote_writes == remote_copy_writes + remote_put_writes`.
+// - `remote_writes`, `remote_already_durable`, `local_only_writes` and
+//   `remote_upload_failed` sum to `fragments_processed`: every processed
+//   fragment reaches exactly one of those outcomes.
+// - `data_fragments + fragmentlists + no_payload_fragments == fragments_processed`.
+// - `data_content_bytes + no_payload_content_bytes == processed_content_bytes`.
+typedef struct lore_fragment_stats_data_t {
+  // Fragments handed to the store, whatever came of them.
+  uint64_t fragments_produced;
+  // Uncompressed content bytes the produced fragments stand for.
+  uint64_t fragment_content_bytes;
+  // Fragments the stores already held in the form the write wanted, so no
+  // payload was loaded, compressed or uploaded for them.
+  uint64_t fragments_deduplicated;
+  // Content bytes of `fragments_deduplicated`.
+  uint64_t deduplicated_content_bytes;
+  // Fragments that entered the write pipeline.
+  uint64_t fragments_processed;
+  // Content bytes of `fragments_processed`.
+  uint64_t processed_content_bytes;
+  // Of `fragments_processed`, those that produced a stored payload of content.
+  uint64_t data_fragments;
+  // Stored payload bytes of `data_fragments`, after compression where the
+  // pipeline compressed them.
+  uint64_t data_payload_bytes;
+  // Uncompressed content bytes `data_fragments` stand for. Compare against
+  // `data_payload_bytes` for the compression ratio.
+  uint64_t data_content_bytes;
+  // Of `fragments_processed`, those that produced a stored fragment list.
+  uint64_t fragmentlists;
+  // Stored payload bytes of `fragmentlists`.
+  uint64_t fragmentlist_payload_bytes;
+  // Of `fragments_processed`, those that needed no payload, so none was
+  // prepared: the remote duplicated an association for them and the write did
+  // not ask for the payload to be cached locally.
+  uint64_t no_payload_fragments;
+  // Content bytes `no_payload_fragments` stand for.
+  uint64_t no_payload_content_bytes;
+  // Terminal entries written to the local store.
+  uint64_t local_writes;
+  // Of `local_writes`, those that recorded only the fragment header — the
+  // payload lives on the remote and was not cached here.
+  uint64_t local_metadata_writes;
+  // Of `local_writes`, those that also wrote a payload.
+  uint64_t local_payload_writes;
+  // Payload bytes written by `local_payload_writes`.
+  uint64_t local_payload_bytes;
+  // Fragments registered with the remote.
+  uint64_t remote_writes;
+  // Of `remote_writes`, those the remote duplicated from an association it
+  // already held, so no payload crossed the wire.
+  uint64_t remote_copy_writes;
+  // Of `remote_writes`, those whose payload was uploaded.
+  uint64_t remote_put_writes;
+  // Payload bytes uploaded by `remote_put_writes`.
+  uint64_t remote_put_bytes;
+  // Fragments the remote already held under this very address, so they took
+  // neither a copy nor an upload.
+  uint64_t remote_already_durable;
+  // Fragments written with no remote consulted, a local-only write having been
+  // asked for. Branch latest history is one such write, which the server does
+  // not store, so a commit against a remote has exactly one.
+  uint64_t local_only_writes;
+  // Fragments whose upload did not land, leaving them stored only locally for
+  // a later push to offer again. Their payloads are counted under
+  // `local_payload_writes` too, indistinguishably from those kept by request.
+  uint64_t remote_upload_failed;
+} lore_fragment_stats_data_t;
+
+// Event data reporting what a commit cost.
+//
+// Emitted once, when the commit has drained every background write, at
+// statistics level one and above. A commit that failed reports what it had done
+// by then.
+typedef struct lore_revision_commit_stats_event_data_t {
+  // Files committed, by action.
+  struct lore_commit_file_stats_data_t files;
+  // What the commit's fragment writes cost.
+  struct lore_fragment_stats_data_t fragments;
+} lore_revision_commit_stats_event_data_t;
+
+// Data for the event reporting what a push cost.
+//
+// Emitted once, when the push finishes, at statistics level one and above. A
+// push that failed reports what it had done by then. The counts are cumulative
+// across every revision, link and layer the push registers, where
+// [`LoreBranchPushFragmentProgressEventData`] reports the revision in flight.
+//
+// A push stores no payload of its own: a fragment the peer was asked about is
+// deduplicated, copied or put, unless the push ended before it was reached.
+typedef struct lore_branch_push_stats_event_data_t {
+  // Fragments the peer already held, so nothing was registered for them.
+  uint64_t deduplicated;
+  // Fragments the peer duplicated an association for, sending no payload.
+  uint64_t copied;
+  // Fragments whose payload was uploaded.
+  uint64_t put;
+} lore_branch_push_stats_event_data_t;
+
 // An event delivered to a callback. Each variant names a kind of event and
 // carries the data for that event.
 enum lore_event_id_t {
@@ -3477,6 +3627,10 @@ enum lore_event_id_t {
   LORE_EVENT_REVISION_TREE_BATCH_COMPLETE,
   // A metadata-clear entry completed.
   LORE_EVENT_REVISION_TREE_METADATA_CLEAR_COMPLETE,
+  // What a commit has cost so far, or in total once it has drained its writes.
+  LORE_EVENT_REVISION_COMMIT_STATS,
+  // What a push has cost so far, or in total once it has finished.
+  LORE_EVENT_BRANCH_PUSH_STATS,
 };
 typedef uint32_t lore_event_tag_t;
 
@@ -3713,6 +3867,8 @@ typedef struct lore_event_t {
     struct lore_compaction_end_event_data_t compaction_end;
     struct lore_revision_tree_batch_complete_event_data_t revision_tree_batch_complete;
     struct lore_revision_tree_metadata_clear_complete_event_data_t revision_tree_metadata_clear_complete;
+    struct lore_revision_commit_stats_event_data_t revision_commit_stats;
+    struct lore_branch_push_stats_event_data_t branch_push_stats;
   };
 } lore_event_t;
 
@@ -3783,6 +3939,21 @@ typedef struct lore_global_args_t {
   // Supplying either token puts the call in external-credential mode: `identity`
   // must be left empty, since it is read from the token.
   struct lore_string_t access_token;
+  // How much an operation reports about what it cost.
+  //
+  // - `0` — no statistics event, and no per-fragment counters kept for one.
+  // - `1` — one statistics event when the operation finishes: per-action file
+  //   counts, and the fragment, local-store and remote-store totals.
+  // - `2` — also a `FragmentWrite` event per stored fragment, which describes
+  //   the shape of what was written rather than its sums. One event per
+  //   fragment is the cost of this level.
+  //
+  // A level above the highest known behaves as the highest known.
+  uint32_t stats;
+  // How often an operation emits progress events, in milliseconds. Applies
+  // whatever `stats` is set to, statistics being reported once at the end
+  // rather than on an interval. Zero takes [`DEFAULT_EVENT_INTERVAL_MS`].
+  uint64_t event_interval_ms;
 } lore_global_args_t;
 
 // Arguments for resolving user IDs to display names via the remote auth service.
@@ -4568,8 +4739,6 @@ typedef struct lore_revision_commit_args_t {
   struct lore_string_array_t layer_paths;
   // Array of messages corresponding to each layer path (parallel array with `layer_paths`)
   struct lore_string_array_t layer_messages;
-  // Emit per-fragment write stats during the commit
-  uint8_t stats;
 } lore_revision_commit_args_t;
 
 // Arguments for amending the most recent revision's commit message.

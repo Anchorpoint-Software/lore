@@ -137,6 +137,23 @@ pub struct LoreCli {
     /// Disable interactive prompts (e.g., per-link commit messages)
     #[clap(global = true, long, action)]
     pub non_interactive: bool,
+
+    /// Report what the operation cost: `--stats` for totals, `--stats=2` to add
+    /// per-fragment detail
+    #[clap(
+        global = true,
+        long,
+        value_name = "level",
+        num_args = 0..=1,
+        require_equals = true,
+        default_value_t = 0,
+        default_missing_value = "1"
+    )]
+    pub stats: u32,
+
+    /// How often to emit progress events, in milliseconds
+    #[clap(global = true, long, value_name = "milliseconds")]
+    pub event_interval: Option<u64>,
 }
 
 pub type EventCallbackFn = Box<dyn Fn(&LoreEvent) + Send + Sync>;
@@ -374,6 +391,9 @@ pub fn lore_globals_from_args(cli: &LoreCli) -> LoreGlobalArgs {
 
         search_limit: cli.search_limit.unwrap_or_default() as u32,
         search_nearest: cli.search_nearest.into(),
+
+        stats: cli.stats,
+        event_interval_ms: cli.event_interval.unwrap_or_default(),
 
         ..Default::default()
     };

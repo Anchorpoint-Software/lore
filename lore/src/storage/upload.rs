@@ -205,7 +205,7 @@ async fn upload_item(
         payload,
         true,
         session,
-        None,
+        lore_revision::immutable::counted_write_context(),
         permit,
     )
     .await

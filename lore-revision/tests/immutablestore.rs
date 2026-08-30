@@ -1370,7 +1370,7 @@ mod tests {
                     payload,
                     false,
                     None,
-                    None,
+                    lore_storage::WriteContext::none(),
                     None,
                 )
                 .await;
@@ -1416,7 +1416,7 @@ mod tests {
                     payload,
                     false,
                     None,
-                    None,
+                    lore_storage::WriteContext::none(),
                     None,
                 )
                 .await;

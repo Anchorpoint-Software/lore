@@ -4,7 +4,6 @@ use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
@@ -14,7 +13,7 @@ use tokio::task::JoinSet;
 
 use crate::MAX_CONCURRENT_TREE_TASKS;
 use crate::branch;
-use crate::branch::push::PushStatistics;
+use crate::branch::push::PushProgress;
 use crate::branch::push::push_fragments;
 use crate::branch::push::push_query;
 use crate::change;
@@ -969,7 +968,6 @@ async fn merge_start_link(
             link: None,
             layer_messages: std::collections::HashMap::new(),
             layer: None,
-            stats: false,
         };
         let signature = Box::pin(commit::commit(repository, token, commit_options))
             .await
@@ -1588,7 +1586,6 @@ async fn auto_commit_merge(
         link: None,
         layer_messages: std::collections::HashMap::new(),
         layer: None,
-        stats: false,
     };
     Box::pin(commit::commit(repository, token, commit_options))
         .await
@@ -3919,6 +3916,8 @@ async fn merge_into_link(
         target_branch,
         rehash_tracker.clone(),
         modified_times.clone(),
+        commit::CommitStats::new(),
+        execution_context().globals().event_interval(),
     )
     .await;
     let drain_result = rehash_tracker.await_all().await;
@@ -3961,7 +3960,7 @@ async fn merge_into_link(
     let mut revision_number = state_new.revision_number();
 
     if let Ok(remote) = repository.remote().await {
-        let stats = Arc::new(PushStatistics::default());
+        let stats = Arc::new(PushProgress::new(execution_context().push_stats().clone()));
         let correlation_id = execution_context().globals().correlation_id.to_string();
         let storage_protocol = remote
             .session(repository.id, &correlation_id)
@@ -3976,6 +3975,7 @@ async fn merge_into_link(
             storage_protocol.clone(),
             fragments,
             remote.environment.max_query_batch(),
+            execution_context().push_stats(),
         )
         .await
         .forward::<MergeError>("querying fragments")?;
@@ -4272,6 +4272,8 @@ pub async fn merge_into(
         current_branch,
         rehash_tracker.clone(),
         modified_times.clone(),
+        commit::CommitStats::new(),
+        execution_context().globals().event_interval(),
     )
     .await;
     let drain_result = rehash_tracker.await_all().await;
@@ -4320,7 +4322,7 @@ pub async fn merge_into(
     let mut revision_number = state_new.revision_number();
 
     if let Ok(remote) = repository.remote().await {
-        let stats = Arc::new(PushStatistics::default());
+        let stats = Arc::new(PushProgress::new(execution_context().push_stats().clone()));
 
         LoreEvent::BranchMergeIntoFragmentBegin(LoreBranchMergeIntoFragmentBeginEventData {
             fragments: fragments.len() as u64,
@@ -4341,6 +4343,7 @@ pub async fn merge_into(
             storage_protocol.clone(),
             fragments,
             remote.environment.max_query_batch(),
+            execution_context().push_stats(),
         )
         .await
         .forward::<MergeError>("querying fragments")?;
@@ -4356,8 +4359,8 @@ pub async fn merge_into(
             tokio::select! {
                 _ = ticker.tick() => {
                     LoreEvent::BranchMergeIntoFragmentProgress(LoreBranchMergeIntoFragmentProgressEventData {
-                        complete: stats.fragment_complete.load(Ordering::Relaxed) as u64,
-                        count: stats.fragment_count.load(Ordering::Relaxed) as u64,
+                        complete: stats.complete(),
+                        count: stats.count(),
                     }).send();
                 },
                 result = &mut push_task => {
@@ -4368,7 +4371,7 @@ pub async fn merge_into(
         result.forward::<MergeError>("pushing fragments")?;
 
         LoreEvent::BranchMergeIntoFragmentEnd(LoreBranchMergeIntoFragmentEndEventData {
-            fragments: stats.fragment_complete.load(Ordering::Relaxed) as u64,
+            fragments: stats.complete(),
         })
         .send();
 

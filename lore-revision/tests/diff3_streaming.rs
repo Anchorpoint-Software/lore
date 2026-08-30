@@ -164,7 +164,6 @@ mod tests {
                 link: None,
                 layer_messages: std::collections::HashMap::new(),
                 layer: None,
-                stats: false,
             };
             Box::pin(commit::commit(
                 self.repository.clone(),

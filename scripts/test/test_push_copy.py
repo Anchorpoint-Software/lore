@@ -17,7 +17,7 @@ import os
 import pytest
 
 from lore import Lore
-from lore_parsers import parse_jsonl
+from lore_parsers import parse_jsonl, parse_push_stats_json
 
 logger = logging.getLogger(__name__)
 
@@ -73,4 +73,55 @@ def test_push_copies_content_the_peer_already_holds(new_lore_repo):
     )
     assert repo.compare_file(cloned, "first.bin", "second.bin"), (
         "the copied file must read back from the clone with the same content"
+    )
+
+
+@pytest.mark.smoke
+def test_push_stats_account_for_copies_and_uploads(new_lore_repo):
+    """The statistics a push reports must distinguish an association the peer
+    duplicated from a payload it was sent. The two cost very different amounts and
+    the copy path exists to turn one into the other, so folding them together
+    would hide the saving it was made to show.
+    """
+    repo: Lore = new_lore_repo("PushStats")
+    blob = os.urandom(BLOB_SIZE)
+
+    with repo.open_file("uploaded.bin", "wb+") as output_file:
+        output_file.write(blob)
+    repo.stage(scan=True)
+    repo.commit("Commit the content offline", offline=True)
+
+    output = repo.push(json=True, stats=1)
+    events = parse_jsonl(output, "branchPushStats")
+    assert len(events) == 1, (
+        f"the statistics event is emitted once, when the push finishes, got "
+        f"{len(events)}"
+    )
+
+    stats = parse_push_stats_json(output)
+    assert stats is not None, "push must emit a branchPushStats event"
+
+    assert stats["put"] > 0, (
+        f"the peer holds nothing yet, so the payload must be uploaded, got {stats}"
+    )
+    assert stats["copied"] == 0, (
+        f"the peer has nothing to duplicate an association from, got {stats}"
+    )
+
+    # The same bytes under a second file, so the peer holds the hash under another
+    # context and can duplicate the association instead of being sent it again.
+    repo.copy2("uploaded.bin", "copied.bin")
+    repo.stage(scan=True)
+    repo.commit("Commit the same content under a second file", offline=True)
+
+    stats = parse_push_stats_json(repo.push(json=True, stats=1))
+    assert stats is not None, "the second push must report too"
+
+    assert stats["copied"] > 0, (
+        "the peer holds these hashes under another context, so the associations "
+        f"must be duplicated rather than uploaded, got {stats}"
+    )
+
+    assert stats["copied"] + stats["put"] > 0, (
+        f"and every fragment offered was registered one way or the other, got {stats}"
     )

@@ -27,6 +27,7 @@ use crate::types::Fragment;
 use crate::types::FragmentReference;
 use crate::types::Partition;
 use crate::write::store_fragment;
+use crate::write_tracker::WriteContext;
 
 /// Figure out where to cut `buffer` into chunks, all in one go.
 ///
@@ -73,7 +74,7 @@ pub async fn write_fragmented(
     flags: WriteOptions,
     hash_only: bool,
     remote_session: Option<Arc<StorageSession>>,
-    tracker: Option<Arc<crate::write_tracker::WriteTracker>>,
+    writes: WriteContext,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> Result<(Address, bool, bool), StorageError> {
     let size = buffer.len();
@@ -116,7 +117,7 @@ pub async fn write_fragmented(
                 chunk_buffer,
                 flags.local_cache_priority,
                 remote_session,
-                tracker,
+                writes,
                 chunk_permit,
             )
             .await?;
@@ -125,7 +126,7 @@ pub async fn write_fragmented(
 
         let store = store.clone();
         let session = remote_session.clone();
-        let task_tracker = tracker.clone();
+        let task_writes = writes.clone();
         lore_base::lore_spawn!(tasks, async move {
             let hash = hash::hash_slice(chunk_buffer.as_ref());
             let (chunk_address, chunk_local, chunk_remote) = if hash_only {
@@ -139,7 +140,7 @@ pub async fn write_fragmented(
                     chunk_buffer,
                     flags.local_cache_priority,
                     session,
-                    task_tracker,
+                    task_writes,
                     chunk_permit,
                 )
                 .await?;
@@ -169,7 +170,7 @@ pub async fn write_fragmented(
         flags,
         hash_only,
         remote_session,
-        tracker,
+        writes,
     )
     .await
 }
@@ -207,7 +208,7 @@ pub async fn write_fragmented_from_file(
     flags: WriteOptions,
     hash_only: bool,
     remote_session: Option<Arc<StorageSession>>,
-    tracker: Option<Arc<crate::write_tracker::WriteTracker>>,
+    writes: WriteContext,
 ) -> Result<(Address, bool, bool), StorageError> {
     let mut tasks = JoinSet::<Result<StoredChunk, StorageError>>::new();
 
@@ -248,7 +249,7 @@ pub async fn write_fragmented_from_file(
 
         let store = store.clone();
         let session = remote_session.clone();
-        let task_tracker = tracker.clone();
+        let task_writes = writes.clone();
         lore_base::lore_spawn!(tasks, async move {
             let hash = hash::hash_slice(chunk_buffer.as_ref());
             let (chunk_address, chunk_local, chunk_remote) = if hash_only {
@@ -262,7 +263,7 @@ pub async fn write_fragmented_from_file(
                     chunk_buffer,
                     flags.local_cache_priority,
                     session,
-                    task_tracker,
+                    task_writes,
                     chunk_budget,
                 )
                 .await?;
@@ -294,7 +295,7 @@ pub async fn write_fragmented_from_file(
         flags,
         hash_only,
         remote_session,
-        tracker,
+        writes,
     )
     .await
 }
@@ -365,7 +366,7 @@ async fn write_chunk_list(
     flags: WriteOptions,
     hash_only: bool,
     remote_session: Option<Arc<StorageSession>>,
-    tracker: Option<Arc<crate::write_tracker::WriteTracker>>,
+    writes: WriteContext,
 ) -> Result<(Address, bool, bool), StorageError> {
     results.drain(&mut tasks).await;
 
@@ -408,7 +409,7 @@ async fn write_chunk_list(
         flags,
         hash_only,
         remote_session,
-        tracker,
+        writes,
         list_permit,
     )
     .await?;
@@ -438,7 +439,7 @@ async fn write_fragmentlist_impl(
     flags: WriteOptions,
     hash_only: bool,
     remote_session: Option<Arc<StorageSession>>,
-    tracker: Option<Arc<crate::write_tracker::WriteTracker>>,
+    writes: WriteContext,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> Result<(Address, bool, bool), StorageError> {
     let size = buffer.len();
@@ -465,7 +466,7 @@ async fn write_fragmentlist_impl(
                 buffer,
                 true, /* Fragment lists have local priority */
                 remote_session,
-                tracker,
+                writes,
                 permit,
             )
             .await?;
@@ -519,7 +520,7 @@ async fn write_fragmentlist_impl(
 
             let store = store.clone();
             let session = remote_session.clone();
-            let task_tracker = tracker.clone();
+            let task_writes = writes.clone();
             lore_base::lore_spawn!(tasks, async move {
                 let hash = hash::hash_slice(chunk_buffer.as_ref());
                 let (chunk_address, chunk_local, chunk_remote) = if hash_only {
@@ -534,7 +535,7 @@ async fn write_fragmentlist_impl(
                         chunk_buffer,
                         flags.local_cache_priority,
                         session,
-                        task_tracker,
+                        task_writes,
                         permit,
                     )
                     .await?;
@@ -601,7 +602,7 @@ async fn write_fragmentlist_impl(
             flags,
             hash_only,
             remote_session,
-            tracker,
+            writes,
             next_permit,
         )
         .await?;
@@ -625,7 +626,7 @@ pub fn write_fragmentlist(
     flags: WriteOptions,
     hash_only: bool,
     remote_session: Option<Arc<StorageSession>>,
-    tracker: Option<Arc<crate::write_tracker::WriteTracker>>,
+    writes: WriteContext,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<(Address, bool, bool), StorageError>> + Send>,
@@ -639,7 +640,7 @@ pub fn write_fragmentlist(
         flags,
         hash_only,
         remote_session,
-        tracker,
+        writes,
         permit,
     ))
 }
@@ -723,7 +724,7 @@ mod tests {
             WriteOptions::default(),
             true,
             None,
-            None,
+            crate::write_tracker::WriteContext::none(),
         )
         .await
         .expect_err("a fragment list with no entries must not be written");

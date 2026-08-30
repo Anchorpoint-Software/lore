@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
@@ -10,7 +9,7 @@ use serde::Serialize;
 
 use crate::branch;
 use crate::branch::BranchLatestStatus;
-use crate::branch::push::PushStatistics;
+use crate::branch::push::PushProgress;
 use crate::branch::push::push_fragments;
 use crate::branch::push::push_query;
 use crate::change;
@@ -446,6 +445,8 @@ pub async fn restore(
         current_branch,
         rehash_tracker.clone(),
         modified_times.clone(),
+        commit::CommitStats::new(),
+        execution_context().globals().event_interval(),
     )
     .await;
     let drain_result = rehash_tracker.await_all().await;
@@ -493,7 +494,7 @@ pub async fn restore(
     let mut revision_number = new_state.revision_number();
     let mut remote_pushed = false;
     if let Ok(remote) = repository.remote().await {
-        let stats = Arc::new(PushStatistics::default());
+        let stats = Arc::new(PushProgress::new(execution_context().push_stats().clone()));
 
         LoreEvent::RevisionRestoreFragmentBegin(LoreRevisionRestoreFragmentBeginEventData {
             fragments: fragments.len() as u64,
@@ -514,6 +515,7 @@ pub async fn restore(
             storage_protocol.clone(),
             fragments,
             remote.environment.max_query_batch(),
+            execution_context().push_stats(),
         )
         .await
         .forward::<RestoreError>("querying missing fragments from server")?;
@@ -529,8 +531,8 @@ pub async fn restore(
             tokio::select! {
                 _ = ticker.tick() => {
                     LoreEvent::RevisionRestoreFragmentProgress(LoreRevisionRestoreFragmentProgressEventData {
-                        complete: stats.fragment_complete.load(Ordering::Relaxed) as u64,
-                        count: stats.fragment_count.load(Ordering::Relaxed) as u64,
+                        complete: stats.complete(),
+                        count: stats.count(),
                     }).send();
                 },
                 result = &mut push_task => {
@@ -541,7 +543,7 @@ pub async fn restore(
         result.forward::<RestoreError>("pushing fragments to remote")?;
 
         LoreEvent::RevisionRestoreFragmentEnd(LoreRevisionRestoreFragmentEndEventData {
-            fragments: stats.fragment_complete.load(Ordering::Relaxed) as u64,
+            fragments: stats.complete(),
         })
         .send();
 

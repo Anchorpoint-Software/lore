@@ -237,6 +237,8 @@ class Lore:
         search_nearest: bool = False,
         no_gc: bool = False,
         non_interactive: bool = False,
+        stats: int | None = None,
+        event_interval: int | None = None,
     ):
         if urc_args is None:
             urc_args = []
@@ -271,6 +273,12 @@ class Lore:
             + (["--search-nearest"] if search_nearest else [])
             + (["--no-gc"] if no_gc else [])
             + (["--non-interactive"] if non_interactive else [])
+            + ([f"--stats={stats}"] if stats is not None else [])
+            + (
+                ["--event-interval", str(event_interval)]
+                if event_interval is not None
+                else []
+            )
             + urc_args
         )
         command_string = " ".join(command_args)
@@ -2066,7 +2074,6 @@ class Lore:
     def commit(
         self,
         message: str | None = None,
-        stats: bool = False,
         link: str | None = None,
         link_messages: dict[str, str] | None = None,
         layer: str | None = None,
@@ -2086,7 +2093,6 @@ class Lore:
                 layer_args.extend(["--layer-message", path, msg])
         return self.run(
             ["commit", message if message else ""]
-            + (["--stats"] if stats else [])
             + (["--link", link] if link else [])
             + link_args
             + (["--layer", layer] if layer else [])

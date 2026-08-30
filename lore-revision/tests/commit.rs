@@ -105,7 +105,6 @@ mod tests {
                     link: None,
                     layer_messages: std::collections::HashMap::new(),
                     layer: None,
-                    stats: false,
                 };
                 let signature = Box::pin(commit::commit(repository.clone(), &write_token, options))
                     .await
@@ -241,7 +240,6 @@ mod tests {
                     link: None,
                     layer_messages: std::collections::HashMap::new(),
                     layer: None,
-                    stats: false,
                 };
                 let _signature =
                     Box::pin(commit::commit(repository.clone(), &write_token, options))
@@ -374,7 +372,6 @@ mod tests {
                     link: None,
                     layer_messages: std::collections::HashMap::new(),
                     layer: None,
-                    stats: false,
                 };
                 Box::pin(commit::commit(repository.clone(), &write_token, options))
                     .await
@@ -481,7 +478,6 @@ mod tests {
                     link: None,
                     layer_messages: std::collections::HashMap::new(),
                     layer: None,
-                    stats: false,
                 };
                 let callback: lore_revision::interface::LoreEventCallback = None;
                 let dry_run = Arc::new(ExecutionContext::new_client_with_user_id(
@@ -583,7 +579,6 @@ mod tests {
                     link: None,
                     layer_messages: std::collections::HashMap::new(),
                     layer: None,
-                    stats: false,
                 };
                 let result =
                     Box::pin(commit::commit(repository.clone(), &write_token, options)).await;
