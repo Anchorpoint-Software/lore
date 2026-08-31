@@ -115,6 +115,9 @@ class PathExistChildrenLinkError(LoreException): ...
 class NestedLinkError(LoreException): ...
 
 
+class NestedRepositoryError(LoreException): ...
+
+
 class PathExistLinkError(LoreException): ...
 
 
@@ -214,6 +217,7 @@ ERROR_MAP: list[tuple[str | re.Pattern, type[LoreException]]] = [
     ("Link path already has children", PathExistChildrenLinkError),
     ("Link path is already a link", PathExistLinkError),
     ("Nested link", NestedLinkError),
+    ("path is a nested repository", NestedRepositoryError),
     ("A shared store was supposed to exist at", MissingSharedStore),
     ("Invalid repository path", InvalidRepositoryPath),
     ("Loading the shared store for a repo with remote url", WrongSharedStoreRemote),

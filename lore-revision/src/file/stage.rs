@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 
 use lore_base::lore_spawn;
@@ -265,6 +266,7 @@ async fn stage_into_single_layer(
             None, // No link tracking in layer staging
             None, // Layers don't have nested layer mounts (no overlap)
             None, // Prefixes are resolved against the repository root, not a layer
+            None, // Node ids here index the layer's own state
         )
     );
 
@@ -341,6 +343,7 @@ pub async fn stage(
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(500));
     let stats = Arc::new(StageStats::default());
     let link_tracker = LinkTracker::new();
+    let discards: Arc<Mutex<Vec<crate::node::NodeID>>> = Arc::new(Mutex::new(Vec::new()));
 
     // Every layer mount is staged by its own task, never the parent walk, so
     // masking every layer subtree on every main-repo walk is correct: an entry
@@ -443,6 +446,7 @@ pub async fn stage(
                     Some(link_tracker),
                     global_mask,
                     base.prefixes,
+                    None, // Pre-create stages no children, so it reaches no boundary
                 )
                 .await;
                 (index, result)
@@ -497,6 +501,7 @@ pub async fn stage(
                 Some(link_tracker.clone()),
                 global_mask.clone(),
                 base.prefixes,
+                Some(discards.clone()),
             )
         );
         if let Err(err) = lore_limit_drain_tasks!(
@@ -569,6 +574,15 @@ pub async fn stage(
         return Err(err);
     }
 
+    let queued = discards
+        .lock()
+        .map(|mut queued| std::mem::take(&mut *queued))
+        .unwrap_or_default();
+    let discarded = !queued.is_empty();
+    state::apply_pending_discards(state.clone(), repository.clone(), queued)
+        .await
+        .forward::<StageError>("Failed to discard nested repository entries")?;
+
     let layer_staged: Vec<_> = staged_layers
         .into_iter()
         .map(|layer_index| (&layers[layer_index].0, &layers[layer_index].1))
@@ -578,7 +592,9 @@ pub async fn stage(
     let total_count = count.total_count;
     event::LoreEvent::FileStageEnd(LoreFileStageEndEventData { count }).send();
 
-    if total_count == 0 {
+    // A discard stages nothing and so raises no count, but it does mutate the
+    // tree, and the mutation is only kept if the state is serialized below.
+    if total_count == 0 && !discarded {
         return Ok(state.revision());
     }
 
@@ -1169,6 +1185,7 @@ pub async fn stage_move(
         None, // TODO(vri): UCS-18009 - Implement stage move for linked changes
         None,
         None, // No prefix map for a path resolved on its own
+        None, // A move stages the parent alone, so it reaches no boundary
     ))
     .await?;
 

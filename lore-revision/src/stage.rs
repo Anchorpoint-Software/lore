@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -300,6 +301,42 @@ pub(crate) async fn process_link_updates(
         .forward::<StageError>("Failed to update link")
 }
 
+/// Entries a walk found behind a nested-repository boundary, for
+/// [`state::apply_pending_discards`] to drop once the walk has drained.
+///
+/// Collected rather than discarded where they are found: the discard rewrites the
+/// sibling chains the walk's own tasks are still reading. The ids index one state,
+/// so a walk crossing into a linked state carries `None` from there on, as does a
+/// caller that reconciles nothing against the file system: a boundary is still
+/// skipped, only an entry an earlier walk left indexed is left in place.
+pub(crate) type PendingDiscards = Option<Arc<Mutex<Vec<NodeID>>>>;
+
+/// Whether no commit covers the child the parent tree holds as `held`, which is
+/// what makes a `.lore/` inside it a nested working copy rather than parent
+/// content.
+///
+/// A child the parent committed stays part of the parent's tree once a `.lore/`
+/// appears inside it, since untracking committed content is an explicit user
+/// action, and so does a staged add, matching the scan. `None` is a name the tree
+/// holds no child for, which no commit covers. Answered before the boundary is
+/// probed, so the file system is left alone for every child already in the tree.
+async fn is_uncommitted_child(
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    held: Option<NodeID>,
+) -> Result<bool, StageError> {
+    let Some(held) = held else {
+        return Ok(true);
+    };
+
+    let node = state
+        .node(repository.clone(), held)
+        .await
+        .forward::<StageError>("Failed to resolve the child node")?;
+
+    Ok(node.is_dirty_add())
+}
+
 /// Stage changes from filesystem into the given state
 /// The base directory is the point where the relative path starts
 /// Only the relative path will be checked for case consistency
@@ -316,6 +353,7 @@ pub(crate) async fn stage_filesystem_path(
     link_tracker: Option<Arc<crate::link::LinkTracker>>,
     layer_mask: Option<Arc<Vec<String>>>,
     prefixes: Option<Arc<util::fs::ResolvedPrefixes>>,
+    discards: PendingDiscards,
 ) -> Result<NodeLink, StageError> {
     lore_debug!(
         "Staging path: {}/{}",
@@ -413,6 +451,30 @@ pub(crate) async fn stage_filesystem_path(
                         )
                     })?
             };
+
+            // A named path is refused rather than skipped: the caller asked for
+            // this path specifically, and staging it into the parent would take
+            // content the nested repository owns.
+            if current_metadata.is_dir() {
+                let held = current_state
+                    .find_subnode(
+                        current_repository.clone(),
+                        current_node,
+                        hash::hash_string(current_name),
+                    )
+                    .await
+                    .ok()
+                    .filter(|node| node.is_valid_node_id());
+                if is_uncommitted_child(&current_repository, &current_state, held).await?
+                    && state::is_nested_repository_root(&mut current_absolute_path, current_name)
+                        .await
+                {
+                    return Err(StageError::internal(format!(
+                        "Failed to stage path {}, path is a nested repository",
+                        current_absolute_path.join(current_name).display()
+                    )));
+                }
+            }
 
             let node_link = stage_node_from_metadata(
                 current_repository.clone(),
@@ -513,6 +575,7 @@ pub(crate) async fn stage_filesystem_path(
                 stats.clone(),
                 link_tracker.clone(),
                 layer_mask.clone(),
+                discards.clone(),
             )
             .await;
             stats.task_count.fetch_sub(1, Ordering::Release);
@@ -1298,6 +1361,7 @@ pub(crate) async fn stage_directory(
     stats: Arc<StageStats>,
     link_tracker: Option<Arc<crate::link::LinkTracker>>,
     layer_mask: Option<Arc<Vec<String>>>,
+    discards: PendingDiscards,
 ) -> Result<(), StageError> {
     let mut children = DirectoryChildren::new(
         state
@@ -1351,6 +1415,7 @@ pub(crate) async fn stage_directory(
     } else {
         String::new()
     };
+    let mut nested_probe: Option<PathBuf> = None;
     for item in items {
         if item.metadata.is_dir() {
             let directory = item;
@@ -1399,6 +1464,37 @@ pub(crate) async fn stage_directory(
                 }
             };
 
+            let uncommitted = match is_uncommitted_child(&repository, &state, claimed).await {
+                Ok(uncommitted) => uncommitted,
+                Err(err) => {
+                    failure = failure.or(Some(err));
+                    break;
+                }
+            };
+
+            if uncommitted {
+                let probe = nested_probe.get_or_insert_with(|| absolute_path.to_path_buf());
+                if state::is_nested_repository_root(probe, directory.name.as_str()).await {
+                    lore_trace!(
+                        "Skipping nested repository root {} in {}/",
+                        directory.name,
+                        relative_path.as_str()
+                    );
+
+                    // An entry an earlier walk indexed is left claimed, so the
+                    // unclaimed pass below does not stage a delete against a base
+                    // the parent never committed, and is queued for discard so
+                    // the tree stops holding what the boundary excludes.
+                    if let (Some(node), Some(discards)) = (claimed, discards.as_ref())
+                        && let Ok(mut queued) = discards.lock()
+                    {
+                        queued.push(node);
+                    }
+
+                    continue;
+                }
+            }
+
             let node_link = match stage_node_from_metadata(
                 repository.clone(),
                 state.clone(),
@@ -1433,6 +1529,7 @@ pub(crate) async fn stage_directory(
                     let absolute_path = absolute_path.to_path_buf();
                     let link_tracker = link_tracker.clone();
                     let layer_mask = layer_mask.clone();
+                    let discards = discards.clone();
                     async move {
                         let _permit = permit;
                         stage_child_directory(
@@ -1446,6 +1543,7 @@ pub(crate) async fn stage_directory(
                             stats,
                             link_tracker,
                             layer_mask,
+                            discards,
                         )
                         .await
                     }
@@ -1462,6 +1560,7 @@ pub(crate) async fn stage_directory(
                     stats.clone(),
                     link_tracker.clone(),
                     layer_mask.clone(),
+                    discards.clone(),
                 )
                 .await;
                 failure = failure.or(result.err());
@@ -1595,6 +1694,7 @@ async fn stage_child_directory(
     stats: Arc<StageStats>,
     link_tracker: Option<Arc<crate::link::LinkTracker>>,
     layer_mask: Option<Arc<Vec<String>>>,
+    discards: PendingDiscards,
 ) -> Result<(), StageError> {
     if !node_link.is_valid() {
         return Ok(());
@@ -1656,6 +1756,7 @@ async fn stage_child_directory(
             stats.clone(),
             link_tracker.clone(),
             layer_mask.clone(),
+            None,
         )
         .await;
 
@@ -1686,6 +1787,7 @@ async fn stage_child_directory(
             stats.clone(),
             link_tracker.clone(),
             layer_mask.clone(),
+            discards.clone(),
         )
         .await;
         stats.task_count.fetch_sub(1, Ordering::Release);
@@ -1705,6 +1807,7 @@ fn stage_directory_recurse(
     stats: Arc<StageStats>,
     link_tracker: Option<Arc<crate::link::LinkTracker>>,
     layer_mask: Option<Arc<Vec<String>>>,
+    discards: PendingDiscards,
 ) -> Pin<Box<dyn Future<Output = Result<(), StageError>> + Send + '_>> {
     Box::pin(stage_directory(
         repository,
@@ -1717,6 +1820,7 @@ fn stage_directory_recurse(
         stats,
         link_tracker,
         layer_mask,
+        discards,
     ))
 }
 
@@ -2674,6 +2778,7 @@ pub(crate) async fn stage_from_parent_revision(
                     None, // TODO(vri): UCS-17955 - Merging and conflict resolution for links
                     None, // No layer mask
                     None, // No prefix map for a path resolved on its own
+                    None, // No discard queue
                 ))
                 .await?;
 
@@ -2836,6 +2941,7 @@ pub(crate) async fn stage_from_parent_revision(
                     None, // TODO(vri): UCS-17955 - Merging and conflict resolution for links
                     None, // No layer mask
                     None, // No prefix map for a path resolved on its own
+                    None, // No discard queue
                 ))
                 .await?;
 
@@ -3186,6 +3292,7 @@ pub(crate) async fn stage_link_paths_from_parent_revision(
                     None,
                     None,
                     None, // No prefix map for a path resolved on its own
+                    None, // No discard queue
                 ))
                 .await?;
                 sync::unlink_merge_mine_theirs_base(absolute.as_path()).await;
@@ -3230,6 +3337,7 @@ pub(crate) async fn stage_link_paths_from_parent_revision(
                     None,
                     None,
                     None, // No prefix map for a path resolved on its own
+                    None, // No discard queue
                 ))
                 .await?;
 

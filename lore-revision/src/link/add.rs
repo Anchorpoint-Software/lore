@@ -343,6 +343,7 @@ pub async fn add(
                 None, // No link tracking when adding links
                 None, // No layer mask
                 None, // Prefixes resolved for the outer repository do not apply
+                None, // Node ids here index the inner repository's own state
             ))
             .await
             .forward::<LinkError>("Failed staging the link node")?;

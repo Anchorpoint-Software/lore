@@ -227,6 +227,62 @@ pub async fn test_repository_create(
     }
 }
 
+/// Creates (or truncates) the file at `path` and writes `contents` to it.
+///
+/// Panics on failure, since a fixture the test cannot write invalidates what it
+/// would go on to assert.
+#[allow(dead_code)]
+pub fn test_file_write(path: &std::path::Path, contents: &[u8]) {
+    // Test fixture writes; not subject to repository write-token discipline.
+    #[allow(clippy::disallowed_methods)]
+    std::fs::write(path, contents)
+        .unwrap_or_else(|_| panic!("Failed to write test file at {}", path.display()));
+}
+
+/// Reconciles the working tree against `state_staged`, mutating it in place as
+/// `lore status --scan` does, and returns the changes detected.
+#[allow(dead_code)]
+pub async fn test_scan(
+    repository: std::sync::Arc<lore_revision::repository::RepositoryContext>,
+    state_staged: std::sync::Arc<lore_revision::state::State>,
+    state_current: std::sync::Arc<lore_revision::state::State>,
+) -> Vec<lore_revision::change::NodeChange> {
+    let (changes, _stats) = lore_revision::state::diff_filesystem_ex(
+        repository.clone(),
+        state_staged,
+        repository,
+        state_current,
+        None, /* full tree */
+        lore_revision::filter::FilterMode::Full,
+        true, /* scan_dirty */
+        std::sync::Arc::new(Vec::new()),
+    )
+    .await
+    .expect("Failed to diff filesystem");
+    changes
+}
+
+/// The anchor revision's state, deserialized twice: once as the current
+/// revision and once as the staged state a scan reconciles in place.
+#[allow(dead_code)]
+pub async fn test_anchor_states(
+    repository: &std::sync::Arc<lore_revision::repository::RepositoryContext>,
+) -> (
+    std::sync::Arc<lore_revision::state::State>,
+    std::sync::Arc<lore_revision::state::State>,
+) {
+    let (revision, _branch) = lore_revision::instance::load_current_anchor(repository)
+        .await
+        .expect("Failed to load current anchor");
+    let current = lore_revision::state::State::deserialize(repository.clone(), revision)
+        .await
+        .expect("Failed to deserialize current state");
+    let staged = lore_revision::state::State::deserialize(repository.clone(), revision)
+        .await
+        .expect("Failed to deserialize staged state");
+    (current, staged)
+}
+
 pub fn setup_test_execution() -> std::sync::Arc<lore_revision::interface::ExecutionContext> {
     std::sync::Arc::new(
         lore_revision::interface::ExecutionContext::new_client_with_user_id(

@@ -5151,60 +5151,24 @@ pub async fn node_discard_nopatch<F>(
 where
     F: Fn(NodeID, u16) + Clone + Send + 'static,
 {
-    let mut counts = DiscardCounts::default();
     let block_index = NodeBlock::index(node_id);
     let node_index = Node::index(node_id);
     let block = state.block(repository.clone(), block_index).await?;
     let node = block.node(node_index);
 
-    if recurse && node.is_directory() {
-        // Directory, discard all children recursively, but no need to patch up parent/child/sibling pointers
-        // as all the nodes are discarded anyway
-        lore_trace!("Recursively discarding directory node {node_id}",);
-        let mut tasks = JoinSet::new();
-        let mut child_node_ref = node.child();
-        let mut cycle = SiblingCycleGuard::new(node_id);
-        while let Some(child_node_id) = child_node_ref {
-            let child_block_index = NodeBlock::index(child_node_id);
-            let child_node_index = Node::index(child_node_id);
-
-            let child_block = state.block(repository.clone(), child_block_index).await?;
-            let child_node = child_block.node(child_node_index);
-
-            child_node.walk_step(child_node_id, node_id, &mut cycle)?;
-
-            lore_spawn!(tasks, {
-                let state = state.clone();
-                let repository = repository.clone();
-                let handler = handler.clone();
-                async move {
-                    node_discard_recurse(
-                        state,
-                        repository,
-                        child_node_id,
-                        recurse,
-                        discard,
-                        handler,
-                    )
-                    .await
-                }
-            });
-
-            child_node_ref = child_node.sibling();
-        }
-
-        let mut task_failure = Ok(());
-        while let Some(task) = tasks.join_next().await {
-            if let Ok(result) = task {
-                let child_counts = result?;
-                counts.file_count += child_counts.file_count;
-                counts.directory_count += child_counts.directory_count;
-            } else {
-                task_failure = Err(task.unwrap_err());
-            }
-        }
-        task_failure.internal("Discard node task")?;
-    }
+    let mut counts = if recurse && node.is_directory() {
+        node_discard_children(
+            state.clone(),
+            repository.clone(),
+            node_id,
+            node.child(),
+            discard,
+            handler.clone(),
+        )
+        .await?
+    } else {
+        DiscardCounts::default()
+    };
 
     handler(node_id, node.flags);
 
@@ -5226,6 +5190,66 @@ where
     } else {
         counts.file_count += 1;
     }
+    Ok(counts)
+}
+
+/// Discards every node below `parent_node_id`, whose child chain starts at
+/// `first_child`, leaving that node and its hierarchy links untouched. Children
+/// are discarded concurrently: nothing in the subtree patches a parent, child
+/// or sibling pointer, so no walk observes a partially relinked chain. Each
+/// child's sibling is read before that child is discarded, since discarding
+/// repurposes the pointer for the block's free list.
+///
+/// With `discard` false the subtree is walked and reported through `handler`
+/// without being discarded. The returned counts cover the subtree, excluding
+/// `parent_node_id` itself.
+async fn node_discard_children<F>(
+    state: Arc<State>,
+    repository: Arc<RepositoryContext>,
+    parent_node_id: NodeID,
+    first_child: Option<NodeID>,
+    discard: bool,
+    handler: F,
+) -> Result<DiscardCounts, StateError>
+where
+    F: Fn(NodeID, u16) + Clone + Send + 'static,
+{
+    lore_trace!("Recursively discarding children of directory node {parent_node_id}");
+    let mut counts = DiscardCounts::default();
+    let mut tasks = JoinSet::new();
+    let mut child_node_ref = first_child;
+    let mut cycle = SiblingCycleGuard::new(parent_node_id);
+    while let Some(child_node_id) = child_node_ref {
+        let child_block = state
+            .block(repository.clone(), NodeBlock::index(child_node_id))
+            .await?;
+        let child_node = child_block.node(Node::index(child_node_id));
+
+        child_node.walk_step(child_node_id, parent_node_id, &mut cycle)?;
+
+        lore_spawn!(tasks, {
+            let state = state.clone();
+            let repository = repository.clone();
+            let handler = handler.clone();
+            async move {
+                node_discard_recurse(state, repository, child_node_id, true, discard, handler).await
+            }
+        });
+
+        child_node_ref = child_node.sibling();
+    }
+
+    let mut task_failure = Ok(());
+    while let Some(task) = tasks.join_next().await {
+        if let Ok(result) = task {
+            let child_counts = result?;
+            counts.file_count += child_counts.file_count;
+            counts.directory_count += child_counts.directory_count;
+        } else {
+            task_failure = Err(task.unwrap_err());
+        }
+    }
+    task_failure.internal("Discard node task")?;
     Ok(counts)
 }
 
@@ -6049,13 +6073,15 @@ pub async fn diff_filesystem_ex(
     }
 }
 
-/// Patch-discard reverted-DirtyAdd nodes collected during the parallel
-/// filesystem walk and clear stale `Dirty` propagation on each ancestor
-/// chain. Must only be called after the corresponding walk's task set has
-/// drained — discarding mid-walk mutates `parent.child` / sibling chains
-/// under walks that are still reading them and races into
+/// Patch-discard the nodes a parallel filesystem walk collected — a
+/// reverted `DirtyAdd`, or an entry behind a nested-repository boundary — and
+/// clear stale `Dirty` propagation on each ancestor chain. A directory node goes
+/// with the whole subtree below it, so no slot is left holding an entry
+/// unreachable from the root. Must only be called after the corresponding walk's
+/// task set has drained — discarding mid-walk mutates `parent.child` / sibling
+/// chains under walks that are still reading them and races into
 /// `node_discard_patch`'s `"Discard hierarchy broken"`.
-async fn apply_pending_discards(
+pub(crate) async fn apply_pending_discards(
     state: Arc<State>,
     repository: Arc<RepositoryContext>,
     mut pending_discards: Vec<NodeID>,
@@ -6075,6 +6101,19 @@ async fn apply_pending_discards(
         }
 
         let initial_ancestor = discard_node.parent;
+
+        if discard_node.is_directory() {
+            node_discard_children(
+                state.clone(),
+                repository.clone(),
+                discard_node_id,
+                discard_node.child(),
+                true,
+                |_, _| {},
+            )
+            .await?;
+        }
+
         node_discard_patch(
             state.clone(),
             repository.clone(),
@@ -7009,6 +7048,45 @@ async fn emit_filesystem_subtree_deletes(
     Ok(false)
 }
 
+/// Returns whether the child `name` of the directory `parent` addresses holds
+/// its own `.lore/`, making it a nested working copy. Such a working copy
+/// bounds the parent's filesystem walk: its contents belong to it, not to the
+/// parent, the way a nested `.git` bounds git. A legacy `.urc/` working copy is
+/// not a boundary — the format predates nesting support and no client that
+/// creates one is still in use.
+///
+/// `parent` holds the absolute path of the directory being walked and is
+/// restored before returning, so building a candidate costs no allocation once
+/// the buffer has grown. The driver copies the path it is handed, so passing a
+/// borrow leaves one allocation per candidate — handing over an owned path
+/// built per candidate instead costs the same copy plus the build.
+pub(crate) async fn is_nested_repository_root(parent: &mut std::path::PathBuf, name: &str) -> bool {
+    parent.push(name);
+    parent.push(DOT_LORE);
+    let nested = lore_io::IoDriver::global()
+        .metadata(parent.as_path())
+        .await
+        .is_ok_and(|metadata| metadata.is_dir());
+    parent.pop();
+    parent.pop();
+    nested
+}
+
+/// Match each filesystem item from `file_receiver` against `node_list` (the
+/// `from` state's children) and `current_node_list` (the `current` state's
+/// children), emitting changes into `changes`, marking matched entries in
+/// `node_list_found`, spawning subtree-recursion tasks into `tasks`, and
+/// queueing stale directory nodes into `pending_discards`. Items with no
+/// match in `node_list` are buffered and processed as new adds once the
+/// receiver is drained. Must only be called from [`diff_filesystem_directory`],
+/// which sorts `node_list` and `current_node_list` by name beforehand — the
+/// binary searches here assume that ordering.
+///
+/// A scan reconciles a node the current revision does not hold and no walked
+/// entry matched — removed from disk, or a directory the walk declined as a
+/// nested working copy — by queueing it for discard rather than reporting a
+/// `Delete`: with no committed base there is nothing to delete from, and no
+/// mutation verb would clear the entry.
 #[allow(clippy::too_many_arguments)]
 async fn diff_filesystem_directory_walk(
     ctx: &DiffFilesystemContext,
@@ -7021,6 +7099,8 @@ async fn diff_filesystem_directory_walk(
     stats: &mut FilesystemDiffStats,
     pending_discards: &mut Vec<NodeID>,
 ) -> Result<(), StateError> {
+    let repository_root = ctx.from.repository.require_path()?;
+    let mut nested_probe: Option<std::path::PathBuf> = None;
     let mut new_file_list = vec![];
     while let Some(entry) = file_listing.next().await {
         let Some(item) = util::fs::file_list_item(entry) else {
@@ -7204,9 +7284,13 @@ async fn diff_filesystem_directory_walk(
             .await?;
         } else if was_directory && is_directory {
             if ctx.scan_dirty && !current_node_id.is_valid_node_id() {
-                // Re-emit a staged dirty-add directory (in staged, absent from
-                // the current revision) as a single node so repeated scans stay
-                // idempotent; the recursion below surfaces its children.
+                let probe = nested_probe
+                    .get_or_insert_with(|| ctx.filesystem_path.to_absolute_path(repository_root));
+                if is_nested_repository_root(probe, item.name.as_str()).await {
+                    lore_trace!("Discarding zombie entry for nested repository root {item_path}");
+                    node_list_found[current_index] = false;
+                    continue;
+                }
                 emit_dirty_add_node_single(
                     node_list.repository.clone(),
                     node_list.state.clone(),
@@ -7343,6 +7427,23 @@ async fn diff_filesystem_directory_walk(
         else {
             continue;
         };
+
+        if ctx.scan_dirty && from_node.node.is_directory() {
+            let in_current = current_node_list
+                .children
+                .as_slice()
+                .binary_search_by(|child| child.name.cmp(&from_named_node.name))
+                .is_ok();
+            if !in_current {
+                lore_trace!(
+                    "Queueing reverted uncommitted directory node {} (no entry at {}, not in current)",
+                    from_named_node.node,
+                    from_node.path
+                );
+                pending_discards.push(from_named_node.node);
+                continue;
+            }
+        }
 
         // Emit deletes only for the materialized portion of the subtree,
         // suppressing directories the filter merely descended through but never
@@ -7515,6 +7616,12 @@ async fn diff_filesystem_directory_walk(
                     stats,
                 )
                 .await?;
+                continue 'new_file_iter;
+            }
+            let probe = nested_probe
+                .get_or_insert_with(|| ctx.filesystem_path.to_absolute_path(repository_root));
+            if is_nested_repository_root(probe, file.name.as_str()).await {
+                lore_trace!("Skipping nested repository root {child_file_path}");
                 continue 'new_file_iter;
             }
             lore_trace!("Filesystem has new directory in path {child_file_path}, recursing");
