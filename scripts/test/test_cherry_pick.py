@@ -1318,12 +1318,12 @@ def test_cherry_pick_then_merge(new_lore_repo):
 @pytest.mark.smoke
 def test_cherry_pick_metadata(new_lore_repo):
     """
-    Test that cherry-pick carries the source revision's metadata, not the
-    target branch's metadata.
+    A cherry-pick carries the keys named by --inherit-metadata from the source
+    revision, not from the target branch.
 
-    Both the source and target revisions set reviewed-by, merged-by, and
-    change-request with different values. After cherry-pick the result should
-    have the source's values, not the target's.
+    Both revisions set reviewed-by, merged-by and change-request to different
+    values. The named keys arrive from the source; merged-by is reserved, and a
+    cherry-pick is not a merge, so it names no merger at all.
     """
     repo: Lore = new_lore_repo()
 
@@ -1340,12 +1340,14 @@ def test_cherry_pick_metadata(new_lore_repo):
         f.write("Feature content\n")
     repo.stage("feature_file.txt")
     repo.revision_metadata_set(["merged-by", "source-merger@example.com"])
+    repo.revision_metadata_set(["reviewed-by", "source-reviewer@example.com"])
     repo.revision_metadata_set(["change-request", "SOURCE-CR-111"])
     repo.commit("Add feature file")
     repo.push()
 
     # Verify the source metadata is set on the feature branch
     assert "source-merger@example.com" in repo.revision_metadata_get("merged-by")
+    assert "source-reviewer@example.com" in repo.revision_metadata_get("reviewed-by")
     assert "SOURCE-CR-111" in repo.revision_metadata_get("change-request")
 
     # Switch back to main and make a second change with different metadata
@@ -1368,6 +1370,7 @@ def test_cherry_pick_metadata(new_lore_repo):
     repo.revision_cherry_pick(
         revision="feature-metadata@LATEST",
         message="Cherry-pick feature file onto main",
+        inherit_metadata=["change-request", "reviewed-by"],
     )
 
     logger.info(repo.revision_metadata_get())
@@ -1378,27 +1381,27 @@ def test_cherry_pick_metadata(new_lore_repo):
         f"cherry-picked-from should be set on the cherry-picked revision. Got:\n{cherry_picked_from}"
     )
 
-    # Verify the source's metadata IS carried through
-    merged_by_after = repo.revision_metadata_get("merged-by")
-    assert "source-merger@example.com" in merged_by_after, (
-        f"merged-by should come from the source revision. Got:\n{merged_by_after}"
-    )
-
+    # The named keys arrive from the source, not the target
     change_request_after = repo.revision_metadata_get("change-request")
     assert "SOURCE-CR-111" in change_request_after, (
         f"change-request should come from the source revision. Got:\n{change_request_after}"
     )
+    assert "TARGET-CR-999" not in change_request_after, (
+        f"change-request should NOT come from the target branch. Got:\n{change_request_after}"
+    )
 
-    # Verify the target's metadata is NOT present
     reviewed_by_after = repo.revision_metadata_get("reviewed-by")
+    assert "source-reviewer@example.com" in reviewed_by_after, (
+        f"reviewed-by should come from the source revision. Got:\n{reviewed_by_after}"
+    )
     assert "target-reviewer@example.com" not in reviewed_by_after, (
         f"reviewed-by should NOT come from the target branch. Got:\n{reviewed_by_after}"
     )
-    assert "target-merger@example.com" not in merged_by_after, (
-        f"merged-by should NOT come from the target branch. Got:\n{merged_by_after}"
-    )
-    assert "TARGET-CR-999" not in change_request_after, (
-        f"change-request should NOT come from the target branch. Got:\n{change_request_after}"
+
+    # merged-by is reserved, and a cherry-pick performs no merge
+    merged_by_after = repo.revision_metadata_get("merged-by").strip()
+    assert not merged_by_after, (
+        f"a cherry-pick should name no merger. Got:\n{merged_by_after}"
     )
 
 

@@ -156,6 +156,12 @@ pub struct BranchMergeArgs {
     /// Change the message for committing when no conflicts arise from the merge
     #[clap(long, action)]
     message: Option<String>,
+
+    /// Carry this metadata key from the source revision onto the merge
+    /// revision. Repeatable. Pass `*` to carry every key that is not reserved
+    /// to the merge itself. Carries nothing when not given.
+    #[clap(long = "inherit-metadata", value_name = "KEY")]
+    inherit_metadata: Vec<String>,
 }
 
 #[derive(Args)]
@@ -183,6 +189,12 @@ pub struct BranchMergeStartArgs {
     /// Merge only the main repository, skipping all linked repositories
     #[clap(long, action, conflicts_with = "link")]
     ignore_links: bool,
+
+    /// Carry this metadata key from the source revision onto the merge
+    /// revision. Repeatable. Pass `*` to carry every key that is not reserved
+    /// to the merge itself. Carries nothing when not given.
+    #[clap(long = "inherit-metadata", value_name = "KEY")]
+    inherit_metadata: Vec<String>,
 }
 
 #[derive(Args)]
@@ -236,6 +248,13 @@ pub struct BranchMergeIntoArgs {
     /// Merge only the main repository, skipping all linked repositories
     #[clap(long, action, conflicts_with = "link")]
     ignore_links: bool,
+
+    /// Carry this metadata key from the current branch onto the revision
+    /// created on the target branch. Repeatable. Pass `*` to carry every key
+    /// that is not reserved to the merge itself. Carries nothing when not
+    /// given.
+    #[clap(long = "inherit-metadata", value_name = "KEY")]
+    inherit_metadata: Vec<String>,
 }
 
 #[derive(Args)]
@@ -1014,6 +1033,9 @@ fn handle_branch_merge_into(globals: LoreGlobalArgs, args: &BranchMergeIntoArgs)
         message,
         link: LoreString::from(&args.link),
         ignore_links: args.ignore_links as u8,
+        inherit_metadata: LoreArray::from_vec(util::convert_to_lore_string_vec(
+            &args.inherit_metadata,
+        )),
     };
 
     let debug = progress_debug();
@@ -1080,6 +1102,9 @@ fn handle_branch_merge_start(globals: LoreGlobalArgs, args: &BranchMergeStartArg
         no_commit: args.no_commit as u8,
         link: LoreString::from(&args.link),
         ignore_links: args.ignore_links as u8,
+        inherit_metadata: LoreArray::from_vec(util::convert_to_lore_string_vec(
+            &args.inherit_metadata,
+        )),
     };
 
     let debug = progress_debug();
@@ -1321,6 +1346,7 @@ pub fn handle_branch_merge(globals: LoreGlobalArgs, args: &BranchMergeArgs) -> u
             dry_run: false,
             link: None,
             ignore_links: false,
+            inherit_metadata: args.inherit_metadata.clone(),
         };
 
         return handle_branch_merge_start(globals, &sub_args);

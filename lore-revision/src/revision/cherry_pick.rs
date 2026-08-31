@@ -23,6 +23,7 @@ use crate::lore::BranchId;
 use crate::lore::Hash;
 use crate::lore::RepositoryId;
 use crate::lore_info;
+use crate::metadata::MetadataInherit;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
 use crate::revision;
@@ -133,6 +134,9 @@ pub struct CherryPickOptions {
     pub message: String,
     /// Disable auto commits, even if no conflicts arise.
     pub no_commit: bool,
+    /// Which of the picked revision's metadata keys to carry onto the revision
+    /// this creates. Carries nothing unless the caller names keys.
+    pub inherit_metadata: MetadataInherit,
 }
 
 pub async fn cherry_pick(
@@ -211,6 +215,7 @@ pub async fn cherry_pick(
         MergeType::CherryPick,
         false,
         current_branch,
+        &options.inherit_metadata,
     )
     .await?;
 

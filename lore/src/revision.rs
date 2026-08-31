@@ -1042,6 +1042,11 @@ pub struct LoreRevisionCherryPickArgs {
     pub message: LoreString,
     /// Disable auto-commit even if no conflicts arise
     pub no_commit: u8,
+    /// Metadata keys to carry from the picked revision onto the revision this
+    /// creates. Empty carries nothing; the single entry `*` carries every key
+    /// that is not reserved to the cherry-pick itself.
+    #[serde(default)]
+    pub inherit_metadata: LoreArray<LoreString>,
 }
 
 pub async fn cherry_pick(
@@ -1075,6 +1080,12 @@ pub async fn cherry_pick_local(
             let options = revision::cherry_pick::CherryPickOptions {
                 message: args.message.to_string(),
                 no_commit: args.no_commit != 0,
+                inherit_metadata: lore_revision::metadata::MetadataInherit::from_keys(
+                    args.inherit_metadata
+                        .as_slice()
+                        .iter()
+                        .map(LoreString::as_str),
+                ),
             };
 
             revision::cherry_pick::cherry_pick(repository, &token, target_revision, options).await
@@ -1708,6 +1719,31 @@ async fn revert_resolve_theirs_local(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cherry_pick_args_old_payload_missing_inherit_metadata_uses_default() {
+        // Old IPC client payload with no inherit_metadata field. The new field
+        // must be `#[serde(default)]` so old clients keep working.
+        let full = LoreRevisionCherryPickArgs {
+            revision: "main@3".into(),
+            message: "pick".into(),
+            no_commit: 0,
+            inherit_metadata: LoreArray::from_vec(vec![LoreString::from("change-request")]),
+        };
+        let mut payload = serde_json::to_value(&full).expect("args must serialise");
+        payload
+            .as_object_mut()
+            .expect("args serialise to an object")
+            .remove("inherit_metadata")
+            .expect("the field must be present before it is removed");
+
+        let args: LoreRevisionCherryPickArgs =
+            serde_json::from_value(payload).expect("old payload must deserialise");
+
+        assert_eq!(args.revision.as_str(), "main@3");
+        assert_eq!(args.message.as_str(), "pick");
+        assert!(args.inherit_metadata.as_slice().is_empty());
+    }
 
     #[test]
     fn commit_args_old_payload_missing_layer_fields_uses_defaults() {

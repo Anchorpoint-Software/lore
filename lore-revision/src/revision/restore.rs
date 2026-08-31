@@ -27,6 +27,7 @@ use crate::lore::execution_context;
 use crate::lore_debug;
 use crate::metadata;
 use crate::metadata::Metadata;
+use crate::metadata::MetadataInherit;
 use crate::metadata::MetadataType;
 use crate::metadata::RESTORED_FROM;
 use crate::node::Node;
@@ -382,12 +383,21 @@ pub async fn restore(
     })
     .send();
 
-    // Apply the metadata on the state
+    let restored_metadata_hash = current_state.metadata_hash();
+    let restored_metadata = if restored_metadata_hash.is_zero() {
+        Metadata::new()
+    } else {
+        Metadata::deserialize(repository.clone(), restored_metadata_hash)
+            .await
+            .forward::<RestoreError>("deserializing restored revision metadata")?
+    };
+
     branch::merge::merge_metadata(
         repository.clone(),
         Arc::new(changes.clone()),
         current_state.clone(),
         state_staged.clone(),
+        &MetadataInherit::All,
     )
     .await
     .forward::<RestoreError>("merging metadata on state")?;
@@ -395,15 +405,16 @@ pub async fn restore(
 
     // Get or create metadata chunk
     let metadata_hash = state_staged.metadata_hash();
-    if metadata_hash.is_zero() {
-        return Err(RestoreError::internal("Failed to deserialize metadata"));
-    }
-    let original_metadata = Metadata::deserialize(repository.clone(), metadata_hash)
-        .await
-        .forward::<RestoreError>("deserializing original metadata")?;
+    let original_metadata = if metadata_hash.is_zero() {
+        Metadata::new()
+    } else {
+        Metadata::deserialize(repository.clone(), metadata_hash)
+            .await
+            .forward::<RestoreError>("deserializing original metadata")?
+    };
 
     let message = options.message.unwrap_or(
-        original_metadata
+        restored_metadata
             .get_string(metadata::MESSAGE)
             .forward::<RestoreError>("reading commit message from metadata")?
             .to_owned(),

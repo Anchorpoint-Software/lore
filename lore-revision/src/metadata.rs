@@ -103,9 +103,11 @@ impl EventError for MetadataErrors {
 pub const MESSAGE: &str = "message";
 /// Timestamp when revision was committed (`u64`)
 pub const TIMESTAMP: &str = "timestamp";
-/// Creator(s) of the revision ([`MetadataType::String`])
+/// Origin of the work in the revision ([`MetadataType::String`]). Set by the
+/// caller or carried by an inherit list; a commit fills it only when unset.
 pub const CREATED_BY: &str = "created-by";
-/// Committer of the revision ([`MetadataType::String`])
+/// Who put the revision into the chain ([`MetadataType::String`]). Always the
+/// committer, so never inheritable.
 pub const COMMITTED_BY: &str = "committed-by";
 /// Reviewer(s) of the revision ([`MetadataType::String`])
 pub const REVIEWED_BY: &str = "reviewed-by";
@@ -125,6 +127,85 @@ pub const REVERTED_FROM: &str = "reverted-from";
 pub const CHANGE_REQUEST: &str = "change-request";
 /// Indicates the revision was created by a fast-forward merge ([`MetadataType::Numeric`])
 pub const FAST_FORWARD_MERGE: &str = "fast-forward-merge";
+
+/// Keys describing the operation that creates a revision rather than the work
+/// it records, written by that operation.
+///
+/// Never inheritable, so [`MetadataInherit::All`] cannot forward the attribution
+/// an inherit list exists to govern.
+pub const RESERVED_STAMP: [&str; 5] = [MESSAGE, TIMESTAMP, BRANCH, COMMITTED_BY, MERGED_BY];
+
+/// Keys recording an operation the new revision is not.
+///
+/// Never inheritable: a merge holding `cherry-picked-from` claims to be a
+/// cherry-pick. Each is written by the operation that owns it, after the
+/// inherit filter runs.
+pub const RESERVED_ERASE: [&str; 4] = [
+    CHERRY_PICKED_FROM,
+    REVERTED_FROM,
+    RESTORED_FROM,
+    FAST_FORWARD_MERGE,
+];
+
+/// Which of a source revision's keys a merge or cherry-pick carries onto the
+/// revision it creates, so the result reads as the integrated sum of the work
+/// brought in.
+///
+/// Supplied per operation, since whether a key is a durable property of the work
+/// or an assertion about one revision is not something its name reveals. The
+/// default carries nothing.
+#[derive(Clone, Debug)]
+pub enum MetadataInherit {
+    /// Carry only the named keys.
+    Keys(Vec<String>),
+    /// Carry every key the reserved sets above allow.
+    All,
+}
+
+impl Default for MetadataInherit {
+    fn default() -> Self {
+        MetadataInherit::Keys(Vec::new())
+    }
+}
+
+impl MetadataInherit {
+    /// The sentinel key name selecting [`MetadataInherit::All`].
+    pub const ALL: &'static str = "*";
+
+    /// Build from caller-supplied key names. [`Self::ALL`] anywhere in `keys`
+    /// selects [`MetadataInherit::All`].
+    pub fn from_keys<I, S>(keys: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut names = Vec::new();
+        for key in keys {
+            let key = key.as_ref();
+            if key == Self::ALL {
+                return MetadataInherit::All;
+            }
+            names.push(key.to_string());
+        }
+        MetadataInherit::Keys(names)
+    }
+
+    /// Whether `key` survives onto the new revision.
+    pub fn permits(&self, key: &str) -> bool {
+        if RESERVED_STAMP.contains(&key) || RESERVED_ERASE.contains(&key) {
+            return false;
+        }
+        match self {
+            MetadataInherit::All => true,
+            MetadataInherit::Keys(keys) => keys.iter().any(|named| named == key),
+        }
+    }
+
+    /// Whether this carries nothing, the default.
+    pub fn is_empty(&self) -> bool {
+        matches!(self, MetadataInherit::Keys(keys) if keys.is_empty())
+    }
+}
 
 #[error_set]
 pub enum MetadataError {
@@ -243,6 +324,11 @@ impl Default for Metadata {
 }
 
 impl Metadata {
+    /// Size of [`MetadataHeader`] at the start of the buffer.
+    const HEADER_SIZE: usize = std::mem::size_of::<u32>() * 2;
+    /// Size of the [`MetadataItem`] header preceding each entry's bytes.
+    const ITEM_SIZE: usize = std::mem::size_of::<u32>() * 3;
+
     pub fn new() -> Self {
         Self {
             buffer: BytesMut::with_capacity(DEFAULT_METADATA_CAPACITY),
@@ -645,58 +731,87 @@ impl Metadata {
         self.remove(key.as_bytes())
     }
 
-    fn remove(&mut self, key: &[u8]) -> bool {
+    /// Keep the entries `inherit` permits, drop the rest, and answer how many
+    /// were dropped. Dropping none leaves the buffer byte-identical.
+    ///
+    /// Carrying nothing empties the buffer, which serializes to the zero hash a
+    /// revision without metadata holds. A key that is not valid UTF-8 cannot be
+    /// named in an inherit list, so it is never permitted.
+    pub fn retain_inherited(&mut self, inherit: &MetadataInherit) -> usize {
+        let dropped = self
+            .retain_entries(|key| std::str::from_utf8(key).is_ok_and(|key| inherit.permits(key)));
+        if self.buffer.len() == Self::HEADER_SIZE {
+            self.buffer.clear();
+        }
+        dropped
+    }
+
+    /// Move the entries in `[from, to)` down to `write`, answering the cursor
+    /// past them.
+    fn shift_down(&mut self, from: usize, to: usize, write: usize) -> usize {
+        if from == to {
+            return write;
+        }
+        if write != from {
+            self.buffer.copy_within(from..to, write);
+        }
+        write + (to - from)
+    }
+
+    /// Compact the entry chain down to the entries `keep` accepts, answering how
+    /// many were dropped.
+    ///
+    /// Consecutive retained entries move as one block, so a single removal costs
+    /// one copy and keeping or dropping everything costs none. An entry whose
+    /// lengths reach past the buffer ends the walk, as in [`Self::walk`].
+    fn retain_entries(&mut self, mut keep: impl FnMut(&[u8]) -> bool) -> usize {
         if self.is_empty() {
-            return false;
+            return 0;
         }
 
-        let header_size = std::mem::size_of::<u32>() * 2;
-        let item_size = std::mem::size_of::<u32>() * 3;
-
-        let mut offset = header_size;
-        while offset < self.buffer.len() {
-            let buffer = self.buffer.as_mut();
-            let raw_pointer = unsafe { buffer.as_ptr().add(offset).cast::<MetadataItem>() };
-            let item: MetadataItem = unsafe { raw_pointer.read_unaligned() };
-
+        let mut dropped = 0;
+        let mut read = Self::HEADER_SIZE;
+        let mut write = Self::HEADER_SIZE;
+        let mut retained = Self::HEADER_SIZE;
+        while read + Self::ITEM_SIZE <= self.buffer.len() {
+            // SAFETY: the entry header fits, as just checked.
+            let item: MetadataItem = unsafe {
+                self.buffer
+                    .as_ptr()
+                    .add(read)
+                    .cast::<MetadataItem>()
+                    .read_unaligned()
+            };
             let key_length = item.key_length as usize;
-            let value_length = item.value_length as usize;
-            let start_offset = offset;
-            offset += item_size;
-
-            let key_data = unsafe { buffer.as_ptr().add(offset) };
-            let key_slice = unsafe { std::slice::from_raw_parts(key_data, key_length) };
-            offset += key_length;
-
-            if key == key_slice {
-                let block_size = item_size + key_length + value_length;
-                let next_offset = start_offset + block_size;
-                if buffer.len() > next_offset {
-                    unsafe {
-                        std::ptr::copy(
-                            buffer.as_mut_ptr().add(next_offset),
-                            buffer.as_mut_ptr().add(start_offset),
-                            self.buffer.len() - next_offset,
-                        );
-                    }
-                    self.buffer.truncate(self.buffer.len() - block_size);
-                } else {
-                    self.buffer.truncate(start_offset);
-                }
-                return true;
+            let block = Self::ITEM_SIZE + key_length + item.value_length as usize;
+            if read + block > self.buffer.len() {
+                break;
             }
 
-            offset += value_length;
+            let key_at = read + Self::ITEM_SIZE;
+            if keep(&self.buffer[key_at..key_at + key_length]) {
+                read += block;
+            } else {
+                write = self.shift_down(retained, read, write);
+                read += block;
+                retained = read;
+                dropped += 1;
+            }
         }
-        false
+
+        write = self.shift_down(retained, read, write);
+        self.buffer.truncate(write);
+        dropped
+    }
+
+    fn remove(&mut self, key: &[u8]) -> bool {
+        self.retain_entries(|stored| stored != key) > 0
     }
 
     /// How large a buffer holding this pair and nothing else would be: the
     /// buffer's own header, the pair's entry header, and the bytes.
     fn stored_size(key_length: usize, value_length: usize) -> usize {
-        let header_size = std::mem::size_of::<u32>() * 2;
-        let item_size = std::mem::size_of::<u32>() * 3;
-        header_size + item_size + key_length + value_length
+        Self::HEADER_SIZE + Self::ITEM_SIZE + key_length + value_length
     }
 
     /// Whether metadata could ever hold this pair, given [`METADATA_MAX_SIZE`].
@@ -1238,6 +1353,276 @@ mod tests {
         // get() works on raw &[u8] keys, so it should find the value
         let result = metadata.get(b"\xe4\xb8").unwrap();
         assert_eq!(result, b"value");
+    }
+
+    /// Keys and values of differing lengths, empty ones included, so no two
+    /// entries shift by the same offset.
+    const COMPACTION_ENTRIES: [(&str, &[u8]); 5] = [
+        ("first", b"1"),
+        ("k", b""),
+        ("third-key-longer", b"three three three"),
+        ("", b"no-key"),
+        ("fifth", &[0xff, 0x00, 0xfe]),
+    ];
+
+    fn compaction_subject(entries: &[(&str, &[u8])]) -> Metadata {
+        let mut metadata = Metadata::new();
+        for (key, value) in entries {
+            metadata.set_binary(key, value).unwrap();
+        }
+        metadata
+    }
+
+    /// Every subset, compared byte for byte against a buffer written with only
+    /// the retained entries.
+    #[test]
+    fn retain_entries_leaves_what_writing_the_retained_entries_would() {
+        let count = COMPACTION_ENTRIES.len();
+        for mask in 0..(1u32 << count) {
+            let kept: Vec<(&str, &[u8])> = COMPACTION_ENTRIES
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| mask & (1 << index) != 0)
+                .map(|(_, entry)| *entry)
+                .collect();
+
+            let mut subject = compaction_subject(&COMPACTION_ENTRIES);
+            let dropped = subject
+                .retain_entries(|key| kept.iter().any(|(kept_key, _)| kept_key.as_bytes() == key));
+
+            assert_eq!(
+                dropped,
+                count - kept.len(),
+                "mask {mask:#07b} must report every entry it dropped"
+            );
+
+            if kept.is_empty() {
+                assert_eq!(
+                    subject.buffer.len(),
+                    Metadata::HEADER_SIZE,
+                    "mask {mask:#07b} must leave the header and nothing else"
+                );
+            } else {
+                let expected = compaction_subject(&kept);
+                assert_eq!(
+                    subject.buffer.as_ref(),
+                    expected.buffer.as_ref(),
+                    "mask {mask:#07b} must match a buffer written with only those entries"
+                );
+            }
+
+            for (key, value) in &kept {
+                assert_eq!(
+                    subject.get(key.as_bytes()).unwrap(),
+                    *value,
+                    "mask {mask:#07b} must preserve the value of {key}"
+                );
+            }
+            let mut walked = 0;
+            subject.walk(|_, _, _| walked += 1);
+            assert_eq!(walked, kept.len(), "mask {mask:#07b} entry count");
+        }
+    }
+
+    /// Nothing to walk, so nothing to drop and nothing to truncate.
+    #[test]
+    fn retain_entries_on_a_buffer_with_no_entries() {
+        let mut empty = Metadata::new();
+        assert_eq!(empty.retain_entries(|_| false), 0);
+        assert!(empty.is_empty());
+
+        let mut header_only = compaction_subject(&COMPACTION_ENTRIES[..1]);
+        header_only.retain_entries(|_| false);
+        assert_eq!(header_only.buffer.len(), Metadata::HEADER_SIZE);
+        assert_eq!(header_only.retain_entries(|_| true), 0);
+        assert_eq!(header_only.buffer.len(), Metadata::HEADER_SIZE);
+    }
+
+    /// The predicate sees raw key bytes, so a key that is not text is decided on
+    /// like any other rather than ending the walk.
+    #[test]
+    fn retain_entries_judges_a_key_that_is_not_text() {
+        let mut metadata = Metadata::new();
+        metadata
+            .set(b"\xe4\xb8", b"binary key", MetadataType::String)
+            .unwrap();
+        metadata.set_string("text", "kept").unwrap();
+
+        assert_eq!(metadata.retain_entries(|key| key != b"\xe4\xb8"), 1);
+        assert_eq!(metadata.get_string("text").unwrap(), "kept");
+        assert!(metadata.get(b"\xe4\xb8").is_err());
+    }
+
+    /// A length reaching past the buffer ends the walk and the unreadable tail
+    /// is discarded. Only a blob that failed [`Metadata::check_buffer`] gets here.
+    #[test]
+    fn retain_entries_stops_at_an_entry_that_leaves_the_buffer() {
+        let mut metadata = compaction_subject(&COMPACTION_ENTRIES[..2]);
+        let first_block = Metadata::ITEM_SIZE + "first".len() + 1;
+        let forged = Metadata::HEADER_SIZE + first_block + std::mem::size_of::<u32>();
+        metadata.buffer[forged..forged + std::mem::size_of::<u32>()]
+            .copy_from_slice(&u32::MAX.to_ne_bytes());
+
+        assert_eq!(metadata.retain_entries(|_| true), 0);
+        assert_eq!(metadata.get_binary("first").unwrap(), b"1");
+        assert!(metadata.get_binary("k").is_err());
+    }
+
+    /// A compacted buffer is still in the state [`Metadata::set`] appends against.
+    #[test]
+    fn retain_entries_leaves_the_buffer_appendable() {
+        let mut metadata = compaction_subject(&COMPACTION_ENTRIES);
+        metadata.retain_entries(|key| key == b"third-key-longer");
+        metadata.set_string("added", "after").unwrap();
+
+        metadata
+            .check_buffer()
+            .expect("a compacted buffer must still be well formed");
+        assert_eq!(
+            metadata.get_binary("third-key-longer").unwrap(),
+            b"three three three"
+        );
+        assert_eq!(metadata.get_string("added").unwrap(), "after");
+
+        let expected = {
+            let mut expected = Metadata::new();
+            expected
+                .set_binary("third-key-longer", b"three three three")
+                .unwrap();
+            expected.set_string("added", "after").unwrap();
+            expected
+        };
+        assert_eq!(metadata.buffer.as_ref(), expected.buffer.as_ref());
+    }
+
+    /// The reserved sets bound every list, including the sentinel.
+    #[test]
+    fn no_inherit_list_can_carry_a_reserved_key() {
+        let reserved: Vec<&str> = RESERVED_STAMP
+            .iter()
+            .chain(RESERVED_ERASE.iter())
+            .copied()
+            .collect();
+
+        for key in &reserved {
+            for inherit in [
+                MetadataInherit::All,
+                MetadataInherit::from_keys([*key]),
+                MetadataInherit::from_keys([MetadataInherit::ALL]),
+            ] {
+                assert!(
+                    !inherit.permits(key),
+                    "{key} is reserved and must not be inheritable via {inherit:?}"
+                );
+            }
+        }
+    }
+
+    /// Naming a key is what carries it, so the default carries nothing.
+    #[test]
+    fn the_default_inherit_list_carries_nothing() {
+        let inherit = MetadataInherit::default();
+        assert!(inherit.is_empty());
+        for key in [
+            CHANGE_REQUEST,
+            REVIEWED_BY,
+            CREATED_BY,
+            "crowd-status-checks",
+        ] {
+            assert!(!inherit.permits(key), "{key} must not survive by default");
+        }
+    }
+
+    /// Keys lore does not know are governed by the same list as its own.
+    #[test]
+    fn only_the_named_keys_are_carried() {
+        let inherit = MetadataInherit::from_keys([CHANGE_REQUEST, "crowd-status-checks"]);
+
+        assert!(inherit.permits(CHANGE_REQUEST));
+        assert!(inherit.permits("crowd-status-checks"));
+        assert!(!inherit.permits(REVIEWED_BY));
+        assert!(!inherit.permits(CREATED_BY));
+        assert!(!inherit.permits("crowd-review-state"));
+    }
+
+    /// The sentinel selects everything wherever it appears in the list.
+    #[test]
+    fn the_sentinel_selects_all_wherever_it_appears() {
+        for keys in [
+            vec![MetadataInherit::ALL],
+            vec![CHANGE_REQUEST, MetadataInherit::ALL],
+            vec![MetadataInherit::ALL, CHANGE_REQUEST],
+        ] {
+            let inherit = MetadataInherit::from_keys(keys.clone());
+            assert!(
+                matches!(inherit, MetadataInherit::All),
+                "{keys:?} must resolve to All"
+            );
+            assert!(inherit.permits("anything-at-all"));
+            assert!(!inherit.permits(MERGED_BY), "All is still bounded");
+        }
+    }
+
+    /// Only permitted keys survive; the values of those that do are unchanged.
+    #[test]
+    fn retain_inherited_drops_everything_not_named() {
+        let mut metadata = Metadata::new();
+        metadata.set_string(MESSAGE, "source message").unwrap();
+        metadata.set_string(COMMITTED_BY, "source.user").unwrap();
+        metadata.set_string(MERGED_BY, "source.merger").unwrap();
+        metadata.set_string(CHANGE_REQUEST, "CR-1234").unwrap();
+        metadata.set_string(REVIEWED_BY, "source.reviewer").unwrap();
+        metadata.set_string("crowd-status-checks", "green").unwrap();
+        metadata.set_u64(FAST_FORWARD_MERGE, 1).unwrap();
+
+        metadata.retain_inherited(&MetadataInherit::from_keys([CHANGE_REQUEST]));
+
+        assert_eq!(metadata.get_string(CHANGE_REQUEST).unwrap(), "CR-1234");
+        for dropped in [
+            MESSAGE,
+            COMMITTED_BY,
+            MERGED_BY,
+            REVIEWED_BY,
+            "crowd-status-checks",
+            FAST_FORWARD_MERGE,
+        ] {
+            assert!(
+                metadata.get_typed(dropped).is_err(),
+                "{dropped} must not survive an inherit list that does not name it"
+            );
+        }
+    }
+
+    /// Carrying nothing empties the buffer, which is what serializes to the
+    /// zero hash a revision without metadata holds.
+    #[test]
+    fn retain_inherited_can_empty_the_buffer() {
+        let mut metadata = Metadata::new();
+        metadata.set_string(MESSAGE, "source message").unwrap();
+        metadata.set_string(CHANGE_REQUEST, "CR-1234").unwrap();
+
+        metadata.retain_inherited(&MetadataInherit::default());
+
+        assert!(metadata.is_empty(), "carrying nothing must leave nothing");
+    }
+
+    /// A key that is not text cannot be named in an inherit list, so it is
+    /// never permitted, not even by the sentinel.
+    #[test]
+    fn a_key_that_is_not_text_is_never_inherited() {
+        let mut metadata = Metadata::new();
+        metadata
+            .set(b"\xe4\xb8", b"value", MetadataType::String)
+            .unwrap();
+        metadata.set_string(CHANGE_REQUEST, "CR-1234").unwrap();
+
+        metadata.retain_inherited(&MetadataInherit::All);
+
+        assert_eq!(metadata.get_string(CHANGE_REQUEST).unwrap(), "CR-1234");
+        assert!(
+            metadata.get(b"\xe4\xb8").is_err(),
+            "a key that cannot be named cannot be inherited"
+        );
     }
 
     #[test]

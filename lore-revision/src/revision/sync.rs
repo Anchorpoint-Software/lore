@@ -534,6 +534,7 @@ pub async fn sync(
                 message: String::new(),
                 no_commit: false,
                 scope: merge::MergeScope::MainOnly,
+                inherit_metadata: crate::metadata::MetadataInherit::default(),
             };
             let revision_staged = Box::pin(merge::merge_start(
                 repository.clone(),

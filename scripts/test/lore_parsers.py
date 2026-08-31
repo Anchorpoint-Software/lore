@@ -7,7 +7,7 @@ import json
 import logging
 import re
 import typing
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from dataclasses import field as dc_field
 from typing import TYPE_CHECKING
 
@@ -405,6 +405,11 @@ def parse_branch_info(output: str):
     return BranchDescription(**result_values)
 
 
+# Revision metadata keys are open-ended, so a revision may carry keys this
+# harness has no field for. Those are skipped rather than failing the parse.
+_REVISION_INFO_FIELDS = frozenset(f.name for f in fields(RevisionInfo))
+
+
 def parse_revision_list(revision_output: str, oneline: bool) -> list[RevisionInfo]:
     revision_output = revision_output.replace("\\n", "\n")
     revisions = []
@@ -439,7 +444,15 @@ def parse_revision_list(revision_output: str, oneline: bool) -> list[RevisionInf
                     message_lines.append(s)
             if message_lines:
                 record["message"] = "\n".join(message_lines)
-            revisions.append(RevisionInfo(**record))
+            revisions.append(
+                RevisionInfo(
+                    **{
+                        k: v
+                        for k, v in record.items()
+                        if k in _REVISION_INFO_FIELDS
+                    }
+                )
+            )
     revisions.reverse()
     return revisions
 

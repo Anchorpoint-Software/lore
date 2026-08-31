@@ -4125,6 +4125,10 @@ typedef struct lore_branch_merge_into_args_t {
   struct lore_string_t link;
   // Merge only the main repository, skipping all linked repositories
   uint8_t ignore_links;
+  // Metadata keys to carry from the current branch onto the revision
+  // created on the target branch. Empty carries nothing; the single entry
+  // `*` carries every key that is not reserved to the merge itself.
+  struct lore_string_array_t inherit_metadata;
 } lore_branch_merge_into_args_t;
 
 // Arguments for marking conflicted paths as resolved.
@@ -4163,6 +4167,10 @@ typedef struct lore_branch_merge_start_args_t {
   struct lore_string_t link;
   // Merge only the main repository, skipping all linked repositories
   uint8_t ignore_links;
+  // Metadata keys to carry from the source revision onto the merge
+  // revision. Empty carries nothing; the single entry `*` carries every
+  // key that is not reserved to the merge itself.
+  struct lore_string_array_t inherit_metadata;
 } lore_branch_merge_start_args_t;
 
 // Arguments for switching the working directory to a different branch or revision.

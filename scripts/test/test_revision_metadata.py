@@ -193,6 +193,114 @@ def test_revision_metadata_get_across_branches(new_lore_repo):
     )
 
 
+def _metadata_value(output: str) -> str:
+    """The value from a single-key `revision metadata get`, which prints the
+    key's display label ahead of it."""
+    _, _, value = output.partition(":")
+    return value.strip()
+
+
+def _commit_feature_with_metadata(repo: Lore) -> None:
+    """Branch `feature` off main carrying planted provenance on its tip.
+
+    `merged-by` is reserved and `status-checks` is a key lore does not know, so
+    between them they cover both halves of what an inherit list governs.
+    """
+    repo.write_commit_push("Initial commit", {"main.txt": "main\n"})
+    repo.branch_create("feature")
+    with repo.open_file("feature.txt", "w") as f:
+        f.write("feature\n")
+    repo.stage("feature.txt")
+    repo.revision_metadata_set(
+        [
+            "reviewed-by",
+            "source.reviewer@example.com",
+            "merged-by",
+            "source.merger@example.com",
+            "status-checks",
+            "source-checks-payload",
+        ]
+    )
+    repo.commit("Feature work")
+    repo.push()
+
+
+@pytest.mark.smoke
+def test_revision_metadata_not_inherited_by_merge_into(new_lore_repo):
+    """`branch merge into` commits and pushes to the target branch in one call,
+    so an unnamed key must not reach the revision it creates there."""
+    repo: Lore = new_lore_repo()
+
+    _commit_feature_with_metadata(repo)
+    repo.branch_merge_into("main", "Merge feature into main")
+
+    merged = repo.revision_metadata_get(revision="main@LATEST")
+    assert "Merge feature into main" in merged, (
+        f"Expected the merge message on main@LATEST.\nGot:\n{merged}"
+    )
+    for value in (
+        "source.reviewer@example.com",
+        "source.merger@example.com",
+        "source-checks-payload",
+    ):
+        assert value not in merged, (
+            f"'{value}' must not be carried onto the merge revision.\nGot:\n{merged}"
+        )
+
+
+@pytest.mark.smoke
+def test_revision_metadata_inherited_by_merge_when_named(new_lore_repo):
+    """--inherit-metadata carries the keys it names and no others."""
+    repo: Lore = new_lore_repo()
+
+    _commit_feature_with_metadata(repo)
+    repo.branch_switch("main")
+    repo.branch_merge(
+        "feature",
+        inherit_metadata=["reviewed-by"],
+        message="Merge feature into main",
+    )
+
+    reviewed_by = repo.revision_metadata_get("reviewed-by")
+    assert "source.reviewer@example.com" in reviewed_by, (
+        f"A named key must reach the merge revision.\nGot: {reviewed_by}"
+    )
+
+    merged = repo.revision_metadata_get()
+    assert "source-checks-payload" not in merged, (
+        f"An unnamed key must not be carried.\nGot:\n{merged}"
+    )
+
+
+@pytest.mark.smoke
+def test_revision_metadata_inherit_all_excludes_the_merger(new_lore_repo):
+    """The `*` sentinel carries keys lore does not know, but `merged-by` is
+    reserved: the merge revision names whoever ran the merge, which for a
+    client-side merge is the same actor that committed it."""
+    repo: Lore = new_lore_repo()
+
+    _commit_feature_with_metadata(repo)
+    repo.branch_switch("main")
+    repo.branch_merge(
+        "feature", inherit_metadata=["*"], message="Merge feature into main"
+    )
+
+    status_checks = repo.revision_metadata_get("status-checks")
+    assert "source-checks-payload" in status_checks, (
+        f"The sentinel must carry an unknown key.\nGot: {status_checks}"
+    )
+
+    merged_by = _metadata_value(repo.revision_metadata_get("merged-by"))
+    committed_by = _metadata_value(repo.revision_metadata_get("committed-by"))
+    assert "source.merger@example.com" not in merged_by, (
+        f"The sentinel must not carry the source revision's merger.\nGot: {merged_by}"
+    )
+    assert merged_by and merged_by == committed_by, (
+        f"A client-side merge records its operator as merger.\n"
+        f"merged-by: {merged_by}\ncommitted-by: {committed_by}"
+    )
+
+
 @pytest.mark.smoke
 def test_revision_metadata_set_single_arg_rejected(new_lore_repo):
     """A lone argument has no value; the set must be rejected, not panic."""

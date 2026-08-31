@@ -480,7 +480,7 @@ mod tests {
                         .with_write_token(fixture.write_token.share()),
                 );
 
-                let merged_rev = lore_revision::branch::merge::merge_start(
+                let merged_rev = Box::pin(lore_revision::branch::merge::merge_start(
                     view_repo.clone(),
                     &fixture.write_token,
                     main_branch,
@@ -488,8 +488,9 @@ mod tests {
                         message: "merge main into feature (sparse view)".to_string(),
                         no_commit: false,
                         scope: lore_revision::branch::merge::MergeScope::MainOnly,
+                        inherit_metadata: Default::default(),
                     },
-                )
+                ))
                 .await
                 .expect("merge_start failed");
 
@@ -583,7 +584,7 @@ mod tests {
         main_branch: BranchId,
         message: &str,
     ) -> Hash {
-        lore_revision::branch::merge::merge_start(
+        Box::pin(lore_revision::branch::merge::merge_start(
             view_repo.clone(),
             &fixture.write_token,
             main_branch,
@@ -591,8 +592,9 @@ mod tests {
                 message: message.to_string(),
                 no_commit: false,
                 scope: lore_revision::branch::merge::MergeScope::MainOnly,
+                inherit_metadata: Default::default(),
             },
-        )
+        ))
         .await
         .expect("merge_start failed")
     }
@@ -672,8 +674,13 @@ mod tests {
                 fixture.write_file("game/a.txt", b"feature change\n");
 
                 let view_repo = engine_excluded_context(&fixture);
-                let merged_rev =
-                    merge_main_under_view(&view_repo, &fixture, main_branch, "merge main").await;
+                let merged_rev = Box::pin(merge_main_under_view(
+                    &view_repo,
+                    &fixture,
+                    main_branch,
+                    "merge main",
+                ))
+                .await;
 
                 // Every path under engine/ must now agree with main. A missed
                 // create or discard shows up here as a divergent path.
@@ -731,12 +738,12 @@ mod tests {
                 //    what must stop the later merge from adopting it.
                 fixture.switch_to(main_branch, base_revision).await;
                 let feature_branch = fixture.create_branch("feature").await;
-                let feature_rev = merge_main_under_view(
+                let feature_rev = Box::pin(merge_main_under_view(
                     &fixture.repository,
                     &fixture,
                     other_branch,
                     "merge other",
-                )
+                ))
                 .await;
 
                 // 4. main advances a different out-of-view path.
@@ -748,8 +755,13 @@ mod tests {
                 // 5. feature merges main under a view that excludes engine/.
                 fixture.switch_to(feature_branch, feature_rev).await;
                 let view_repo = engine_excluded_context(&fixture);
-                let merged_rev =
-                    merge_main_under_view(&view_repo, &fixture, main_branch, "merge main").await;
+                let merged_rev = Box::pin(merge_main_under_view(
+                    &view_repo,
+                    &fixture,
+                    main_branch,
+                    "merge main",
+                ))
+                .await;
 
                 let divergent = paths_divergent_from_main(
                     &fixture,
@@ -839,7 +851,13 @@ mod tests {
                         .with_write_token(fixture.write_token.share()),
                 );
 
-                merge_main_under_view(&view_repo, &fixture, main_branch, "merge main").await;
+                Box::pin(merge_main_under_view(
+                    &view_repo,
+                    &fixture,
+                    main_branch,
+                    "merge main",
+                ))
+                .await;
 
                 let destination = fixture.repo_path.join("shown.txt");
                 assert!(
@@ -1214,7 +1232,7 @@ mod tests {
                 // Step 4: merge target into source. Source has not
                 // touched shared.txt yet, so the merge resolves
                 // cleanly and auto-commits.
-                let merge_revision = lore_revision::branch::merge::merge_start(
+                let merge_revision = Box::pin(lore_revision::branch::merge::merge_start(
                     fixture.repository.clone(),
                     &fixture.write_token,
                     target_branch,
@@ -1222,8 +1240,9 @@ mod tests {
                         message: "merge target into source".to_string(),
                         no_commit: false,
                         scope: lore_revision::branch::merge::MergeScope::MainOnly,
+                        inherit_metadata: Default::default(),
                     },
-                )
+                ))
                 .await
                 .expect("merge_start failed");
                 assert_ne!(

@@ -305,6 +305,12 @@ pub struct RevisionCherryPickArgs {
     /// Disable auto commits even if no conflicts arise from the cherry-pick.
     #[clap(long, action)]
     no_commit: bool,
+
+    /// Carry this metadata key from the picked revision onto the revision this
+    /// creates. Repeatable. Pass `*` to carry every key that is not reserved
+    /// to the cherry-pick itself. Carries nothing when not given.
+    #[clap(long = "inherit-metadata", value_name = "KEY")]
+    inherit_metadata: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -1696,6 +1702,9 @@ pub fn handle_revision_cherry_pick(globals: LoreGlobalArgs, args: &RevisionCherr
             revision: LoreString::from(&args.revision),
             message: LoreString::from(&args.message),
             no_commit: args.no_commit as u8,
+            inherit_metadata: LoreArray::from_vec(util::convert_to_lore_string_vec(
+                &args.inherit_metadata,
+            )),
         };
 
         let debug = progress_debug();

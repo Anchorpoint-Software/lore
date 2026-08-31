@@ -211,6 +211,7 @@ pub async fn revert(
         MergeType::Revert,
         false,
         current_branch,
+        &crate::metadata::MetadataInherit::default(),
     )
     .await?;
 

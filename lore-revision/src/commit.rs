@@ -3545,9 +3545,11 @@ pub async fn prepare_commit_metadata(
             return Err(MissingIdentity.into());
         }
     } else {
-        metadata
-            .set_string(metadata::CREATED_BY, &commit_user)
-            .forward::<CommitError>("Failed setting revision metadata")?;
+        if string_key_is_unset(&metadata, metadata::CREATED_BY) {
+            metadata
+                .set_string(metadata::CREATED_BY, &commit_user)
+                .forward::<CommitError>("Failed setting revision metadata")?;
+        }
         metadata
             .set_string(metadata::COMMITTED_BY, &commit_user)
             .forward::<CommitError>("Failed setting revision metadata")?;
