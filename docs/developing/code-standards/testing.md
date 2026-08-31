@@ -79,6 +79,7 @@ async fn test_with_isolated_state() {
 
 - `lore-revision/tests/helper.rs` — `test_store_create()`, `setup_test_execution()`.
 - `lore-revision/tests/` — Cross-module integration tests.
+- `lore-integration-tests/` — Tests against real infrastructure, without mocking
 
 ---
 
