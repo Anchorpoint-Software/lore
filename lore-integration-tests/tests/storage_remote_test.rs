@@ -328,7 +328,7 @@ mod storage_remote_tests {
                     None,
                     None,
                     Duration::from_secs(30),
-                    None,
+                    Default::default(),
                     Default::default(),
                     None,
                 )

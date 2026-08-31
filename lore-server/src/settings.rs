@@ -334,7 +334,10 @@ pub struct QuicSettings {
 pub struct ServerSettings {
     pub auth: Option<AuthSettings>,
     pub grpc: Option<GrpcSettings>,
-    pub grpc_public_services: Option<GrpcPublicServicesSettings>,
+    /// One block per public gRPC service; an absent table enables every
+    /// service.
+    #[serde(default)]
+    pub grpc_public_services: GrpcPublicServicesSettings,
     pub grpc_internal: Option<GrpcSettings>,
     pub http: Option<HttpSettings>,
     // the public facing QUIC server settings
@@ -655,6 +658,227 @@ mod tests {
             topology.provider,
             crate::topology::TopologyProvider::Consul
         ));
+    }
+
+    #[test]
+    fn a_disabled_service_is_parsed() {
+        let config = r#"
+            [server]
+            runtime_shutdown_timeout_seconds = 0
+
+            [server.grpc_public_services.storage_service]
+            enabled = false
+
+            [server.grpc_public_services.lock_service]
+            enabled = false
+
+            [immutable_store]
+            mode = "local"
+
+            [mutable_store]
+            mode = "local"
+        "#;
+
+        let settings: Settings = toml::from_str(config).expect("settings deserialize");
+        let services = &settings.server.grpc_public_services;
+
+        assert!(!services.storage_service.enabled);
+        assert!(!services.lock_service.enabled);
+        assert!(services.thin_client_service.enabled);
+        assert!(services.admin_service.enabled);
+    }
+
+    /// An absent table means every service registers.
+    #[test]
+    fn an_absent_table_registers_every_service() {
+        let config = r#"
+            [server]
+            runtime_shutdown_timeout_seconds = 0
+
+            [immutable_store]
+            mode = "local"
+
+            [mutable_store]
+            mode = "local"
+        "#;
+
+        let settings: Settings = toml::from_str(config).expect("settings deserialize");
+        let services = &settings.server.grpc_public_services;
+
+        assert!(services.admin_service.enabled);
+        assert!(services.storage_service.enabled);
+        assert!(services.lock_service.enabled);
+        assert!(services.notification_service.enabled);
+    }
+
+    /// `general` nests under the service block.
+    #[test]
+    fn general_settings_parse_under_the_service_block() {
+        let config = r#"
+            [server]
+            runtime_shutdown_timeout_seconds = 0
+
+            [server.grpc_public_services.lock_service.general]
+            max_encoding_message_size = 16777216
+
+            [immutable_store]
+            mode = "local"
+
+            [mutable_store]
+            mode = "local"
+        "#;
+
+        let settings: Settings = toml::from_str(config).expect("settings deserialize");
+
+        assert_eq!(
+            settings
+                .server
+                .grpc_public_services
+                .lock_service
+                .general
+                .max_encoding_message_size,
+            Some(16_777_216)
+        );
+        assert!(
+            settings.server.grpc_public_services.lock_service.enabled,
+            "a block carrying only `general` must stay enabled"
+        );
+    }
+
+    /// `mode = "none"` is how a layered config opts out of the `[lock_store]`
+    /// table that `default.toml` sets.
+    #[test]
+    fn a_lock_store_mode_of_none_parses() {
+        let config = r#"
+            [server]
+            runtime_shutdown_timeout_seconds = 0
+
+            [lock_store]
+            mode = "none"
+
+            [immutable_store]
+            mode = "local"
+
+            [mutable_store]
+            mode = "local"
+        "#;
+
+        let settings: Settings = toml::from_str(config).expect("settings deserialize");
+
+        assert_eq!(
+            settings.lock_store.expect("lock_store present").mode,
+            "none"
+        );
+    }
+
+    /// Unknown keys are ignored, so a misspelled disable leaves the service
+    /// registered.
+    #[test]
+    fn a_misspelled_disable_leaves_the_service_registered() {
+        let config = r#"
+            [server]
+            runtime_shutdown_timeout_seconds = 0
+
+            [server.grpc_public_services.thin_cleint_service]
+            enabled = false
+
+            [server.grpc_public_services.storage_service]
+            enabld = false
+
+            [immutable_store]
+            mode = "local"
+
+            [mutable_store]
+            mode = "local"
+        "#;
+
+        let settings: Settings = toml::from_str(config).expect("settings deserialize");
+        let services = &settings.server.grpc_public_services;
+
+        assert!(services.thin_client_service.enabled);
+        assert!(services.storage_service.enabled);
+    }
+
+    /// The pre-`general` spelling of `max_encoding_message_size` deserializes
+    /// but is silently dropped.
+    #[test]
+    fn the_pre_general_spelling_of_max_encoding_message_size_is_dropped() {
+        let config = r#"
+            [server]
+            runtime_shutdown_timeout_seconds = 0
+
+            [server.grpc_public_services.lock_service]
+            max_encoding_message_size = 16777216
+
+            [immutable_store]
+            mode = "local"
+
+            [mutable_store]
+            mode = "local"
+        "#;
+
+        let settings: Settings = toml::from_str(config).expect("settings deserialize");
+
+        assert_eq!(
+            settings
+                .server
+                .grpc_public_services
+                .lock_service
+                .general
+                .max_encoding_message_size,
+            None
+        );
+    }
+
+    /// A configuration disabling every public gRPC service loads.
+    #[test]
+    fn disabling_every_service_still_loads() {
+        let config = r#"
+            [server]
+            runtime_shutdown_timeout_seconds = 0
+
+            [server.grpc_public_services.admin_service]
+            enabled = false
+
+            [server.grpc_public_services.storage_service]
+            enabled = false
+
+            [server.grpc_public_services.revision_service]
+            enabled = false
+
+            [server.grpc_public_services.repository_service]
+            enabled = false
+
+            [server.grpc_public_services.environment_service]
+            enabled = false
+
+            [server.grpc_public_services.thin_client_service]
+            enabled = false
+
+            [server.grpc_public_services.lock_service]
+            enabled = false
+
+            [server.grpc_public_services.notification_service]
+            enabled = false
+
+            [immutable_store]
+            mode = "local"
+
+            [mutable_store]
+            mode = "local"
+        "#;
+
+        let settings: Settings = toml::from_str(config).expect("settings deserialize");
+        let services = &settings.server.grpc_public_services;
+
+        assert!(!services.admin_service.enabled);
+        assert!(!services.storage_service.enabled);
+        assert!(!services.revision_service.enabled);
+        assert!(!services.repository_service.enabled);
+        assert!(!services.environment_service.enabled);
+        assert!(!services.thin_client_service.enabled);
+        assert!(!services.lock_service.enabled);
+        assert!(!services.notification_service.enabled);
     }
 
     #[test]

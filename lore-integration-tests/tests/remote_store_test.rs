@@ -107,7 +107,7 @@ mod remote_store_tests {
                     None,
                     None,
                     Duration::from_secs(30),
-                    None,
+                    Default::default(),
                     Default::default(),
                     None,
                 )

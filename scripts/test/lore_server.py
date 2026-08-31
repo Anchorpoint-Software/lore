@@ -410,12 +410,19 @@ def launch_lore_server(server_root, server_env, executable_path):
         **platform_kwargs,
     )
 
-    # Wait for the server to be ready via health check instead of a blind sleep
     quic_port = server_env["LORE__SERVER__QUIC__PORT"]
     grpc_port = server_env["LORE__SERVER__GRPC__PORT"]
+    http_enabled = (
+        server_env.get("LORE__SERVER__HTTP__ENABLED", "true").lower() != "false"
+    )
+    quic_enabled = (
+        server_env.get("LORE__SERVER__QUIC__ENABLED", "true").lower() != "false"
+    )
     try:
-        _wait_for_health_check("127.0.0.1", http_port)
-        _wait_for_quic_port("127.0.0.1", quic_port)
+        if http_enabled:
+            _wait_for_health_check("127.0.0.1", http_port)
+        if quic_enabled:
+            _wait_for_quic_port("127.0.0.1", quic_port)
         _wait_for_grpc_port("127.0.0.1", grpc_port)
     except ServerException:
         if server_proc.returncode is not None:

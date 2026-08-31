@@ -45,6 +45,7 @@ pub use repository::LoreRepositoryV1Service;
 pub use revision::LoreRevisionV1Service;
 pub use revision_service::LoreRevisionService;
 pub use server::GrpcServerBuilder;
+pub use server::GrpcServiceSettings;
 pub use storage_service::LoreStorageService;
 pub use thinclient::LoreThinClientV1Service;
 use tokio::sync::mpsc::Sender;

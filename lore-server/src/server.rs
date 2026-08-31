@@ -125,6 +125,8 @@ mod store_mode {
     pub const REMOTE: &str = "remote";
     pub const COMPOSITE: &str = "composite";
     pub const REPLICATED: &str = "replicated";
+    /// Build no store. `[lock_store]` only.
+    pub const NONE: &str = "none";
 }
 
 /// Command-line options for the Lore server binary.
@@ -452,11 +454,13 @@ async fn launch_grpc_server(
     let addr =
         SocketAddr::from_str(format!("{}:{}", grpc_settings.host, grpc_settings.port).as_str())?;
 
+    let locks = lock_store.is_some() && service_settings.lock_service.enabled;
+
     info!(
         "Starting Lore GRPC Server: {}, Auth: {} Locks: {}",
         &addr,
         jwt_verifier.as_ref().map_or("disabled", |_| "enabled"),
-        lock_store.as_ref().map_or("disabled", |_| "enabled"),
+        if locks { "enabled" } else { "disabled" },
     );
 
     // The settings map has no relevant entries to surface yet, so it stays empty.
@@ -958,6 +962,12 @@ fn configure_lock_store_via_plugin(
 ) -> Result<Option<Arc<dyn LockStore>>> {
     if let Some(lock_settings) = &settings.lock_store {
         let mode = &lock_settings.mode;
+
+        // The only way to opt out of a store `default.toml` sets.
+        if mode == store_mode::NONE {
+            info!("No lock store configured, LockService will not register");
+            return Ok(None);
+        }
 
         if mode == store_mode::LOCAL {
             info!("Creating local (in-memory) lock store");
@@ -1816,15 +1826,15 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
         None => None,
     };
 
-    let forwarded_requests: Option<Arc<dyn ForwardedRequests>> = if let Some(grpc_public_services) =
-        &settings.server.grpc_public_services
-        && let Some(forwarded_requests_settings) = &grpc_public_services.forwarded_requests
-    {
-        let factory = GrpcForwardedRequests::new(forwarded_requests_settings).await?;
-        Some(Arc::new(factory))
-    } else {
-        None
-    };
+    let forwarded_requests: Option<Arc<dyn ForwardedRequests>> =
+        if let Some(forwarded_requests_settings) =
+            &settings.server.grpc_public_services.forwarded_requests
+        {
+            let factory = GrpcForwardedRequests::new(forwarded_requests_settings).await?;
+            Some(Arc::new(factory))
+        } else {
+            None
+        };
 
     let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
     let mut endpoints = JoinSet::new();

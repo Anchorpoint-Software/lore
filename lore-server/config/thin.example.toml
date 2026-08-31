@@ -1,0 +1,124 @@
+# =============================================================================
+# Lore Server: Thin Client Deployment
+# =============================================================================
+# This read-only example mounts only
+# `lore.thin_client.v1.ThinClientService`. It keeps no fragment cache and reads
+# everything from a separate full server.
+#
+# To run it, copy this file into a directory of its own as `default.toml` and
+# point `LORE_CONFIG_PATH` (or `--config`) at that directory:
+#
+#     mkdir -p /etc/lore/thin && cp thin.example.toml /etc/lore/thin/default.toml
+#     loreserver --config /etc/lore/thin
+#
+# Copy it rather than loading it in place: this directory's `local.toml`
+# layers after `<env>.toml` and would reset the store modes below to "local".
+#
+# Addresses below assume a full server on the same host; change them for a
+# real deployment.
+
+# =============================================================================
+# Services
+# =============================================================================
+# Every service block defaults to `enabled = true`, so this section works by
+# exclusion. Disabled paths answer UNIMPLEMENTED. Listing every service,
+# including `thin_client_service`, makes the intended surface explicit.
+#
+# A service added to the router later mounts here without an edit. Check the
+# `Registered public gRPC services` startup line after an upgrade.
+
+# This deployment serves only these four read RPCs. The remote store modes below
+# keep no local repository copy.
+[server.grpc_public_services.thin_client_service]
+enabled = true
+
+[server.grpc_public_services.admin_service]
+enabled = false
+
+[server.grpc_public_services.storage_service]
+enabled = false
+
+[server.grpc_public_services.revision_service]
+enabled = false
+
+[server.grpc_public_services.repository_service]
+enabled = false
+
+[server.grpc_public_services.environment_service]
+enabled = false
+
+[server.grpc_public_services.lock_service]
+enabled = false
+
+[server.grpc_public_services.notification_service]
+enabled = false
+
+[server.quic]
+enabled = false
+
+# Ports differ from default.toml so this can run beside a full server.
+[server.grpc]
+port = 41347
+
+# The HTTP listener exposes repository-content writes. Disable it for read-only
+# deployments, then probe gRPC readiness or provide an external health endpoint.
+[server.http]
+enabled = false
+port = 41349
+
+[server.quic_internal]
+enabled = false
+
+[server.grpc_internal]
+enabled = false
+
+# =============================================================================
+# Stores
+# =============================================================================
+# Both stores point at the full server. Neither is local: this deployment
+# keeps no copy of the repository.
+
+[immutable_store]
+mode = "replicated"
+
+[immutable_store.replicated]
+# The full server's `[server.quic_internal]` listener, which serves the
+# replication store protocol.
+remote_url = "lore://127.0.0.1:41340"
+periodic_client_refresh_secs = 300
+client_message_limit = 100
+
+# Required because these retry settings have no defaults.
+[immutable_store.replicated.regenerate_retry]
+initial_backoff_ms = 250
+max_backoff_ms = 10_000
+max_attempts = 5
+
+[mutable_store]
+mode = "remote"
+
+[mutable_store.remote]
+remote_url = "lore://127.0.0.1:41337"
+
+# `lock_service` is disabled above, so build no lock store either. `default.toml`
+# sets this to "local", and a layered config cannot remove that key.
+[lock_store]
+mode = "none"
+
+# Server initialization still requires a notification sender. Disabling
+# `notification_service` removes only its public RPC.
+
+# =============================================================================
+# Runtime and request bounds
+# =============================================================================
+# Overrides the server's one-net-thread-per-processor default. On a large node
+# that default reserves dozens of thread stacks for a process serving four
+# read-only RPCs.
+[tokio]
+worker_threads = 4
+net_threads = 2
+max_blocking_threads = 4
+
+[feature]
+revision_diff_source_cap = 20_000
+revision_diff_history_walk_concurrency = 8

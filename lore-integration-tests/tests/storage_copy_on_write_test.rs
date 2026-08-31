@@ -332,7 +332,7 @@ mod storage_copy_on_write_tests {
                     None,
                     None,
                     Duration::from_secs(30),
-                    None,
+                    Default::default(),
                     Default::default(),
                     None,
                 )

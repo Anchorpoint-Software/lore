@@ -177,7 +177,11 @@ Each entry must be a bare `type/subtype` drawn from the RFC 9110 token character
 
 ### gRPC endpoints
 
-`[server.grpc]` is the public gRPC API (HTTP/2 over TCP) serving the admin, storage, revision, repository, environment, lock, and notification services. It runs whenever the server is in normal (non-maintenance) mode. `[server.grpc_internal]` is the opt-in server-to-server gRPC internal endpoint; it is disabled by default and requires mutual TLS. Both tables share the same field set.
+`[server.grpc]` is the public gRPC API over HTTP/2 and TCP. It serves the admin,
+storage, revision, repository, environment, thin-client, lock, and notification
+services in normal mode. `[server.grpc_internal]` is the opt-in server-to-server
+endpoint. It is disabled by default and requires mutual TLS. Both tables share
+the same fields.
 
 > [!NOTE]
 > `[server.grpc]`'s default port `41337` is the same number as `[server.quic]`, but the two do not conflict: gRPC listens on TCP and QUIC on UDP.
@@ -198,13 +202,102 @@ Each entry must be a bare `type/subtype` drawn from the RFC 9110 token character
 | `enabled` | `false` | Whether to start the replication endpoint. Set `true` to opt in. |
 | `verify_client_certs` | `true` | Require client certificates (mutual TLS). The endpoint refuses to start unless this is `true` with a full certificate triple (`cert_file` + `pkey_file` + `cert_chain`), or explicitly set to `false` to accept unverified clients. |
 
-### gRPC public-service tuning
+### gRPC public services
 
-`[server.grpc_public_services]` applies per-service tuning to the public gRPC endpoint. Only the lock service is currently configurable.
+`[server.grpc_public_services]` holds one block per service the public gRPC endpoint can register, plus `forwarded_requests`.
+
+Every service block accepts `enabled` and a `general` namespace. A block may
+also define service-specific fields. A `general` field affects only the
+services named in its description:
 
 | Field | Default | Description |
 | --- | --- | --- |
-| `lock_service.max_encoding_message_size` | `16777216` (16 MiB) | Maximum encoded gRPC response size, in bytes, for the lock service. When unset, the gRPC framework default applies. |
+| `enabled` | `true` | Whether the public router registers this service. Set `false` and every RPC on it answers `UNIMPLEMENTED`. |
+| `general.max_encoding_message_size` | unset | Maximum encoded gRPC response size in bytes. When unset, the gRPC framework default applies. Honored by `lock_service`. |
+
+Use `lock_service.general.max_encoding_message_size` instead of
+`lock_service.max_encoding_message_size`, which current servers ignore. During
+a mixed-version rollout, set both paths. Legacy servers read the direct key;
+current servers read the key beneath `general`. Remove the direct key after all
+servers are upgraded.
+
+#### Selecting services
+
+An absent block means enabled. A present block without `enabled` also means
+enabled. Restrict a deployment by disabling every service it must not serve:
+
+| Block | Registers |
+| --- | --- |
+| `admin_service` | `urc.rpc.AdminService` (`ServerInfo`, `Obliterate`) |
+| `storage_service` | `urc.rpc.StorageService` and `lore.storage.v1.StorageService` |
+| `revision_service` | `urc.rpc.RevisionService` and `lore.revision.v1.RevisionService` |
+| `repository_service` | `urc.rpc.RepositoryService` and `lore.repository.v1.RepositoryService` |
+| `environment_service` | `urc.rpc.EnvironmentService` and `lore.environment.v1.EnvironmentService` |
+| `thin_client_service` | `lore.thin_client.v1.ThinClientService`. Every RPC it serves is a read. |
+| `lock_service` | `urc.lock.LockService`. Also requires `[lock_store]` at a mode other than `none`. |
+| `notification_service` | `lore.notification.NotificationService`. Registers for local notification mode, the default when `[notification]` is absent. Notification plugins provide a sender but do not register this public service. |
+
+One block gates a whole proto family. The legacy `urc.rpc` services are not
+read-only shadows of their `v1` twins. They carry `BranchPush`,
+`RepositoryCreate`, and `RepositoryDelete`.
+
+Each flag is a scalar, so it is also settable from the environment:
+
+```shell
+LORE__SERVER__GRPC_PUBLIC_SERVICES__STORAGE_SERVICE__ENABLED=false
+```
+
+Disabling every service is legal. The process starts, and the public gRPC
+listener answers every RPC with `UNIMPLEMENTED`. The same result occurs when
+only `lock_service` is enabled without a store, or only `notification_service`
+is enabled with a notification plugin. An empty effective set logs a warning:
+`No public gRPC services registered; every RPC on this listener will answer
+UNIMPLEMENTED`.
+
+Unknown keys are ignored, as elsewhere in the settings. A misspelled block or
+key therefore leaves the service registered. Verify the effective set in the
+startup log.
+
+The startup message `Registered public gRPC services` lists the services that
+the router registered. Its `authenticated` field reports whether `[server.auth]`
+is active. The effective set can differ from the configured set because
+`lock_service` requires a store and `notification_service` requires local mode.
+
+For example, a read-only thin-client deployment disables every other service:
+
+```toml
+# Enabled by default; written out so the file states what the process serves.
+[server.grpc_public_services.thin_client_service]
+enabled = true
+
+[server.grpc_public_services.admin_service]
+enabled = false
+
+[server.grpc_public_services.storage_service]
+enabled = false
+
+# ... revision_service, repository_service, environment_service,
+#     lock_service, notification_service
+```
+
+`lore-server/config/thin.example.toml` is a complete example. It contains the
+exclusions above, disables the QUIC and HTTP listeners, and points both stores
+at a separate full server so the process keeps no repository copy. Copy it to a
+separate directory as `default.toml`, then point `LORE_CONFIG_PATH` at that
+directory. The server does not load the example in place.
+
+> [!IMPORTANT]
+> These flags govern only the gRPC router. The separate QUIC and HTTP listeners
+> accept writes, so a read-only process must also set
+> `server.quic.enabled = false` and `server.http.enabled = false`. Disabling HTTP
+> also removes `/health_check`. Use a gRPC readiness probe or an external
+> health-only endpoint.
+>
+> These flags reduce exposure, not memory. The stores are unaffected.
+>
+> A service added in a later release defaults to enabled. It therefore mounts on
+> a restricted deployment without an edit. Check the `Registered public gRPC
+> services` line after an upgrade.
 
 ### Authentication
 
@@ -239,7 +332,9 @@ Lore Server keeps three stores: an immutable store for content-addressed fragmen
 | --- | --- | --- |
 | `[immutable_store]` | `local` | `local`, `composite`, `replicated`, `remote`, or a plugin name such as `aws`. |
 | `[mutable_store]` | `local` | `local`, `remote`, or a plugin name such as `aws`. |
-| `[lock_store]` | `local` | `local`, or a plugin name such as `aws` (DynamoDB). |
+| `[lock_store]` | `local` | `local`, `none`, or a plugin name such as `aws` (DynamoDB). |
+
+`lock_store.mode = "none"` builds no lock store, so `LockService` does not register. The mode exists because `default.toml` sets `[lock_store]` and a layered configuration cannot remove a key a lower layer supplied.
 
 Each mode reads its settings from a matching sub-table. The `local` mode uses `[immutable_store.local]`, `[mutable_store.local]`, and the in-memory local lock store. Plugin modes such as `aws` read from `[plugins.<name>]` (see [Plugin backends](#plugin-backends)).
 
@@ -340,7 +435,7 @@ Five kinds of backend can be supplied by a plugin, each chosen by a different fi
 | --- | --- | --- |
 | Immutable store | `immutable_store.mode` | `local`, `composite`, `replicated`, `remote` |
 | Mutable store | `mutable_store.mode` | `local`, `remote` |
-| Lock store | `lock_store.mode` | `local` |
+| Lock store | `lock_store.mode` | `local`, `none` |
 | Topology | `topology.provider` | `none`, `fixed`, `rotating_id_fixed`, `composite` |
 | Notification | `notification.mode` | `local` |
 
