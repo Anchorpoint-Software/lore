@@ -101,6 +101,30 @@ mod tests {
             .await;
     }
 
+    // Exercises the branch@LATEST arm: with a latest on neither side the miss
+    // surfaces as RevisionNotFound. The fixture carries no remote, so this says
+    // nothing about search-location handling — see
+    // scripts/test/test_local_reads_skip_connect.py for that.
+    #[tokio::test]
+    async fn resolve_latest_local_only_returns_revision_not_found_without_remote() {
+        let execution = setup_test_execution();
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let repository = make_repo_context().await;
+                let signature = format!("{}@LATEST", uuid::Uuid::now_v7());
+                let err =
+                    revision::resolve(repository, signature, None, ResolveSearchLocation::Local)
+                        .await
+                        .expect_err("resolve should fail for unknown branch latest");
+                assert!(
+                    err.is_revision_not_found(),
+                    "expected RevisionNotFound, got {err:?}"
+                );
+                assert!(!err.is_internal());
+            })
+            .await;
+    }
+
     #[tokio::test]
     async fn test_diff3() {
         let (_immutable_store, _mutable_store, execution) =

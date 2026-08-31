@@ -1240,9 +1240,7 @@ pub async fn resolve(
             branch_status.id
         };
 
-        let remote_latest = if let Ok(remote) = repository.remote().await
-            && should_search_remote
-        {
+        let remote_latest = if should_search_remote && let Ok(remote) = repository.remote().await {
             branch::load_remote_latest(remote.clone(), repository.id, branch)
                 .await
                 .ok()
@@ -1373,8 +1371,14 @@ pub async fn resolve(
             .send();
         }
 
-        if let Ok(found_revision) =
-            find::revision_by_string(repository.clone(), branch, signature, search_limit).await
+        if let Ok(found_revision) = find::revision_by_string(
+            repository.clone(),
+            branch,
+            signature,
+            search_limit,
+            should_search_remote,
+        )
+        .await
         {
             revision = found_revision;
             lore_debug!("Resolved partial match revision {revision}");
