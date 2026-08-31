@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::anyhow;
+use lore_transport::quic::client::STREAM_COUNT;
 use lore_transport::tls;
 use rustls::server::NoClientAuth;
 use rustls::server::danger::ClientCertVerifier;
@@ -84,7 +85,6 @@ pub struct QuinnConfigBuilder {
 
 const DEFAULT_IDLE_TIMEOUT_MILLIS: u64 = 30_000;
 const DEFAULT_KEEP_ALIVE_MILLS: u64 = 500;
-const DEFAULT_BIDI_STREAMS: u64 = 8;
 const DEFAULT_LISTENERS_COUNT: u8 = 10;
 const DEFAULT_METRICS_FREQUENCY: Duration = Duration::from_millis(60_000);
 const DEFAULT_TRANSPORT_BITS_PER_SECOND: usize = 1_073_741_824; // 1gbit/s
@@ -220,7 +220,7 @@ impl QuinnConfigBuilder {
             keep_alive: self
                 .keep_alive
                 .unwrap_or(Duration::from_millis(DEFAULT_KEEP_ALIVE_MILLS)),
-            max_bidi_streams: self.max_bidi_streams.unwrap_or(DEFAULT_BIDI_STREAMS),
+            max_bidi_streams: self.max_bidi_streams.unwrap_or(STREAM_COUNT as u64),
             num_listeners: self.num_listeners.unwrap_or(DEFAULT_LISTENERS_COUNT),
             metrics_frequency: self.metrics_frequency.unwrap_or(DEFAULT_METRICS_FREQUENCY),
             transport_bits_per_second: self

@@ -8,11 +8,13 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 ### Breaking changes
 
 - C API: `LoreGlobalArgs.no_atime` is removed. Nothing set it and nothing read it — the accessor it gated was never wired to the store settings, so the flag named a behavior that did not exist. Rebuild against the new `lore.h`; a caller that zero-initializes the struct needs no other change
+- `lore-server`: `connection_message_limit` under `[server.quic]` / `[server.quic_internal]` is renamed `stream_message_limit` and applies per stream rather than per connection, so with `max_bidi_streams = 8` a value of 500 allows 4000 requests in flight per connection instead of 500
 
 ### Features
 
 - `lore commit --stats` / `lore push --stats` report what the operation cost: files by the action each was staged with, and fragments by what became of them — already stored, compressed, written to the local store, duplicated as an association by the peer or uploaded. Reported once when the operation finishes, on the path that fails as on the one that succeeds, through the `RevisionCommitStats` and `BranchPushStats` events; `--stats=2` adds the per-fragment `FragmentWrite` stream. `--event-interval <milliseconds>` paces the progress events
 - `lore-storage`: the local store records when an entry was last read, so eviction and compaction rank by what commands actually read rather than by when content was written. An entry is serialized inside its whole bucket, so the read stamp marks a bucket for rewrite only once the time it holds moves by an hour or more: a burst of reads costs at most one index write per bucket instead of one per read, a smaller move rides to disk with whatever writes the bucket next, and marking never schedules a flush of its own
+- `lore-server`: request admission is per QUIC stream rather than per connection, so a saturated stream no longer stalls the others, and a connection-wide ceiling sheds immediately once requests in handling — including those waiting for a stream permit — reach `connection_inflight_limit`. The wait for a permit is bounded by `permit_timeout_ms` (default 100ms) rather than by the request deadline, and the two refusal paths report separate `AdmissionLimit` and `PermitTimeout` metric labels
 
 ### Fixes & Improvements
 

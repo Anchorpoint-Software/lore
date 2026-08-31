@@ -34,8 +34,6 @@ pub mod write;
 pub mod write_stats;
 pub mod write_tracker;
 
-use std::time::Duration;
-
 // Re-export compress types
 pub use compress::COMPRESSION_MODE;
 pub use compress::CompressionMode;
@@ -100,6 +98,10 @@ pub use local::mutable_store::LocalMutableStoreError;
 pub use local::mutable_store::MutableStoreSettings;
 use lore_base::lore_info;
 use lore_base::lore_warn;
+pub use lore_base::retry::DEFAULT_JITTER;
+pub use lore_base::retry::Retry;
+pub use lore_base::retry::retry;
+pub use lore_base::retry::retry_with_jitter;
 // Re-export maintenance functions
 pub use maintenance::compactor;
 pub use maintenance::evictor;
@@ -171,54 +173,16 @@ pub use write_stats::FragmentWriteStats;
 pub use write_tracker::WriteContext;
 pub use write_tracker::WriteTracker;
 
-/// Retry waiter with exponential backoff and jitter.
-pub struct Retry {
-    current: u64,
-    maximum: u64,
-    jitter: f32,
-    counter: usize,
-    limit: usize,
-}
-
-const DEFAULT_JITTER: f32 = 0.1;
-
-impl Retry {
-    pub async fn wait(&mut self) -> bool {
-        if self.counter >= self.limit {
-            return false;
-        }
-
-        // Generate some jitter to avoid alignment storms
-        let jitter = rand::random::<f32>() * self.jitter;
-        let jitter = std::cmp::min((jitter * self.current as f32) as u64, 100);
-
-        tokio::time::sleep(Duration::from_millis(self.current + jitter)).await;
-
-        self.current = std::cmp::min(self.current * 2, self.maximum);
-        self.counter += 1;
-
-        true
-    }
-
-    pub fn counter(&self) -> usize {
-        self.counter
-    }
-
-    pub fn limit(&self) -> usize {
-        self.limit
-    }
-}
-
-/// Create a retry waiter, start and maximum times in milliseconds. Will give up
-/// after trying for the limit number of times.
-pub fn retry(start: u64, maximum: u64, limit: usize) -> Retry {
-    Retry {
-        current: start,
-        maximum,
-        jitter: DEFAULT_JITTER,
-        counter: 0,
-        limit,
-    }
+/// Back-off for store operations, including every `SlowDown` retry path. Tops out at one second
+/// so a caller that can recompute is not held for minutes.
+pub fn store_retry() -> Retry {
+    retry(
+        50,
+        1_000,
+        *STORE_RETRY_ATTEMPTS.get_or_init(|| {
+            60 //default try 60 times
+        }),
+    )
 }
 
 /// Store interactions use a retry policy to retry failures.

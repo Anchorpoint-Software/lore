@@ -47,6 +47,7 @@ use lore_telemetry::user_agent_filter::UserAgentFilter;
 use lore_transport::grpc::set_user_agent;
 use lore_transport::quic::client;
 use lore_transport::quic::client::ClientCerts;
+use lore_transport::quic::client::STREAM_COUNT;
 use lore_transport::quic::client::ServiceClient;
 use lore_transport::quic::storage_service::client::StorageClient;
 use opentelemetry::KeyValue;
@@ -93,6 +94,7 @@ use crate::quic::replication_store_service::client_container;
 use crate::quic::replication_store_service::client_container::ClientContainerConfig;
 use crate::quic::replication_store_service::server::ReplicationStoreService;
 use crate::quic::storage_service::StorageService;
+use crate::quic::stream_handler::AdmissionLimits;
 use crate::quic::stream_handler::StreamHandler;
 use crate::server_config::ServerConfig;
 use crate::settings::CompositeStoreSettings;
@@ -338,6 +340,14 @@ impl From<QuicSettings> for QuinnConfigBuilder {
 
         builder
     }
+}
+
+/// Requests a connection may hold in handling, defaulting to the capacity of its streams' pools.
+fn connection_inflight_limit(settings: &QuicSettings, process_limit: usize) -> usize {
+    settings.connection_inflight_limit.unwrap_or_else(|| {
+        let streams = settings.max_bidi_streams.unwrap_or(STREAM_COUNT as u64);
+        process_limit.saturating_mul(streams as usize)
+    })
 }
 
 async fn launch_quinn_server(
@@ -723,8 +733,7 @@ impl QuicPublicStreamHandler {
         local_store: Arc<dyn ImmutableStore>,
         mutable_store: Arc<dyn MutableStore>,
         jwt_verifier: Option<JwtVerifier>,
-        process_limit: usize,
-        handler_duration_timeout: Option<Duration>,
+        limits: AdmissionLimits,
     ) -> Self {
         let mut service_store = ServiceStore::default();
 
@@ -743,8 +752,7 @@ impl QuicPublicStreamHandler {
                     Box::new(StreamHandler::new(
                         Arc::new(storage_protocol),
                         context,
-                        process_limit,
-                        handler_duration_timeout,
+                        limits,
                     )) as Box<dyn StreamDataHandler>
                 }) as StreamDataHandlerBuilder
             };
@@ -772,12 +780,8 @@ impl QuicPublicStreamHandler {
                         local_store.clone(),
                         mutable_store.clone(),
                     );
-                    Box::new(StreamHandler::new(
-                        Arc::new(v4_service),
-                        context,
-                        process_limit,
-                        handler_duration_timeout,
-                    )) as Box<dyn StreamDataHandler>
+                    Box::new(StreamHandler::new(Arc::new(v4_service), context, limits))
+                        as Box<dyn StreamDataHandler>
                 }) as StreamDataHandlerBuilder,
             );
         }
@@ -810,8 +814,7 @@ impl QuicInternalStreamHandler {
     fn new(
         immutable_store: Arc<dyn ImmutableStore>,
         local_store: Arc<dyn ImmutableStore>,
-        process_limit: usize,
-        handler_duration_timeout: Option<Duration>,
+        limits: AdmissionLimits,
     ) -> Self {
         let mut service_store = ServiceStore::default();
         {
@@ -820,12 +823,7 @@ impl QuicInternalStreamHandler {
                 Box::new(move |context: Arc<AttributeMap>| {
                     let protocol =
                         ReplicationStoreService::new(immutable_store.clone(), local_store.clone());
-                    Box::new(StreamHandler::new(
-                        Arc::new(protocol),
-                        context,
-                        process_limit,
-                        handler_duration_timeout,
-                    ))
+                    Box::new(StreamHandler::new(Arc::new(protocol), context, limits))
                 }),
             );
         }
@@ -1977,9 +1975,18 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 .handler_timeout_seconds
                 .map(Duration::from_secs);
 
-            /// With 8 streams per connection this amounts to 4000 commands
-            /// being processed in parallel per connection
-            const DEFAULT_PROCESS_LIMIT: usize = 500;
+            /// With the 8 streams a connection opens this amounts to 4000 commands being
+            /// processed in parallel per connection.
+            const DEFAULT_STREAM_MESSAGE_LIMIT: usize = 500;
+            let process_limit = quic_settings
+                .stream_message_limit
+                .unwrap_or(DEFAULT_STREAM_MESSAGE_LIMIT);
+            let limits = AdmissionLimits {
+                process_limit,
+                inflight_limit: connection_inflight_limit(&quic_settings, process_limit),
+                handler_timeout: request_handler_timeout,
+                permit_timeout: quic_settings.permit_timeout_ms.map(Duration::from_millis),
+            };
 
             let local_immutable_store = local_store().unwrap_or_else(|| {
                 warn!("No local store available for public QUIC server, operations requiring local store will route to the main store");
@@ -1998,10 +2005,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                     local_immutable_store,
                     mutable_store,
                     jwt_verifier,
-                    quic_settings
-                        .connection_message_limit
-                        .unwrap_or(DEFAULT_PROCESS_LIMIT),
-                    request_handler_timeout,
+                    limits,
                 )),
                 frequency,
                 quic_settings,
@@ -2058,15 +2062,22 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 immutable_store.clone()
             });
 
+            let process_limit = quic_settings
+                .stream_message_limit
+                .unwrap_or(replication_store_service::DEFAULT_CLIENT_MESSAGE_LIMIT);
+            let limits = AdmissionLimits {
+                process_limit,
+                inflight_limit: connection_inflight_limit(&quic_settings, process_limit),
+                handler_timeout: request_handler_timeout,
+                permit_timeout: quic_settings.permit_timeout_ms.map(Duration::from_millis),
+            };
+
             launch_quinn_server(
                 "internal",
                 Box::new(QuicInternalStreamHandler::new(
                     immutable_store,
                     local_immutable_store,
-                    quic_settings
-                        .connection_message_limit
-                        .unwrap_or(replication_store_service::DEFAULT_CLIENT_MESSAGE_LIMIT),
-                    request_handler_timeout,
+                    limits,
                 )),
                 frequency,
                 quic_settings,

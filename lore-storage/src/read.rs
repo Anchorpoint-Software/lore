@@ -16,7 +16,6 @@ use lore_base::types::KeyType;
 use lore_error_set::prelude::*;
 use lore_transport::StorageSession;
 
-use crate::STORE_RETRY_ATTEMPTS;
 use crate::compress;
 use crate::concurrency::file_count_limit_acquire;
 use crate::defragment::DefragmentSink;
@@ -35,17 +34,6 @@ use crate::types::Address;
 use crate::types::Fragment;
 use crate::types::Partition;
 
-fn store_retry() -> crate::Retry {
-    // Retry, start at 50 milliseconds, maximum wait 10 seconds
-    crate::retry(
-        50,
-        10_000,
-        *STORE_RETRY_ATTEMPTS.get_or_init(|| {
-            60 //default try 60 times
-        }),
-    )
-}
-
 /// Load a single raw fragment from store with retry backoff. How widely the store searches for it
 /// is the store's own business - see [`ImmutableStore::read_scope`].
 pub async fn read_raw(
@@ -53,7 +41,7 @@ pub async fn read_raw(
     partition: Partition,
     address: Address,
 ) -> Result<(Fragment, Bytes), StorageError> {
-    let mut retry = store_retry();
+    let mut retry = crate::store_retry();
     loop {
         debug_assert!(
             !address.hash.is_zero(),
@@ -168,7 +156,7 @@ async fn remote_get_retry(
     priority: bool,
 ) -> Result<(Fragment, Bytes), StorageError> {
     let _guard = RemoteFetchGuard::new();
-    let mut retry = store_retry();
+    let mut retry = crate::store_retry();
     let mut stale_session_retries: u32 = 0;
     loop {
         debug_assert!(
@@ -1199,7 +1187,7 @@ async fn remote_get_resolved_retry(
     flags: u32,
 ) -> Result<(Hash, Fragment, Bytes), StorageError> {
     let _guard = RemoteFetchGuard::new();
-    let mut retry = store_retry();
+    let mut retry = crate::store_retry();
     let mut stale_session_retries: u32 = 0;
     let key_address = Address { hash: key, context };
     loop {

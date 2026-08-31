@@ -326,7 +326,6 @@ pub struct QuicConnection {
     max_reconnects: Option<u32>,
     reconnect_guard: Semaphore,
     counter: AtomicU32,
-    non_priority_counter: AtomicU32,
     pub stream_count: AtomicU32,
     stream_inflight: Arc<[AtomicU64; STREAM_COUNT as usize]>,
     max_chunk_size: usize,
@@ -352,7 +351,6 @@ impl QuicConnection {
             max_reconnects: None,
             reconnect_guard: Semaphore::new(1),
             counter: AtomicU32::new(0),
-            non_priority_counter: AtomicU32::new(0),
             stream_count: AtomicU32::new(0),
             stream_inflight: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
             max_chunk_size,
@@ -1182,7 +1180,7 @@ async fn add_stream(connection: Arc<QuicConnection>) -> Result<u32, QuicClientEr
 
 /// Counts a request as outstanding on a stream for as long as the guard is alive.
 ///
-/// The count is what the high priority path of [`select_stream`] balances on, so it has
+/// The count is what [`select_stream`] balances on, so it has
 /// to come back down on every way out of a send - error returns and a dropped send future
 /// included, not just the successful path.
 struct StreamInflightGuard<'a> {
@@ -1202,34 +1200,40 @@ impl Drop for StreamInflightGuard<'_> {
     }
 }
 
-/// Select stream index based on priority scheduling.
-fn select_stream(
-    stream_inflight: &[AtomicU64],
-    non_priority_counter: &AtomicU32,
-    reader_count: u32,
-    high_priority: bool,
-) -> u32 {
-    if high_priority {
-        // Pick the stream with fewest outstanding requests
-        let mut min_inflight = u64::MAX;
-        let mut min_stream = 0u32;
-        for i in 0..reader_count {
-            let inflight = stream_inflight[i as usize].load(Ordering::Relaxed);
-            if inflight < min_inflight {
-                min_inflight = inflight;
-                min_stream = i;
-            }
-        }
-        min_stream
+/// Select the stream to send a command on: of the streams that command may use, the one with
+/// the fewest requests outstanding.
+///
+/// A high priority command may use any stream. Everything else is confined to
+/// `PRIORITY_STREAM_COUNT..reader_count`, so bulk traffic can never crowd the metadata path off
+/// the streams kept for it. Until that many streams exist there is nothing to reserve yet, and
+/// every command shares whatever is open.
+///
+/// Balancing on outstanding requests rather than round-robining matters because a QUIC stream is
+/// an in-order byte FIFO: a stream still draining a large response would keep receiving its turn
+/// under round-robin, queueing new requests behind bytes already in flight. It also keeps the
+/// client honest about the server's per-stream processing limit, which it would otherwise walk
+/// into on one stream while others sat idle.
+///
+/// Ties resolve to the lowest eligible index, which deliberately keeps a caller that issues one
+/// request at a time on a single stream rather than scattering requests that were never
+/// concurrent.
+fn select_stream(stream_inflight: &[AtomicU64], reader_count: u32, high_priority: bool) -> u32 {
+    let first = if high_priority || reader_count <= PRIORITY_STREAM_COUNT {
+        0
     } else {
-        // Round-robin across streams PRIORITY_STREAM_COUNT..STREAM_COUNT
-        let index = non_priority_counter.fetch_add(1, Ordering::Relaxed);
-        if reader_count > PRIORITY_STREAM_COUNT {
-            PRIORITY_STREAM_COUNT + (index % (reader_count - PRIORITY_STREAM_COUNT))
-        } else {
-            0
+        PRIORITY_STREAM_COUNT
+    };
+
+    let mut min_inflight = u64::MAX;
+    let mut min_stream = first;
+    for i in first..reader_count {
+        let inflight = stream_inflight[i as usize].load(Ordering::Relaxed);
+        if inflight < min_inflight {
+            min_inflight = inflight;
+            min_stream = i;
         }
     }
+    min_stream
 }
 
 pub async fn send_normal(
@@ -1320,7 +1324,6 @@ pub async fn send_command<const HIGH_PRIORITY: bool>(
         let reader_count = connection_lock.reader.len() as u32;
         let stream_index = select_stream(
             connection.stream_inflight.as_slice(),
-            &connection.non_priority_counter,
             reader_count,
             HIGH_PRIORITY,
         ) as usize
@@ -1402,12 +1405,11 @@ mod tests {
     #[test]
     fn high_priority_spreads_concurrent_requests_over_every_stream() {
         let inflight = inflight_counters();
-        let non_priority_counter = AtomicU32::new(0);
 
         let mut guards = Vec::new();
         let mut selected = Vec::new();
         for _ in 0..STREAM_COUNT {
-            let stream = select_stream(&inflight, &non_priority_counter, STREAM_COUNT, true);
+            let stream = select_stream(&inflight, STREAM_COUNT, true);
             guards.push(StreamInflightGuard::new(&inflight[stream as usize]));
             selected.push(stream);
         }
@@ -1419,10 +1421,9 @@ mod tests {
     #[test]
     fn high_priority_reuses_a_stream_once_its_request_completed() {
         let inflight = inflight_counters();
-        let non_priority_counter = AtomicU32::new(0);
 
         for _ in 0..STREAM_COUNT * 4 {
-            let stream = select_stream(&inflight, &non_priority_counter, STREAM_COUNT, true);
+            let stream = select_stream(&inflight, STREAM_COUNT, true);
             let _guard = StreamInflightGuard::new(&inflight[stream as usize]);
             assert_eq!(stream, 0);
         }
@@ -1435,17 +1436,65 @@ mod tests {
     }
 
     #[test]
-    fn normal_priority_round_robins_over_the_non_priority_streams() {
+    fn normal_priority_spreads_concurrent_requests_over_the_non_priority_streams() {
         let inflight = inflight_counters();
-        let non_priority_counter = AtomicU32::new(0);
 
-        let selected: Vec<u32> = (PRIORITY_STREAM_COUNT..STREAM_COUNT)
-            .map(|_| select_stream(&inflight, &non_priority_counter, STREAM_COUNT, false))
-            .collect();
+        let mut guards = Vec::new();
+        let mut selected = Vec::new();
+        for _ in PRIORITY_STREAM_COUNT..STREAM_COUNT {
+            let stream = select_stream(&inflight, STREAM_COUNT, false);
+            guards.push(StreamInflightGuard::new(&inflight[stream as usize]));
+            selected.push(stream);
+        }
 
+        selected.sort_unstable();
         assert_eq!(
             selected,
             (PRIORITY_STREAM_COUNT..STREAM_COUNT).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn normal_priority_leaves_the_priority_streams_to_metadata() {
+        let inflight = inflight_counters();
+
+        // Every non-priority stream is busy while the priority streams sit idle. Balancing on
+        // outstanding requests alone would send bulk traffic to a priority stream; the reserved
+        // window is what stops it.
+        let _guards: Vec<_> = (PRIORITY_STREAM_COUNT..STREAM_COUNT)
+            .map(|stream| StreamInflightGuard::new(&inflight[stream as usize]))
+            .collect();
+
+        let stream = select_stream(&inflight, STREAM_COUNT, false);
+        assert!(
+            stream >= PRIORITY_STREAM_COUNT,
+            "bulk traffic must stay off the reserved streams, got {stream}"
+        );
+    }
+
+    #[test]
+    fn normal_priority_shares_what_is_open_before_any_stream_can_be_reserved() {
+        let inflight = inflight_counters();
+
+        // With fewer streams open than the reservation needs, there is nothing to reserve.
+        assert_eq!(select_stream(&inflight, 1, false), 0);
+        assert_eq!(select_stream(&inflight, PRIORITY_STREAM_COUNT, false), 0);
+    }
+
+    #[test]
+    fn normal_priority_reuses_a_stream_once_its_request_completed() {
+        let inflight = inflight_counters();
+
+        for _ in 0..STREAM_COUNT * 4 {
+            let stream = select_stream(&inflight, STREAM_COUNT, false);
+            let _guard = StreamInflightGuard::new(&inflight[stream as usize]);
+            assert_eq!(stream, PRIORITY_STREAM_COUNT);
+        }
+
+        assert!(
+            inflight
+                .iter()
+                .all(|count| count.load(Ordering::Relaxed) == 0)
         );
     }
     fn ipv6_addr() -> SocketAddr {

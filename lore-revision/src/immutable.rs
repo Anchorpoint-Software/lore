@@ -218,7 +218,7 @@ pub async fn store_raw_remote_retry(
     fragment: Fragment,
     payload: Option<Bytes>,
 ) -> Result<(), ImmutableError> {
-    let mut retry = lore_storage::retry(50, 10_000, 60);
+    let mut retry = lore_storage::store_retry();
     loop {
         match remote_storage.put(address, fragment, payload.clone()).await {
             Ok(_) => return Ok(()),

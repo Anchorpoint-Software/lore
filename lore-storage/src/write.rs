@@ -18,7 +18,6 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use zerocopy::FromZeros;
 
-use crate::STORE_RETRY_ATTEMPTS;
 use crate::compress::COMPRESSION_MODE;
 use crate::concurrency::file_count_limit_acquire;
 use crate::error::StorageError;
@@ -47,16 +46,6 @@ use crate::write_stats::FragmentWriteStats;
 use crate::write_tracker::WriteContext;
 use crate::write_tracker::WriteTracker;
 
-fn store_retry() -> crate::Retry {
-    crate::retry(
-        50,
-        10_000,
-        *STORE_RETRY_ATTEMPTS.get_or_init(|| {
-            60 //default try 60 times
-        }),
-    )
-}
-
 /// Write a single raw fragment to the local store with retry backoff.
 pub async fn write_raw(
     store: Arc<dyn ImmutableStore>,
@@ -65,7 +54,7 @@ pub async fn write_raw(
     fragment: Fragment,
     payload: Option<Bytes>,
 ) -> Result<(), StorageError> {
-    let mut retry = store_retry();
+    let mut retry = crate::store_retry();
     loop {
         match store
             .clone()
@@ -359,7 +348,7 @@ async fn remote_put_resolved_retry(
     fragment: Fragment,
     payload: Option<Bytes>,
 ) -> Result<(), StorageError> {
-    let mut retry = store_retry();
+    let mut retry = crate::store_retry();
     loop {
         match session
             .put_resolved(&key, address, fragment, payload.clone())
@@ -382,7 +371,7 @@ async fn remote_put_retry(
     fragment: Fragment,
     payload: Option<Bytes>,
 ) -> Result<(), StorageError> {
-    let mut retry = store_retry();
+    let mut retry = crate::store_retry();
     loop {
         match session.put(address, fragment, payload.clone()).await {
             Ok(_) => return Ok(()),

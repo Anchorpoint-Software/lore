@@ -316,8 +316,17 @@ pub struct QuicSettings {
     /// then assume something has gone wrong and return a timeout response so we can get metrics
     /// and clients don't hang forever
     pub handler_timeout_seconds: Option<u64>,
-    /// How many inflight messages are allowed per connection
-    pub connection_message_limit: Option<usize>,
+    /// How many inflight messages are allowed per QUIC stream. With `max_bidi_streams` streams
+    /// this is the per-connection parallelism, so a value of 500 over 8 streams allows 4000
+    /// commands in flight per connection.
+    pub stream_message_limit: Option<usize>,
+    /// Hard ceiling on requests in handling per connection, counted across all its streams and
+    /// including those still waiting for a stream permit. Over it, the server answers `SlowDown`
+    /// immediately rather than waiting. Defaults to `stream_message_limit * max_bidi_streams`.
+    pub connection_inflight_limit: Option<usize>,
+    /// How long a request may wait for one of the `stream_message_limit` permits before the
+    /// server answers `SlowDown`. Defaults to roughly one round trip, 100ms.
+    pub permit_timeout_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
