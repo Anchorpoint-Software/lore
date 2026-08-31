@@ -23,6 +23,7 @@ use crate::lock::file::release::ReleaseOptions;
 use crate::lock::file::release::release;
 use crate::lock::util::LOCK_BATCH_SIZE;
 use crate::lock::util::assemble_resource_for_path;
+use crate::lock::util::fold_batch_results;
 use crate::lore::execution_context;
 use crate::lore_debug;
 use crate::lore_error;
@@ -209,7 +210,6 @@ pub async fn acquire(
         .await
         .forward::<AcquireError>("Unable to acquire lock while offline")?;
 
-    let resources_count = resources.len();
     let resources_values = resources.values().cloned().collect::<Vec<_>>();
     let batch_iterator = resources_values.chunks(LOCK_BATCH_SIZE);
     let num_batches = batch_iterator.len();
@@ -246,42 +246,30 @@ pub async fn acquire(
     }
     task_error?;
 
-    let mut locks = Vec::with_capacity(resources_count);
-
-    let mut num_batch_success = 0;
-    let mut num_batch_failed = 0;
-    for batch_result in batches_results {
-        if let Ok(mut results) = batch_result {
-            locks.append(&mut results);
-            num_batch_success += 1;
-        } else {
-            num_batch_failed += 1;
-        }
-    }
+    let (mut locks, num_batch_success, first_batch_error) =
+        fold_batch_results(batches_results, resources.len());
+    let num_batch_failed = num_batches - num_batch_success;
 
     if num_batch_failed > 0 {
         lore_error!("Failed to lock-acquire {num_batch_failed} batch(es) out of {num_batches}");
-    }
 
-    if num_batch_success == 0 {
-        return Err(AcquireError::internal("Failed to acquire the lock"));
-    }
+        if num_batch_success > 0 {
+            lore_debug!("Attempting releasing partial acquired locks.");
 
-    if num_batch_success > 0 && num_batch_success < num_batches {
-        lore_debug!("Attempting releasing partial acquired locks.");
+            let options = ReleaseOptions {
+                paths: options.paths,
+                branch: options.branch,
+                owner: String::default(),
+                owner_id: String::default(),
+            };
 
-        let options = ReleaseOptions {
-            paths: options.paths,
-            branch: options.branch,
-            owner: String::default(),
-            owner_id: String::default(),
-        };
+            release(repository.clone(), options)
+                .await
+                .forward::<AcquireError>("Failed to acquire the lock")?;
+        }
 
-        release(repository.clone(), options)
-            .await
-            .forward::<AcquireError>("Failed to acquire the lock")?;
-
-        return Err(AcquireError::internal("Failed to acquire the lock"));
+        return Err(first_batch_error
+            .unwrap_or_else(|| AcquireError::internal("Failed to acquire the lock")));
     }
 
     locks.sort_by(|lock_a, lock_b| {
@@ -323,4 +311,45 @@ pub async fn acquire(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Builds a batch error shaped like the one a batch task produces: the
+    /// remote's denial forwarded under the generic acquire context.
+    fn denied_batch_error() -> AcquireError {
+        AcquireError::internal("resource already locked").forward("Failed to acquire the lock")
+    }
+
+    #[test]
+    fn batch_denial_reason_survives_the_fold() {
+        let denial = denied_batch_error();
+        let reported = denial.to_string();
+
+        let (locks, num_batch_success, first_batch_error) = fold_batch_results::<LockData, _>(
+            vec![Err(denial), Err(AcquireError::internal("a later batch"))],
+            0,
+        );
+
+        assert!(locks.is_empty());
+        assert_eq!(num_batch_success, 0);
+        assert_eq!(
+            first_batch_error
+                .expect("a failing batch keeps its error")
+                .to_string(),
+            reported
+        );
+    }
+
+    #[test]
+    fn batch_denial_reason_reaches_the_message() {
+        let reported = denied_batch_error().to_string();
+
+        assert!(
+            reported.ends_with("resource already locked"),
+            "the remote's reason is not in the reported message: {reported}"
+        );
+    }
 }

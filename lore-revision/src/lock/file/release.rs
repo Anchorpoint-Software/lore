@@ -21,6 +21,7 @@ use crate::interface::LoreString;
 use crate::lock;
 use crate::lock::util::LOCK_BATCH_SIZE;
 use crate::lock::util::assemble_resource_for_path;
+use crate::lock::util::fold_batch_results;
 use crate::lore::execution_context;
 use crate::lore_debug;
 use crate::lore_error;
@@ -292,25 +293,17 @@ pub async fn release(
     }
     task_error?;
 
-    let mut unlocks = Vec::with_capacity(resources_count);
-
-    let mut num_batch_success = 0;
-    let mut num_batch_failed = 0;
-    for batch_result in batches_results {
-        if let Ok(mut results) = batch_result {
-            unlocks.append(&mut results);
-            num_batch_success += 1;
-        } else {
-            num_batch_failed += 1;
-        }
-    }
+    let (mut unlocks, num_batch_success, first_batch_error) =
+        fold_batch_results(batches_results, resources_count);
+    let num_batch_failed = num_batches - num_batch_success;
 
     if num_batch_failed > 0 {
         lore_error!("Failed to lock-release {num_batch_failed} batch(es) out of {num_batches}");
     }
 
     if num_batch_success == 0 {
-        return Err(ReleaseError::internal("Failed to release the lock"));
+        return Err(first_batch_error
+            .unwrap_or_else(|| ReleaseError::internal("Failed to release the lock")));
     }
 
     if unlocks.is_empty() {
