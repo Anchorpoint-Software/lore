@@ -22,6 +22,7 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 - `lore-storage`: a stopped garbage collection pass gives up within one packfile instead of after a whole compaction step, so process exit waits at most one packfile rewrite; the stop at the end of every repository command is gone, so background eviction and compaction continue across commands
 - Fix a directory staged as an add and then removed before any commit being reported as a delete no command could clear; a scan now discards the entry with its whole subtree, as it already did for a reverted single-file add
 - Fix `stage --scan` keeping an entry `status --scan` discards, which left the two walks with different trees
+- `lore branch merge`, `branch merge into` and `revision cherry-pick` carry nothing from the source revision's metadata unless `--inherit-metadata <KEY>` (repeatable) names it, so `merged-by`, `reviewed-by` and `change-request` record whoever performed the merge rather than whoever produced the branch; actor and provenance keys stay reserved even under `*`
 
 ## v0.9.0 (Aug 28th 2026) [#782]
 
