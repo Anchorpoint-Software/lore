@@ -285,6 +285,19 @@ pub struct CommitOptions {
     pub stats: bool,
 }
 
+/// Metadata a caller states for the revision a commit creates: the triple
+/// [`commit_with_metadata`] takes, kept together so operations that commit on
+/// the caller's behalf — a merge's auto commit, a sync's divergence merge — can
+/// carry it. [`prepare_commit_metadata`] applies these keys after the identity
+/// stamp, so a `created-by` / `committed-by` given here is what the revision
+/// records, exactly as it is for a direct `commit_with_metadata`.
+#[derive(Clone, Debug, Default)]
+pub struct CommitMetadata {
+    pub keys: LoreArray<LoreString>,
+    pub values: LoreArray<LoreString>,
+    pub formats: LoreArray<LoreMetadataType>,
+}
+
 impl CommitOptions {
     pub fn new(message: String) -> Self {
         Self {

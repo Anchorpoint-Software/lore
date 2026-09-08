@@ -226,6 +226,9 @@ mod store_keep_alive_tests {
                 no_commit: 0,
                 link: Default::default(),
                 ignore_links: 0,
+                metadata_keys: Default::default(),
+                metadata_values: Default::default(),
+                metadata_formats: Default::default(),
             },
             None,
         )

@@ -1076,6 +1076,9 @@ fn handle_branch_merge_start(globals: LoreGlobalArgs, args: &BranchMergeStartArg
         no_commit: args.no_commit as u8,
         link: LoreString::from(&args.link),
         ignore_links: args.ignore_links as u8,
+        metadata_keys: Default::default(),
+        metadata_values: Default::default(),
+        metadata_formats: Default::default(),
     };
 
     let debug = progress_debug();

@@ -314,6 +314,13 @@ pub struct LoreBranchMergeStartArgs {
     pub link: LoreString,
     /// Merge only the main repository, skipping all linked repositories
     pub ignore_links: u8,
+    /// Metadata keys for the auto commit when the merge has no conflicts;
+    /// empty leaves that revision as a plain commit would make it
+    pub metadata_keys: LoreArray<LoreString>,
+    /// Metadata values, one per key
+    pub metadata_values: LoreArray<LoreString>,
+    /// Metadata formats, one per key
+    pub metadata_formats: LoreArray<LoreMetadataType>,
 }
 
 /// Begins merging a source branch into the current branch, auto-committing if there are no conflicts.
@@ -379,6 +386,11 @@ async fn merge_start_local(
                 message: args.message.to_string(),
                 no_commit: args.no_commit != 0,
                 scope,
+                metadata: lore_revision::commit::CommitMetadata {
+                    keys: args.metadata_keys.clone(),
+                    values: args.metadata_values.clone(),
+                    formats: args.metadata_formats.clone(),
+                },
             };
 
             async move {

@@ -489,6 +489,7 @@ mod tests {
                         message: "merge main into feature (sparse view)".to_string(),
                         no_commit: false,
                         scope: lore_revision::branch::merge::MergeScope::MainOnly,
+                        metadata: Default::default(),
                     },
                 )
                 .await
@@ -592,6 +593,7 @@ mod tests {
                 message: message.to_string(),
                 no_commit: false,
                 scope: lore_revision::branch::merge::MergeScope::MainOnly,
+                metadata: Default::default(),
             },
         )
         .await
@@ -1223,6 +1225,7 @@ mod tests {
                         message: "merge target into source".to_string(),
                         no_commit: false,
                         scope: lore_revision::branch::merge::MergeScope::MainOnly,
+                        metadata: Default::default(),
                     },
                 )
                 .await
@@ -1283,5 +1286,131 @@ mod tests {
             }))
             .await
             .expect("Test task failed");
+    }
+
+    /// The auto commit of a clean merge records the authorship the caller
+    /// states, and only falls back to the identity that ran the merge when the
+    /// caller states none — the rule `commit_with_metadata` already applies to
+    /// a direct commit, reached here through `MergeStartOptions::metadata`.
+    /// A client whose connecting identity is an account key, not a name, can
+    /// so name the author of the merges it performs on the user's behalf.
+    #[tokio::test]
+    async fn merge_auto_commit_records_the_callers_authorship() {
+        let _ = test_store_create().await.expect("Failed to create stores");
+        let execution = Arc::new(
+            lore_revision::interface::ExecutionContext::new_client_with_user_id(
+                lore_revision::interface::LoreGlobalArgs::default().set_offline(),
+                lore_revision::relay::EventDispatcher::no_dispatch(),
+                "connecting-identity".to_string(),
+            ),
+        );
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let fixture = DiffFixture::new().await;
+                let main_branch = fixture.main_branch_id;
+                fixture.write_file("a.txt", b"base\n");
+                let base = fixture.stage_and_commit("base").await;
+
+                let feature = fixture.create_branch("feature").await;
+                fixture.write_file("feature.txt", b"feature\n");
+                let feature_rev = fixture.stage_and_commit("feature work").await;
+
+                fixture.switch_to(main_branch, base).await;
+                fixture.delete_file("feature.txt");
+                fixture.write_file("main.txt", b"main\n");
+                let main_moved = fixture.stage_and_commit("main moved on").await;
+
+                fixture.switch_to(feature, feature_rev).await;
+                fixture.delete_file("main.txt");
+                fixture.write_file("feature.txt", b"feature\n");
+
+                let authorship = |name: &str| lore_revision::commit::CommitMetadata {
+                    keys: LoreArray::from_vec(vec![
+                        LoreString::from(lore_revision::metadata::CREATED_BY),
+                        LoreString::from(lore_revision::metadata::COMMITTED_BY),
+                    ]),
+                    values: LoreArray::from_vec(vec![
+                        LoreString::from(name),
+                        LoreString::from(name),
+                    ]),
+                    formats: LoreArray::from_vec(vec![
+                        lore_revision::interface::LoreMetadataType::String,
+                        lore_revision::interface::LoreMetadataType::String,
+                    ]),
+                };
+                let merge = |metadata: lore_revision::commit::CommitMetadata| {
+                    lore_revision::branch::merge::merge_start(
+                        fixture.repository.clone(),
+                        &fixture.write_token,
+                        main_branch,
+                        lore_revision::branch::merge::MergeStartOptions {
+                            message: "merge main".to_string(),
+                            no_commit: false,
+                            scope: lore_revision::branch::merge::MergeScope::MainOnly,
+                            metadata,
+                        },
+                    )
+                };
+                let author_of = |revision: Hash| {
+                    let repository = fixture.repository.clone();
+                    async move {
+                        let state = lore_revision::state::State::deserialize(
+                            repository.clone(),
+                            revision,
+                        )
+                        .await
+                        .expect("the merge revision must deserialize");
+                        let metadata = lore_revision::metadata::Metadata::deserialize(
+                            repository,
+                            state.metadata_hash(),
+                        )
+                        .await
+                        .expect("the merge metadata must deserialize");
+                        (
+                            metadata
+                                .get_string(lore_revision::metadata::CREATED_BY)
+                                .unwrap_or_default()
+                                .to_string(),
+                            metadata
+                                .get_string(lore_revision::metadata::COMMITTED_BY)
+                                .unwrap_or_default()
+                                .to_string(),
+                        )
+                    }
+                };
+
+                let named = merge(authorship("Display Name"))
+                    .await
+                    .expect("merge with authorship metadata");
+                assert_eq!(
+                    author_of(named).await,
+                    ("Display Name".to_string(), "Display Name".to_string()),
+                    "the caller's authorship must be what the merge records"
+                );
+
+                // Main moves again; the same merge without metadata falls back
+                // to the identity that ran it, as every commit always has.
+                fixture.switch_to(main_branch, main_moved).await;
+                fixture.delete_file("feature.txt");
+                fixture.write_file("main-again.txt", b"main again\n");
+                fixture.stage_and_commit("main moved again").await;
+                fixture.switch_to(feature, named).await;
+                fixture.delete_file("main-again.txt");
+                fixture.write_file("feature.txt", b"feature\n");
+
+                let unnamed = merge(Default::default())
+                    .await
+                    .expect("merge without authorship metadata");
+                assert_eq!(
+                    author_of(unnamed).await,
+                    (
+                        "connecting-identity".to_string(),
+                        "connecting-identity".to_string()
+                    ),
+                    "with nothing stated, the identity stamps the merge"
+                );
+            }))
+            .await
+            .expect("Task failed");
     }
 }

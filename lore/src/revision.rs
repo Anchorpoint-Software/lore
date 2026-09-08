@@ -746,6 +746,13 @@ pub struct LoreRevisionSyncArgs {
     pub dependency_recursive: u8,
     /// Maximum dependency traversal depth; 0 means unlimited
     pub dependency_depth_limit: u32,
+    /// Metadata keys for the merge revision a diverged sync commits; empty
+    /// leaves that revision as a plain commit would make it
+    pub metadata_keys: LoreArray<LoreString>,
+    /// Metadata values, one per key
+    pub metadata_values: LoreArray<LoreString>,
+    /// Metadata formats, one per key
+    pub metadata_formats: LoreArray<LoreMetadataType>,
 }
 
 /// Synchronizes the working directory to a target revision, optionally merging divergent branches.
@@ -834,6 +841,11 @@ async fn sync_local(
                 dependency_tags,
                 dependency_recursive: args.dependency_recursive != 0,
                 dependency_depth_limit: args.dependency_depth_limit,
+                metadata: lore_revision::commit::CommitMetadata {
+                    keys: args.metadata_keys,
+                    values: args.metadata_values,
+                    formats: args.metadata_formats,
+                },
             };
 
             sync::sync(repository, &token, options).await
