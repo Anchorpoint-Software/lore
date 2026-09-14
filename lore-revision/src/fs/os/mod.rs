@@ -34,6 +34,7 @@ use crate::util;
 use crate::util::path::RelativePath;
 
 /// OS-backed filesystem provider.
+#[derive(Debug)]
 pub struct OsFilesystem {
     filesystem_root: PathBuf,
 }
@@ -46,19 +47,19 @@ impl OsFilesystem {
         }
     }
 
-    fn begin_operation(&self) -> Result<Arc<InstanceOperationImpl>, FsError> {
-        Ok(Arc::new(InstanceOperationImpl::new(
-            StaticDispatchInstanceOperation::Os(OsOperation {
-                filesystem_root: self.filesystem_root.clone(),
-            }),
-        )))
+    pub fn begin_operation(&self) -> OsOperation {
+        OsOperation {
+            filesystem_root: self.filesystem_root.clone(),
+        }
     }
 }
 
 #[async_trait]
 impl FilesystemProvider for OsFilesystem {
     async fn begin_operation(&self) -> Result<Arc<InstanceOperationImpl>, FsError> {
-        OsFilesystem::begin_operation(self)
+        Ok(Arc::new(InstanceOperationImpl::new(
+            StaticDispatchInstanceOperation::Os(OsFilesystem::begin_operation(self)),
+        )))
     }
 }
 

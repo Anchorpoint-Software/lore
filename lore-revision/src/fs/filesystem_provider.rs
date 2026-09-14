@@ -20,10 +20,12 @@ use lore_error_set::prelude::*;
 use crate::filter::FilterMode;
 use crate::filter::FilterStates;
 use crate::fs::os::OsOperation;
+use crate::fs::swfs::filesystem::SwfsOperation;
 use crate::lore::Address;
 use crate::lore::Context;
 use crate::merge::MergeTextMode;
 use crate::node::Node;
+use crate::node::NodeFileMode;
 use crate::node::NodeFlags;
 use crate::repository::RepositoryContext;
 use crate::state::ChangeStream;
@@ -84,6 +86,14 @@ impl FileInfo {
         FileInfo::File {
             executable: crate::util::fs::file_executable_observed(metadata),
             size,
+            mtime,
+        }
+    }
+
+    pub fn from_node_and_mtime(node: &Node, mtime: u64) -> Self {
+        FileInfo::File {
+            executable: Some(node.mode & NodeFileMode::Executable == NodeFileMode::Executable),
+            size: node.size,
             mtime,
         }
     }
@@ -500,6 +510,7 @@ pub trait InstanceOperation: Send + Sync {
 /// while still not knowing which type is in use at compile time.
 pub enum StaticDispatchInstanceOperation {
     Os(OsOperation),
+    Swfs(SwfsOperation),
     #[cfg(test)]
     Test(tests::TestOperation),
 }
@@ -556,6 +567,9 @@ impl InstanceOperation for InstanceOperationImpl {
             StaticDispatchInstanceOperation::Os(this) => {
                 this.changes_from_filesystem_to_state(diff)
             }
+            StaticDispatchInstanceOperation::Swfs(this) => {
+                this.changes_from_filesystem_to_state(diff)
+            }
         }
     }
 
@@ -564,6 +578,7 @@ impl InstanceOperation for InstanceOperationImpl {
             #[cfg(test)]
             StaticDispatchInstanceOperation::Test(this) => this.file_info(path).await,
             StaticDispatchInstanceOperation::Os(this) => this.file_info(path).await,
+            StaticDispatchInstanceOperation::Swfs(this) => this.file_info(path).await,
         }
     }
 
@@ -572,6 +587,7 @@ impl InstanceOperation for InstanceOperationImpl {
             #[cfg(test)]
             StaticDispatchInstanceOperation::Test(this) => this.holds_name_exactly(path).await,
             StaticDispatchInstanceOperation::Os(this) => this.holds_name_exactly(path).await,
+            StaticDispatchInstanceOperation::Swfs(this) => this.holds_name_exactly(path).await,
         }
     }
 
@@ -584,6 +600,7 @@ impl InstanceOperation for InstanceOperationImpl {
             #[cfg(test)]
             StaticDispatchInstanceOperation::Test(this) => this.names_folding_to(path, name).await,
             StaticDispatchInstanceOperation::Os(this) => this.names_folding_to(path, name).await,
+            StaticDispatchInstanceOperation::Swfs(this) => this.names_folding_to(path, name).await,
         }
     }
 
@@ -592,6 +609,7 @@ impl InstanceOperation for InstanceOperationImpl {
             #[cfg(test)]
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
             StaticDispatchInstanceOperation::Os(this) => this.content_source(path),
+            StaticDispatchInstanceOperation::Swfs(this) => this.content_source(path),
         }
     }
 
@@ -610,6 +628,10 @@ impl InstanceOperation for InstanceOperationImpl {
                 this.file_holds_content(repository, path, previous, previous_size, established)
                     .await
             }
+            StaticDispatchInstanceOperation::Swfs(this) => {
+                this.file_holds_content(repository, path, previous, previous_size, established)
+                    .await
+            }
         }
     }
 
@@ -620,6 +642,9 @@ impl InstanceOperation for InstanceOperationImpl {
             StaticDispatchInstanceOperation::Os(this) => {
                 this.make_executable(path, executable).await
             }
+            StaticDispatchInstanceOperation::Swfs(this) => {
+                this.make_executable(path, executable).await
+            }
         }
     }
 
@@ -628,6 +653,7 @@ impl InstanceOperation for InstanceOperationImpl {
             #[cfg(test)]
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
             StaticDispatchInstanceOperation::Os(this) => this.create_dir_all(path).await,
+            StaticDispatchInstanceOperation::Swfs(this) => this.create_dir_all(path).await,
         }
     }
 
@@ -636,6 +662,7 @@ impl InstanceOperation for InstanceOperationImpl {
             #[cfg(test)]
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
             StaticDispatchInstanceOperation::Os(this) => this.create_file(path).await,
+            StaticDispatchInstanceOperation::Swfs(this) => this.create_file(path).await,
         }
     }
 
@@ -648,6 +675,7 @@ impl InstanceOperation for InstanceOperationImpl {
             #[cfg(test)]
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
             StaticDispatchInstanceOperation::Os(this) => this.unify_case_rename(from, to).await,
+            StaticDispatchInstanceOperation::Swfs(this) => this.unify_case_rename(from, to).await,
         }
     }
 
@@ -656,6 +684,7 @@ impl InstanceOperation for InstanceOperationImpl {
             #[cfg(test)]
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
             StaticDispatchInstanceOperation::Os(this) => this.remove(path).await,
+            StaticDispatchInstanceOperation::Swfs(this) => this.remove(path).await,
         }
     }
 
@@ -664,6 +693,7 @@ impl InstanceOperation for InstanceOperationImpl {
             #[cfg(test)]
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
             StaticDispatchInstanceOperation::Os(this) => this.remove_recursive(path).await,
+            StaticDispatchInstanceOperation::Swfs(this) => this.remove_recursive(path).await,
         }
     }
 
@@ -677,6 +707,9 @@ impl InstanceOperation for InstanceOperationImpl {
             #[cfg(test)]
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
             StaticDispatchInstanceOperation::Os(this) => {
+                this.write_node(repository, node, path).await
+            }
+            StaticDispatchInstanceOperation::Swfs(this) => {
                 this.write_node(repository, node, path).await
             }
         }
@@ -695,6 +728,10 @@ impl InstanceOperation for InstanceOperationImpl {
                 this.set_file_to_immutable_store_contents(repository, node, path)
                     .await
             }
+            StaticDispatchInstanceOperation::Swfs(this) => {
+                this.set_file_to_immutable_store_contents(repository, node, path)
+                    .await
+            }
         }
     }
 
@@ -707,6 +744,9 @@ impl InstanceOperation for InstanceOperationImpl {
             #[cfg(test)]
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
             StaticDispatchInstanceOperation::Os(this) => {
+                this.copy_file(source_path, destination_path).await
+            }
+            StaticDispatchInstanceOperation::Swfs(this) => {
                 this.copy_file(source_path, destination_path).await
             }
         }
@@ -727,6 +767,10 @@ impl InstanceOperation for InstanceOperationImpl {
                 this.merge3_text_by_path(base, mine, theirs, result, mode)
                     .await
             }
+            StaticDispatchInstanceOperation::Swfs(this) => {
+                this.merge3_text_by_path(base, mine, theirs, result, mode)
+                    .await
+            }
         }
     }
 
@@ -735,6 +779,7 @@ impl InstanceOperation for InstanceOperationImpl {
             #[cfg(test)]
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
             StaticDispatchInstanceOperation::Os(this) => this.infer_is_diffable(path).await,
+            StaticDispatchInstanceOperation::Swfs(this) => this.infer_is_diffable(path).await,
         }
     }
 
@@ -746,6 +791,7 @@ impl InstanceOperation for InstanceOperationImpl {
             #[cfg(test)]
             StaticDispatchInstanceOperation::Test(this) => this.finalize(changes_made).await,
             StaticDispatchInstanceOperation::Os(this) => this.finalize(changes_made).await,
+            StaticDispatchInstanceOperation::Swfs(this) => this.finalize(changes_made).await,
         }
     }
 }

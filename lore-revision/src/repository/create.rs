@@ -318,6 +318,9 @@ pub async fn create_with_metadata(
         store: Some(StoreConfig::client_default()),
         file: Some(FileConfig::default()),
     };
+    config
+        .validate()
+        .forward::<CreateError>("Error validating repository config")?;
 
     // `create` is a genesis-path write command that doesn't flow through
     // `repository_call`, so acquire the per-path write mutex here. The token

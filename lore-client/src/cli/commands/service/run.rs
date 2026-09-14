@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use lore::error_set::prelude::*;
 use lore::interface::LoreEvent;
+use lore::interface::LoreGlobalArgs;
 use lore::lore_spawn;
 use lore::lore_spawn_blocking;
 use lore::remote::connection::ConnectionError;
@@ -55,6 +56,7 @@ fn detached_working_directory() -> std::path::PathBuf {
 }
 
 pub async fn service_main(
+    globals: LoreGlobalArgs,
     listening_signal: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<(), ServiceMainError> {
     if !uds_supported() {
@@ -69,7 +71,7 @@ pub async fn service_main(
         );
     }
 
-    initialize_service()
+    initialize_service(globals)
         .await
         .forward::<ServiceMainError>("Failed initializing service")?;
 

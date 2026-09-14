@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_SWFS");
     if env::var("CARGO_FEATURE_SWFS").is_ok() {
         let swfs_lib_dir =
             PathBuf::from_str(&env::var("SWFS_LIB_DIR").expect("SWFS_LIB_DIR not set"))

@@ -6,20 +6,24 @@ import os
 import shutil
 
 import pytest
-
+from assertion_helpers import AlwaysEqual
 from error_types import (
+    BadSharedStoreRemoteUrl,
     BranchAdvanced,
     ExistingSharedStore,
     LocalMutableStoreWithSharedStore,
     MissingSharedStore,
     WrongSharedStoreRemote,
-    BadSharedStoreRemoteUrl,
 )
-from lore import Lore
-from lore_parsers import SharedStoreListEntry, SharedStoreList
-from assertion_helpers import AlwaysEqual
+from lore_parsers import (
+    SharedStoreList,
+    SharedStoreListEntry,
+    SpecificSharedStoreInfo,
+    parse_jsonl,
+)
 from test_utils import to_posix
-from lore_parsers import SpecificSharedStoreInfo, parse_jsonl
+
+from lore import Lore
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +79,7 @@ def _strip_protocol(url: str) -> str:
     return url
 
 
-def _per_url_store_path(base: str, remote: str) -> str:
+def per_url_store_path(base: str, remote: str) -> str:
     """Path to the shared store for `remote` under base path `base`, mirroring the
     Rust layout <base>/<escaped-url>/shared_store. Each remote URL gets its own
     subdirectory so one base path can back multiple endpoints."""
@@ -139,7 +143,7 @@ def test_create(new_lore_repo, scratch_dir):
     # Create a shared store which will implicitly get set as the default
     store1_containing_path = scratch_dir("store1")
     repo.shared_store_create(repo.remote, str(store1_containing_path))
-    store1_path = _per_url_store_path(str(store1_containing_path), repo.remote)
+    store1_path = per_url_store_path(str(store1_containing_path), repo.remote)
 
     assert os.path.exists(store1_path), f"{store1_path} was created but does not exist"
 
@@ -152,7 +156,7 @@ def test_create(new_lore_repo, scratch_dir):
     repo.shared_store_create(
         repo.remote, str(store2_containing_path), make_default=False
     )
-    store2_path = _per_url_store_path(str(store2_containing_path), repo.remote)
+    store2_path = per_url_store_path(str(store2_containing_path), repo.remote)
 
     assert os.path.exists(store2_path), f"{store2_path} was created but does not exist"
 
@@ -250,7 +254,7 @@ def test_create_repo_custom_default(new_lore_repo, scratch_dir):
     repo: Lore = new_lore_repo(create_repo=False)
     default_store_base = str(scratch_dir("default_store"))
     repo.shared_store_create(repo.remote, default_store_base)
-    default_store_path = _per_url_store_path(default_store_base, repo.remote)
+    default_store_path = per_url_store_path(default_store_base, repo.remote)
 
     # Create a repo using the default shared store and verify it used the correct immutable store
     repo: Lore = new_lore_repo(create_repo=False)
@@ -280,7 +284,7 @@ def test_create_repo_custom_non_default(new_lore_repo, scratch_dir, create_repo)
     # Create a repo using the non-default shared store and verify it used the correct immutable store
     repo = create_repo(use_shared_store=True, shared_store_path=non_default_store_base)
 
-    non_default_store_path = _per_url_store_path(non_default_store_base, repo.remote)
+    non_default_store_path = per_url_store_path(non_default_store_base, repo.remote)
     non_default_immutable_store_bytes = verify_shared_store_repo(
         repo.path, non_default_store_path
     )
@@ -323,7 +327,7 @@ def test_create_repo_relative_path(
 
     monkeypatch.chdir(repo.path)
 
-    non_default_store_path = _per_url_store_path(non_default_store_path, repo.remote)
+    non_default_store_path = per_url_store_path(non_default_store_path, repo.remote)
     non_default_immutable_store_bytes = verify_shared_store_repo(
         repo.path, non_default_store_path
     )
@@ -361,8 +365,8 @@ def test_create_two_repos(new_lore_repo, create_repo):
 
     # Create the contents of two files whose size in the immutable store will be much larger than the metadata associated with storing them
     file_name = "test_file.txt"
-    large_file_contents = "".join((str(x) for x in range(1000)))
-    other_large_file_contents = "".join((str(x) for x in range(1000, 2000)))
+    large_file_contents = "".join(str(x) for x in range(1000))
+    other_large_file_contents = "".join(str(x) for x in range(1000, 2000))
 
     # Add the same commit to both repo1 and repo2. The second identical commit should add less data to the immutable store because the fragments containing file contents are reused.
     repo1.write_commit_push("test commit", {file_name: large_file_contents})
@@ -414,7 +418,7 @@ def test_shared_store_remote_mismatch_rejected(new_lore_repo, scratch_dir):
     repo: Lore = new_lore_repo(create_repo=False)
     repo.repository_create(use_shared_store=True, shared_store_path=base)
 
-    config_path = os.path.join(_per_url_store_path(base, repo.remote), CONFIG_TOML)
+    config_path = os.path.join(per_url_store_path(base, repo.remote), CONFIG_TOML)
     with open(config_path, "r+") as f:
         contents = f.read().replace(_strip_protocol(repo.remote), "some.other.host")
         f.seek(0)
@@ -496,7 +500,7 @@ def test_deleted_shared_store(new_lore_repo, scratch_dir):
     repo: Lore = new_lore_repo(create_repo=False)
     repo.repository_create(use_shared_store=True, shared_store_path=store_base)
 
-    store_path = _per_url_store_path(store_base, repo.remote)
+    store_path = per_url_store_path(store_base, repo.remote)
     assert os.path.isdir(store_path)
     shutil.rmtree(store_path)
 
@@ -601,8 +605,8 @@ def test_explicit_base_hosts_multiple_endpoints(
 
     repo = create_repo(use_shared_store=True, shared_store_path=base)
 
-    real_store = _per_url_store_path(base, repo.remote)
-    other_store = _per_url_store_path(base, other_endpoint)
+    real_store = per_url_store_path(base, repo.remote)
+    other_store = per_url_store_path(base, other_endpoint)
     assert real_store != other_store
     assert os.path.isdir(real_store), (
         f"This endpoint's store should have been auto-created at {real_store}"
@@ -624,7 +628,7 @@ def test_legacy_store_migrated_to_per_url_dir(
     seed: Lore = new_lore_repo(create_repo=False)
     seed.shared_store_create(seed.remote, path=base, make_default=False)
 
-    per_url_store = _per_url_store_path(base, seed.remote)
+    per_url_store = per_url_store_path(base, seed.remote)
     legacy_store = os.path.join(base, "shared_store")
     shutil.move(per_url_store, legacy_store)
     assert not os.path.exists(per_url_store)
@@ -654,14 +658,14 @@ def test_legacy_store_not_migrated_for_different_remote(
     seed: Lore = new_lore_repo(create_repo=False)
     seed.shared_store_create(other_remote, path=base, make_default=False, offline=True)
 
-    other_per_url_store = _per_url_store_path(base, other_remote)
+    other_per_url_store = per_url_store_path(base, other_remote)
     legacy_store = os.path.join(base, "shared_store")
     shutil.move(other_per_url_store, legacy_store)
     assert os.path.isdir(legacy_store)
 
     repo = create_repo(use_shared_store=True, shared_store_path=base)
 
-    real_store = _per_url_store_path(base, repo.remote)
+    real_store = per_url_store_path(base, repo.remote)
     assert real_store != legacy_store
 
     assert os.path.isdir(legacy_store), (
@@ -805,7 +809,7 @@ def test_shared_store_auto_upgrade_mutable_dir(new_lore_repo, scratch_dir):
     store_containing_path = str(scratch_dir("gs_upgrade"))
     repo: Lore = new_lore_repo(create_repo=False)
     repo.shared_store_create(repo.remote, store_containing_path)
-    shared_store_path = _per_url_store_path(store_containing_path, repo.remote)
+    shared_store_path = per_url_store_path(store_containing_path, repo.remote)
 
     # Remove the mutable/ directory to simulate a pre-upgrade shared store
     mutable_path = os.path.join(shared_store_path, "mutable")

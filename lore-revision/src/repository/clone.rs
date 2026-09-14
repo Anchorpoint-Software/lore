@@ -915,6 +915,9 @@ pub async fn clone(
         file: Some(FileConfig::default()),
         vfs: options.vfs_options.clone(),
     };
+    repository_config
+        .validate()
+        .forward::<CloneError>("Error validating repository config")?;
 
     let repository_metadata = {
         // Dummy repository context just to be able to load the repository
@@ -1235,6 +1238,11 @@ pub async fn clone(
 
     let _ = repository.flush(call.sync_data()).await;
 
+    let operation_result = operation
+        .finalize(true)
+        .await
+        .forward::<CloneError>("Finishing operation");
+
     if !call.dry_run() {
         repository_path_guard.clean_path_on_drop = false;
         dot_directory_guard.clean_path_on_drop = false;
@@ -1250,11 +1258,6 @@ pub async fn clone(
         count: LoreRepositoryCloneCountData::new(&stats),
     })
     .send();
-
-    let operation_result = operation
-        .finalize(true)
-        .await
-        .forward::<CloneError>("Finishing operation");
 
     operation_result.and(materialize_result.and(store_result))
 }
@@ -1283,20 +1286,6 @@ async fn clone_materialize(
         stats,
         ..
     } = ctx.clone();
-    if options
-        .vfs_options
-        .as_ref()
-        .is_some_and(|config| config.vfs_type.is_swfs())
-    {
-        let path = repository.require_path()?;
-        if path.exists() {
-            Err(InvalidPath {
-                path: format!("{}", path.display()),
-            })?;
-        }
-        return Ok(());
-    }
-
     let mut clone_result = Ok(());
     let mut cache_task = None;
 
@@ -2102,8 +2091,7 @@ mod tests {
     async fn create_operation() -> (TempDir, Arc<InstanceOperationImpl>) {
         let temp = TempDir::new("lore-clone-temp-path-");
         let os_filesystem = OsFilesystem::new(temp.path());
-        let operation = os_filesystem
-            .begin_operation()
+        let operation = <OsFilesystem as FilesystemProvider>::begin_operation(&os_filesystem)
             .await
             .expect("Starting test operation");
         (temp, operation)

@@ -1912,7 +1912,7 @@ class Lore:
         # Recorded before the directory exists, so a clone that fails partway
         # through still has its half-written tree removed with the test.
         self.created_paths.append(str(new_repo_path))
-        if not kwargs.get("dry_run"):
+        if not kwargs.get("dry_run") and vfs != "swfs":
             new_repo_path.mkdir(exist_ok=True)
         root_file_args = []
         for rf in root_files or []:

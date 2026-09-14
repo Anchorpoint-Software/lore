@@ -191,6 +191,31 @@ pub struct RepositoryConfig {
     pub vfs: Option<VfsConfig>,
 }
 
+impl RepositoryConfig {
+    pub fn validate(&self) -> Result<(), RepositoryError> {
+        if self.is_swfs()
+            && !matches!(
+                self.shared_store_to_use.as_ref(),
+                Some(SharedStoreToUseConfig {
+                    use_shared_store: Some(true),
+                    ..
+                })
+            )
+        {
+            return Err(RepositoryError::internal(
+                "Using SWFS without using a shared store",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn is_swfs(&self) -> bool {
+        self.vfs
+            .as_ref()
+            .is_some_and(|vfs_config| vfs_config.vfs_type.is_swfs())
+    }
+}
+
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
 pub struct StoreConfig {
     pub max_capacity: Option<usize>,
@@ -2006,7 +2031,7 @@ fn connect(
     .shared())
 }
 
-fn read_id_from_file(path: PathBuf) -> io::Result<RepositoryId> {
+pub fn read_id_from_file(path: PathBuf) -> io::Result<RepositoryId> {
     let mut id = RepositoryId::default();
     // Synchronous read: tiny file, avoids thread hop and queuing behind
     // any store flush tasks still in flight from the previous command.
@@ -2296,6 +2321,20 @@ pub async fn load_and_connect_with_token(
         instance_id
     };
 
+    // Load the mounted filesystem if this is a SWFS-backed instance
+    let filesystem: Option<Arc<dyn FilesystemProvider + 'static>> = if config.is_swfs() {
+        let mount_manager = MountManagerState::mount_manager().ok_or(RepositoryError::internal(
+            "Loading a SWFS repository without using the service",
+        ))?;
+        Some(
+            mount_manager
+                .get_mount_filesystem_provider(path)
+                .forward::<RepositoryError>("Unable to find mount for SWFS repository")?,
+        )
+    } else {
+        None
+    };
+
     // Keep the remote pending so local-only commands finish without waiting on the
     // background connect. The upgrade path above already forced resolution when needed.
     let remote_state = match (resolved_remote_for_upgrade, remote) {
@@ -2311,7 +2350,7 @@ pub async fn load_and_connect_with_token(
         instance_id,
         remote_state,
         filter,
-        None,
+        filesystem,
     );
     let repository = match repo_lock {
         Some(lock) => repository.with_repository_lock(lock),
@@ -2326,9 +2365,9 @@ pub async fn load_and_connect_with_token(
     // Commit command will look at the global flag and set this explicitly
     repository.set_disable_upload(true);
 
+    repository.set_disable_cache(!(global.cache() || config.is_swfs()));
     let config_file = config.file.unwrap_or_default();
     repository.set_direct_file_write(config_file.direct_write.unwrap_or_default());
-    repository.set_disable_cache(!global.cache());
 
     if global.local() {
         repository.set_disable_upload(true);
@@ -2470,27 +2509,32 @@ pub async fn create_local(
     require_text_root(path)?;
     let instance_id = InstanceId::generate();
 
-    let dotpath = if config
-        .vfs
-        .as_ref()
-        .is_some_and(|config| config.vfs_type.is_swfs())
-    {
+    let dotpath;
+    let filesystem_provider: Option<Arc<dyn FilesystemProvider + 'static>>;
+    if config.is_swfs() {
         let mount_manager = MountManagerState::mount_manager().ok_or(RepositoryError::internal(
             "Attempting to create an SWFS instance outside the service",
         ))?;
-        mount_manager
-            .create_mount(path, instance_id)
-            .forward::<RepositoryError>("Failed to create mount for SWFS instance")?
+        dotpath = mount_manager
+            .create_mount(path, &config, repository, instance_id)
+            .await
+            .forward::<RepositoryError>("Failed to create mount for SWFS instance")?;
+        filesystem_provider = Some(
+            mount_manager
+                .get_mount_filesystem_provider(path)
+                .forward::<RepositoryError>("Failed to get filesystem provider for fresh mount")?,
+        );
     } else {
-        path.join(DOT_LORE)
+        dotpath = path.join(DOT_LORE);
+        filesystem_provider = None;
     };
     let idpath = dotpath.join(ID);
 
-    if dotpath.exists() {
+    /*if dotpath.exists() {
         return Err(RepositoryError::from(RepositoryAlreadyExists {
             path: path.display().to_string(),
         }));
-    }
+    }*/
 
     let dotpath_display = dotpath.display().to_string();
     lore_io::IoDriver::global()
@@ -2563,7 +2607,7 @@ pub async fn create_local(
             instance_id,
             remote: Err(ProtocolError::from(NoRemote)),
             filter: Arc::default(),
-            filesystem_provider: None,
+            filesystem_provider,
         })
         .with_write_token(token.share()),
     );

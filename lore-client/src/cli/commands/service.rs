@@ -50,8 +50,8 @@ pub enum ServiceCommands {
     Stop(ServiceStopArgs),
 }
 
-fn handle_service_run(_globals: LoreGlobalArgs, _args: &ServiceRunArgs) -> u8 {
-    match runtime().block_on(async move { service_main(None).await }) {
+fn handle_service_run(globals: LoreGlobalArgs, _args: &ServiceRunArgs) -> u8 {
+    match runtime().block_on(async move { service_main(globals, None).await }) {
         Ok(_) => 0,
         Err(error) => {
             eprintln!(
