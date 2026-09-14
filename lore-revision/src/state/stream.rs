@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 
+use std::num::NonZeroUsize;
+
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
 use tokio::sync::mpsc;
@@ -28,11 +30,12 @@ pub(crate) async fn emit(changes: &ChangeSender, change: NodeChange) -> Result<(
         .map_err(|_closed| StateError::internal("Diff receiver dropped"))
 }
 
-/// How many changes a diff may run ahead of the caller reading them.
+/// How many changes a diff may run ahead of the caller reading them, for a caller with no depth
+/// of its own in mind.
 ///
 /// A walk that outruns its reader is holding change records nobody has looked at, which is what
 /// taking them one at a time is for; a walk held to one at a time spends its parallelism waiting.
-const CHANGE_LOOKAHEAD: usize = 1000;
+const CHANGE_LOOKAHEAD: NonZeroUsize = NonZeroUsize::new(1000).expect("a nonzero literal");
 
 /// The changes a diff finds, as it finds them, and what the walk reports once it ends.
 ///
@@ -40,12 +43,13 @@ const CHANGE_LOOKAHEAD: usize = 1000;
 /// its next emit rather than running on for a caller that has gone — which is how a caller
 /// probing for one kind of change stops the walk once it has found one.
 ///
-/// Four ways to read it, and which one a caller wants is what it means to have this:
+/// Ways to read it, and which one a caller wants is what it means to have this:
 ///
 /// - [`collect`](Self::collect) for a caller that transforms the change set as a whole
 /// - [`next`](Self::next) then [`finish`](Self::finish) for one reading each change once
 /// - [`any`](Self::any) for one asking whether a change of some kind is there at all
-/// - dropping it for one that has seen enough
+/// - [`abandon`](Self::abandon) for one that has seen enough and must not outrun the walk
+/// - dropping it for one that has seen enough and has no reason to wait
 ///
 /// [`finish`](Self::finish) is not ceremony: a walk that marks as it goes leaves those marks as
 /// its real answer, and only waiting for it tells a caller they are complete.
@@ -60,13 +64,27 @@ impl<Summary: Default + Send + 'static> ChangeStream<Summary> {
     /// Spawns `walk` behind a channel, and answers with the changes it emits.
     ///
     /// `walk` is handed the sender to emit through, so how it walks and what it reports stay its
-    /// own; the depth it may run ahead by is settled here.
+    /// own. A caller that holds what it reads somewhere else as well wants the walk to run less
+    /// far ahead of it, and says so with
+    /// [`spawn_with_lookahead`](Self::spawn_with_lookahead).
     pub fn spawn<Walk, Walking>(walk: Walk) -> Self
     where
         Walk: FnOnce(ChangeSender) -> Walking,
         Walking: Future<Output = Result<Summary, StateError>> + Send + 'static,
     {
-        let (sender, changes) = mpsc::channel(CHANGE_LOOKAHEAD);
+        Self::spawn_with_lookahead(CHANGE_LOOKAHEAD, walk)
+    }
+
+    /// [`spawn`](Self::spawn) with the walk held to `lookahead` changes ahead of its reader.
+    ///
+    /// Nonzero because a channel of no depth is one no change fits through, which the channel
+    /// itself refuses rather than deadlocks on.
+    pub fn spawn_with_lookahead<Walk, Walking>(lookahead: NonZeroUsize, walk: Walk) -> Self
+    where
+        Walk: FnOnce(ChangeSender) -> Walking,
+        Walking: Future<Output = Result<Summary, StateError>> + Send + 'static,
+    {
+        let (sender, changes) = mpsc::channel(lookahead.get());
         ChangeStream {
             changes,
             walk: Some(lore_spawn!(walk(sender))),
@@ -121,6 +139,20 @@ impl<Summary: Default + Send + 'static> ChangeStream<Summary> {
         }
         joined(walk).await?;
         Ok(false)
+    }
+
+    /// Ends the walk where it stands, and waits for it to stop.
+    ///
+    /// Closes the channel so the walk unwinds at its next emit, then joins it, so whatever the
+    /// walk had in flight has settled by the time this answers. What it reports is then the
+    /// closed channel rather than what it found, so nothing comes back. A caller with no reason
+    /// to wait drops the stream instead.
+    pub async fn abandon(self) {
+        let ChangeStream { changes, walk } = self;
+        drop(changes);
+        if let Some(walk) = walk {
+            let _stopped = walk.await;
+        }
     }
 
     /// What the walk reported, for a caller that has read the changes it came for.

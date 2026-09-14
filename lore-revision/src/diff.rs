@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use lore_base::lore_spawn;
@@ -30,6 +31,14 @@ pub enum DiffError {
     SlowDown,
 }
 
+/// How many changes one path's walk may run ahead of the task forwarding them on.
+///
+/// Shallower than a walk read directly would take, on two counts: there is one of these per
+/// requested path, and every change one holds is held a second time in the shared channel it is
+/// forwarded to. What depth is for is keeping a walk's parallelism busy, and a walk that is
+/// already running behind a second channel has that.
+const PATH_LOOKAHEAD: NonZeroUsize = NonZeroUsize::new(256).expect("a nonzero literal");
+
 /// Calculate the difference between two revisions, as the set of changes
 /// that describe going from revision 'source' to revision 'target',
 /// optionally filtered by a set of paths. Emits each change into `tx` as
@@ -37,7 +46,8 @@ pub enum DiffError {
 /// interleave their items on the channel.
 ///
 /// Each per-path task streams its `state::diff` output directly into the
-/// shared sender — there is no per-path-task buffering. Items arrive in
+/// shared sender, buffering no more than `PATH_LOOKAHEAD`, so a slow
+/// consumer holds its walk back rather than being outrun by it. Items arrive in
 /// `state::diff`'s natural walk order (sorted by name-hash within each
 /// subtree pair) and per-path blocks may interleave by completion order.
 /// Callers that need a globally-sorted `Vec` drain via `collect_stream`
@@ -64,46 +74,30 @@ pub async fn diff_revision_paths(
         let task_tx = tx.clone();
 
         lore_spawn!(tasks, async move {
-            // Stream straight from `state::diff`'s walker through a thin
-            // per-task adapter into the shared sender — no per-path
-            // buffering. `state::diff` emits `Result<NodeChange, StateError>`
-            // on its inner channel; the adapter loop converts each item to
-            // `Result<NodeChange, DiffError>` and forwards to the shared
-            // `task_tx`. The inner channel is bounded so the engine
-            // backpressures on a slow downstream consumer the same way
-            // the outer channel does.
-            let (state_tx, mut state_rx) = mpsc::channel::<NodeChange>(256);
             let walker_repo = repository.clone();
-            let walker = lore_spawn!(async move {
-                state::diff(
-                    walker_repo.clone(),
-                    state_source,
-                    walker_repo,
-                    state_target,
-                    path,
-                    None,
-                    &state_tx,
-                    FilterMode::View,
-                )
-                .await
-            });
-            while let Some(item) = state_rx.recv().await {
+            let mut walk =
+                state::ChangeStream::spawn_with_lookahead(PATH_LOOKAHEAD, async move |changes| {
+                    state::diff(
+                        walker_repo.clone(),
+                        state_source,
+                        walker_repo,
+                        state_target,
+                        path,
+                        None,
+                        &changes,
+                        FilterMode::View,
+                    )
+                    .await
+                });
+            while let Some(change) = walk.next().await {
                 task_tx
-                    .send(Ok(item))
+                    .send(Ok(change))
                     .await
                     .internal("revision diff receiver dropped")?;
             }
-            // Surface any error from the walker task itself.
-            match walker.await {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => Err(err).forward_any::<DiffError>("calculating revision diff")?,
-                Err(join_err) => {
-                    return Err(DiffError::internal_with_context(
-                        join_err,
-                        "revision diff walker task failed",
-                    ));
-                }
-            }
+            walk.finish()
+                .await
+                .forward_any::<DiffError>("calculating revision diff")?;
             Ok(())
         });
     }

@@ -311,10 +311,12 @@ pub const DEFAULT_HISTORY_WALK_CONCURRENCY: usize = 24;
 
 /// `diff3` with optional tunables.
 ///
-/// * `source_cap` — abort with `StateError::Oversized` when source's
-///   `diff_collect` produces more than `n` items. The error message
-///   includes the cap and the produced count. Bounds peak memory for
-///   callers that need a ceiling. Library callers (filesystem diff,
+/// * `source_cap` — fail with `StateError::Oversized`, naming the cap, once the
+///   source walk has produced more than `n` changes. Counted as they arrive
+///   rather than once the walk is done, so a diff that will be rejected is not
+///   walked to the end. Bounds peak memory for callers that need a ceiling, and
+///   is what they map to `Status::resource_exhausted` through `is_oversized()`
+///   rather than by matching the message. Library callers (filesystem diff,
 ///   merge, capi, CLI) pass `None` via `diff3` to stay unbounded.
 /// * `history_walk_concurrency` — permit count for the semaphore
 ///   gating parallel `is_last_change_merged` history walks. Passing
@@ -360,14 +362,7 @@ pub async fn diff3_with_source_cap(
         state_target.revision()
     );
 
-    // Stream source so the cap fires mid-walk: drop the channel and
-    // abort the producer as soon as we cross `source_cap`, instead of
-    // paying for a full walk that we're going to reject. Surfaces as
-    // `StateError::Oversized` so callers can map to
-    // `Status::resource_exhausted` via `is_oversized()` without
-    // string-matching across crates.
     lore_debug!("Diff source branch revisions (streaming)");
-    let (source_tx, mut source_rx) = mpsc::channel::<NodeChange>(256);
     let source_walker_repo = repository.clone();
     let source_walker_state_base = state_base.clone();
     let source_walker_state_source = state_source.clone();
@@ -381,7 +376,7 @@ pub async fn diff3_with_source_cap(
             view,
         ))
     });
-    let source_walker = lore_spawn!(async move {
+    let mut source_walk = state::ChangeStream::spawn(async move |changes| {
         state::diff(
             source_walker_repo.clone(),
             source_walker_state_base,
@@ -389,7 +384,7 @@ pub async fn diff3_with_source_cap(
             source_walker_state_source,
             source_walker_path,
             source_walker_graft,
-            &source_tx,
+            &changes,
             FilterMode::View,
         )
         .await
@@ -397,7 +392,7 @@ pub async fn diff3_with_source_cap(
 
     let mut source_changes: Vec<NodeChange> = Vec::new();
     let mut oversized = false;
-    while let Some(change) = source_rx.recv().await {
+    while let Some(change) = source_walk.next().await {
         let is_file_id_only_churn = !change.from.address.hash.is_zero()
             && change.action != FileAction::Move
             && change.from.address.hash == change.to.address.hash;
@@ -413,12 +408,7 @@ pub async fn diff3_with_source_cap(
         }
     }
     if oversized {
-        // Drop the receiver so the producer's next `send` errors on
-        // closed channel and `state::diff` exits naturally — no abort,
-        // so an in-flight side effect inside `state::diff` is allowed
-        // to complete before the task ends.
-        drop(source_rx);
-        let _ = source_walker.await;
+        source_walk.abandon().await;
         return Err(StateError::from(Oversized {
             context: format!(
                 "source-side diff change count exceeds configured limit of {}",
@@ -426,16 +416,7 @@ pub async fn diff3_with_source_cap(
             ),
         }));
     }
-    match source_walker.await {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => return Err(err),
-        Err(join_err) => {
-            return Err(StateError::internal_with_context(
-                join_err,
-                "3-way diff source walker task failed",
-            ));
-        }
-    }
+    source_walk.finish().await?;
     state::detect_and_coalesce_moves(&mut source_changes);
 
     lore_debug!("Sorting {} source changes", source_changes.len());
@@ -451,11 +432,10 @@ pub async fn diff3_with_source_cap(
     let target_repository = Arc::new(repository.to_filter_context(target_filter));
 
     lore_debug!("Diff target branch revisions (streaming)");
-    let (target_tx, mut target_rx) = mpsc::channel::<NodeChange>(256);
     let walker_repo = target_repository.clone();
     let walker_state_base = state_base.clone();
     let walker_path = path.clone();
-    let walker = lore_spawn!(async move {
+    let mut target_walk = state::ChangeStream::spawn(async move |changes| {
         state::diff(
             walker_repo.clone(),
             walker_state_base,
@@ -464,7 +444,7 @@ pub async fn diff3_with_source_cap(
             walker_path,
             // Adoption is a source-side decision.
             None,
-            &target_tx,
+            &changes,
             FilterMode::View,
         )
         .await
@@ -476,7 +456,7 @@ pub async fn diff3_with_source_cap(
     let mut joined_changes: Vec<NodeChange> = Vec::new();
     let mut joined_conflicts: Vec<(NodeChange, NodeChange)> = Vec::new();
     let mut source_consumed = vec![false; source_changes.len()];
-    while let Some(mut target_change) = target_rx.recv().await {
+    while let Some(mut target_change) = target_walk.next().await {
         let is_file_id_only_churn = !target_change.from.address.hash.is_zero()
             && target_change.from.address.hash == target_change.to.address.hash;
         if is_file_id_only_churn {
@@ -506,16 +486,7 @@ pub async fn diff3_with_source_cap(
         }
     }
 
-    match walker.await {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => return Err(err),
-        Err(join_err) => {
-            return Err(StateError::internal_with_context(
-                join_err,
-                "3-way diff target walker task failed",
-            ));
-        }
-    }
+    target_walk.finish().await?;
 
     for (idx, consumed) in source_consumed.iter().enumerate() {
         if !*consumed {
