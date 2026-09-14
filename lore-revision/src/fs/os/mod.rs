@@ -84,7 +84,7 @@ impl InstanceOperation for OsOperation {
         diff: FilesystemDiffContext,
         changes: &mut Vec<NodeChange>,
     ) -> Result<FilesystemDiffStats, FsError> {
-        crate::state::diff_os_filesystem(diff, changes)
+        crate::state::os_diff::diff_os_filesystem(diff, changes)
             .await
             .forward_any::<FsError>("Failed to diff filesystem")
     }
