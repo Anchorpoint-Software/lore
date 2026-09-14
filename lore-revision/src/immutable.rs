@@ -517,16 +517,18 @@ pub async fn hash_file(
     .forward("hashing file")
 }
 
-/// Whether `path` still holds the content `previous` addresses, fetching fragment metadata
+/// Whether `source` still holds the content `previous` addresses, fetching fragment metadata
 /// but never content payloads.
+///
+/// Measured against the fragmentation the content was stored under, which is the only one that
+/// answers for it, so the comparison reaches the remote where the local store no longer holds it.
 pub async fn file_matches(
     repository: Arc<RepositoryContext>,
     previous: Address,
     previous_size: Option<usize>,
-    content: &lore_storage::ContentHashMemo<'_>,
+    source: &lore_storage::ContentSource,
+    established: &lore_storage::ContentHashes,
 ) -> Result<lore_storage::FileMatch, ImmutableError> {
-    // Only the fragmentation the content was stored under answers for it, and the
-    // local store need not still hold it.
     let remote_session = resolve_session(&repository);
     lore_storage::file_matches(
         repository.immutable_store(),
@@ -534,7 +536,8 @@ pub async fn file_matches(
         previous,
         previous_size,
         remote_session,
-        content,
+        source,
+        established,
     )
     .await
     .forward("comparing file against stored content")

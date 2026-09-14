@@ -6258,7 +6258,7 @@ fn walk_filter_mode(filter_mode: FilterMode, intent: FilesystemDiffIntent) -> Fi
 /// non-overlapping layers.
 #[allow(clippy::too_many_arguments)]
 pub async fn diff_filesystem(
-    operation: &InstanceOperationImpl,
+    operation: &Arc<InstanceOperationImpl>,
     from: FilesystemDiffTree,
     current: FilesystemDiffTree,
     path: Option<RelativePath>,
@@ -6298,6 +6298,7 @@ pub async fn diff_filesystem(
         return diff_with(
             operation,
             FilesystemDiffContext {
+                operation: operation.clone(),
                 from: NodeMapping {
                     repository: repository_from,
                     state: state_from,
@@ -6350,6 +6351,7 @@ pub async fn diff_filesystem(
     diff_with(
         operation,
         FilesystemDiffContext {
+            operation: operation.clone(),
             from: NodeMapping {
                 repository: repository_from,
                 state: state_from,
@@ -6463,7 +6465,7 @@ pub(crate) async fn apply_pending_discards(
 /// [`diff_filesystem`] is the entry for a caller holding a path rather than roots.
 #[allow(clippy::too_many_arguments)]
 pub async fn diff_filesystem_subtree(
-    operation: &InstanceOperationImpl,
+    operation: &Arc<InstanceOperationImpl>,
     from: NodeMapping,
     current: NodeMapping,
     filesystem_path: RelativePath,
@@ -6478,6 +6480,7 @@ pub async fn diff_filesystem_subtree(
     diff_with(
         operation,
         FilesystemDiffContext {
+            operation: operation.clone(),
             from,
             current,
             filesystem_path,
@@ -6495,7 +6498,7 @@ pub async fn diff_filesystem_subtree(
 
 /// Hands one diff to `operation`.
 async fn diff_with(
-    operation: &InstanceOperationImpl,
+    operation: &Arc<InstanceOperationImpl>,
     context: FilesystemDiffContext,
     changes: &mut Vec<NodeChange>,
 ) -> Result<FilesystemDiffStats, StateError> {
@@ -6644,6 +6647,7 @@ pub enum SingleFileCompareResult {
 /// # Returns
 /// The comparison result indicating what type of change occurred
 async fn compare_single_file_against_state(
+    operation: &InstanceOperationImpl,
     repository: Arc<RepositoryContext>,
     from_node: Option<&Node>,
     current_node: Option<&Node>,
@@ -6687,7 +6691,8 @@ async fn compare_single_file_against_state(
             observed.size(),
             file_path,
             !force_hash_check,
-            None,
+            operation,
+            &lore_storage::ContentHashes::default(),
         )
         .await?;
         stats.classify(&modification);
@@ -8109,6 +8114,7 @@ async fn diff_filesystem_directory_walk(
 
             let observed = FileInfo::from_metadata(&item.metadata);
             let compare_result = compare_single_file_against_state(
+                &ctx.operation,
                 node_list.repository.clone(),
                 Some(&from_node),
                 current_node_ref,
@@ -8188,6 +8194,7 @@ async fn diff_filesystem_directory_walk(
                 .0;
             diff_filesystem_subtree_dispatch(
                 FilesystemDiffContext {
+                    operation: ctx.operation.clone(),
                     from: NodeMapping {
                         repository: link_from,
                         state: state_from,
@@ -8340,6 +8347,7 @@ async fn diff_filesystem_directory_walk(
             };
             diff_filesystem_subtree_dispatch(
                 FilesystemDiffContext {
+                    operation: ctx.operation.clone(),
                     from: NodeMapping {
                         repository: repository_from,
                         state: state_from,
@@ -8411,6 +8419,7 @@ async fn diff_filesystem_directory_walk(
                 let item_path = entry.to_path();
                 diff_filesystem_subtree_dispatch(
                     FilesystemDiffContext {
+                        operation: ctx.operation.clone(),
                         from: NodeMapping {
                             repository: ctx.from.repository.clone(),
                             state: ctx.from.state.clone(),
@@ -8644,6 +8653,7 @@ async fn diff_filesystem_directory_walk(
                 let layer_source_node = mount.source_node;
                 diff_filesystem_subtree_dispatch(
                     FilesystemDiffContext {
+                        operation: ctx.operation.clone(),
                         from: NodeMapping {
                             repository: layer_repository.clone(),
                             state: layer_state.clone(),
@@ -8743,6 +8753,7 @@ async fn diff_filesystem_directory_walk(
             let state_current = ctx.current.state.clone();
             diff_filesystem_subtree_dispatch(
                 FilesystemDiffContext {
+                    operation: ctx.operation.clone(),
                     from: NodeMapping {
                         repository: repository_from,
                         state: state_from,
@@ -8979,6 +8990,7 @@ async fn diff_filesystem_single_file(
     }
 
     let compare_result = compare_single_file_against_state(
+        &ctx.operation,
         ctx.from.repository.clone(),
         from_node.as_ref(),
         current_node.as_ref(),
@@ -9137,6 +9149,7 @@ pub async fn count_staged_files(
 
 // TODO(UCS-13059): Extend with file mode check
 /// Outcome of comparing a file on disk to the content a node addresses.
+#[derive(Debug)]
 pub enum NodeComparison {
     /// The file holds the node's content.
     Matches,
@@ -9149,63 +9162,61 @@ pub enum NodeComparison {
     Unreadable,
 }
 
-/// Whether the file on disk holds the content `node` addresses.
+/// Whether the working tree holds the content `node` addresses.
 ///
-/// The file is measured against the stored object's own fragmentation, which is the only
-/// comparison that holds: a commit may reuse a previous fragmentation, so the stored hash is
-/// a function of the content and of how it came to be chunked, and re-hashing the content
-/// from scratch does not reproduce it.
+/// A size of its own settles it without asking anything further, as does anything a previous
+/// comparison against the same file already established. What neither answers is asked of
+/// `operation`, and how it reaches the answer is its own business.
 ///
-/// Fetches fragment metadata but never content payloads, so the cost is bounded by the file
-/// however large the stored object is. Reads no recorded modification time and records none:
-/// a recorded time speaks for the current revision's node, and this answers about any node.
+/// `established` is what those previous comparisons settled. A caller measuring one file against
+/// several nodes passes one across them and the file is read no more than the answers require; a
+/// caller asking once passes a fresh one.
+///
+/// Reads no recorded modification time and records none: a recorded time speaks for the current
+/// revision's node, and this answers about any node.
 pub async fn file_matches_node(
     repository: Arc<RepositoryContext>,
     node: &Node,
     file_size: u64,
     file_path: &impl WalkPath,
-    content: Option<&lore_storage::ContentHashMemo<'_>>,
+    operation: &InstanceOperationImpl,
+    established: &lore_storage::ContentHashes,
 ) -> Result<NodeComparison, StateError> {
     if file_size != node.size {
         lore_trace!("File {file_path} size differs from node, differs");
         return Ok(NodeComparison::Differs);
     }
 
-    let own_path;
-    let own_content;
-    let content = if let Some(content) = content {
-        debug_assert!(
-            repository
-                .require_path()
-                .is_ok_and(|root| root.join(file_path.as_str()) == content.path()),
-            "a shared memo answers for another file"
-        );
-        content
-    } else {
-        own_path = repository.require_path()?.join(file_path.as_str());
-        own_content = lore_storage::ContentHashMemo::new(&own_path);
-        &own_content
-    };
-    let matches =
-        immutable::file_matches(repository, node.address, Some(node.size as usize), content).await;
+    if let Some(settled) = established.decides(node.address, Some(node.size), file_size) {
+        lore_trace!("File {file_path} settled by an earlier comparison: {settled:?}");
+        return Ok(node_comparison(settled));
+    }
 
-    match matches {
-        Ok(lore_storage::FileMatch::Match) => {
-            lore_trace!("File {file_path} matches stored content");
-            Ok(NodeComparison::Matches)
+    let comparison = operation
+        .file_holds_content(
+            repository,
+            &file_path.to_path(),
+            node.address,
+            node.size,
+            established,
+        )
+        .await
+        .forward_any::<StateError>("Failed to compare the file to the node")?;
+    lore_trace!("File {file_path} compared to stored content: {comparison:?}");
+    Ok(comparison)
+}
+
+/// How a storage comparison reads as a node comparison.
+///
+/// A comparison that settled nothing reads as differing: treating it as a match would let a real
+/// local change be overwritten.
+pub fn node_comparison(matched: lore_storage::FileMatch) -> NodeComparison {
+    match matched {
+        lore_storage::FileMatch::Match => NodeComparison::Matches,
+        lore_storage::FileMatch::Differs | lore_storage::FileMatch::Indeterminate => {
+            NodeComparison::Differs
         }
-        Ok(lore_storage::FileMatch::Differs) => {
-            lore_trace!("File {file_path} differs from stored content");
-            Ok(NodeComparison::Differs)
-        }
-        Ok(lore_storage::FileMatch::Indeterminate) => {
-            lore_trace!("File {file_path} could not be compared, treated as differing");
-            Ok(NodeComparison::Differs)
-        }
-        Err(_) => {
-            lore_trace!("File {file_path} could not be read");
-            Ok(NodeComparison::Unreadable)
-        }
+        lore_storage::FileMatch::Unreadable => NodeComparison::Unreadable,
     }
 }
 
@@ -9266,6 +9277,7 @@ impl FileModification {
 ///
 /// Records nothing. Whether an observed match is worth recording depends on which node was
 /// asked about, which only the caller knows.
+#[allow(clippy::too_many_arguments)]
 pub async fn file_modification(
     repository: Arc<RepositoryContext>,
     node: &Node,
@@ -9273,7 +9285,8 @@ pub async fn file_modification(
     file_size: u64,
     file_path: &impl WalkPath,
     force_check_hash: bool,
-    content: Option<&lore_storage::ContentHashMemo<'_>>,
+    operation: &InstanceOperationImpl,
+    established: &lore_storage::ContentHashes,
 ) -> Result<FileModification, StateError> {
     // Assume files are identical if size and timestamp match
     let node_size = node.size;
@@ -9297,7 +9310,16 @@ pub async fn file_modification(
     );
 
     Ok(
-        match file_matches_node(repository, node, file_size, file_path, content).await? {
+        match file_matches_node(
+            repository,
+            node,
+            file_size,
+            file_path,
+            operation,
+            established,
+        )
+        .await?
+        {
             NodeComparison::Matches => FileModification::UnmodifiedByHash,
             NodeComparison::Differs => FileModification::ModifiedByHash,
             NodeComparison::Unreadable => FileModification::Unreadable,
@@ -9312,6 +9334,7 @@ pub async fn file_modification(
 /// and gates both halves: a recorded time speaks for that node alone, so it can neither
 /// answer for any other node nor be written from a match against one. Recording here is what
 /// spares the next scan the hash check this one just paid for.
+#[allow(clippy::too_many_arguments)]
 pub async fn file_modified_against_node(
     repository: Arc<RepositoryContext>,
     node: &Node,
@@ -9319,7 +9342,8 @@ pub async fn file_modified_against_node(
     file_size: u64,
     file_path: &impl WalkPath,
     node_is_current: bool,
-    content: Option<&lore_storage::ContentHashMemo<'_>>,
+    operation: &InstanceOperationImpl,
+    established: &lore_storage::ContentHashes,
 ) -> Result<FileModification, StateError> {
     let modification = file_modification(
         repository.clone(),
@@ -9328,7 +9352,8 @@ pub async fn file_modified_against_node(
         file_size,
         file_path,
         !node_is_current,
-        content,
+        operation,
+        established,
     )
     .await?;
 
@@ -10867,7 +10892,6 @@ mod tests {
     }
 
     use super::*;
-    use crate::repository::RepositoryPaths;
 
     /// The key every stored modification time is filed under. It has to stay the
     /// digest over the path's own lowercase form, or a scan finds nothing it wrote
@@ -11021,12 +11045,16 @@ mod tests {
         .await
         .expect("in-memory mutable store");
 
-        let mut context = RepositoryContext::new_null_context(immutable_store, mutable_store);
-        context.paths = Some(RepositoryPaths::new(
-            path.to_path_buf(),
-            path.join(DOT_LORE),
-        ));
-        Arc::new(context)
+        // Built with the path rather than assigned one afterwards, so the filesystem provider is
+        // rooted where the working tree is.
+        use crate::repository::test_helpers::RepositoryContextCreationArgsExt;
+        Arc::new(RepositoryContext::new(
+            crate::repository::test_helpers::default_repository_creation_args(
+                immutable_store,
+                mutable_store,
+            )
+            .with_path(path),
+        ))
     }
 
     fn pseudo_random_bytes(length: usize) -> Vec<u8> {
@@ -11060,6 +11088,120 @@ mod tests {
         path
     }
 
+    /// An operation on the repository's own filesystem, which is what every caller compares
+    /// through.
+    async fn working_operation(repository: &RepositoryContext) -> Arc<InstanceOperationImpl> {
+        repository
+            .file_system()
+            .begin_operation()
+            .await
+            .expect("beginning an operation")
+    }
+
+    /// What one comparison established answers the next, which is what spares a file measured
+    /// against several addresses being read once for each.
+    ///
+    /// The file is removed between the two: a comparison that reached the working tree again
+    /// would find nothing there and report it unreadable.
+    #[tokio::test]
+    async fn what_one_comparison_established_answers_the_next() {
+        let dir = lore_base::test_util::TempDir::new("lore-state-test-");
+        let repository = working_tree_repository(dir.path()).await;
+        let content = pseudo_random_bytes(4 * 1024);
+        let path = write_working_file(&repository, "established.bin", &content).await;
+        let operation = working_operation(&repository).await;
+        let established = lore_storage::ContentHashes::default();
+
+        let mut first = content_node(&content);
+        first.address = Address::zero_context_hash(Hash::hash_buffer(b"one address"));
+        assert!(matches!(
+            file_matches_node(
+                repository.clone(),
+                &first,
+                first.size,
+                &path,
+                &operation,
+                &established,
+            )
+            .await
+            .expect("comparing a readable file must not error"),
+            NodeComparison::Differs
+        ));
+
+        lore_io::IoDriver::global()
+            .remove_file(path.to_absolute_path(repository.require_path().expect("working tree")))
+            .await
+            .expect("remove working file");
+
+        let mut second = content_node(&content);
+        second.address = Address::zero_context_hash(Hash::hash_buffer(b"another address"));
+        assert!(matches!(
+            file_matches_node(
+                repository,
+                &second,
+                second.size,
+                &path,
+                &operation,
+                &established,
+            )
+            .await
+            .expect("an established comparison reads nothing"),
+            NodeComparison::Differs
+        ));
+    }
+
+    /// A file removed under a run of comparisons reads as unreadable, not as differing.
+    ///
+    /// Nothing established stands in for the file being there, so the size is measured afresh for
+    /// every comparison. Reported unmodified, a routine deletion does not read as local work.
+    #[tokio::test]
+    async fn a_file_removed_between_comparisons_reads_as_unreadable() {
+        let dir = lore_base::test_util::TempDir::new("lore-state-test-");
+        let repository = working_tree_repository(dir.path()).await;
+        // Above the minimum cut, so no established hash can answer on its own.
+        let content = pseudo_random_bytes(100 * 1024);
+        let path = write_working_file(&repository, "removed.bin", &content).await;
+        let operation = working_operation(&repository).await;
+        let established = lore_storage::ContentHashes::default();
+
+        let mut first = content_node(&content);
+        first.address = Address::zero_context_hash(Hash::hash_buffer(b"one address"));
+        assert!(matches!(
+            file_matches_node(
+                repository.clone(),
+                &first,
+                first.size,
+                &path,
+                &operation,
+                &established,
+            )
+            .await
+            .expect("comparing a readable file must not error"),
+            NodeComparison::Differs
+        ));
+
+        lore_io::IoDriver::global()
+            .remove_file(path.to_absolute_path(repository.require_path().expect("working tree")))
+            .await
+            .expect("remove working file");
+
+        let mut second = content_node(&content);
+        second.address = Address::zero_context_hash(Hash::hash_buffer(b"another address"));
+        assert!(matches!(
+            file_matches_node(
+                repository,
+                &second,
+                second.size,
+                &path,
+                &operation,
+                &established,
+            )
+            .await
+            .expect("a removed file is not an error"),
+            NodeComparison::Unreadable
+        ));
+    }
+
     /// A comparison that settles nothing has to read as modified. The address names a list
     /// nothing stored, so neither the stored chunking nor a rehash can answer, and
     /// overwriting a file that may hold local work is the one outcome there is no
@@ -11074,17 +11216,35 @@ mod tests {
         let mut node = content_node(&content);
         node.address = Address::zero_context_hash(Hash::hash_buffer(b"a list nothing stored"));
 
+        let operation = working_operation(&repository).await;
+        let established = lore_storage::ContentHashes::default();
         assert!(matches!(
-            file_matches_node(repository.clone(), &node, node.size, &path, None,)
-                .await
-                .expect("comparing a readable file must not error"),
+            file_matches_node(
+                repository.clone(),
+                &node,
+                node.size,
+                &path,
+                &operation,
+                &established,
+            )
+            .await
+            .expect("comparing a readable file must not error"),
             NodeComparison::Differs
         ));
         assert!(
-            file_modification(repository, &node, 1, node.size, &path, true, None,)
-                .await
-                .expect("comparing a readable file must not error")
-                .is_modified()
+            file_modification(
+                repository,
+                &node,
+                1,
+                node.size,
+                &path,
+                true,
+                &operation,
+                &established,
+            )
+            .await
+            .expect("comparing a readable file must not error")
+            .is_modified()
         );
     }
 
@@ -11098,10 +11258,19 @@ mod tests {
         let path = write_working_file(&repository, "unfragmented.bin", &content).await;
         let node = content_node(&content);
 
+        let operation = working_operation(&repository).await;
+        let established = lore_storage::ContentHashes::default();
         assert!(matches!(
-            file_matches_node(repository.clone(), &node, node.size, &path, None,)
-                .await
-                .expect("comparing a readable file must not error"),
+            file_matches_node(
+                repository.clone(),
+                &node,
+                node.size,
+                &path,
+                &operation,
+                &established,
+            )
+            .await
+            .expect("comparing a readable file must not error"),
             NodeComparison::Matches
         ));
 
@@ -11116,11 +11285,23 @@ mod tests {
             .await
             .expect("rewrite working file");
 
+        // What the first comparison established answers for the content it read, so the rewrite
+        // starts again.
+        let established = lore_storage::ContentHashes::default();
         assert!(
-            file_modification(repository, &node, 1, node.size, &path, true, None,)
-                .await
-                .expect("comparing a readable file must not error")
-                .is_modified()
+            file_modification(
+                repository,
+                &node,
+                1,
+                node.size,
+                &path,
+                true,
+                &operation,
+                &established,
+            )
+            .await
+            .expect("comparing a readable file must not error")
+            .is_modified()
         );
     }
 
@@ -11133,6 +11314,7 @@ mod tests {
         let path = write_working_file(&repository, "resized.bin", &content).await;
         let node = content_node(&content[..content.len() - 1]);
 
+        let operation = working_operation(&repository).await;
         assert!(matches!(
             file_modification(
                 repository,
@@ -11141,7 +11323,8 @@ mod tests {
                 content.len() as u64,
                 &path,
                 false,
-                None,
+                &operation,
+                &lore_storage::ContentHashes::default(),
             )
             .await
             .expect("comparing a readable file must not error"),

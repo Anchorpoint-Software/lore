@@ -10,8 +10,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use lore_base::types::Address;
 use lore_base::types::Fragment;
-use lore_base::types::Hash;
 use lore_error_set::prelude::*;
 
 use super::filesystem_provider::FileInfo;
@@ -120,45 +120,36 @@ impl InstanceOperation for OsOperation {
         Ok(crate::util::fs::names_folding_to(path, name).await?)
     }
 
-    async fn file_hash(
+    /// Measures the file the operation's root holds at `path` against the stored object's own
+    /// fragmentation, which is the only comparison that holds: a commit may reuse a previous
+    /// fragmentation, so the stored hash is a function of the content and of how it came to be
+    /// chunked, and re-hashing the content from scratch does not reproduce it.
+    ///
+    /// Fetches fragment metadata but never content payloads, so the cost is bounded by the file
+    /// however large the stored object is.
+    ///
+    /// The source is named per call and the hashes come from `established`, so a caller measuring
+    /// one path against several addresses reads it no more than the answers require.
+    async fn file_holds_content(
         &self,
         repository: Arc<RepositoryContext>,
         path: &RelativePath,
-        node_hint: Option<&Node>,
-    ) -> Result<Hash, FsError> {
-        Ok(immutable::hash_file(
-            repository.clone(),
-            self.absolute(path),
-            node_hint.and_then(|node| {
-                if !node.address.is_zero() {
-                    Some(node.address)
-                } else {
-                    None
-                }
-            }),
-            node_hint.and_then(|node| {
-                if node.size > 0 {
-                    Some(node.size as usize)
-                } else {
-                    None
-                }
-            }),
+        previous: Address,
+        previous_size: u64,
+        established: &lore_storage::ContentHashes,
+    ) -> Result<NodeComparison, FsError> {
+        let source = lore_storage::ContentSource::File(self.absolute(path));
+        let matched = crate::immutable::file_matches(
+            repository,
+            previous,
+            Some(previous_size as usize),
+            &source,
+            established,
         )
         .await
-        .unwrap_or_default())
-    }
+        .forward_any::<FsError>("Failed to compare the file to stored content")?;
 
-    async fn compare_file_to_node(
-        &self,
-        repository: Arc<RepositoryContext>,
-        node: &Node,
-        path: &RelativePath,
-        file_size: u64,
-        content: &lore_storage::ContentHashMemo<'_>,
-    ) -> Result<NodeComparison, FsError> {
-        crate::state::file_matches_node(repository, node, file_size, path, Some(content))
-            .await
-            .forward_any::<FsError>("Failed to compare file to node")
+        Ok(crate::state::node_comparison(matched))
     }
 
     async fn make_executable(&self, path: &RelativePath, executable: bool) -> Result<(), FsError> {

@@ -29,7 +29,6 @@ use crate::fs::filesystem_provider::FilesystemDiffIntent;
 use crate::fs::filesystem_provider::FilesystemDiffTree;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
-use crate::fs::filesystem_provider::with_operation;
 use crate::fs::filesystem_provider::with_operation_if;
 use crate::interface::LoreError;
 use crate::interface::LoreFileAction;
@@ -512,9 +511,9 @@ async fn file_size_from_node_change_path(
 /// A missing or unreadable file is reported as modified — the dirty flag then
 /// reflects a real change that the regular diff will surface.
 ///
-/// The measurement — whether a file is there, and its size and modified time — is read through
-/// `operation`. Comparing content reads the working tree directly, which is the one part of this a
-/// provider's own view does not answer for.
+/// Everything read of the working tree — whether a file is there, its size and modified time, and
+/// the content a hash check compares — is read through `operation`, so that the measurement and the
+/// content it is measured against come from one view of the tree.
 ///
 /// What the check settles is written, not only reported: a flag it finds stale is cleared on the
 /// node.
@@ -554,7 +553,8 @@ async fn dirty_change_is_modified(
         info.size(),
         change.path(),
         !node.is_staged(),
-        None,
+        operation,
+        &lore_storage::ContentHashes::default(),
     )
     .await
     .forward::<StatusError>("comparing dirty file against filesystem")?;
@@ -805,6 +805,46 @@ fn layer_selection(layer: &layer::Layer, path: Option<&RelativePath>) -> Option<
         mount_path: RelativePath::new_from_clean_parts(&layer.target_path, sub_path),
         source_path: RelativePath::new_from_clean_parts(&layer.source_path, sub_path),
     })
+}
+
+/// Compare the current state against the staged one for every requested path, in the repository's
+/// own tree and in each layer the path selects, and report what differs.
+async fn report_staged_diffs(
+    repository: &Arc<RepositoryContext>,
+    paths: &[Option<RelativePath>],
+    state_current: &Arc<State>,
+    state_staged: &Arc<State>,
+    layers: &[(layer::Layer, layer::LayerState)],
+    diff: StagedDiff,
+) -> Result<(), StatusError> {
+    lore_debug!("Calculating deltas against staged revision");
+
+    let mut tasks = JoinSet::new();
+    for path in paths.iter() {
+        lore_spawn!(
+            tasks,
+            report_repository_staged_diff(
+                diff.clone(),
+                repository.clone(),
+                state_current.clone(),
+                state_staged.clone(),
+                path.clone(),
+            )
+        );
+
+        for (layer, layer_state) in layers.iter() {
+            let Some(selection) = layer_selection(layer, path.as_ref()) else {
+                continue;
+            };
+            lore_spawn!(
+                tasks,
+                report_layer_staged_diff(diff.clone(), layer_state.clone(), selection)
+            );
+        }
+    }
+
+    lore_drain_tasks!(tasks, StatusError::internal("Recursion task failed"))?;
+    Ok(())
 }
 
 /// Resolve `source_path` to the work needed to count its subtree, labelling
@@ -1214,6 +1254,86 @@ async fn scan_paths(
     Ok(())
 }
 
+/// What a status run reads out of the trees it has: the comparison against the staged state, the
+/// scan against the working tree, or both.
+#[derive(Clone, Copy)]
+struct TreeDiffPlan {
+    /// Whether a staged state was asked for and exists to compare the current one against.
+    compare_staged: bool,
+    /// Whether a dirty flag the staged comparison finds is checked against the working tree.
+    check_dirty: bool,
+    /// Whether the working tree is scanned for changes neither state holds.
+    scan: bool,
+    /// Whether the repository holds a staged state, which selects the tree a scan compares against.
+    has_staged: bool,
+}
+
+impl TreeDiffPlan {
+    /// Whether the staged comparison checks dirty flags, which it does only where it runs at all.
+    fn checks_dirty(&self) -> bool {
+        self.compare_staged && self.check_dirty
+    }
+
+    /// Whether either phase reads the working tree, and so whether an operation is opened at all.
+    fn reads_working_tree(&self) -> bool {
+        self.checks_dirty() || self.scan
+    }
+}
+
+/// Report what the staged state and the working tree hold against the current state.
+///
+/// One operation covers whichever phases `plan` asks for. Beginning an operation freezes a
+/// provider's view of the working tree, so a run that both checks dirty flags and scans reads a
+/// single snapshot rather than two that may disagree; a run reading neither opens none.
+#[allow(clippy::too_many_arguments)]
+async fn report_tree_diffs(
+    repository: &Arc<RepositoryContext>,
+    paths: &[Option<RelativePath>],
+    state_current: &Arc<State>,
+    state_staged: &Arc<State>,
+    layers: &[(layer::Layer, layer::LayerState)],
+    layer_mounts: &Arc<Vec<state::LayerMountInfo>>,
+    summary: &Arc<StatusSummaryStats>,
+    plan: TreeDiffPlan,
+) -> Result<(), StatusError> {
+    with_operation_if(
+        repository.file_system(),
+        plan.reads_working_tree(),
+        false, /* Reads the working tree, writes only the staged tree */
+        async |operation| {
+            if plan.compare_staged {
+                let diff = StagedDiff {
+                    summary: summary.clone(),
+                    show_scan: plan.scan,
+                    check_dirty: operation.clone().filter(|_| plan.checks_dirty()),
+                };
+                report_staged_diffs(repository, paths, state_current, state_staged, layers, diff)
+                    .await?;
+            }
+
+            let Some(operation) = operation.filter(|_| plan.scan) else {
+                return Ok(());
+            };
+            lore_debug!(
+                "Calculating deltas against filesystem for {} paths",
+                paths.len()
+            );
+            scan_paths(
+                operation,
+                repository,
+                paths,
+                state_current,
+                state_staged,
+                layer_mounts,
+                summary,
+                plan.has_staged,
+            )
+            .await
+        },
+    )
+    .await
+}
+
 pub async fn status(
     repository: Arc<RepositoryContext>,
     paths: Option<Vec<RelativePath>>,
@@ -1556,73 +1676,22 @@ pub async fn status(
         return Ok(());
     }
 
-    // Compare current state against staged state
-    if show_staged && has_staged {
-        lore_debug!("Calculating deltas against staged revision");
-
-        with_operation_if(
-            repository.file_system(),
+    report_tree_diffs(
+        &repository,
+        &paths,
+        &state_current,
+        &state_staged,
+        &layers,
+        &layer_mounts,
+        &summary,
+        TreeDiffPlan {
+            compare_staged: show_staged && has_staged,
             check_dirty,
-            false, /* Reads the working tree, writes only the staged tree */
-            async |operation| {
-                let diff = StagedDiff {
-                    summary: summary.clone(),
-                    show_scan,
-                    check_dirty: operation,
-                };
-                let mut tasks = JoinSet::new();
-                for path in paths.iter() {
-                    lore_spawn!(
-                        tasks,
-                        report_repository_staged_diff(
-                            diff.clone(),
-                            repository.clone(),
-                            state_current.clone(),
-                            state_staged.clone(),
-                            path.clone(),
-                        )
-                    );
-
-                    for (layer, layer_state) in layers.iter() {
-                        let Some(selection) = layer_selection(layer, path.as_ref()) else {
-                            continue;
-                        };
-                        lore_spawn!(
-                            tasks,
-                            report_layer_staged_diff(diff.clone(), layer_state.clone(), selection)
-                        );
-                    }
-                }
-
-                lore_drain_tasks!(tasks, StatusError::internal("Recursion task failed"))?;
-                Ok::<(), StatusError>(())
-            },
-        )
-        .await?;
-    }
-
-    // Compare current/staged state against filesystem
-    if show_scan {
-        lore_debug!(
-            "Calculating deltas against filesystem for {} paths",
-            paths.len()
-        );
-
-        with_operation(repository.file_system(), false, async |operation| {
-            scan_paths(
-                operation,
-                &repository,
-                &paths,
-                &state_current,
-                &state_staged,
-                &layer_mounts,
-                &summary,
-                has_staged,
-            )
-            .await
-        })
-        .await?;
-    }
+            scan: show_scan,
+            has_staged,
+        },
+    )
+    .await?;
 
     // Emit the aggregate dirty-node summary for reconciling status runs. For
     // --scan these are the changes detected against the filesystem; for
@@ -1789,5 +1858,132 @@ mod remote_resolve_tests {
             (None, false, false),
             "failed remote should degrade to unavailable"
         );
+    }
+}
+
+#[cfg(test)]
+mod tree_diff_operation_tests {
+    use lore_base::runtime::LORE_CONTEXT;
+
+    use super::*;
+    use crate::fs::filesystem_provider::tests::TestFilesystemProvider;
+    use crate::fs::filesystem_provider::tests::test_store_create;
+    use crate::repository::test_helpers::RepositoryContextCreationArgsExt;
+    use crate::repository::test_helpers::default_repository_creation_args;
+
+    /// Runs `plan` over a repository whose states are empty and whose working tree holds what they
+    /// do, and answers how many operations it began and what each finalize reported.
+    ///
+    /// Empty states leave every phase with nothing to report, which is what isolates the count from
+    /// the reporting.
+    async fn operations_begun(plan: TreeDiffPlan) -> (usize, Vec<bool>) {
+        let filesystem = Arc::new(TestFilesystemProvider::new());
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Making test stores");
+        let repository = Arc::new(RepositoryContext::new(
+            default_repository_creation_args(immutable_store, mutable_store)
+                .with_filesystem_provider(filesystem.clone()),
+        ));
+
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let state = Arc::new(State::new());
+                report_tree_diffs(
+                    &repository,
+                    &[None],
+                    &state,
+                    &state,
+                    &[],
+                    &Arc::new(Vec::new()),
+                    &Arc::new(StatusSummaryStats::default()),
+                    plan,
+                )
+                .await
+                .expect("The diff succeeded");
+            })
+            .await;
+
+        let finalizes = filesystem.finalize_events.lock().clone();
+        (filesystem.begins(), finalizes)
+    }
+
+    #[tokio::test]
+    async fn a_staged_comparison_alone_reads_no_working_tree() {
+        let (begins, finalizes) = operations_begun(TreeDiffPlan {
+            compare_staged: true,
+            check_dirty: false,
+            scan: false,
+            has_staged: true,
+        })
+        .await;
+
+        assert_eq!(
+            0, begins,
+            "A comparison of two states read the working tree"
+        );
+        assert!(finalizes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_dirty_check_without_a_staged_comparison_reads_no_working_tree() {
+        let (begins, _) = operations_begun(TreeDiffPlan {
+            compare_staged: false,
+            check_dirty: true,
+            scan: false,
+            has_staged: false,
+        })
+        .await;
+
+        assert_eq!(
+            0, begins,
+            "A dirty check with no comparison to check for opened an operation"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dirty_check_opens_one_operation() {
+        let (begins, finalizes) = operations_begun(TreeDiffPlan {
+            compare_staged: true,
+            check_dirty: true,
+            scan: false,
+            has_staged: true,
+        })
+        .await;
+
+        assert_eq!(1, begins);
+        assert_eq!(vec![false], finalizes);
+    }
+
+    #[tokio::test]
+    async fn a_scan_opens_one_operation() {
+        let (begins, finalizes) = operations_begun(TreeDiffPlan {
+            compare_staged: false,
+            check_dirty: false,
+            scan: true,
+            has_staged: false,
+        })
+        .await;
+
+        assert_eq!(1, begins);
+        assert_eq!(vec![false], finalizes);
+    }
+
+    /// The snapshot a dirty check reads is the one the scan reads, which holds only while both run
+    /// within a single operation.
+    #[tokio::test]
+    async fn a_dirty_check_and_a_scan_share_one_operation() {
+        let (begins, finalizes) = operations_begun(TreeDiffPlan {
+            compare_staged: true,
+            check_dirty: true,
+            scan: true,
+            has_staged: true,
+        })
+        .await;
+
+        assert_eq!(
+            1, begins,
+            "Checking dirty flags and scanning read separate snapshots"
+        );
+        assert_eq!(vec![false], finalizes);
     }
 }

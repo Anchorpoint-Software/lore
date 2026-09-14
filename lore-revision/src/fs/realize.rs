@@ -351,7 +351,7 @@ async fn holds_the_replaced_content(
     file_size: u64,
     measured: Option<crate::lore::Address>,
     incoming: crate::lore::Address,
-    content: &lore_storage::ContentHashMemo<'_>,
+    established: &lore_storage::ContentHashes,
 ) -> Result<bool, SyncError> {
     if !change.from.mapping.node.is_valid_node_id() {
         return Ok(false);
@@ -368,15 +368,16 @@ async fn holds_the_replaced_content(
     }
 
     Ok(matches!(
-        operation
-            .compare_file_to_node(
-                change.from.mapping.repository.clone(),
-                &node_from,
-                change.path(),
-                file_size,
-                content,
-            )
-            .await?,
+        state::file_matches_node(
+            change.from.mapping.repository.clone(),
+            &node_from,
+            file_size,
+            change.path(),
+            operation,
+            established,
+        )
+        .await
+        .forward::<SyncError>("Failed to compare the file to the node the change starts from")?,
         NodeComparison::Matches
     ))
 }
@@ -396,7 +397,7 @@ async fn modification_against_measured_node(
     current: &NodeMapping,
     force_full_check: bool,
     repository_path: &RelativePath,
-    content: &lore_storage::ContentHashMemo<'_>,
+    established: &lore_storage::ContentHashes,
 ) -> Result<crate::fs::filesystem_provider::FileModifiedCheck, SyncError> {
     let info = operation.file_info(repository_path).await?;
     if !info.exists() {
@@ -451,7 +452,8 @@ async fn modification_against_measured_node(
                     info.size(),
                     change.path(),
                     true,
-                    Some(content),
+                    operation,
+                    established,
                 )
                 .await
             } else {
@@ -462,7 +464,8 @@ async fn modification_against_measured_node(
                     info.size(),
                     change.path(),
                     is_current,
-                    Some(content),
+                    operation,
+                    established,
                 )
                 .await
             }
@@ -495,8 +498,9 @@ pub async fn verify_filesystem(
 ) -> Result<Option<NodeChange>, SyncError> {
     lore_trace!("Verify path: {change:?}");
     let repository_path = change.path().clone();
-    let absolute_path = repository_path.to_absolute_path(repository.require_path()?);
-    let content = lore_storage::ContentHashMemo::new(&absolute_path);
+    // One file is measured against the node it was realized from, the incoming node and the
+    // node the change starts at. What comparing it establishes serves all three.
+    let established = lore_storage::ContentHashes::default();
     let modifications = modification_against_measured_node(
         &operation,
         repository.clone(),
@@ -504,7 +508,7 @@ pub async fn verify_filesystem(
         &current,
         force_full_check,
         &repository_path,
-        &content,
+        &established,
     )
     .await?;
 
@@ -635,15 +639,16 @@ pub async fn verify_filesystem(
         let comparison = if differs_from == Some(node_to.address) {
             NodeComparison::Differs
         } else {
-            operation
-                .compare_file_to_node(
-                    change.from.mapping.repository.clone(),
-                    &node_to,
-                    change.path(),
-                    file_size,
-                    &content,
-                )
-                .await?
+            state::file_matches_node(
+                change.from.mapping.repository.clone(),
+                &node_to,
+                file_size,
+                change.path(),
+                &operation,
+                &established,
+            )
+            .await
+            .forward::<SyncError>("Failed to compare the file to the incoming node")?
         };
 
         match comparison {
@@ -662,7 +667,7 @@ pub async fn verify_filesystem(
                     file_size,
                     differs_from,
                     node_to.address,
-                    &content,
+                    &established,
                 )
                 .await?
                 {
@@ -807,20 +812,11 @@ pub async fn verify_filesystem(
                                 subchange.path()
                             );
                         } else {
-                            let file_hash = operation
-                                .file_hash(
-                                    change.from.mapping.repository.clone(),
-                                    &subchange_path,
-                                    from_node.as_ref().ok(),
-                                )
-                                .await
-                                .unwrap_or_default();
                             lore_info!(
-                                "  {} {} : size {} hash {} mtime {}",
+                                "  {} {} : size {} mtime {}",
                                 subchange.action.as_string_short(),
                                 subchange.path(),
                                 file_info.size(),
-                                file_hash,
                                 file_info.mtime()
                             );
                         }

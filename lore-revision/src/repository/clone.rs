@@ -1811,7 +1811,8 @@ async fn clone_file(
                 file_info.size(),
                 &repository_path,
                 force,
-                None,
+                &operation,
+                &lore_storage::ContentHashes::default(),
             )
             .await,
             Ok(FileModification::UnmodifiedByMtime | FileModification::UnmodifiedByHash)

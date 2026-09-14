@@ -481,6 +481,7 @@ pub(crate) async fn stage_filesystem_path(
             }
 
             let staged = stage_node_from_metadata(
+                &operation,
                 NodeMapping {
                     repository: current_repository.clone(),
                     state: current_state.clone(),
@@ -573,6 +574,7 @@ pub(crate) async fn stage_filesystem_path(
             stats.task_count.fetch_add(1, Ordering::Release);
 
             let result = stage_directory(
+                operation.clone(),
                 current_repository.clone(),
                 current_state.clone(),
                 current_absolute_path.as_path(),
@@ -1357,6 +1359,7 @@ fn directory_task_semaphore() -> &'static Arc<Semaphore> {
 /// from rather than folding its whole path.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn stage_directory(
+    operation: Arc<InstanceOperationImpl>,
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
     absolute_path: &Path,
@@ -1505,6 +1508,7 @@ pub(crate) async fn stage_directory(
             }
 
             let staged = match stage_node_from_metadata(
+                &operation,
                 NodeMapping {
                     repository: repository.clone(),
                     state: state.clone(),
@@ -1535,6 +1539,7 @@ pub(crate) async fn stage_directory(
             // the bounded fan-out would deadlock.
             if let Ok(permit) = directory_task_semaphore().clone().try_acquire_owned() {
                 lore_spawn!(directory_tasks, {
+                    let operation = operation.clone();
                     let repository = repository.clone();
                     let state = state.clone();
                     let stats = stats.clone();
@@ -1546,6 +1551,7 @@ pub(crate) async fn stage_directory(
                     async move {
                         let _permit = permit;
                         stage_child_directory(
+                            operation,
                             repository,
                             state,
                             absolute_path,
@@ -1564,6 +1570,7 @@ pub(crate) async fn stage_directory(
                 });
             } else {
                 let result = stage_child_directory(
+                    operation.clone(),
                     repository.clone(),
                     state.clone(),
                     absolute_path.to_path_buf(),
@@ -1614,6 +1621,7 @@ pub(crate) async fn stage_directory(
             };
 
             let result = stage_node_from_metadata(
+                &operation,
                 NodeMapping {
                     repository: repository.clone(),
                     state: state.clone(),
@@ -1707,6 +1715,7 @@ pub(crate) async fn stage_directory(
 /// `states` is the child's own filter verdict, which staging it already reached.
 #[allow(clippy::too_many_arguments)]
 async fn stage_child_directory(
+    operation: Arc<InstanceOperationImpl>,
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
     mut absolute_path: PathBuf,
@@ -1771,6 +1780,7 @@ async fn stage_child_directory(
         let link_states = linked_repository.filter.mount_states(&link_relative_path);
 
         let result = stage_directory_recurse(
+            operation.clone(),
             linked_repository.clone(),
             linked_state.clone(),
             absolute_path.as_path(),
@@ -1803,6 +1813,7 @@ async fn stage_child_directory(
         // needed here.
         stats.task_count.fetch_add(1, Ordering::Release);
         let result = stage_directory_recurse(
+            operation,
             repository,
             state,
             absolute_path.as_path(),
@@ -1824,6 +1835,7 @@ async fn stage_child_directory(
 
 #[allow(clippy::too_many_arguments)]
 fn stage_directory_recurse(
+    operation: Arc<InstanceOperationImpl>,
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
     absolute_path: &Path,
@@ -1838,6 +1850,7 @@ fn stage_directory_recurse(
     states: FilterStates,
 ) -> Pin<Box<dyn Future<Output = Result<(), StageError>> + Send + '_>> {
     Box::pin(stage_directory(
+        operation,
         repository,
         state,
         absolute_path,
@@ -1891,6 +1904,7 @@ impl StagedChild {
 /// rather than folding its whole path.
 #[allow(clippy::too_many_arguments, unused_assignments)]
 pub(crate) async fn stage_node_from_metadata(
+    operation: &Arc<InstanceOperationImpl>,
     base: NodeMapping,
     name: String,
     info: FileInfo,
@@ -2303,15 +2317,15 @@ pub(crate) async fn stage_node_from_metadata(
             } else {
                 let node_path = relative_path.join(name.as_str());
 
-                let (mtime, size) = (info.mtime(), info.size());
                 file_modified_against_node(
                     repository.clone(),
                     &node,
-                    mtime,
-                    size,
+                    info.mtime(),
+                    info.size(),
                     &node_path,
                     !node.is_staged(),
-                    None,
+                    operation,
+                    &lore_storage::ContentHashes::default(),
                 )
                 .await
                 .forward::<StageError>("Failed to determine if file is modified")?
@@ -3653,6 +3667,7 @@ pub(crate) async fn stage_from_parent_state(
                 // folded here rather than threaded from a walk.
                 let parent_states = repository.filter.exclusion_states(&parent_path);
                 stage_node_from_metadata(
+                    &operation,
                     NodeMapping {
                         repository,
                         state,

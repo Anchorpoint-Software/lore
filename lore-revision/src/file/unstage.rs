@@ -17,6 +17,7 @@ use crate::event;
 use crate::event::EventError;
 use crate::filter::FilterMode;
 use crate::filter::FilterStates;
+use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::with_operation;
 use crate::interface::LoreArray;
@@ -516,6 +517,7 @@ async fn unstage_path(
         lore_debug!("Unstaging the repository from root");
 
         return unstage_directory(
+            operation,
             NodeMapping {
                 repository: repository.clone(),
                 state: state_staged.clone(),
@@ -546,6 +548,7 @@ async fn unstage_path(
     };
 
     Box::pin(unstage_node(
+        operation,
         NodeMapping {
             repository: target.repository,
             state: target.state_staged,
@@ -655,6 +658,7 @@ async fn resolve_unstage_target(
 /// Each child of `at`'s path steps from the verdict `states` carries.
 #[allow(clippy::too_many_arguments)]
 async fn unstage_directory(
+    operation: Arc<InstanceOperationImpl>,
     at: NodeMapping,
     state_current: Arc<State>,
     discard: Arc<DashMap<RepositoryId, Vec<u32>>>,
@@ -702,6 +706,7 @@ async fn unstage_directory(
         );
 
         unstage_node_recurse(
+            operation.clone(),
             NodeMapping {
                 repository: repository.clone(),
                 state: state_staged.clone(),
@@ -785,6 +790,7 @@ async fn unstage_parent_chain(
 /// `at`'s path from.
 #[allow(clippy::too_many_arguments)]
 async fn unstage_node(
+    operation: Arc<InstanceOperationImpl>,
     at: NodeMapping,
     state_current: Arc<State>,
     discard: Arc<DashMap<RepositoryId, Vec<u32>>>,
@@ -998,39 +1004,40 @@ async fn unstage_node(
 
         // After clearing Staged, re-check filesystem: clear Dirty if file matches current
         // revision. If still differs, preserve Dirty.
-        if node.is_dirty() && node.is_file() {
-            let absolute_path = node_path.to_absolute_path(repository.require_path()?);
-            if let Ok(file_metadata) = lore_io::IoDriver::global().metadata(&absolute_path).await {
-                let (file_mtime, file_size) = crate::util::fs::file_mtime_and_size(&file_metadata);
-                let file_modified = crate::state::file_modification(
-                    repository.clone(),
-                    &current_node,
-                    file_mtime,
-                    file_size,
-                    &node_path,
-                    true, /* Force hash check */
-                    None,
-                )
-                .await
-                .forward::<UnstageError>("Failed to check if file was modified")?
-                .is_modified();
+        if node.is_dirty()
+            && node.is_file()
+            && let Ok(info) = operation.file_info(&node_path).await
+            && info.is_file()
+        {
+            let file_modified = crate::state::file_modification(
+                repository.clone(),
+                &current_node,
+                info.mtime(),
+                info.size(),
+                &node_path,
+                true, /* Force hash check */
+                &operation,
+                &lore_storage::ContentHashes::default(),
+            )
+            .await
+            .forward::<UnstageError>("Failed to check if file was modified")?
+            .is_modified();
 
-                if !file_modified {
-                    // File matches current revision — clear Dirty
-                    node.clear_dirty_flags();
-                    let dirtied = {
-                        let mut block_writer = block.write();
-                        block_writer.node(node_index).flags = node.flags;
-                        block_writer.mark_dirty()
-                    };
-                    if dirtied {
-                        state_staged.block_modified(block.clone(), block_index);
-                        state_staged.mark_dirty();
-                    }
+            if !file_modified {
+                // File matches current revision — clear Dirty
+                node.clear_dirty_flags();
+                let dirtied = {
+                    let mut block_writer = block.write();
+                    block_writer.node(node_index).flags = node.flags;
+                    block_writer.mark_dirty()
+                };
+                if dirtied {
+                    state_staged.block_modified(block.clone(), block_index);
+                    state_staged.mark_dirty();
                 }
             }
-            // If file doesn't exist on disk — could be a delete, preserve Dirty
         }
+        // If file doesn't exist on disk — could be a delete, preserve Dirty
     }
 
     unstage_parent_chain(
@@ -1146,6 +1153,7 @@ async fn unstage_node(
                     .forward::<UnstageError>("Failed to unstage link nodes")?;
 
             unstage_directory(
+                operation.clone(),
                 NodeMapping {
                     repository: linked_repository.clone(),
                     state: linked_state.clone(),
@@ -1167,6 +1175,7 @@ async fn unstage_node(
         }
 
         unstage_directory(
+            operation.clone(),
             NodeMapping {
                 repository: repository.clone(),
                 state: state_staged.clone(),
@@ -1199,6 +1208,7 @@ async fn unstage_node(
 
 #[allow(clippy::too_many_arguments)]
 fn unstage_node_recurse<'a>(
+    operation: Arc<InstanceOperationImpl>,
     at: NodeMapping,
     state_current: Arc<State>,
     discard: Arc<DashMap<RepositoryId, Vec<u32>>>,
@@ -1208,6 +1218,7 @@ fn unstage_node_recurse<'a>(
     states: FilterStates,
 ) -> Pin<Box<dyn Future<Output = Result<(), UnstageError>> + Send + 'a>> {
     Box::pin(unstage_node(
+        operation,
         at,
         state_current,
         discard,

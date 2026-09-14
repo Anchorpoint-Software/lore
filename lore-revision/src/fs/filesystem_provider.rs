@@ -21,8 +21,8 @@ use crate::change::NodeChange;
 use crate::filter::FilterMode;
 use crate::filter::FilterStates;
 use crate::fs::os::OsOperation;
+use crate::lore::Address;
 use crate::lore::Context;
-use crate::lore::Hash;
 use crate::merge::MergeTextMode;
 use crate::node::Node;
 use crate::node::NodeFlags;
@@ -188,6 +188,9 @@ impl FilesystemDiffIntent {
 /// `current` is what the working copy last held, which is how an unstaged add is told
 /// apart from a tracked file.
 pub struct FilesystemDiffContext {
+    /// The operation the walk reads the working tree through, carried here because the walk
+    /// spawns tasks and so needs one it can own rather than borrow.
+    pub operation: Arc<InstanceOperationImpl>,
     pub from: NodeMapping,
     pub current: NodeMapping,
     /// The path as the file system spells it, which parts from the mappings' own spelling only
@@ -359,30 +362,28 @@ pub trait InstanceOperation: Send + Sync {
         name: &str,
     ) -> impl Future<Output = Result<Vec<String>, FsError>> + Send;
 
-    /// Gets the hash of a file in the repository, optionally providing the Node if it has
-    /// separately been loaded.
-    fn file_hash(
-        &self,
-        repository: Arc<RepositoryContext>,
-        path: &RelativePath,
-        node_hint: Option<&Node>,
-    ) -> impl Future<Output = Result<Hash, FsError>> + Send;
-
-    /// How the file at `path` compares to the content `node` addresses.
+    /// Whether the file at `path` holds the content `previous` addresses, and `previous_size`
+    /// bytes of it.
     ///
-    /// Takes the node to compare against rather than deriving it from a change, so a caller
-    /// holding both sides of a change can ask about either. Compares content rather than
-    /// consulting a recorded modification time, which speaks only for the current revision's
-    /// node and so cannot answer for the other side of a change. A file that cannot be read
-    /// is reported as such rather than as either answer, so a caller does not act on a
-    /// comparison that never happened.
-    fn compare_file_to_node(
+    /// How the answer is reached is the operation's own business. One materializing its files
+    /// reads and measures them; one that records what it wrote answers from that record without
+    /// reading anything. A file that cannot be read is reported as such rather than as either
+    /// answer, so a caller does not act on a comparison that never happened.
+    ///
+    /// Takes the address to compare against rather than a change, so a caller holding both sides
+    /// of one can ask about either. Reads no recorded modification time: a recorded time speaks
+    /// for the node the current revision holds and answers for no other.
+    ///
+    /// `established` carries what comparing this file has already settled, so a caller measuring
+    /// one path against several addresses reads it no more than the answers require. A provider
+    /// answering without reading leaves it untouched.
+    fn file_holds_content(
         &self,
         repository: Arc<RepositoryContext>,
-        node: &Node,
         path: &RelativePath,
-        file_size: u64,
-        content: &lore_storage::ContentHashMemo<'_>,
+        previous: Address,
+        previous_size: u64,
+        established: &lore_storage::ContentHashes,
     ) -> impl Future<Output = Result<NodeComparison, FsError>> + Send;
 
     /// Make a file executable (Unix) or set executable bit equivalent.
@@ -538,7 +539,9 @@ impl InstanceOperation for InstanceOperationImpl {
     ) -> Result<FilesystemDiffStats, FsError> {
         match &self.dispatch {
             #[cfg(test)]
-            StaticDispatchInstanceOperation::Test(_this) => panic!(),
+            StaticDispatchInstanceOperation::Test(this) => {
+                this.changes_from_filesystem_to_state(diff, changes).await
+            }
             StaticDispatchInstanceOperation::Os(this) => {
                 this.changes_from_filesystem_to_state(diff, changes).await
             }
@@ -573,34 +576,19 @@ impl InstanceOperation for InstanceOperationImpl {
         }
     }
 
-    async fn file_hash(
+    async fn file_holds_content(
         &self,
         repository: Arc<RepositoryContext>,
         path: &RelativePath,
-        node_hint: Option<&Node>,
-    ) -> Result<Hash, FsError> {
-        match &self.dispatch {
-            #[cfg(test)]
-            StaticDispatchInstanceOperation::Test(_this) => panic!(),
-            StaticDispatchInstanceOperation::Os(this) => {
-                this.file_hash(repository, path, node_hint).await
-            }
-        }
-    }
-
-    async fn compare_file_to_node(
-        &self,
-        repository: Arc<RepositoryContext>,
-        node: &Node,
-        path: &RelativePath,
-        file_size: u64,
-        content: &lore_storage::ContentHashMemo<'_>,
+        previous: Address,
+        previous_size: u64,
+        established: &lore_storage::ContentHashes,
     ) -> Result<NodeComparison, FsError> {
         match &self.dispatch {
             #[cfg(test)]
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
             StaticDispatchInstanceOperation::Os(this) => {
-                this.compare_file_to_node(repository, node, path, file_size, content)
+                this.file_holds_content(repository, path, previous, previous_size, established)
                     .await
             }
         }
@@ -769,7 +757,7 @@ pub mod tests {
     use crate::fs::filesystem_provider::StaticDispatchInstanceOperation;
     use crate::fs::filesystem_provider::with_operation;
     use crate::fs::filesystem_provider::with_operation_if;
-    use crate::lore::Hash;
+    use crate::lore::Address;
     use crate::lore::RepositoryId;
     use crate::merge::MergeTextMode;
     use crate::node::Node;
@@ -834,7 +822,9 @@ pub mod tests {
     }
 
     /// A repository over `filesystem`, with the stores every context needs.
-    async fn test_repository(filesystem: Arc<TestFilesystemProvider>) -> Arc<RepositoryContext> {
+    pub async fn test_repository(
+        filesystem: Arc<TestFilesystemProvider>,
+    ) -> Arc<RepositoryContext> {
         let (immutable_store, mutable_store, _context) =
             test_store_create().await.expect("Making test stores");
         Arc::new(RepositoryContext::new(
@@ -870,8 +860,8 @@ pub mod tests {
     }
 
     impl InstanceOperation for TestOperation {
-        /// The only actually implemented member, the rest are unimplemented which will fail any
-        /// test that calls them.
+        /// Members beyond finalizing, the walk and the name lookups are unimplemented, which will
+        /// fail any test that calls them.
         async fn finalize(&self, changes_made: bool) -> Result<(), FsError> {
             self.finalize_events.lock().push(changes_made);
             if self.finalize_fails {
@@ -880,12 +870,14 @@ pub mod tests {
             Ok(())
         }
 
+        /// Reports a working tree holding exactly what the state does, which is what a walk over a
+        /// tree with nothing to reconcile answers.
         async fn changes_from_filesystem_to_state(
             &self,
             _diff: FilesystemDiffContext,
             _changes: &mut Vec<NodeChange>,
         ) -> Result<FilesystemDiffStats, FsError> {
-            panic!("Test operation unimplemented except finalize")
+            Ok(FilesystemDiffStats::default())
         }
 
         /// Counts the lookup and reports what the provider was told to hold, which for the
@@ -924,22 +916,13 @@ pub mod tests {
             })
         }
 
-        async fn file_hash(
+        async fn file_holds_content(
             &self,
             _repository: Arc<RepositoryContext>,
             _path: &RelativePath,
-            _node_hint: Option<&Node>,
-        ) -> Result<Hash, FsError> {
-            panic!("Test operation unimplemented except finalize")
-        }
-
-        async fn compare_file_to_node(
-            &self,
-            _repository: Arc<RepositoryContext>,
-            _node: &Node,
-            _path: &RelativePath,
-            _file_size: u64,
-            _content: &lore_storage::ContentHashMemo<'_>,
+            _previous: Address,
+            _previous_size: u64,
+            _established: &lore_storage::ContentHashes,
         ) -> Result<NodeComparison, FsError> {
             panic!("Test operation unimplemented except finalize")
         }

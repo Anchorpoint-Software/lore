@@ -22,6 +22,7 @@ use crate::file::unstage;
 use crate::file::unstage::UnstageOptions;
 use crate::filter::FilterMode;
 use crate::filter::FilterStates;
+use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::with_operation;
 use crate::interface::LoreArray;
@@ -1745,25 +1746,26 @@ async fn reset_file_realize(
         node,
     } = item;
 
-    let node_path = relative_path.clone();
-    let node_absolute = node_path.to_absolute_path(repository.require_path()?);
-    let metadata = lore_io::IoDriver::global().metadata(&node_absolute).await;
+    let info = operation.file_info(&relative_path).await;
 
     let force = execution_context().globals().force();
 
     let block_index = NodeBlock::index(node_id);
     let node_index = Node::index(node_id);
 
-    if !force && let Ok(file_metadata) = metadata.as_ref() {
-        let (mtime, size) = crate::util::fs::file_mtime_and_size(file_metadata);
+    if !force
+        && let Ok(info) = info.as_ref()
+        && info.is_file()
+    {
         let file_modified = state::file_modification(
             repository.clone(),
             &node,
-            mtime,
-            size,
+            info.mtime(),
+            info.size(),
             &relative_path,
             true, /* Force hash check */
-            None,
+            &operation,
+            &lore_storage::ContentHashes::default(),
         )
         .await
         .forward::<ResetError>("Failed to check whether file changed")?
@@ -1795,10 +1797,10 @@ async fn reset_file_realize(
                 })
                 .send();
 
-                let to_path = to_path.to_absolute_path(repository.require_path()?);
-                util::fs::unify_name_case_rename(&node_absolute, to_path.as_path())
+                operation
+                    .unify_case_rename(&relative_path, &to_path)
                     .await
-                    .internal("Failed renaming file")?;
+                    .forward::<ResetError>("Failed renaming file")?;
             } else {
                 lore_trace!("File {relative_path} is not modified, no reset");
             }
@@ -1813,9 +1815,7 @@ async fn reset_file_realize(
 
     // If being reset from a directory to a file the directory must be deleted before the file is
     // created.
-    if let Ok(metadata) = metadata
-        && metadata.is_dir()
-    {
+    if info.is_ok_and(|info| info.is_dir()) {
         reset_delete_path(&repository, &stats, relative_path.clone()).await?;
     }
 
@@ -1830,7 +1830,7 @@ async fn reset_file_realize(
     crate::fs::realize::realize_file(
         repository.clone(),
         operation,
-        &node_path,
+        &relative_path,
         node,
         Arc::new(SyncRealizeStats::default()),
     )

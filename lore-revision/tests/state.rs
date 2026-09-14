@@ -1975,6 +1975,23 @@ mod is_file_modified_chunking_compat {
     /// execution context the store operations read.
     ///
     /// The directory outlives `body`, which is what lets it write the files to hash.
+    /// The content a file the test wrote holds, for exercising the storage comparison directly.
+    /// Logic outside the provider names no file; these tests are the comparison's own.
+    fn file_content(path: &std::path::Path) -> lore_storage::ContentSource {
+        lore_storage::ContentSource::File(path.to_path_buf())
+    }
+
+    /// An operation on the repository, which is what every caller compares a file through.
+    async fn working_operation(
+        repository: &Arc<RepositoryContext>,
+    ) -> Arc<lore_revision::fs::filesystem_provider::InstanceOperationImpl> {
+        repository
+            .file_system()
+            .begin_operation()
+            .await
+            .expect("beginning an operation")
+    }
+
     async fn on_a_repository<Body, Run>(body: Body)
     where
         Body: FnOnce(Arc<RepositoryContext>, PathBuf, Context) -> Run,
@@ -2029,7 +2046,8 @@ mod is_file_modified_chunking_compat {
                     repository.clone(),
                     address,
                     Some(size),
-                    &lore_storage::ContentHashMemo::new(path.as_path()),
+                    &file_content(&path),
+                    &lore_storage::ContentHashes::default(),
                 )
                 .await
                 .expect("Failed to compare small file"),
@@ -2059,7 +2077,8 @@ mod is_file_modified_chunking_compat {
                     repository.clone(),
                     address,
                     Some(size),
-                    &lore_storage::ContentHashMemo::new(path.as_path()),
+                    &file_content(&path),
+                    &lore_storage::ContentHashes::default(),
                 )
                 .await
                 .expect("Failed to compare small file"),
@@ -2102,7 +2121,8 @@ mod is_file_modified_chunking_compat {
                     empty,
                     address,
                     Some(size),
-                    &lore_storage::ContentHashMemo::new(path.as_path()),
+                    &file_content(&path),
+                    &lore_storage::ContentHashes::default(),
                 )
                 .await
                 .expect("Failed to compare large file"),
@@ -2132,7 +2152,8 @@ mod is_file_modified_chunking_compat {
                     repository.clone(),
                     address,
                     Some(size),
-                    &lore_storage::ContentHashMemo::new(path.as_path()),
+                    &file_content(&path),
+                    &lore_storage::ContentHashes::default(),
                 )
                 .await
                 .expect("Failed to compare large file"),
@@ -2172,7 +2193,8 @@ mod is_file_modified_chunking_compat {
                 file_size,
                 &RelativePath::new_from_initial_path("large.bin").unwrap(),
                 true,
-                None,
+                working_operation(&repository).await.as_ref(),
+                &lore_storage::ContentHashes::default(),
             )
             .await
             .expect("file_modification failed")
@@ -2215,7 +2237,8 @@ mod is_file_modified_chunking_compat {
                     size,
                     &relative_path,
                     true,
-                    None,
+                    working_operation(&repository).await.as_ref(),
+                &lore_storage::ContentHashes::default(),
                 )
                     .await
                     .expect("file_modification failed")
@@ -2260,7 +2283,8 @@ mod is_file_modified_chunking_compat {
                     size,
                     &relative_path,
                     true,
-                    None,
+                    working_operation(&repository).await.as_ref(),
+                &lore_storage::ContentHashes::default(),
                 )
                     .await
                     .expect("file_modification failed")
