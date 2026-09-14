@@ -1269,3 +1269,47 @@ pub async fn store_layer_staged(
 
     Err(LayerNotFound.into())
 }
+
+/// Pin `state`'s staged revision on the layer, writing a zero pin when nothing is left staged.
+///
+/// A pin that differs from `current` without staged content makes the next commit produce an
+/// empty revision in the layer.
+pub async fn store_staged_or_clear(
+    repository: Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    layer: &Layer,
+    state: &LayerState,
+) -> Result<Hash, LayerError> {
+    let has_staged = state
+        .state_staged
+        .node_has_staged_children(state.repository.clone(), crate::node::ROOT_NODE)
+        .await
+        .forward::<LayerError>("Failed to check staged nodes")?;
+    let has_dirty = state
+        .state_staged
+        .node_has_dirty_children(state.repository.clone(), crate::node::ROOT_NODE)
+        .await
+        .forward::<LayerError>("Failed to check dirty nodes")?;
+
+    let signature = if has_staged || has_dirty {
+        state.state_staged.mark_dirty();
+        state
+            .state_staged
+            .serialize(state.repository.clone(), token)
+            .await
+            .forward::<LayerError>("Failed to serialize layer staged revision state")?
+    } else {
+        Hash::default()
+    };
+
+    store_layer_staged(
+        repository,
+        token,
+        layer.target_path.as_str(),
+        layer.repository,
+        signature,
+    )
+    .await?;
+
+    Ok(signature)
+}
