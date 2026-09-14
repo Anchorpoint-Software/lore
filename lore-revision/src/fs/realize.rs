@@ -139,8 +139,7 @@ pub async fn realize_state(
             "Calculating deltas from filesystem -> {}",
             state_target.revision_number()
         );
-        let mut changes = Vec::new();
-        state::diff_filesystem_subtree(
+        let mut changes = state::diff_filesystem_subtree(
             &operation,
             NodeMapping {
                 repository: repository.clone(),
@@ -158,8 +157,12 @@ pub async fn realize_state(
             options.filter_mode | FilterMode::Ignore,
             FilesystemDiffIntent::Report,
             Arc::new(Vec::new()),
-            &mut changes,
         )
+        .await
+        .forward::<SyncError>(
+            "Failed to calculate delta changes between file system and target state",
+        )?
+        .collect()
         .await
         .forward::<SyncError>(
             "Failed to calculate delta changes between file system and target state",
@@ -737,8 +740,7 @@ pub async fn verify_filesystem(
                 })?;
             let subnode_current = current_node_link.node;
             let state_from = change.from.mapping.state.clone();
-            let mut directory_changes = Vec::new();
-            state::diff_filesystem_subtree(
+            let mut directory_changes = state::diff_filesystem_subtree(
                 &operation,
                 NodeMapping {
                     repository: change.from.mapping.repository.clone(),
@@ -756,91 +758,90 @@ pub async fn verify_filesystem(
                 filter_mode,
                 FilesystemDiffIntent::Report,
                 Arc::new(Vec::new()),
-                &mut directory_changes,
             )
             .await
             .forward::<SyncError>(
                 "Failed to calculate delta changes between file system and target state",
             )?;
-            if !directory_changes.is_empty() {
-                let mut has_modified_file = false;
-                for subchange in directory_changes {
-                    let subchange_path = subchange.path().clone();
+            let mut has_modified_file = false;
+            while let Some(subchange) = directory_changes.next().await {
+                let subchange_path = subchange.path().clone();
 
-                    if subchange.action == change::FileAction::Add {
-                        // Allow locally added files to remain and keep directory
-                        lore_trace!(
-                            "Allow locally added file in {}",
-                            subchange
-                                .path()
-                                .to_absolute_path(change.from.mapping.repository.require_path()?)
-                                .display()
-                        );
-                        continue;
-                    }
+                if subchange.action == change::FileAction::Add {
+                    // Allow locally added files to remain and keep directory
+                    lore_trace!(
+                        "Allow locally added file in {}",
+                        subchange
+                            .path()
+                            .to_absolute_path(change.from.mapping.repository.require_path()?)
+                            .display()
+                    );
+                    continue;
+                }
 
-                    let file_info = operation.file_info(&subchange_path).await.ok();
+                let file_info = operation.file_info(&subchange_path).await.ok();
 
-                    // A tracked entry that is already missing on disk is
-                    // effectively pre-aligned with the directory delete the
-                    // destination branch is performing. There is nothing to
-                    // lose by letting the switch proceed.
-                    if subchange.action == change::FileAction::Delete
-                        && file_info.as_ref().is_none_or(|info| !info.exists())
-                    {
-                        lore_trace!(
-                            "Skip already-missing tracked entry inside deleted directory: {}",
+                // A tracked entry that is already missing on disk is
+                // effectively pre-aligned with the directory delete the
+                // destination branch is performing. There is nothing to
+                // lose by letting the switch proceed.
+                if subchange.action == change::FileAction::Delete
+                    && file_info.as_ref().is_none_or(|info| !info.exists())
+                {
+                    lore_trace!(
+                        "Skip already-missing tracked entry inside deleted directory: {}",
+                        subchange.path()
+                    );
+                    continue;
+                }
+
+                if !has_modified_file {
+                    lore_error!(
+                        "Deleted directory has modified files in file system: {}",
+                        change.path()
+                    );
+                }
+                has_modified_file = true;
+
+                let from_node = subchange.from.get_node().await;
+                if let Some(file_info) = file_info {
+                    if file_info.is_dir() {
+                        lore_info!(
+                            "  {} {}/",
+                            subchange.action.as_string_short(),
                             subchange.path()
                         );
-                        continue;
-                    }
-
-                    if !has_modified_file {
-                        lore_error!(
-                            "Deleted directory has modified files in file system: {}",
-                            change.path()
+                    } else {
+                        lore_info!(
+                            "  {} {} : size {} mtime {}",
+                            subchange.action.as_string_short(),
+                            subchange.path(),
+                            file_info.size(),
+                            file_info.mtime()
                         );
                     }
-                    has_modified_file = true;
+                } else {
+                    lore_info!("  Failed to get local file info");
+                }
 
-                    let from_node = subchange.from.get_node().await;
-                    if let Some(file_info) = file_info {
-                        if file_info.is_dir() {
-                            lore_info!(
-                                "  {} {}/",
-                                subchange.action.as_string_short(),
-                                subchange.path()
-                            );
-                        } else {
-                            lore_info!(
-                                "  {} {} : size {} mtime {}",
-                                subchange.action.as_string_short(),
-                                subchange.path(),
-                                file_info.size(),
-                                file_info.mtime()
-                            );
-                        }
+                if subchange.from.mapping.node.is_valid_node_id() {
+                    if let Ok(node) = from_node {
+                        lore_info!(
+                            "  Revision state   : mode {:o} size {} hash {}",
+                            node.mode,
+                            node.size,
+                            node.address.hash,
+                        );
                     } else {
-                        lore_info!("  Failed to get local file info");
-                    }
-
-                    if subchange.from.mapping.node.is_valid_node_id() {
-                        if let Ok(node) = from_node {
-                            lore_info!(
-                                "  Revision state   : mode {:o} size {} hash {}",
-                                node.mode,
-                                node.size,
-                                node.address.hash,
-                            );
-                        } else {
-                            lore_info!("  Revision state node block deserialize failed");
-                        }
+                        lore_info!("  Revision state node block deserialize failed");
                     }
                 }
-
-                if has_modified_file {
-                    return Err(LocalModifications.into());
-                }
+            }
+            directory_changes.finish().await.forward::<SyncError>(
+                "Failed to calculate delta changes between file system and target state",
+            )?;
+            if has_modified_file {
+                return Err(LocalModifications.into());
             }
             return Ok(Some(change));
         }

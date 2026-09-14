@@ -3,7 +3,7 @@
 mod diff;
 pub mod dump;
 pub(crate) mod os_diff;
-mod sink;
+mod stream;
 
 use core::str;
 use std::future::Future;
@@ -25,8 +25,9 @@ use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
 use serde::Deserialize;
 use serde::Serialize;
-pub use sink::ChangeSink;
-pub use sink::OwnedChangeSink;
+pub use stream::ChangeSender;
+pub use stream::ChangeStream;
+use stream::emit;
 use tokio::join;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
@@ -5416,7 +5417,7 @@ async fn emit_change(
     to: NodeChangeState,
     action: change::FileAction,
     measured: change::Flags,
-    sink: &mut ChangeSink<'_>,
+    changes: &ChangeSender,
     filter_mode: FilterMode,
 ) -> Result<(), StateError> {
     debug_assert!(
@@ -5428,7 +5429,7 @@ async fn emit_change(
         to,
         action,
         measured,
-        sink,
+        changes,
         filter_mode,
         FilterStates::ROOT,
     )
@@ -5443,7 +5444,7 @@ async fn add_change(
     to: NodeChangeState,
     action: change::FileAction,
     measured: change::Flags,
-    sink: &mut ChangeSink<'_>,
+    changes: &ChangeSender,
     filter_mode: FilterMode,
     states: FilterStates,
 ) -> Result<(), StateError> {
@@ -5481,12 +5482,15 @@ async fn add_change(
         // Compute flags and create change record
         let flags = compute_change_flags(&node) | measured;
 
-        sink.emit(NodeChange {
-            action,
-            flags,
-            from: from.clone(),
-            to: to.clone(),
-        })
+        emit(
+            changes,
+            NodeChange {
+                action,
+                flags,
+                from: from.clone(),
+                to: to.clone(),
+            },
+        )
         .await?;
 
         if recursion_node.is_file() {
@@ -5499,8 +5503,10 @@ async fn add_change(
         return Ok(());
     }
 
-    Box::pin(async move { add_change_hierarchy(from, to, action, sink, filter_mode, states).await })
-        .await
+    Box::pin(
+        async move { add_change_hierarchy(from, to, action, changes, filter_mode, states).await },
+    )
+    .await
 }
 
 /// Coalesce the add/delete pairs that name one file into moves.
@@ -5593,7 +5599,7 @@ pub fn detect_and_coalesce_moves(changes: &mut Vec<NodeChange>) {
 }
 
 /// Calculate the set of changes between two revision states and emit them
-/// into `sink`. Streams raw `Add` / `Delete` / `Keep` records as discovered
+/// into `changes`. Streams raw `Add` / `Delete` / `Keep` records as discovered
 /// — does **not** run the post-walk move-coalescing or path-sort fixup that
 /// the legacy `Vec`-returning version applied. Callers that want the
 /// historical buffered-and-coalesced shape use `diff_collect` instead.
@@ -5605,7 +5611,7 @@ pub async fn diff(
     state_to: Arc<State>,
     path: Option<RelativePath>,
     graft: Option<Arc<GraftOracle>>,
-    sink: &mut ChangeSink<'_>,
+    changes: &ChangeSender,
     filter_mode: FilterMode,
 ) -> Result<(), StateError> {
     if let Some(path) = path {
@@ -5639,7 +5645,7 @@ pub async fn diff(
             node_change_state(&repository_from, &state_from, from_link.node, path.clone()).await;
         let to = node_change_state(&repository_to, &state_to, to_link.node, path.clone()).await;
 
-        diff::diff_subtree(from, to, path, 0, graft, sink, filter_mode).await?;
+        diff::diff_subtree(from, to, path, 0, graft, changes, filter_mode).await?;
     } else {
         diff::diff_subtree(
             NodeChangeState {
@@ -5669,7 +5675,7 @@ pub async fn diff(
             RelativePath::new(),
             0,
             graft,
-            sink,
+            changes,
             filter_mode,
         )
         .await?;
@@ -5721,11 +5727,11 @@ pub async fn diff_collect_subtree(
     path: RelativePath,
     filter_mode: FilterMode,
 ) -> Result<Vec<NodeChange>, StateError> {
-    let mut changes: Vec<NodeChange> = Vec::new();
-    {
-        let mut sink = ChangeSink::Vec(&mut changes);
-        diff::diff_subtree(from, to, path, 0, None, &mut sink, filter_mode).await?;
-    }
+    let mut changes = ChangeStream::spawn(async move |changes| {
+        diff::diff_subtree(from, to, path, 0, None, &changes, filter_mode).await
+    })
+    .collect()
+    .await?;
     detect_and_coalesce_moves(&mut changes);
     crate::change::sort_by_path(&mut changes);
     Ok(changes)
@@ -5743,9 +5749,7 @@ pub async fn diff_collect(
     path: Option<RelativePath>,
     filter_mode: FilterMode,
 ) -> Result<Vec<NodeChange>, StateError> {
-    let mut changes: Vec<NodeChange> = Vec::new();
-    {
-        let mut sink = ChangeSink::Vec(&mut changes);
+    let mut changes = ChangeStream::spawn(async move |changes| {
         diff(
             repository_from,
             state_from,
@@ -5753,11 +5757,13 @@ pub async fn diff_collect(
             state_to,
             path,
             None,
-            &mut sink,
+            &changes,
             filter_mode,
         )
-        .await?;
-    }
+        .await
+    })
+    .collect()
+    .await?;
     detect_and_coalesce_moves(&mut changes);
     crate::change::sort_by_path(&mut changes);
     Ok(changes)
@@ -5953,8 +5959,7 @@ pub async fn diff_filesystem(
     filter_mode: FilterMode,
     intent: FilesystemDiffIntent,
     layer_mounts: Arc<Vec<LayerMountInfo>>,
-    changes: &mut Vec<NodeChange>,
-) -> Result<FilesystemDiffStats, StateError> {
+) -> Result<ChangeStream<FilesystemDiffStats>, StateError> {
     let FilesystemDiffTree {
         repository: repository_from,
         state: state_from,
@@ -5973,7 +5978,7 @@ pub async fn diff_filesystem(
                     .filter
                     .child_emit_excludes(parent_states, path, true, filter_mode);
             if excluded {
-                return Ok(FilesystemDiffStats::default());
+                return Ok(ChangeStream::nothing());
             }
             states
         }
@@ -5983,7 +5988,7 @@ pub async fn diff_filesystem(
     let link_mounts = Arc::new(collect_link_mounts(&state_current, &repository_current).await?);
 
     let Some(path) = path else {
-        return diff_with(
+        return Ok(diff_with(
             operation,
             FilesystemDiffContext {
                 operation: operation.clone(),
@@ -6007,9 +6012,7 @@ pub async fn diff_filesystem(
                 layer_mounts,
                 link_mounts,
             },
-            changes,
-        )
-        .await;
+        ));
     };
 
     let node_link_from = state_from
@@ -6036,7 +6039,7 @@ pub async fn diff_filesystem(
         .resolve(repository_current.clone(), state_current.clone())
         .await?;
 
-    diff_with(
+    Ok(diff_with(
         operation,
         FilesystemDiffContext {
             operation: operation.clone(),
@@ -6060,9 +6063,7 @@ pub async fn diff_filesystem(
             layer_mounts,
             link_mounts,
         },
-        changes,
-    )
-    .await
+    ))
 }
 
 /// Patch-discard the nodes a parallel filesystem walk collected — a
@@ -6160,12 +6161,11 @@ pub async fn diff_filesystem_subtree(
     filter_mode: FilterMode,
     intent: FilesystemDiffIntent,
     layer_mounts: Arc<Vec<LayerMountInfo>>,
-    changes: &mut Vec<NodeChange>,
-) -> Result<FilesystemDiffStats, StateError> {
+) -> Result<ChangeStream<FilesystemDiffStats>, StateError> {
     let filter_mode = walk_filter_mode(filter_mode, intent);
     let link_mounts = Arc::new(collect_link_mounts(&current.state, &current.repository).await?);
     let states = from.repository.filter.exclusion_states(&filesystem_path);
-    diff_with(
+    Ok(diff_with(
         operation,
         FilesystemDiffContext {
             operation: operation.clone(),
@@ -6179,21 +6179,15 @@ pub async fn diff_filesystem_subtree(
             layer_mounts,
             link_mounts,
         },
-        changes,
-    )
-    .await
+    ))
 }
 
-/// Hands one diff to `operation`.
-async fn diff_with(
+/// Hands one diff to `operation`, which answers with the walk behind a stream.
+fn diff_with(
     operation: &Arc<InstanceOperationImpl>,
     context: FilesystemDiffContext,
-    changes: &mut Vec<NodeChange>,
-) -> Result<FilesystemDiffStats, StateError> {
-    operation
-        .changes_from_filesystem_to_state(context, changes)
-        .await
-        .forward::<StateError>("Failed to diff the filesystem")
+) -> ChangeStream<FilesystemDiffStats> {
+    operation.changes_from_filesystem_to_state(context)
 }
 
 /// Result of comparing a single file from filesystem against state.
@@ -9938,15 +9932,15 @@ async fn add_change_hierarchy(
     from: NodeChangeState,
     to: NodeChangeState,
     action: change::FileAction,
-    sink: &mut ChangeSink<'_>,
+    changes: &ChangeSender,
     filter_mode: FilterMode,
     states: FilterStates,
 ) -> Result<(), StateError> {
     match action {
         FileAction::Delete => {
-            add_hierarchy_delete(from, to, sink, filter_mode, states).await?;
+            add_hierarchy_delete(from, to, changes, filter_mode, states).await?;
         }
-        FileAction::Add => add_hierarchy_add(from, to, sink, filter_mode, states).await?,
+        FileAction::Add => add_hierarchy_add(from, to, changes, filter_mode, states).await?,
         _ => {} // Keep/Copy/Move don't recurse here
     }
     Ok(())
@@ -9984,7 +9978,7 @@ bitflagsops!(TreeFlags, u32);
 async fn add_hierarchy_delete(
     from: NodeChangeState,
     to: NodeChangeState,
-    sink: &mut ChangeSink<'_>,
+    changes: &ChangeSender,
     filter_mode: FilterMode,
     states: FilterStates,
 ) -> Result<(), StateError> {
@@ -10060,7 +10054,7 @@ async fn add_hierarchy_delete(
             to.invalid(child_path),
             FileAction::Delete,
             change::Flags::None,
-            sink,
+            changes,
             filter_mode,
             child_states,
         ))
@@ -10075,7 +10069,7 @@ async fn add_hierarchy_delete(
 async fn add_hierarchy_add(
     from: NodeChangeState,
     to: NodeChangeState,
-    sink: &mut ChangeSink<'_>,
+    changes: &ChangeSender,
     filter_mode: FilterMode,
     states: FilterStates,
 ) -> Result<(), StateError> {
@@ -10130,7 +10124,7 @@ async fn add_hierarchy_add(
             child_to,
             FileAction::Add,
             change::Flags::None,
-            sink,
+            changes,
             filter_mode,
             child_states,
         ))

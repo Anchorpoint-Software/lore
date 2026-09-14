@@ -367,7 +367,7 @@ pub async fn diff3_with_source_cap(
     // `Status::resource_exhausted` via `is_oversized()` without
     // string-matching across crates.
     lore_debug!("Diff source branch revisions (streaming)");
-    let (source_tx, mut source_rx) = mpsc::channel::<Result<NodeChange, StateError>>(256);
+    let (source_tx, mut source_rx) = mpsc::channel::<NodeChange>(256);
     let source_walker_repo = repository.clone();
     let source_walker_state_base = state_base.clone();
     let source_walker_state_source = state_source.clone();
@@ -382,7 +382,6 @@ pub async fn diff3_with_source_cap(
         ))
     });
     let source_walker = lore_spawn!(async move {
-        let mut sink = state::ChangeSink::Channel(&source_tx);
         state::diff(
             source_walker_repo.clone(),
             source_walker_state_base,
@@ -390,7 +389,7 @@ pub async fn diff3_with_source_cap(
             source_walker_state_source,
             source_walker_path,
             source_walker_graft,
-            &mut sink,
+            &source_tx,
             FilterMode::View,
         )
         .await
@@ -398,15 +397,7 @@ pub async fn diff3_with_source_cap(
 
     let mut source_changes: Vec<NodeChange> = Vec::new();
     let mut oversized = false;
-    while let Some(item) = source_rx.recv().await {
-        let change = match item {
-            Ok(c) => c,
-            Err(err) => {
-                drop(source_rx);
-                let _ = source_walker.await;
-                return Err(err);
-            }
-        };
+    while let Some(change) = source_rx.recv().await {
         let is_file_id_only_churn = !change.from.address.hash.is_zero()
             && change.action != FileAction::Move
             && change.from.address.hash == change.to.address.hash;
@@ -460,12 +451,11 @@ pub async fn diff3_with_source_cap(
     let target_repository = Arc::new(repository.to_filter_context(target_filter));
 
     lore_debug!("Diff target branch revisions (streaming)");
-    let (target_tx, mut target_rx) = mpsc::channel::<Result<NodeChange, StateError>>(256);
+    let (target_tx, mut target_rx) = mpsc::channel::<NodeChange>(256);
     let walker_repo = target_repository.clone();
     let walker_state_base = state_base.clone();
     let walker_path = path.clone();
     let walker = lore_spawn!(async move {
-        let mut sink = state::ChangeSink::Channel(&target_tx);
         state::diff(
             walker_repo.clone(),
             walker_state_base,
@@ -474,7 +464,7 @@ pub async fn diff3_with_source_cap(
             walker_path,
             // Adoption is a source-side decision.
             None,
-            &mut sink,
+            &target_tx,
             FilterMode::View,
         )
         .await
@@ -486,13 +476,7 @@ pub async fn diff3_with_source_cap(
     let mut joined_changes: Vec<NodeChange> = Vec::new();
     let mut joined_conflicts: Vec<(NodeChange, NodeChange)> = Vec::new();
     let mut source_consumed = vec![false; source_changes.len()];
-    while let Some(item) = target_rx.recv().await {
-        let mut target_change = match item {
-            Ok(c) => c,
-            Err(e) => {
-                return Err(e);
-            }
-        };
+    while let Some(mut target_change) = target_rx.recv().await {
         let is_file_id_only_churn = !target_change.from.address.hash.is_zero()
             && target_change.from.address.hash == target_change.to.address.hash;
         if is_file_id_only_churn {

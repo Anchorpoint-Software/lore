@@ -21,13 +21,13 @@ use super::filesystem_provider::FsError;
 use super::filesystem_provider::InstanceOperation;
 use super::filesystem_provider::InstanceOperationImpl;
 use super::filesystem_provider::StaticDispatchInstanceOperation;
-use crate::change::NodeChange;
 use crate::immutable;
 use crate::merge::MergeTextMode;
 use crate::merge::merge3_text_by_path;
 use crate::node::Node;
 use crate::node::NodeFileMode;
 use crate::repository::RepositoryContext;
+use crate::state::ChangeStream;
 use crate::state::FilesystemDiffStats;
 use crate::state::NodeComparison;
 use crate::util;
@@ -79,14 +79,13 @@ impl OsOperation {
 
 /// All operations delegate to the regular OS file system.
 impl InstanceOperation for OsOperation {
-    async fn changes_from_filesystem_to_state(
+    fn changes_from_filesystem_to_state(
         &self,
         diff: FilesystemDiffContext,
-        changes: &mut Vec<NodeChange>,
-    ) -> Result<FilesystemDiffStats, FsError> {
-        crate::state::os_diff::diff_os_filesystem(diff, changes)
-            .await
-            .forward_any::<FsError>("Failed to diff filesystem")
+    ) -> ChangeStream<FilesystemDiffStats> {
+        ChangeStream::spawn(async move |changes| {
+            crate::state::os_diff::diff_os_filesystem(diff, &changes).await
+        })
     }
 
     /// A path mid-deletion stats as `PermissionDenied` on Windows rather than

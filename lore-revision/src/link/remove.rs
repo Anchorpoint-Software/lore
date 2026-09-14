@@ -192,9 +192,8 @@ async fn verify_no_local_changes_under_link(
     // so `diff_filesystem` has nothing to resolve and walks a node with no
     // children, reporting every file under the mount as added.
     let filesystem = repository.file_system();
-    let changes = with_operation(filesystem, false, async |operation| {
-        let mut changes = Vec::new();
-        state::diff_filesystem(
+    let modified = with_operation(filesystem, false, async |operation| {
+        let changes = state::diff_filesystem(
             &operation,
             FilesystemDiffTree {
                 repository: repository.clone(),
@@ -210,18 +209,17 @@ async fn verify_no_local_changes_under_link(
             FilterMode::View,
             FilesystemDiffIntent::Report,
             Arc::new(Vec::new()),
-            &mut changes,
         )
         .await
         .forward::<LinkError>("Failed comparing link content with the file system")?;
-        Ok::<_, LinkError>(changes)
+        changes
+            .any(|change| link_path.covers_ignore_case(change.path()))
+            .await
+            .forward::<LinkError>("Failed comparing link content with the file system")
     })
     .await?;
 
-    if changes
-        .iter()
-        .any(|change| link_path.covers_ignore_case(change.path()))
-    {
+    if modified {
         lore_warn!(
             "Link at '{}' has locally modified files (use --force to discard)",
             link_path.as_str()

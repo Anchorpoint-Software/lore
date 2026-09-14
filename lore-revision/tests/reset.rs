@@ -48,8 +48,7 @@ mod tests {
             .begin_operation()
             .await
             .expect("Failed to start filesystem operation");
-        let mut changes = Vec::new();
-        state::diff_filesystem(
+        let changes = state::diff_filesystem(
             &operation,
             FilesystemDiffTree {
                 repository: repository.clone(),
@@ -63,8 +62,10 @@ mod tests {
             FilterMode::Full,
             FilesystemDiffIntent::Report,
             Arc::new(Vec::new()),
-            &mut changes,
         )
+        .await
+        .expect("Failed to diff filesystem")
+        .collect()
         .await
         .expect("Failed to diff filesystem");
         operation

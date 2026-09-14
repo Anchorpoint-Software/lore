@@ -595,18 +595,22 @@ mod tests {
 
                 // Diff current (clean) vs current-with-dirty-flag
                 // The dirty node has same content but the Dirty flag — diff should report it
-                let mut changes = Vec::new();
-                let mut sink = lore_revision::state::ChangeSink::Vec(&mut changes);
-                lore_revision::state::diff(
-                    repository.clone(),
-                    state_current.clone(), // from (also the "to" since we modified in-place)
-                    repository.clone(),
-                    state_current.clone(), // to (same state, but with dirty flag set)
-                    None,
-                    None, // graft_view: no grafting
-                    &mut sink,
-                    lore_revision::filter::FilterMode::Full,
-                )
+                let diff_repository = repository.clone();
+                let diff_state = state_current.clone();
+                let changes = lore_revision::state::ChangeStream::spawn(async move |changes| {
+                    lore_revision::state::diff(
+                        diff_repository.clone(),
+                        diff_state.clone(), // from (also the "to" since we modified in-place)
+                        diff_repository,
+                        diff_state, // to (same state, but with dirty flag set)
+                        None,
+                        None, // graft_view: no grafting
+                        &changes,
+                        lore_revision::filter::FilterMode::Full,
+                    )
+                    .await
+                })
+                .collect()
                 .await
                 .expect("Diff failed");
 

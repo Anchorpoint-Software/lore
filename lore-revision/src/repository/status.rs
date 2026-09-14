@@ -497,6 +497,50 @@ async fn file_size_from_node_change_path(
     Ok(info.size())
 }
 
+/// Reports every change a path's scan finds, answering with how many arrived and the first
+/// failure among them.
+///
+/// Reads to the end rather than stopping at a failure: the walk marks dirty as it goes, and its
+/// marks are what a status run leaves behind whether or not every change could be reported.
+async fn report_scan_changes(
+    operation: &InstanceOperationImpl,
+    repository: &Arc<RepositoryContext>,
+    summary: &StatusSummaryStats,
+    changes: &mut state::ChangeStream<state::FilesystemDiffStats>,
+) -> (usize, Option<StatusError>) {
+    let mut reported = 0;
+    let mut failure = None;
+    while let Some(change) = changes.next().await {
+        reported += 1;
+        if let Err(err) = report_scan_change(operation, repository, summary, &change).await {
+            failure.get_or_insert(err);
+        }
+    }
+    (reported, failure)
+}
+
+/// Reports one scanned change: a staged one is the caller's own doing and only traced, and every
+/// other is counted into the summary and emitted for display. Dirty flags are set and cleared by
+/// the walk itself.
+async fn report_scan_change(
+    operation: &InstanceOperationImpl,
+    repository: &Arc<RepositoryContext>,
+    summary: &StatusSummaryStats,
+    change: &NodeChange,
+) -> Result<(), StatusError> {
+    if change.flags.is_stage() {
+        lore_debug!("Ignore staged file {}", change.path());
+        return Ok(());
+    }
+    let size = file_size_from_node_change_path(operation, repository, change).await?;
+    summary.classify(change);
+    event::LoreEvent::RepositoryStatusFile(LoreRepositoryStatusFileEventData::from_node_change(
+        change, size,
+    ))
+    .send();
+    Ok(())
+}
+
 /// Verify whether a dirty file change reflects a real on-disk modification,
 /// clearing the node's dirty flag when it does not.
 ///
@@ -1201,50 +1245,42 @@ async fn scan_paths(
 
                     let start = Instant::now();
 
-                    let mut changes = Vec::new();
-                    let diff_stats = state::diff_filesystem(
+                    let mut changes = state::diff_filesystem(
                         &operation,
                         FilesystemDiffTree {
                             repository: repository.clone(),
-                            state: state_staged.clone(),
+                            state: state_staged,
                         },
                         FilesystemDiffTree {
                             repository: repository.clone(),
-                            state: state_current.clone(),
+                            state: state_current,
                         },
                         path,
                         FilterMode::Full,
                         FilesystemDiffIntent::MarkDirty,
-                        layer_mounts.clone(),
-                        &mut changes,
+                        layer_mounts,
                     )
                     .await
                     .forward::<StatusError>("computing diff against filesystem")?;
+
+                    let (reported, failure) =
+                        report_scan_changes(&operation, &repository, &summary, &mut changes).await;
+
+                    let diff_stats = changes
+                        .finish()
+                        .await
+                        .forward::<StatusError>("computing diff against filesystem")?;
                     summary.append_diff(&diff_stats);
 
                     lore_debug!(
-                        "Scan found {} file system changes in {:.3}s",
-                        changes.len(),
+                        "Scan found {reported} file system changes in {:.3}s",
                         start.elapsed().as_secs_f64(),
                     );
 
-                    for change in changes.iter() {
-                        let size = file_size_from_node_change_path(&operation, &repository, change)
-                            .await?;
-
-                        // Emit event for display (dirty set/clear handled inline by diff)
-                        if !change.flags.is_stage() {
-                            summary.classify(change);
-                            event::LoreEvent::RepositoryStatusFile(
-                                LoreRepositoryStatusFileEventData::from_node_change(change, size),
-                            )
-                            .send();
-                        } else {
-                            lore_debug!("Ignore staged file {}", change.path());
-                        }
+                    match failure {
+                        Some(err) => Err(err),
+                        None => Ok(()),
                     }
-
-                    Ok(())
                 }
             });
         }

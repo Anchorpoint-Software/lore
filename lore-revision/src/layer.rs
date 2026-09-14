@@ -947,8 +947,7 @@ async fn sync_in_operation(
             "Calculating deltas from filesystem -> {}",
             state_target.revision_number()
         );
-        let mut changes = Vec::new();
-        state::diff_filesystem_subtree(
+        let mut changes = state::diff_filesystem_subtree(
             &operation,
             NodeMapping {
                 repository: target.mapping.repository,
@@ -966,8 +965,10 @@ async fn sync_in_operation(
             options.filter_mode,
             FilesystemDiffIntent::Report,
             Arc::new(Vec::new()),
-            &mut changes,
         )
+        .await
+        .forward::<LayerError>("Failed to calculate file system diff when synchronizing")?
+        .collect()
         .await
         .forward::<LayerError>("Failed to calculate file system diff when synchronizing")?;
 

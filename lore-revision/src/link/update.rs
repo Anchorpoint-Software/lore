@@ -89,9 +89,8 @@ pub async fn update(
     // TODO(vri): Verify filesystem in any case for local modifications
     // Tree roots at the innermost node; filesystem path is the full link path.
     if state_current.revision() != state_staged.revision() {
-        let linked_changes = with_operation(repository.file_system(), false, async |operation| {
-            let mut linked_changes = Vec::new();
-            state::diff_filesystem_subtree(
+        let changed = with_operation(repository.file_system(), false, async |operation| {
+            let linked_changes = state::diff_filesystem_subtree(
                 &operation,
                 NodeMapping {
                     repository: inner_repository.clone(),
@@ -109,15 +108,18 @@ pub async fn update(
                 FilterMode::View,
                 FilesystemDiffIntent::Report,
                 std::sync::Arc::new(Vec::new()),
-                &mut linked_changes,
             )
             .await
             .forward::<LinkError>("Failed to diff link with filesystem")?;
-            Ok::<_, LinkError>(linked_changes)
+            let changed = linked_changes
+                .any(|_change| true)
+                .await
+                .forward::<LinkError>("Failed to diff link with filesystem")?;
+            Ok::<_, LinkError>(changed)
         })
         .await?;
 
-        if !linked_changes.is_empty() {
+        if changed {
             return Err(LinkError::internal("Link has filesystem changes"));
         }
     }

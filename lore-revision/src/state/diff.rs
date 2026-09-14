@@ -24,9 +24,8 @@ use crate::node::NodeFlags;
 use crate::node::NodeID;
 use crate::node::NodeIDExt;
 use crate::repository::RepositoryContext;
-use crate::state::ChangeSink;
+use crate::state::ChangeSender;
 use crate::state::NodeMapping;
-use crate::state::OwnedChangeSink;
 use crate::state::State;
 use crate::state::StateChildrenNodes;
 use crate::state::StateError;
@@ -118,7 +117,7 @@ pub async fn diff_subtree(
     path: RelativePath,
     flags: u32,
     graft: Option<Arc<GraftOracle>>,
-    sink: &mut ChangeSink<'_>,
+    changes: &ChangeSender,
     filter_mode: FilterMode,
 ) -> Result<(), StateError> {
     let parent_states = to.mapping.repository.filter.parent_exclusion_states(&path);
@@ -147,7 +146,7 @@ pub async fn diff_subtree(
         },
         flags,
         graft,
-        sink,
+        changes,
         filter_mode,
     )
     .await
@@ -159,13 +158,11 @@ fn recurse_diff_subtree_node(
     cursor: DiffCursor,
     flags: u32,
     graft: Option<Arc<GraftOracle>>,
-    mut sink: OwnedChangeSink,
+    changes: ChangeSender,
     filter_mode: FilterMode,
-) -> Pin<Box<dyn Future<Output = Result<OwnedChangeSink, StateError>> + Send>> {
+) -> Pin<Box<dyn Future<Output = Result<(), StateError>> + Send>> {
     Box::pin(async move {
-        let mut local = sink.as_sink();
-        diff_subtree_node(from, to, cursor, flags, graft, &mut local, filter_mode).await?;
-        Ok(sink)
+        diff_subtree_node(from, to, cursor, flags, graft, &changes, filter_mode).await
     })
 }
 
@@ -220,7 +217,7 @@ async fn diff_subtree_node(
     cursor: DiffCursor,
     flags: u32,
     graft: Option<Arc<GraftOracle>>,
-    sink: &mut ChangeSink<'_>,
+    changes: &ChangeSender,
     filter_mode: FilterMode,
 ) -> Result<(), StateError> {
     // If path is a file then treat this as a call for the parent with only one child.
@@ -244,7 +241,7 @@ async fn diff_subtree_node(
         states,
         flags,
         graft,
-        sink,
+        changes,
         filter_mode,
         &from_nodes,
         &to_nodes,
@@ -272,11 +269,11 @@ async fn diff_subtree_node_walk(
     states: DiffStates,
     flags: u32,
     graft: Option<Arc<GraftOracle>>,
-    sink: &mut ChangeSink<'_>,
+    changes: &ChangeSender,
     filter_mode: FilterMode,
     from_nodes: &StateChildrenNodes,
     to_nodes: &StateChildrenNodes,
-    subtasks: &mut JoinSet<Result<OwnedChangeSink, StateError>>,
+    subtasks: &mut JoinSet<Result<(), StateError>>,
 ) -> Result<(), StateError> {
     let mut to_index = 0;
     for from_named_node in from_nodes.children.iter() {
@@ -297,7 +294,7 @@ async fn diff_subtree_node_walk(
         {
             add_change_for_solo_to_node(
                 DiffContext {
-                    sink,
+                    changes,
                     from_nodes,
                     to_nodes,
                     paths,
@@ -316,7 +313,7 @@ async fn diff_subtree_node_walk(
         {
             add_change_for_solo_from_node(
                 DiffContext {
-                    sink,
+                    changes,
                     from_nodes,
                     to_nodes,
                     paths,
@@ -338,7 +335,7 @@ async fn diff_subtree_node_walk(
                 flags,
                 graft.clone(),
                 DiffContext {
-                    sink,
+                    changes,
                     from_nodes,
                     to_nodes,
                     paths,
@@ -357,7 +354,7 @@ async fn diff_subtree_node_walk(
     for to_index in to_index..to_nodes.children.len() {
         add_change_for_solo_to_node(
             DiffContext {
-                sink,
+                changes,
                 from_nodes,
                 to_nodes,
                 paths,
@@ -371,18 +368,17 @@ async fn diff_subtree_node_walk(
     }
 
     while let Some(task_result) = subtasks.join_next().await {
-        let task_sink = task_result
+        task_result
             .internal("Task failure")
             .map_err(StateError::from)
             .flatten()?;
-        sink.finalize_task_sink(task_sink);
     }
 
     Ok(())
 }
 
-struct DiffContext<'a, 'b> {
-    sink: &'a mut ChangeSink<'b>,
+struct DiffContext<'a> {
+    changes: &'a ChangeSender,
     from_nodes: &'a StateChildrenNodes,
     to_nodes: &'a StateChildrenNodes,
     paths: &'a DiffPaths,
@@ -391,14 +387,14 @@ struct DiffContext<'a, 'b> {
 }
 
 async fn add_change_for_solo_from_node(
-    context: DiffContext<'_, '_>,
+    context: DiffContext<'_>,
     from_named_node: &StateNamedNode,
     to: &NodeChangeState,
     from_node_search: &NodeSearchResult,
     from_node_states: FilterStates,
 ) -> Result<(), StateError> {
     let DiffContext {
-        sink,
+        changes,
         from_nodes,
         to_nodes,
         filter_mode,
@@ -449,7 +445,7 @@ async fn add_change_for_solo_from_node(
             to.invalid(from_path.clone()),
             change::FileAction::Delete,
             change::Flags::None,
-            sink,
+            changes,
             filter_mode,
             from_node_states,
         )
@@ -459,12 +455,12 @@ async fn add_change_for_solo_from_node(
 }
 
 async fn add_change_for_solo_to_node(
-    context: DiffContext<'_, '_>,
+    context: DiffContext<'_>,
     from: &NodeChangeState,
     to_index: usize,
 ) -> Result<(), StateError> {
     let DiffContext {
-        sink,
+        changes,
         from_nodes,
         to_nodes,
         paths,
@@ -546,7 +542,7 @@ async fn add_change_for_solo_to_node(
         to,
         file_action,
         change::Flags::None,
-        sink,
+        changes,
         filter_mode,
         to_node_states,
     )
@@ -586,17 +582,17 @@ fn subtree_states(
 /// itself, and is reported only for what else changed about it.
 #[allow(clippy::too_many_arguments)]
 async fn add_change_for_paired_nodes(
-    subtasks: &mut JoinSet<Result<OwnedChangeSink, StateError>>,
+    subtasks: &mut JoinSet<Result<(), StateError>>,
     flags: u32,
     graft: Option<Arc<GraftOracle>>,
-    context: DiffContext<'_, '_>,
+    context: DiffContext<'_>,
     to_named_node: &StateNamedNode,
     from_node_id: NodeID,
     from_node_search: &NodeSearchResult,
     from_node_states: FilterStates,
 ) -> Result<(), StateError> {
     let DiffContext {
-        sink,
+        changes,
         from_nodes,
         to_nodes,
         paths,
@@ -672,7 +668,7 @@ async fn add_change_for_paired_nodes(
             to,
             change::FileAction::Delete,
             change::Flags::None,
-            sink,
+            changes,
             filter_mode,
             from_node_states,
         )
@@ -723,7 +719,7 @@ async fn add_change_for_paired_nodes(
                     to.clone(),
                     action,
                     measured,
-                    sink,
+                    changes,
                     filter_mode,
                 )
                 .await?;
@@ -754,7 +750,7 @@ async fn add_change_for_paired_nodes(
                     to.clone(),
                     action,
                     measured,
-                    sink,
+                    changes,
                     filter_mode,
                 )
                 .await?;
@@ -800,14 +796,14 @@ async fn add_change_for_paired_nodes(
                             to.clone(),
                             action,
                             measured,
-                            sink,
+                            changes,
                             filter_mode,
                         )
                         .await?;
                     } else {
                         lore_debug!("Diff node {subpath} has linked changes, recurse diff");
                         let from_path = from_path.clone();
-                        let task_sink = sink.task_sink();
+                        let task_changes = changes.clone();
                         lore_spawn!(subtasks, async move {
                             recurse_diff_subtree_node(
                                 from,
@@ -823,7 +819,7 @@ async fn add_change_for_paired_nodes(
                                 // A linked repository merges through its own
                                 // link.
                                 None,
-                                task_sink,
+                                task_changes,
                                 filter_mode,
                             )
                             .await
@@ -849,7 +845,7 @@ async fn add_change_for_paired_nodes(
                             to.clone(),
                             change::FileAction::Graft,
                             measured,
-                            sink,
+                            changes,
                             filter_mode,
                         )
                         .await?;
@@ -858,7 +854,7 @@ async fn add_change_for_paired_nodes(
                             "Diff node {subpath} directory hash change from {from_address} to {to_address}, recurse diff"
                         );
                         let from_path = from_path.clone();
-                        let task_sink = sink.task_sink();
+                        let task_changes = changes.clone();
                         lore_spawn!(subtasks, async move {
                             recurse_diff_subtree_node(
                                 from,
@@ -872,7 +868,7 @@ async fn add_change_for_paired_nodes(
                                 },
                                 flags,
                                 graft,
-                                task_sink,
+                                task_changes,
                                 filter_mode,
                             )
                             .await
@@ -896,7 +892,7 @@ async fn add_change_for_paired_nodes(
                 to.clone(),
                 change::FileAction::Delete,
                 change::Flags::None,
-                sink,
+                changes,
                 filter_mode,
                 from_node_states,
             )
@@ -906,7 +902,7 @@ async fn add_change_for_paired_nodes(
                 to,
                 change::FileAction::Add,
                 change::Flags::None,
-                sink,
+                changes,
                 filter_mode,
                 to_node_states,
             )

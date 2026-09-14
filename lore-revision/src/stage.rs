@@ -3556,8 +3556,7 @@ pub(crate) async fn stage_from_parent_state(
         Node::default()
     };
 
-    let mut changes = Vec::new();
-    state::diff_filesystem_subtree(
+    let mut changes = state::diff_filesystem_subtree(
         &operation,
         NodeMapping {
             repository: repository_target.clone(),
@@ -3575,8 +3574,10 @@ pub(crate) async fn stage_from_parent_state(
         FilterMode::Full,
         FilesystemDiffIntent::Report,
         Arc::new(Vec::new()),
-        &mut changes,
     )
+    .await
+    .forward::<StageError>("Failed to calculate diff between file system and target state")?
+    .collect()
     .await
     .forward::<StageError>("Failed to calculate diff between file system and target state")?;
 

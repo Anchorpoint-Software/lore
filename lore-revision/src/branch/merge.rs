@@ -1872,22 +1872,27 @@ async fn apply_graft_copy(
     // pairs children by name and stops at a directory whose address already
     // matches, so the result is proportional to the difference rather than to
     // the size of the subtree. No oracle here, because this walk has to descend.
-    let mut changes: Vec<NodeChange> = Vec::new();
-    {
-        let mut sink = state::ChangeSink::Vec(&mut changes);
+    let repository_staged = repository.clone();
+    let state_staged_diff = state_staged.clone();
+    let repository_to = change.to.mapping.repository.clone();
+    let state_to = change.to.mapping.state.clone();
+    let path = change.path().clone();
+    let mut changes = state::ChangeStream::spawn(async move |changes| {
         state::diff(
-            repository.clone(),
-            state_staged.clone(),
-            change.to.mapping.repository.clone(),
-            change.to.mapping.state.clone(),
-            Some(change.path().clone()),
+            repository_staged,
+            state_staged_diff,
+            repository_to,
+            state_to,
+            Some(path),
             None,
-            &mut sink,
+            &changes,
             FilterMode::empty(),
         )
         .await
-        .forward::<MergeError>("diffing the adopted subtree")?;
-    }
+    })
+    .collect()
+    .await
+    .forward::<MergeError>("diffing the adopted subtree")?;
     change::sort_by_path(&mut changes);
 
     let mut counts = GraftCounts::default();

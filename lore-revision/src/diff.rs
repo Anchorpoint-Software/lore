@@ -21,7 +21,6 @@ use crate::lore_debug;
 use crate::path::emit_path_ignore;
 use crate::repository::RepositoryContext;
 use crate::state;
-use crate::state::ChangeSink;
 use crate::state::State;
 use crate::util::path::RelativePath;
 
@@ -73,11 +72,9 @@ pub async fn diff_revision_paths(
             // `task_tx`. The inner channel is bounded so the engine
             // backpressures on a slow downstream consumer the same way
             // the outer channel does.
-            let (state_tx, mut state_rx) =
-                mpsc::channel::<Result<NodeChange, crate::state::StateError>>(256);
+            let (state_tx, mut state_rx) = mpsc::channel::<NodeChange>(256);
             let walker_repo = repository.clone();
             let walker = lore_spawn!(async move {
-                let mut sink = ChangeSink::Channel(&state_tx);
                 state::diff(
                     walker_repo.clone(),
                     state_source,
@@ -85,13 +82,12 @@ pub async fn diff_revision_paths(
                     state_target,
                     path,
                     None,
-                    &mut sink,
+                    &state_tx,
                     FilterMode::View,
                 )
                 .await
             });
             while let Some(item) = state_rx.recv().await {
-                let item = item.forward_any::<DiffError>("calculating revision diff")?;
                 task_tx
                     .send(Ok(item))
                     .await
@@ -208,8 +204,7 @@ async fn diff_filesystem_paths_in(
                         lore_debug!("Calculating deltas against filesystem for full repository");
                     }
 
-                    let mut changes = Vec::new();
-                    state::diff_filesystem(
+                    let mut changes = state::diff_filesystem(
                         &operation,
                         FilesystemDiffTree {
                             repository: repository.clone(),
@@ -223,8 +218,10 @@ async fn diff_filesystem_paths_in(
                         FilterMode::Full,
                         FilesystemDiffIntent::Report,
                         std::sync::Arc::new(Vec::new()),
-                        &mut changes,
                     )
+                    .await
+                    .forward_any::<DiffError>("calculating filesystem diff")?
+                    .collect()
                     .await
                     .forward_any::<DiffError>("calculating filesystem diff")?;
 

@@ -19,7 +19,6 @@ use std::sync::atomic::Ordering;
 
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
-use sink::ChangeSink;
 use tokio::sync::Semaphore;
 use tokio::task::JoinError;
 use tokio::task::JoinSet;
@@ -48,8 +47,10 @@ use crate::repository::DOT_URC;
 use crate::repository::RepositoryContext;
 use crate::repository::TEMP_FILE_EXTENSION;
 use crate::repository::THEIRS_SUFFIX;
+use crate::state::ChangeSender;
 use crate::state::diff::get_filtered_node_and_path;
 use crate::state::diff::get_node_match;
+use crate::state::stream::emit;
 use crate::util;
 use crate::util::path::EntryPath;
 use crate::util::path::RelativePath;
@@ -89,7 +90,8 @@ async fn ensure_scan_dir_chain(
 
 async fn diff_filesystem_subtree_impl(
     mut ctx: FilesystemDiffContext,
-) -> Result<(Vec<NodeChange>, FilesystemDiffStats), StateError> {
+    changes: &ChangeSender,
+) -> Result<FilesystemDiffStats, StateError> {
     let absolute_path = ctx
         .filesystem_path
         .to_absolute_path(ctx.from.repository.require_path()?);
@@ -114,7 +116,7 @@ async fn diff_filesystem_subtree_impl(
                 .await?;
                 ctx.from.node = entry_node;
             }
-            diff_filesystem_directory(ctx, listing).await
+            diff_filesystem_directory(ctx, listing, changes).await
         }
         util::fs::PathListingResult::File { item } => {
             // A path-filtered scan of a new file: ensure its parent directory
@@ -127,7 +129,7 @@ async fn diff_filesystem_subtree_impl(
                 ensure_scan_dir_chain(ctx.from.repository.clone(), ctx.from.state.clone(), parent)
                     .await?;
             }
-            diff_filesystem_single_file(ctx, item).await
+            diff_filesystem_single_file(ctx, item, changes).await
         }
         util::fs::PathListingResult::NotFound => {
             // Path doesn't exist on filesystem - everything in state is deleted
@@ -137,6 +139,7 @@ async fn diff_filesystem_subtree_impl(
                 ctx.states,
                 ctx.filter_mode,
                 ctx.intent,
+                changes,
             )
             .await
         }
@@ -255,7 +258,7 @@ async fn settle_subtree_delete(
 async fn settle_insisted_modification(
     ctx: &FileDiffContext,
     file_path: &RelativePath,
-    sink: &mut ChangeSink<'_>,
+    changes: &ChangeSender,
     filter_mode: FilterMode,
 ) -> Result<(), StateError> {
     mark_settled(
@@ -271,7 +274,7 @@ async fn settle_insisted_modification(
         ctx.new_file_change_state(file_path.clone()),
         FileAction::Keep,
         change::Flags::Modify,
-        sink,
+        changes,
         filter_mode,
     )
     .await
@@ -291,7 +294,7 @@ async fn settle_insisted_directory(
     node: &Node,
     path: &RelativePath,
     observed: FileInfo,
-    sink: &mut ChangeSink<'_>,
+    changes: &ChangeSender,
     intent: FilesystemDiffIntent,
     filter_mode: FilterMode,
 ) -> Result<(), StateError> {
@@ -324,7 +327,7 @@ async fn settle_insisted_directory(
         to,
         FileAction::Keep,
         change::Flags::Modify,
-        sink,
+        changes,
         filter_mode,
     )
     .await
@@ -342,7 +345,7 @@ async fn emit_type_replacement(
     ctx: &FileDiffContext,
     file_path: &RelativePath,
     is_directory: bool,
-    sink: &mut ChangeSink<'_>,
+    changes: &ChangeSender,
     filter_mode: FilterMode,
 ) -> Result<NodeID, StateError> {
     let staging = ctx.intent.stage().is_some();
@@ -361,7 +364,7 @@ async fn emit_type_replacement(
         ctx.invalid_change_state(file_path.clone()),
         FileAction::Delete,
         change::Flags::None,
-        sink,
+        changes,
         filter_mode,
         ctx.states,
     )
@@ -386,7 +389,7 @@ async fn emit_type_replacement(
         to_state,
         FileAction::Add,
         change::Flags::None,
-        sink,
+        changes,
         filter_mode,
         ctx.states,
     )
@@ -414,7 +417,7 @@ async fn emit_unstaged_add(
     from_node: Node,
     file_path: &RelativePath,
     observed: &FileInfo,
-    sink: &mut ChangeSink<'_>,
+    changes: &ChangeSender,
     stats: &FilesystemDiffStats,
     filter_mode: FilterMode,
     states: FilterStates,
@@ -469,7 +472,7 @@ async fn emit_unstaged_add(
         },
         change::FileAction::Add,
         change::Flags::None,
-        sink,
+        changes,
         filter_mode,
         states,
     )
@@ -515,7 +518,7 @@ async fn emit_dirty_add_node_single(
     state: Arc<State>,
     node_id: NodeID,
     path: &RelativePath,
-    sink: &mut ChangeSink<'_>,
+    changes: &ChangeSender,
     stats: &FilesystemDiffStats,
     intent: FilesystemDiffIntent,
 ) -> Result<(), StateError> {
@@ -526,7 +529,7 @@ async fn emit_dirty_add_node_single(
     if intent.stage().is_some() || !node.is_dirty_add() {
         mark_settled(&state, &repository, node_id, SettledAction::Add, intent).await?;
     }
-    emit_add_node_single(repository, state, node_id, path, sink, stats).await
+    emit_add_node_single(repository, state, node_id, path, changes, stats).await
 }
 
 /// Emit a single Add change for `node_id` as it stands, without marking it and without
@@ -536,41 +539,44 @@ async fn emit_add_node_single(
     state: Arc<State>,
     node_id: NodeID,
     path: &RelativePath,
-    sink: &mut ChangeSink<'_>,
+    changes: &ChangeSender,
     stats: &FilesystemDiffStats,
 ) -> Result<(), StateError> {
     let block = state
         .block(repository.clone(), NodeBlock::index(node_id))
         .await?;
     let node = block.node(Node::index(node_id));
-    sink.emit(NodeChange {
-        action: change::FileAction::Add,
-        flags: compute_change_flags(&node),
-        from: NodeChangeState {
-            mapping: NodeMapping {
-                repository: repository.clone(),
-                state: state.clone(),
-                path: path.clone(),
-                node: INVALID_NODE,
+    emit(
+        changes,
+        NodeChange {
+            action: change::FileAction::Add,
+            flags: compute_change_flags(&node),
+            from: NodeChangeState {
+                mapping: NodeMapping {
+                    repository: repository.clone(),
+                    state: state.clone(),
+                    path: path.clone(),
+                    node: INVALID_NODE,
+                },
+                observed: None,
+                flags: NodeFlags::NoFlags,
+                address: Address::default(),
+                mode: 0,
             },
-            observed: None,
-            flags: NodeFlags::NoFlags,
-            address: Address::default(),
-            mode: 0,
-        },
-        to: NodeChangeState {
-            mapping: NodeMapping {
-                repository: repository.clone(),
-                state: state.clone(),
-                path: path.clone(),
-                node: node_id,
+            to: NodeChangeState {
+                mapping: NodeMapping {
+                    repository: repository.clone(),
+                    state: state.clone(),
+                    path: path.clone(),
+                    node: node_id,
+                },
+                observed: None,
+                flags: NodeFlags::from_bits_retain(node.flags),
+                address: node.address,
+                mode: node.mode,
             },
-            observed: None,
-            flags: NodeFlags::from_bits_retain(node.flags),
-            address: node.address,
-            mode: node.mode,
         },
-    })
+    )
     .await?;
     stats.file_add.fetch_add(1, Ordering::Relaxed);
     Ok(())
@@ -587,7 +593,7 @@ async fn emit_add_node_single(
 /// * `file_path` - Path to the file (relative)
 /// * `from_path` - Original path for rename detection (None if not a rename)
 /// * `is_filesystem_directory` - True if the filesystem item is a directory
-/// * `changes` - Vector to append changes to
+/// * `changes` - Where the changes are emitted
 /// * `stats` - Statistics to update
 ///
 /// # Rename Handling
@@ -606,7 +612,7 @@ async fn handle_single_file_compare_result(
     file_path: &impl WalkPath,
     from_path: Option<&RelativePath>,
     is_filesystem_directory: bool,
-    sink: &mut ChangeSink<'_>,
+    changes: &ChangeSender,
     stats: &FilesystemDiffStats,
     filter_mode: FilterMode,
 ) -> Result<NodeID, StateError> {
@@ -639,7 +645,7 @@ async fn handle_single_file_compare_result(
                     ctx.new_file_change_state(item_path.clone()),
                     change::FileAction::Move,
                     change::Flags::None,
-                    sink,
+                    changes,
                     filter_mode,
                     ctx.states,
                 )
@@ -647,7 +653,8 @@ async fn handle_single_file_compare_result(
                 stats.file_replace.fetch_add(1, Ordering::Relaxed);
             } else if ctx.insists {
                 lore_trace!("File {} unmodified, staged anyway", file_path);
-                settle_insisted_modification(ctx, &file_path.to_path(), sink, filter_mode).await?;
+                settle_insisted_modification(ctx, &file_path.to_path(), changes, filter_mode)
+                    .await?;
                 stats.file_replace.fetch_add(1, Ordering::Relaxed);
             } else {
                 lore_trace!("File {} unmodified, retain", file_path);
@@ -708,7 +715,7 @@ async fn handle_single_file_compare_result(
                 ctx.new_file_change_state(item_path.clone()),
                 action,
                 change::Flags::Modify,
-                sink,
+                changes,
                 filter_mode,
                 ctx.states,
             )
@@ -745,7 +752,7 @@ async fn handle_single_file_compare_result(
                 to_state,
                 FileAction::Add,
                 change::Flags::None,
-                sink,
+                changes,
                 filter_mode,
                 ctx.states,
             )
@@ -758,7 +765,7 @@ async fn handle_single_file_compare_result(
                 "Type changed at {} - state has directory/link, filesystem has file, delete + add",
                 file_path
             );
-            return emit_type_replacement(ctx, &file_path.to_path(), false, sink, filter_mode)
+            return emit_type_replacement(ctx, &file_path.to_path(), false, changes, filter_mode)
                 .await;
         }
         SingleFileCompareResult::TypeChangedToDirectory => {
@@ -766,7 +773,8 @@ async fn handle_single_file_compare_result(
                 "Type changed at {} - state has file, filesystem has directory, delete + add",
                 file_path
             );
-            return emit_type_replacement(ctx, &file_path.to_path(), true, sink, filter_mode).await;
+            return emit_type_replacement(ctx, &file_path.to_path(), true, changes, filter_mode)
+                .await;
         }
     }
     Ok(INVALID_NODE)
@@ -778,7 +786,8 @@ async fn handle_single_file_compare_result(
 async fn diff_filesystem_directory(
     ctx: FilesystemDiffContext,
     file_listing: lore_io::DirStream,
-) -> Result<(Vec<NodeChange>, FilesystemDiffStats), StateError> {
+    changes: &ChangeSender,
+) -> Result<FilesystemDiffStats, StateError> {
     /// A staging walk includes the children staged for delete, so a path the file system
     /// still holds takes its delete back rather than being added a second time beside it.
     async fn collect_node_list(
@@ -828,7 +837,6 @@ async fn diff_filesystem_directory(
 
     let mut current_node_list = collect_node_list(&ctx.current, false).await?;
 
-    let mut changes: Vec<NodeChange> = vec![];
     let mut tasks = JoinSet::new();
     let mut stats = FilesystemDiffStats::default();
     let mut pending_discards: Vec<NodeID> = Vec::new();
@@ -849,7 +857,7 @@ async fn diff_filesystem_directory(
         &current_node_list,
         &mut node_list_found,
         &mut tasks,
-        &mut changes,
+        changes,
         &mut stats,
         &mut pending_discards,
     )
@@ -863,7 +871,7 @@ async fn diff_filesystem_directory(
         pending_discards,
     )
     .await?;
-    Ok((changes, stats))
+    Ok(stats)
 }
 
 /// Emit a single `Delete` change for one node, reloading it so any dirty flags
@@ -873,7 +881,7 @@ async fn emit_single_delete(
     repository: Arc<RepositoryContext>,
     node_id: NodeID,
     path: &RelativePath,
-    sink: &mut ChangeSink<'_>,
+    changes: &ChangeSender,
 ) -> Result<(), StateError> {
     let block = state
         .block(repository.clone(), NodeBlock::index(node_id))
@@ -893,12 +901,15 @@ async fn emit_single_delete(
         mode: node.mode,
     };
     let to = from.invalid(path.clone());
-    sink.emit(NodeChange {
-        action: FileAction::Delete,
-        flags,
-        from,
-        to,
-    })
+    emit(
+        changes,
+        NodeChange {
+            action: FileAction::Delete,
+            flags,
+            from,
+            to,
+        },
+    )
     .await
 }
 
@@ -909,7 +920,7 @@ async fn emit_single_delete(
 async fn flush_pending_dir_deletes(
     state: &Arc<State>,
     repository: &Arc<RepositoryContext>,
-    sink: &mut ChangeSink<'_>,
+    changes: &ChangeSender,
     pending: &mut Vec<(NodeID, RelativePath)>,
     intent: FilesystemDiffIntent,
 ) -> Result<(), StateError> {
@@ -917,7 +928,7 @@ async fn flush_pending_dir_deletes(
         if intent.marks_dirty() {
             mark_settled(state, repository, node_id, SettledAction::Delete, intent).await?;
         }
-        emit_single_delete(state.clone(), repository.clone(), node_id, &path, sink).await?;
+        emit_single_delete(state.clone(), repository.clone(), node_id, &path, changes).await?;
     }
     Ok(())
 }
@@ -949,7 +960,7 @@ async fn flush_pending_dir_deletes(
 /// A staging intent settles the whole tree subtree, so a commit removes what the view
 /// leaves out too: an excluded child is descended rather than skipped, and reported along
 /// with the rest of the descent. Narrowing those reports to the in-view set is the
-/// view-filtered delete work, which needs a sink that marks without reporting.
+/// view-filtered delete work, which needs a walk that marks without reporting.
 #[allow(clippy::too_many_arguments)]
 async fn emit_filesystem_subtree_deletes(
     state: Arc<State>,
@@ -960,16 +971,16 @@ async fn emit_filesystem_subtree_deletes(
     states: FilterStates,
     filter_mode: FilterMode,
     intent: FilesystemDiffIntent,
-    sink: &mut ChangeSink<'_>,
+    changes: &ChangeSender,
     pending: &mut Vec<(NodeID, RelativePath)>,
 ) -> Result<bool, StateError> {
     // Caller guarantees `node` is not filter-excluded.
     if node.is_file() || node.is_link() {
-        flush_pending_dir_deletes(&state, &repository, sink, pending, intent).await?;
+        flush_pending_dir_deletes(&state, &repository, changes, pending, intent).await?;
         if intent.marks_dirty() {
             mark_settled(&state, &repository, node_id, SettledAction::Delete, intent).await?;
         }
-        emit_single_delete(state, repository, node_id, path, sink).await?;
+        emit_single_delete(state, repository, node_id, path, changes).await?;
         return Ok(true);
     }
 
@@ -1003,7 +1014,7 @@ async fn emit_filesystem_subtree_deletes(
             child_states,
             filter_mode,
             intent,
-            sink,
+            changes,
             pending,
         ))
         .await?
@@ -1021,7 +1032,7 @@ async fn emit_filesystem_subtree_deletes(
         // Empty in-view directory: clone/checkout writes it, so its absence is a
         // real deletion. It is the materializing leaf here, and its own buffered
         // entry (pushed above) is flushed and marked along with its ancestors.
-        flush_pending_dir_deletes(&state, &repository, sink, pending, intent).await?;
+        flush_pending_dir_deletes(&state, &repository, changes, pending, intent).await?;
         return Ok(true);
     }
 
@@ -1141,7 +1152,7 @@ async fn staged_entry(
 
 /// Match each filesystem item from `file_receiver` against `node_list` (the
 /// `from` state's children) and `current_node_list` (the `current` state's
-/// children), emitting changes into `changes`, marking matched entries in
+/// children), emitting changes through `changes`, marking matched entries in
 /// `node_list_found`, spawning subtree-recursion tasks into `tasks`, and
 /// queueing stale directory nodes into `pending_discards`. Items with no
 /// match in `node_list` are buffered and processed as new adds once the
@@ -1161,8 +1172,8 @@ async fn diff_filesystem_directory_walk(
     node_list: &StateChildrenNodes,
     current_node_list: &StateChildrenNodes,
     node_list_found: &mut [bool],
-    tasks: &mut JoinSet<Result<(Vec<NodeChange>, FilesystemDiffStats), StateError>>,
-    changes: &mut Vec<NodeChange>,
+    tasks: &mut SubtreeTasks,
+    changes: &ChangeSender,
     stats: &mut FilesystemDiffStats,
     pending_discards: &mut Vec<NodeID>,
 ) -> Result<(), StateError> {
@@ -1279,7 +1290,7 @@ async fn diff_filesystem_directory_walk(
                         node_list.state.clone(),
                         from_named_node.node,
                         &entry.to_path(),
-                        &mut ChangeSink::Vec(&mut *changes),
+                        changes,
                         stats,
                     )
                     .await?;
@@ -1300,7 +1311,7 @@ async fn diff_filesystem_directory_walk(
                     from_node,
                     &entry.to_path(),
                     &FileInfo::from_metadata(&item.metadata),
-                    &mut ChangeSink::Vec(&mut *changes),
+                    changes,
                     stats,
                     ctx.filter_mode,
                     item_states,
@@ -1347,7 +1358,7 @@ async fn diff_filesystem_directory_walk(
                 entry.path(),
                 from_match.renamed_path.as_ref(),
                 false, // filesystem item is a file, not directory
-                &mut ChangeSink::Vec(&mut *changes),
+                changes,
                 stats,
                 ctx.filter_mode,
             )
@@ -1366,7 +1377,7 @@ async fn diff_filesystem_directory_walk(
                     node_list.state.clone(),
                     from_named_node.node,
                     &item_path,
-                    &mut ChangeSink::Vec(&mut *changes),
+                    changes,
                     stats,
                 )
                 .await?;
@@ -1450,7 +1461,7 @@ async fn diff_filesystem_directory_walk(
                     node_list.state.clone(),
                     from_named_node.node,
                     &item_path,
-                    &mut ChangeSink::Vec(&mut *changes),
+                    changes,
                     stats,
                 )
                 .await?;
@@ -1462,7 +1473,7 @@ async fn diff_filesystem_directory_walk(
                     node_list.state.clone(),
                     from_named_node.node,
                     &item_path,
-                    &mut ChangeSink::Vec(&mut *changes),
+                    changes,
                     stats,
                     ctx.intent,
                 )
@@ -1502,7 +1513,7 @@ async fn diff_filesystem_directory_walk(
                     },
                     FileAction::Move,
                     measured,
-                    &mut ChangeSink::Vec(&mut *changes),
+                    changes,
                     ctx.filter_mode,
                     item_states,
                 )
@@ -1514,7 +1525,7 @@ async fn diff_filesystem_directory_walk(
                     &from_node,
                     &item_path,
                     FileInfo::from_metadata(&item.metadata),
-                    &mut ChangeSink::Vec(&mut *changes),
+                    changes,
                     ctx.intent,
                     ctx.filter_mode,
                 )
@@ -1610,7 +1621,7 @@ async fn diff_filesystem_directory_walk(
                 entry.path(),
                 None,
                 is_directory,
-                &mut ChangeSink::Vec(&mut *changes),
+                changes,
                 stats,
                 ctx.filter_mode,
             )
@@ -1708,7 +1719,7 @@ async fn diff_filesystem_directory_walk(
                 from_node_states,
                 ctx.filter_mode,
                 ctx.intent,
-                &mut ChangeSink::Vec(&mut *changes),
+                changes,
                 &mut pending,
             )
             .await?;
@@ -1781,7 +1792,7 @@ async fn diff_filesystem_directory_walk(
             },
             FileAction::Delete,
             change::Flags::None,
-            &mut ChangeSink::Vec(&mut *changes),
+            changes,
             ctx.filter_mode,
             from_node_states,
         )
@@ -1932,7 +1943,7 @@ async fn diff_filesystem_directory_walk(
                     ctx.from.state.clone(),
                     new_dir_id,
                     &child_file_path,
-                    &mut ChangeSink::Vec(&mut *changes),
+                    changes,
                     stats,
                     ctx.intent,
                 )
@@ -2012,7 +2023,7 @@ async fn diff_filesystem_directory_walk(
             &child_file_path,
             None,
             is_directory,
-            &mut ChangeSink::Vec(&mut *changes),
+            changes,
             stats,
             ctx.filter_mode,
         )
@@ -2020,11 +2031,17 @@ async fn diff_filesystem_directory_walk(
     }
 
     while let Some(joined) = tasks.join_next().await {
-        diff_filesystem_subtree_merge_task(joined, changes, stats)?;
+        diff_filesystem_subtree_merge_task(joined, stats)?;
     }
 
     Ok(())
 }
+
+/// The subtree walks a directory has in flight, each reporting what it counted.
+///
+/// Nothing else comes back: a subtree emits its changes to the caller through a clone of the
+/// sender rather than collecting them for the parent to fold in.
+type SubtreeTasks = JoinSet<Result<FilesystemDiffStats, StateError>>;
 
 fn diff_filesystem_task_semaphore() -> &'static Arc<Semaphore> {
     DIFF_FILESYSTEM_TASK_SEMAPHORE
@@ -2038,54 +2055,37 @@ fn diff_filesystem_task_semaphore() -> &'static Arc<Semaphore> {
 /// so waiting on one would wait on a descendant that cannot start.
 async fn diff_filesystem_subtree_dispatch(
     subtree: FilesystemDiffContext,
-    tasks: &mut JoinSet<Result<(Vec<NodeChange>, FilesystemDiffStats), StateError>>,
-    changes: &mut Vec<NodeChange>,
+    tasks: &mut SubtreeTasks,
+    changes: &ChangeSender,
     stats: &mut FilesystemDiffStats,
 ) -> Result<(), StateError> {
     if let Ok(permit) = diff_filesystem_task_semaphore().clone().try_acquire_owned() {
+        let changes = changes.clone();
         lore_spawn!(tasks, async move {
             let _permit = permit;
-            diff_filesystem_subtree_recurse(subtree).await
+            diff_filesystem_subtree_recurse(subtree, &changes).await
         });
     } else {
-        diff_filesystem_subtree_merge(
-            diff_filesystem_subtree_recurse(subtree).await?,
-            changes,
-            stats,
-        );
+        stats.append(diff_filesystem_subtree_recurse(subtree, changes).await?);
     }
     while let Some(joined) = tasks.try_join_next() {
-        diff_filesystem_subtree_merge_task(joined, changes, stats)?;
+        diff_filesystem_subtree_merge_task(joined, stats)?;
     }
     Ok(())
 }
 
-/// Folds a joined subtree task into the parent directory's changes and stats.
+/// Folds a joined subtree task's count into the parent directory's.
 fn diff_filesystem_subtree_merge_task(
-    joined: Result<Result<(Vec<NodeChange>, FilesystemDiffStats), StateError>, JoinError>,
-    changes: &mut Vec<NodeChange>,
+    joined: Result<Result<FilesystemDiffStats, StateError>, JoinError>,
     stats: &mut FilesystemDiffStats,
 ) -> Result<(), StateError> {
-    diff_filesystem_subtree_merge(
+    stats.append(
         joined
             .internal("Task failure")
             .map_err(StateError::from)
             .flatten()?,
-        changes,
-        stats,
     );
     Ok(())
-}
-
-/// Folds a finished subtree's changes and stats into the parent directory's.
-fn diff_filesystem_subtree_merge(
-    subtree: (Vec<NodeChange>, FilesystemDiffStats),
-    changes: &mut Vec<NodeChange>,
-    stats: &mut FilesystemDiffStats,
-) {
-    let (mut subtree_changes, subtree_stats) = subtree;
-    changes.append(&mut subtree_changes);
-    stats.append(subtree_stats);
 }
 
 /// Handle diff for a single file path.
@@ -2097,8 +2097,8 @@ fn diff_filesystem_subtree_merge(
 async fn diff_filesystem_single_file(
     ctx: FilesystemDiffContext,
     file_item: util::fs::FileListItem,
-) -> Result<(Vec<NodeChange>, FilesystemDiffStats), StateError> {
-    let mut changes = vec![];
+    changes: &ChangeSender,
+) -> Result<FilesystemDiffStats, StateError> {
     let stats = FilesystemDiffStats::default();
 
     // Path is already correct - file_item represents node_path itself
@@ -2145,18 +2145,18 @@ async fn diff_filesystem_single_file(
         )
         .await?
         {
-            StagedEntry::Settled => return Ok((changes, stats)),
+            StagedEntry::Settled => return Ok(stats),
             StagedEntry::Undeleted => {
                 emit_add_node_single(
                     ctx.from.repository.clone(),
                     ctx.from.state.clone(),
                     ctx.from.node,
                     &ctx.filesystem_path,
-                    &mut ChangeSink::Vec(&mut changes),
+                    changes,
                     &stats,
                 )
                 .await?;
-                return Ok((changes, stats));
+                return Ok(stats);
             }
             StagedEntry::Compare { insisted: asked } => insisted = asked,
         }
@@ -2179,14 +2179,14 @@ async fn diff_filesystem_single_file(
             node,
             &ctx.filesystem_path,
             &observed,
-            &mut ChangeSink::Vec(&mut changes),
+            changes,
             &stats,
             ctx.filter_mode,
             ctx.states,
             ctx.intent,
         )
         .await?;
-        return Ok((changes, stats));
+        return Ok(stats);
     }
 
     let compare_result = compare_single_file_against_state(
@@ -2219,13 +2219,13 @@ async fn diff_filesystem_single_file(
         &ctx.filesystem_path,
         None, // No rename detection for single file path
         file_item.metadata.is_dir(),
-        &mut ChangeSink::Vec(&mut changes),
+        changes,
         &stats,
         ctx.filter_mode,
     )
     .await?;
 
-    Ok((changes, stats))
+    Ok(stats)
 }
 
 /// Handle diff when filesystem path doesn't exist.
@@ -2236,8 +2236,8 @@ async fn diff_filesystem_missing(
     states: FilterStates,
     filter_mode: FilterMode,
     intent: FilesystemDiffIntent,
-) -> Result<(Vec<NodeChange>, FilesystemDiffStats), StateError> {
-    let mut changes = vec![];
+    changes: &ChangeSender,
+) -> Result<FilesystemDiffStats, StateError> {
     let stats = FilesystemDiffStats::default();
 
     // Add delete changes for all nodes under the from node
@@ -2289,40 +2289,33 @@ async fn diff_filesystem_missing(
             },
             FileAction::Delete,
             change::Flags::None,
-            &mut ChangeSink::Vec(&mut changes),
+            changes,
             filter_mode,
             states,
         )
         .await?;
     }
 
-    Ok((changes, stats))
+    Ok(stats)
 }
 
-#[allow(clippy::too_many_arguments)]
-#[allow(clippy::type_complexity)]
-fn diff_filesystem_subtree_recurse(
+/// Walks one subtree, boxed so the walk can descend into itself.
+fn diff_filesystem_subtree_recurse<'a>(
     ctx: FilesystemDiffContext,
-) -> Pin<Box<dyn Future<Output = Result<(Vec<NodeChange>, FilesystemDiffStats), StateError>> + Send>>
-{
-    Box::pin(diff_filesystem_subtree_impl(ctx))
+    changes: &'a ChangeSender,
+) -> Pin<Box<dyn Future<Output = Result<FilesystemDiffStats, StateError>> + Send + 'a>> {
+    Box::pin(diff_filesystem_subtree_impl(ctx, changes))
 }
 
-/// Diffs the working tree under `diff.filesystem_path` against the trees it names, appending a
-/// change per difference to `changes`.
+/// Diffs the working tree under `diff.filesystem_path` against the trees it names, emitting a
+/// change per difference through `changes`.
 ///
 /// The module's entry, and what
 /// [`OsOperation`](crate::fs::os::OsOperation)'s
 /// `changes_from_filesystem_to_state` answers with.
 pub(crate) async fn diff_os_filesystem(
     diff: FilesystemDiffContext,
-    changes: &mut Vec<NodeChange>,
+    changes: &ChangeSender,
 ) -> Result<FilesystemDiffStats, StateError> {
-    let (walked, stats) = Box::pin(diff_filesystem_subtree_impl(diff)).await?;
-    if changes.is_empty() {
-        *changes = walked;
-    } else {
-        changes.extend(walked);
-    }
-    Ok(stats)
+    diff_filesystem_subtree_recurse(diff, changes).await
 }

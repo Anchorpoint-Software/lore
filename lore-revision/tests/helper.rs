@@ -238,8 +238,7 @@ pub async fn test_scan_path_with_intent(
     )
     .await
     .expect("Failed to start filesystem operation");
-    let mut changes = Vec::new();
-    lore_revision::state::diff_filesystem(
+    let changes = lore_revision::state::diff_filesystem(
         &operation,
         lore_revision::fs::filesystem_provider::FilesystemDiffTree {
             repository: repository.clone(),
@@ -253,10 +252,56 @@ pub async fn test_scan_path_with_intent(
         lore_revision::filter::FilterMode::Full,
         intent,
         std::sync::Arc::new(Vec::new()),
-        &mut changes,
+    )
+    .await
+    .expect("Failed to diff filesystem")
+    .collect()
+    .await
+    .expect("Failed to diff filesystem");
+    lore_revision::fs::filesystem_provider::InstanceOperation::finalize(operation.as_ref(), false)
+        .await
+        .expect("Failed to finish filesystem operation");
+    changes
+}
+
+/// [`test_scan`] read one change at a time, for the walk's other consumption path.
+///
+/// Answers in arrival order, which interleaves subtrees by completion, and waits for the walk so
+/// the answer is the whole of it.
+#[allow(dead_code)]
+pub async fn test_scan_streaming(
+    repository: std::sync::Arc<lore_revision::repository::RepositoryContext>,
+    state_staged: std::sync::Arc<lore_revision::state::State>,
+    state_current: std::sync::Arc<lore_revision::state::State>,
+) -> Vec<lore_revision::change::NodeChange> {
+    let operation = lore_revision::fs::filesystem_provider::FilesystemProvider::begin_operation(
+        repository.file_system().as_ref(),
+    )
+    .await
+    .expect("Failed to start filesystem operation");
+    let mut stream = lore_revision::state::diff_filesystem(
+        &operation,
+        lore_revision::fs::filesystem_provider::FilesystemDiffTree {
+            repository: repository.clone(),
+            state: state_staged,
+        },
+        lore_revision::fs::filesystem_provider::FilesystemDiffTree {
+            repository,
+            state: state_current,
+        },
+        None,
+        lore_revision::filter::FilterMode::Full,
+        lore_revision::fs::filesystem_provider::FilesystemDiffIntent::Report,
+        std::sync::Arc::new(Vec::new()),
     )
     .await
     .expect("Failed to diff filesystem");
+
+    let mut changes = Vec::new();
+    while let Some(change) = stream.next().await {
+        changes.push(change);
+    }
+    stream.finish().await.expect("Failed to diff filesystem");
     lore_revision::fs::filesystem_provider::InstanceOperation::finalize(operation.as_ref(), false)
         .await
         .expect("Failed to finish filesystem operation");

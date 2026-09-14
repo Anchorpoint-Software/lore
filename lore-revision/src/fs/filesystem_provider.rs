@@ -17,7 +17,6 @@ use lore_error_set::ErrorSet;
 use lore_error_set::error_set;
 use lore_error_set::prelude::*;
 
-use crate::change::NodeChange;
 use crate::filter::FilterMode;
 use crate::filter::FilterStates;
 use crate::fs::os::OsOperation;
@@ -27,6 +26,7 @@ use crate::merge::MergeTextMode;
 use crate::node::Node;
 use crate::node::NodeFlags;
 use crate::repository::RepositoryContext;
+use crate::state::ChangeStream;
 use crate::state::FilesystemDiffStats;
 use crate::state::LayerMountInfo;
 use crate::state::LinkMountInfo;
@@ -319,18 +319,19 @@ where
 /// This type is not dyn-safe, async methods don't have their future boxed to allow static dispatch
 /// though an `impl InstanceOperation`
 pub trait InstanceOperation: Send + Sync {
-    /// Diff the filesystem under `diff.filesystem_path` against the trees it names,
-    /// pushing a change per difference onto `changes`.
+    /// Diff the filesystem under `diff.filesystem_path` against the trees it names, answering
+    /// with the changes as the walk finds them.
     ///
     /// Reports files added, modified or deleted on disk, and metadata changes.
     /// `diff.intent` decides whether the trees are marked as it goes.
     ///
-    /// TODO(UCS-19486): Stream results rather than fill a Vec
+    /// Returns rather than walks: the walk runs behind the stream, bounded in how far ahead of
+    /// its reader it may get. What the caller does with the changes -- collect them, read each
+    /// once, or stop at the first of some kind -- is the stream's to answer and not this.
     fn changes_from_filesystem_to_state(
         &self,
         diff: FilesystemDiffContext,
-        changes: &mut Vec<NodeChange>,
-    ) -> impl Future<Output = Result<FilesystemDiffStats, FsError>> + Send;
+    ) -> ChangeStream<FilesystemDiffStats>;
 
     /// Get basic file information for a path.
     ///
@@ -543,18 +544,17 @@ impl InstanceOperationImpl {
 }
 
 impl InstanceOperation for InstanceOperationImpl {
-    async fn changes_from_filesystem_to_state(
+    fn changes_from_filesystem_to_state(
         &self,
         diff: FilesystemDiffContext,
-        changes: &mut Vec<NodeChange>,
-    ) -> Result<FilesystemDiffStats, FsError> {
+    ) -> ChangeStream<FilesystemDiffStats> {
         match &self.dispatch {
             #[cfg(test)]
             StaticDispatchInstanceOperation::Test(this) => {
-                this.changes_from_filesystem_to_state(diff, changes).await
+                this.changes_from_filesystem_to_state(diff)
             }
             StaticDispatchInstanceOperation::Os(this) => {
-                this.changes_from_filesystem_to_state(diff, changes).await
+                this.changes_from_filesystem_to_state(diff)
             }
         }
     }
@@ -764,7 +764,6 @@ pub mod tests {
     use lore_base::types::Fragment;
     use parking_lot::Mutex;
 
-    use crate::change::NodeChange;
     use crate::fs::filesystem_provider::FileInfo;
     use crate::fs::filesystem_provider::FilesystemDiffContext;
     use crate::fs::filesystem_provider::FilesystemDiffIntent;
@@ -783,6 +782,7 @@ pub mod tests {
     use crate::repository::RepositoryContext;
     use crate::repository::test_helpers::RepositoryContextCreationArgsExt;
     use crate::repository::test_helpers::default_repository_creation_args;
+    use crate::state::ChangeStream;
     use crate::state::FilesystemDiffStats;
     use crate::state::NodeComparison;
     use crate::state::State;
@@ -891,12 +891,11 @@ pub mod tests {
 
         /// Reports a working tree holding exactly what the state does, which is what a walk over a
         /// tree with nothing to reconcile answers.
-        async fn changes_from_filesystem_to_state(
+        fn changes_from_filesystem_to_state(
             &self,
             _diff: FilesystemDiffContext,
-            _changes: &mut Vec<NodeChange>,
-        ) -> Result<FilesystemDiffStats, FsError> {
-            Ok(FilesystemDiffStats::default())
+        ) -> ChangeStream<FilesystemDiffStats> {
+            ChangeStream::nothing()
         }
 
         /// Counts the lookup and reports what the provider was told to hold, which for the
@@ -1205,9 +1204,7 @@ pub mod tests {
                     repository: repository.clone(),
                     state: state.clone(),
                 };
-                let mut changes = Vec::new();
-
-                let stats = crate::state::diff_filesystem(
+                let mut changes = crate::state::diff_filesystem(
                     &operation,
                     tree(),
                     tree(),
@@ -1218,12 +1215,18 @@ pub mod tests {
                     crate::filter::FilterMode::Full,
                     FilesystemDiffIntent::Report,
                     Arc::new(Vec::new()),
-                    &mut changes,
                 )
                 .await
                 .expect("An excluded path is not an error");
 
-                assert!(changes.is_empty(), "An excluded path reported changes");
+                assert!(
+                    changes.next().await.is_none(),
+                    "An excluded path reported changes"
+                );
+                let stats = changes
+                    .finish()
+                    .await
+                    .expect("An excluded path is not an error");
                 assert_eq!(0, stats.file_add.load(std::sync::atomic::Ordering::Relaxed));
             })
             .await;
