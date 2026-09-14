@@ -424,14 +424,13 @@ async fn compare_to_node(
 
     let local_hash = match comparison {
         NodeComparison::Matches => node.address.hash,
-        NodeComparison::Differs => immutable::hash_file(
-            repository.clone(),
-            relative_path.to_absolute_path(repository.require_path()?),
-            None,
-            None,
-        )
-        .await
-        .forward_with::<InfoError, _>(|| format!("Failed to hash local file: {relative_path}"))?,
+        NodeComparison::Differs => {
+            immutable::hash_file(repository.clone(), &operation.content_source(relative_path))
+                .await
+                .forward_with::<InfoError, _>(|| {
+                    format!("Failed to hash local file: {relative_path}")
+                })?
+        }
         NodeComparison::Unreadable => Hash::default(),
     };
 

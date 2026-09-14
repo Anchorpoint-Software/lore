@@ -488,7 +488,7 @@ pub async fn write_from_file_with_tracker(
     lore_storage::write_from_file(
         repository.immutable_store(),
         repository.id,
-        path,
+        &lore_storage::ContentSource::file(path),
         context,
         flags,
         session,
@@ -499,22 +499,17 @@ pub async fn write_from_file_with_tracker(
     .forward("writing immutable content from file")
 }
 
+/// The address the content of the file at `path` would be stored under.
+///
+/// Whether a file still holds content already stored is [`file_matches`], which measures against
+/// the fragmentation that content was stored under.
 pub async fn hash_file(
     repository: Arc<RepositoryContext>,
-    path: impl AsRef<Path>,
-    previous: Option<Address>,
-    previous_size: Option<usize>,
+    source: &lore_storage::ContentSource<'_>,
 ) -> Result<Hash, ImmutableError> {
-    lore_storage::hash_file(
-        repository.immutable_store(),
-        repository.id,
-        path,
-        previous,
-        previous_size,
-        None,
-    )
-    .await
-    .forward("hashing file")
+    lore_storage::hash_file(repository.immutable_store(), repository.id, source, None)
+        .await
+        .forward("hashing file")
 }
 
 /// Whether `source` still holds the content `previous` addresses, fetching fragment metadata
@@ -526,7 +521,7 @@ pub async fn file_matches(
     repository: Arc<RepositoryContext>,
     previous: Address,
     previous_size: Option<usize>,
-    source: &lore_storage::ContentSource,
+    source: &lore_storage::ContentSource<'_>,
     established: &lore_storage::ContentHashes,
 ) -> Result<lore_storage::FileMatch, ImmutableError> {
     let remote_session = resolve_session(&repository);

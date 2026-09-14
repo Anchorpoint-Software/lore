@@ -21,8 +21,10 @@ use zerocopy::FromZeros;
 
 use crate::compress::COMPRESSION_MODE;
 use crate::concurrency::file_count_limit_acquire;
+use crate::content::ContentHandle;
+use crate::content::ContentSource;
+use crate::content::WindowRead;
 use crate::error::StorageError;
-use crate::errors::InvalidArguments;
 use crate::errors::SlowDown;
 use crate::fragment_engine::write_fragmented;
 use crate::fragment_flags::FragmentFlags;
@@ -231,6 +233,12 @@ pub async fn write_resolved(
         ));
     }
 
+    if flags.hash_only {
+        return Err(StorageError::internal(
+            "a resolved write publishes a mapping, so it cannot address content without storing it",
+        ));
+    }
+
     if buffer.is_empty() {
         return retract_resolved_mapping(mutable, partition, key, context, remote_session).await;
     }
@@ -311,7 +319,6 @@ async fn write_resolved_content(
         context,
         buffer,
         flags,
-        false,
         remote_session,
         writes,
         permit,
@@ -1295,7 +1302,7 @@ fn single_fragment(context: Context, buffer: &Bytes, flags: WriteOptions) -> (Ad
 /// Content larger than one fragment is rejected by [`store_fragment_publishing`] as oversized: it
 /// has no single upload for the key to ride on, and reaches [`write_fragmented`] instead.
 #[allow(clippy::too_many_arguments)]
-pub async fn write_content_publishing(
+pub(crate) async fn write_content_publishing(
     store: Arc<dyn ImmutableStore>,
     partition: Partition,
     context: Context,
@@ -1348,10 +1355,21 @@ pub async fn write_content(
     writes: WriteContext,
     permit: Option<OwnedSemaphorePermit>,
 ) -> Result<StoreResult, StorageError> {
-    let _in_flight = ContentWriteGuard::new();
+    let _in_flight = (!flags.hash_only).then(ContentWriteGuard::new);
     // Check if data should be a single fragment
     if buffer.len() <= crate::compress::FRAGMENT_SIZE_THRESHOLD {
         let (address, fragment) = single_fragment(context, &buffer, flags);
+        if flags.hash_only {
+            return Ok(StoreResult {
+                address,
+                size_content: buffer.len() as u64,
+                stored_local: false,
+                stored_durable: false,
+                deduplicated: false,
+                published: false,
+            });
+        }
+
         // Reuse the caller's read reservation if provided, else reserve here.
         let permit = match permit {
             Some(permit) => Some(permit),
@@ -1378,7 +1396,6 @@ pub async fn write_content(
             context,
             buffer,
             flags,
-            false,
             remote_session,
             writes,
             permit,
@@ -1396,40 +1413,6 @@ pub async fn write_content(
     }
 }
 
-/// Open `path` for reading and report its size, retrying a transient failure but not a path the
-/// caller got wrong.
-///
-/// A path that does not exist, or does not name a regular file, will not open on any attempt, so
-/// spending the back-off on it costs the caller ten seconds and reports an internal fault for what
-/// is an argument error. Both are `InvalidArguments` on the first attempt. Everything else keeps
-/// the back-off, which is there for a reader holding the file open on Windows.
-async fn open_file_to_read(path: &Path) -> Result<(lore_io::IoFile, u64), StorageError> {
-    let mut retry = crate::retry(10, 10_000, 10);
-    loop {
-        match crate::chunker::open_read(path).await {
-            Ok(result) => return Ok(result),
-            Err(err)
-                if matches!(
-                    err.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput
-                ) =>
-            {
-                return Err(StorageError::from(InvalidArguments {
-                    reason: format!("open file: {}: {err}", path.display()),
-                }));
-            }
-            Err(err) => {
-                if !retry.wait().await {
-                    return Err(StorageError::internal_with_context(
-                        err,
-                        &format!("open file: {}", path.display()),
-                    ));
-                }
-            }
-        }
-    }
-}
-
 /// Write content from a file.
 ///
 /// Takes a store, partition, and optional remote session directly.
@@ -1440,27 +1423,24 @@ async fn open_file_to_read(path: &Path) -> Result<(lore_io::IoFile, u64), Storag
 /// stands for.
 ///
 /// A `path` that does not exist or does not name a regular file is `InvalidArguments`; see
-/// [`open_file_to_read`]. A zero-length file yields the zero-hash address without being read.
+/// [`ContentSource::open`]. A zero-length file yields the zero-hash address without being read.
 #[allow(clippy::too_many_arguments)]
 pub async fn write_from_file(
     store: Arc<dyn ImmutableStore>,
     partition: Partition,
-    path: &Path,
+    source: &ContentSource<'_>,
     context: Context,
     flags: WriteOptions,
     remote_session: Option<Arc<StorageSession>>,
     writes: WriteContext,
 ) -> Result<StoreResult, StorageError> {
-    let _in_flight = ContentWriteGuard::new();
+    let _in_flight = (!flags.hash_only).then(ContentWriteGuard::new);
     let _count_permit = file_count_limit_acquire()
         .await
         .forward::<StorageError>("permit failed")?;
-    let (file, size) = open_file_to_read(path).await?;
+    let (handle, size) = source.open().await?;
 
-    lore_base::lore_trace!(
-        "Opened file to read from for immutable data write: {} size {size}",
-        path.display(),
-    );
+    lore_base::lore_trace!("Opened content to read for immutable data write: {source} size {size}");
 
     if size == 0 {
         return Ok(StoreResult {
@@ -1480,8 +1460,8 @@ pub async fn write_from_file(
     let size = size as usize;
     if size <= crate::compress::FRAGMENT_SIZE_THRESHOLD {
         let read_permit = crate::concurrency::acquire_fragment_memory_permit(size).await;
-        let buffer = file.read_exact_at(size, 0).await.map_err(|e| {
-            StorageError::internal_with_context(e, &format!("read file: {}", path.display()))
+        let buffer = handle.read_all(size).await.map_err(|err| {
+            StorageError::internal_with_context(err, &format!("read content: {source}"))
         })?;
         let address = write_content(
             store,
@@ -1505,10 +1485,9 @@ pub async fn write_from_file(
             store,
             partition,
             context,
-            file,
+            handle,
             size,
             flags,
-            false,
             remote_session,
             writes,
             None,
@@ -1540,7 +1519,7 @@ pub async fn write_from_file(
 /// between publishing empty content and publishing none.
 ///
 /// A `path` that does not exist or does not name a regular file is `InvalidArguments` rather than a
-/// retraction; see [`open_file_to_read`]. That check is what keeps a directory — whose reported size
+/// retraction; see [`ContentSource::open`]. That check is what keeps a directory — whose reported size
 /// is whatever the filesystem chooses, and may be zero — from retracting a live key.
 #[allow(clippy::too_many_arguments)]
 pub async fn write_resolved_from_file(
@@ -1560,11 +1539,18 @@ pub async fn write_resolved_from_file(
         ));
     }
 
+    if flags.hash_only {
+        return Err(StorageError::internal(
+            "a resolved write publishes a mapping, so it cannot address content without storing it",
+        ));
+    }
+
     let _in_flight = ContentWriteGuard::new();
     let _count_permit = file_count_limit_acquire()
         .await
         .forward::<StorageError>("permit failed")?;
-    let (file, size) = open_file_to_read(path).await?;
+    let source = ContentSource::file(path);
+    let (handle, size) = source.open().await?;
 
     lore_base::lore_trace!(
         "Opened file to publish under key {key}: {} size {size}",
@@ -1578,8 +1564,8 @@ pub async fn write_resolved_from_file(
     let size = size as usize;
     let written = if size <= crate::compress::FRAGMENT_SIZE_THRESHOLD {
         let read_permit = crate::concurrency::acquire_fragment_memory_permit(size).await;
-        let buffer = file.read_exact_at(size, 0).await.map_err(|e| {
-            StorageError::internal_with_context(e, &format!("read file: {}", path.display()))
+        let buffer = handle.read_all(size).await.map_err(|err| {
+            StorageError::internal_with_context(err, &format!("read content: {source}"))
         })?;
         write_resolved_content(
             store,
@@ -1600,10 +1586,9 @@ pub async fn write_resolved_from_file(
                 store,
                 partition,
                 context,
-                file,
+                handle,
                 size,
                 flags,
-                false,
                 remote_session.clone(),
                 writes,
                 publish.clone(),
@@ -1658,7 +1643,7 @@ pub async fn file_matches(
     previous: Address,
     previous_size: Option<usize>,
     remote_session: Option<Arc<StorageSession>>,
-    source: &ContentSource,
+    source: &ContentSource<'_>,
     established: &ContentHashes,
 ) -> Result<FileMatch, StorageError> {
     let _count_permit = file_count_limit_acquire()
@@ -1723,7 +1708,7 @@ pub async fn file_matches(
     let fragment_list = payload.to_aligned::<FragmentReference>();
     let previous_fragmentation = fragment_list.as_type_slice::<FragmentReference>();
     if !previous_fragmentation.is_empty() {
-        let Ok(file) = source.open().await else {
+        let Ok((file, _)) = source.open().await else {
             return Ok(FileMatch::Unreadable);
         };
         match compare_previous_chunks(
@@ -1836,12 +1821,12 @@ impl ContentHashes {
 /// A file's content paired with what comparing it has established, which is what one comparison
 /// reads through.
 struct ContentHashMemo<'a> {
-    source: &'a ContentSource,
+    source: &'a ContentSource<'a>,
     established: &'a ContentHashes,
 }
 
 impl<'a> ContentHashMemo<'a> {
-    fn new(source: &'a ContentSource, established: &'a ContentHashes) -> Self {
+    fn new(source: &'a ContentSource<'a>, established: &'a ContentHashes) -> Self {
         Self {
             source,
             established,
@@ -1893,7 +1878,7 @@ impl<'a> ContentHashMemo<'a> {
             return Ok(Some(*hash));
         }
 
-        let Ok(file) = self.source.open().await else {
+        let Ok((file, _)) = self.source.open().await else {
             return Ok(None);
         };
         let address = crate::fragment_engine::write_fragmented_from_file(
@@ -1902,8 +1887,7 @@ impl<'a> ContentHashMemo<'a> {
             context,
             file,
             file_size,
-            WriteOptions::default().no_remote_write(),
-            true,
+            WriteOptions::default().no_remote_write().hash_only(),
             None,
             WriteContext::none(),
             None,
@@ -1912,84 +1896,6 @@ impl<'a> ContentHashMemo<'a> {
         Ok(Some(
             *self.established.chunked.get_or_init(|| address.0.hash),
         ))
-    }
-}
-
-/// Where a comparison reads the content it measures, and how much of it at a time.
-///
-/// Separate from [`ContentHashMemo`], which holds what was computed about the content rather
-/// than how it was read, so that one memo serves a comparison whatever the content is held in.
-///
-/// Opening a source yields a [`lore_io::IoFile`], which is what the chunk walk and the
-/// re-chunking read windows from. A source that is not a file on the host has that to answer
-/// for, and is the reason this is an enum rather than a path.
-pub enum ContentSource {
-    /// A file on the host filesystem, read through the IO driver.
-    File(std::path::PathBuf),
-}
-
-impl ContentSource {
-    /// How large the content is, which settles a comparison before any of it is read.
-    async fn size(&self) -> Result<u64, StorageError> {
-        let ContentSource::File(path) = self;
-        lore_io::IoDriver::global()
-            .metadata(path)
-            .await
-            .map(|metadata| metadata.len())
-            .map_err(|err| {
-                StorageError::internal_with_context(
-                    err,
-                    &format!("failed to query file metadata: {}", path.display()),
-                )
-            })
-    }
-
-    /// The whole content at once, for hashing it in one read. The caller budgets for holding it
-    /// resident.
-    async fn read_all(&self) -> Result<Bytes, StorageError> {
-        let ContentSource::File(path) = self;
-        lore_io::IoDriver::global()
-            .read_file_bytes(path)
-            .await
-            .map_err(|err| {
-                StorageError::internal_with_context(err, &format!("read file: {}", path.display()))
-            })
-    }
-
-    /// The content as a handle windows are read from, retrying a file another process may still
-    /// be closing.
-    async fn open(&self) -> Result<lore_io::IoFile, StorageError> {
-        let ContentSource::File(path) = self;
-        let mut retry = crate::retry(10, 10_000, 10);
-        loop {
-            match lore_io::IoDriver::global()
-                .open(path, &lore_io::OpenOptions::new().read(true))
-                .await
-            {
-                Ok(file) => return Ok(file),
-                Err(err) => {
-                    if !retry.wait().await {
-                        return Err(StorageError::internal_with_context(
-                            err,
-                            &format!("open file: {}", path.display()),
-                        ));
-                    }
-                }
-            }
-        }
-    }
-
-    /// The host path the content is read from, where it is read from one.
-    pub fn file_path(&self) -> Option<&Path> {
-        let ContentSource::File(path) = self;
-        Some(path)
-    }
-}
-
-impl std::fmt::Display for ContentSource {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let ContentSource::File(path) = self;
-        write!(formatter, "{}", path.display())
     }
 }
 
@@ -2024,124 +1930,32 @@ async fn hashed_under_current_chunking(
     })
 }
 
-/// Hash a file's content, using previous fragmentation hints when available.
+/// The address the content of the file at `path` would be stored under.
 ///
-/// Takes a store, partition, and optional remote session directly. Internally
-/// uses [`load_fragment`] for loading fragments and calls [`store_fragment`] /
-/// [`write_fragmented`] for storing.
+/// Addressed by the same rule that stores it, so the answer is the address the content has:
+/// [`write_from_file`] with nothing written. Content is cut and hashed either way, since an
+/// address is a function of the chunking as much as of the content.
+///
+/// Whether a file still holds content already stored is [`file_matches`], which measures against
+/// the fragmentation that content was stored under rather than the one cutting it now produces.
 pub async fn hash_file(
     store: Arc<dyn ImmutableStore>,
     partition: Partition,
-    path: impl AsRef<Path>,
-    previous: Option<Address>,
-    previous_size: Option<usize>,
+    source: &ContentSource<'_>,
     remote_session: Option<Arc<StorageSession>>,
 ) -> Result<Hash, StorageError> {
-    let _count_permit = file_count_limit_acquire()
-        .await
-        .forward::<StorageError>("permit failed")?;
-
-    let path = path.as_ref();
-    let Ok(metadata) = lore_io::IoDriver::global().metadata(path).await else {
-        return Err(StorageError::internal(format!(
-            "failed to query file metadata: {}",
-            path.display()
-        )));
-    };
-
-    let file_size = metadata.len() as usize;
-
-    lore_base::lore_trace!("Hash file {} previous address {previous:?}", path.display());
-
-    // Files that fit in a single fragment: just read and hash directly
-    if file_size == 0 {
-        return Ok(Hash::new_zeroed());
-    }
-    if file_size <= crate::compress::FRAGMENT_SIZE_THRESHOLD {
-        let data = lore_io::IoDriver::global()
-            .read_file_bytes(path)
-            .await
-            .map_err(|e| {
-                StorageError::internal_with_context(e, &format!("read file: {}", path.display()))
-            })?;
-        return Ok(Hash::hash_buffer(&data));
-    }
-
-    // Large files: try loading previous fragmentation to compare chunk hashes.
-    // Only attempt if the previous size matches (or is unknown) — different sizes
-    // require re-fragmentation anyway.
-    // TODO: once write_fragmented supports partial fragment reuse, we could
-    // attempt matching even when sizes differ.
-    let previous = previous.unwrap_or_default();
-    let mut fragment_list = None;
-    let size_matches = previous_size.is_none() || previous_size == Some(file_size);
-    if !previous.is_zero() && size_matches {
-        let options = ReadOptions::default().no_decompress().no_verify();
-        if let Ok((fragment, payload)) = load_fragment(
-            store.clone(),
-            partition,
-            previous,
-            options,
-            remote_session.clone(),
-        )
-        .await
-        {
-            // Double-check that the stored content size matches the current file.
-            // TODO: once write_fragmented supports partial fragment reuse, we
-            // could attempt matching even when sizes differ.
-            if fragment.flags & FragmentFlags::PayloadFragmented != 0
-                && fragment.size_content == file_size as u64
-            {
-                fragment_list = Some(payload.to_aligned::<FragmentReference>());
-            }
-        }
-        // Failed to load or size mismatch — fall through to re-fragment
-    }
-
-    // Chunks are read on demand, so a mismatch early in the list stops after reading only
-    // the chunks it compared.
-    // Opened rather than measured again: the size above is the one the chunker is opened at.
-    let source = ContentSource::File(path.to_path_buf());
-    let file = source.open().await?;
-
-    // If we have a non-empty previous fragment list, check if chunks still match
-    if let Some(ref frag_bytes) = fragment_list {
-        let previous_fragmentation = frag_bytes.as_type_slice::<FragmentReference>();
-        if !previous_fragmentation.is_empty()
-            && compare_previous_chunks(
-                SublistSource {
-                    store: &store,
-                    partition,
-                    context: previous.context,
-                    remote_session: &remote_session,
-                },
-                &source,
-                &file,
-                file_size as u64,
-                previous_fragmentation,
-            )
-            .await?
-                == FileMatch::Match
-        {
-            return Ok(previous.hash);
-        }
-    }
-
-    let address = crate::fragment_engine::write_fragmented_from_file(
+    Ok(write_from_file(
         store,
         partition,
-        previous.context,
-        file,
-        file_size,
-        WriteOptions::default().no_remote_write(),
-        true,
-        None,
+        source,
+        Context::default(),
+        WriteOptions::default().no_remote_write().hash_only(),
+        remote_session,
         WriteContext::none(),
-        None,
     )
-    .await?;
-
-    Ok(address.0.hash)
+    .await?
+    .address
+    .hash)
 }
 
 /// One read covering several consecutive chunks. Sized like the chunker's window and for
@@ -2175,24 +1989,23 @@ fn take_window(spare: &mut Option<BytesMut>, capacity: usize, want: usize) -> By
 /// hands it back. Dropping the handle detaches the read, which the engine completes and then
 /// frees its buffer.
 fn start_window_read(
-    file: &lore_io::IoFile,
+    handle: &ContentHandle,
     buffer: BytesMut,
     offset: u64,
 ) -> JoinHandle<std::io::Result<BytesMut>> {
-    let file = file.clone();
+    let handle = handle.clone();
     let want = buffer.len();
     lore_base::lore_spawn!(async move {
-        let window = file
-            .read_exact_vectored_at(
-                crate::chunker::WindowRead {
+        handle
+            .read_window(
+                WindowRead {
                     buffer,
                     start: 0,
                     want,
                 },
                 offset,
             )
-            .await?;
-        Ok(window.buffer)
+            .await
     })
 }
 
@@ -2275,8 +2088,8 @@ struct SublistSource<'a> {
 /// every unchanged file.
 async fn compare_previous_chunks(
     sublists: SublistSource<'_>,
-    source: &ContentSource,
-    file: &lore_io::IoFile,
+    source: &ContentSource<'_>,
+    handle: &ContentHandle,
     file_size: u64,
     previous_fragmentation: &[FragmentReference],
 ) -> Result<FileMatch, StorageError> {
@@ -2383,7 +2196,7 @@ async fn compare_previous_chunks(
                         // takes its buffer with it, so this one starts from a fresh window.
                         drop(other);
                         let buffer = take_window(&mut spare, capacity, window_length(start));
-                        start_window_read(file, buffer, start)
+                        start_window_read(handle, buffer, start)
                     }
                 };
                 let data = read
@@ -2403,7 +2216,7 @@ async fn compare_previous_chunks(
                 if let Some(offset) = next_window_offset(&chunks, index, resident.end(), file_size)
                 {
                     let buffer = take_window(&mut spare, capacity, window_length(offset));
-                    pending = Some((start_window_read(file, buffer, offset), offset));
+                    pending = Some((start_window_read(handle, buffer, offset), offset));
                 }
                 resident
             }
@@ -3740,8 +3553,11 @@ mod tests {
         let (dir, store) = make_test_store().await;
         let path = PathBuf::from(dir.as_ref()).join("hash-compare.bin");
         std::fs::write(&path, content).expect("write test file");
-        let (file, file_size) = crate::chunker::open_read(&path).await.expect("open");
-        let source = ContentSource::File(path);
+        let (file, file_size) = crate::content::ContentSource::file(&path)
+            .open()
+            .await
+            .expect("open");
+        let source = ContentSource::file(&path);
 
         compare_previous_chunks(
             SublistSource {
@@ -3893,7 +3709,10 @@ mod tests {
         partition: Partition,
         path: &Path,
     ) -> Address {
-        let (file, file_size) = crate::chunker::open_read(path).await.expect("open");
+        let (file, file_size) = crate::content::ContentSource::file(path)
+            .open()
+            .await
+            .expect("open");
         crate::fragment_engine::write_fragmented_from_file(
             Arc::clone(store),
             partition,
@@ -3901,7 +3720,6 @@ mod tests {
             file,
             file_size as usize,
             WriteOptions::default().no_remote_write(),
-            false,
             None,
             WriteContext::none(),
             None,
@@ -4016,11 +3834,137 @@ mod tests {
             address,
             Some(stored_size),
             None,
-            &ContentSource::File(path.to_path_buf()),
+            &ContentSource::file(path),
             &ContentHashes::default(),
         )
         .await
         .expect("comparing a readable file must not error")
+    }
+
+    /// Content whose bytes vary, so content-defined cutting finds boundaries in it.
+    fn pseudo_random_content(length: usize) -> Vec<u8> {
+        (0..length)
+            .map(|index| (index.wrapping_mul(2_654_435_761) >> 11) as u8)
+            .collect()
+    }
+
+    /// A resolved write publishes a mapping to stored content, so it refuses to address content
+    /// without storing it rather than publish a mapping to content nobody holds.
+    #[tokio::test]
+    async fn a_resolved_write_refuses_to_only_address() {
+        let (dir, store) = make_test_store().await;
+        let mutable = crate::local::mutable_store::create(
+            None::<&str>,
+            crate::MutableStoreSettings::default(),
+            store.clone(),
+        )
+        .await
+        .expect("create test mutable store");
+        let partition = Partition::from([13u8; 16]);
+        let key = crate::hash::hash_slice(b"a key");
+        let flags = WriteOptions::default().hash_only();
+
+        assert!(
+            write_resolved(
+                store.clone(),
+                mutable.clone(),
+                partition,
+                key,
+                Context::default(),
+                Bytes::from_static(b"content"),
+                flags,
+                None,
+                WriteContext::none(),
+            )
+            .await
+            .is_err()
+        );
+
+        let path = PathBuf::from(dir.as_ref()).join("resolved.bin");
+        std::fs::write(&path, b"content").expect("write test file");
+        assert!(
+            write_resolved_from_file(
+                store,
+                mutable,
+                partition,
+                key,
+                Context::default(),
+                path.as_path(),
+                flags,
+                None,
+                WriteContext::none(),
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    /// Addressing content stores none of it, in either band the size rule cuts at.
+    #[tokio::test]
+    async fn addressing_content_stores_nothing() {
+        let (dir, store) = make_test_store().await;
+        let partition = Partition::from([12u8; 16]);
+
+        for size in [1024, crate::compress::FRAGMENT_SIZE_THRESHOLD * 3] {
+            let path = PathBuf::from(dir.as_ref()).join(format!("unstored-{size}.bin"));
+            std::fs::write(&path, pseudo_random_content(size)).expect("write test file");
+
+            let hash = hash_file(store.clone(), partition, &ContentSource::file(&path), None)
+                .await
+                .expect("addressing the content");
+
+            let described = store
+                .clone()
+                .get_metadata(partition, Address::zero_context_hash(hash))
+                .await;
+            assert!(
+                !described.is_ok_and(|described| described.match_made != StoreMatch::MatchNone),
+                "addressing {size} bytes stored them"
+            );
+        }
+    }
+
+    /// Addressing content without storing it answers what storing it would have addressed it by,
+    /// across every band the size rule cuts at: empty, one fragment, and a list.
+    ///
+    /// The bands matter rather than the sizes. A file in the band below the fragmentation
+    /// threshold is stored as one fragment addressed by its own hash, where cutting it would
+    /// produce a list of several chunks and a different address.
+    #[tokio::test]
+    async fn addressing_content_agrees_with_storing_it() {
+        let (dir, store) = make_test_store().await;
+        let partition = Partition::from([11u8; 16]);
+
+        for size in [
+            0,
+            1024,
+            crate::compress::FRAGMENT_SIZE_THRESHOLD - 1,
+            crate::compress::FRAGMENT_SIZE_THRESHOLD * 3,
+        ] {
+            let path = PathBuf::from(dir.as_ref()).join(format!("content-{size}.bin"));
+            std::fs::write(&path, pseudo_random_content(size)).expect("write test file");
+
+            let source = ContentSource::file(&path);
+            let stored = write_from_file(
+                store.clone(),
+                partition,
+                &source,
+                Context::default(),
+                WriteOptions::default().no_remote_write(),
+                None,
+                WriteContext::none(),
+            )
+            .await
+            .expect("storing the content")
+            .address
+            .hash;
+
+            let addressed = hash_file(store.clone(), partition, &source, None)
+                .await
+                .expect("addressing the content");
+
+            assert_eq!(stored, addressed, "at {size} bytes");
+        }
     }
 
     /// Content beyond reach is an answer, not a failure: a comparison that never happened is
@@ -4036,7 +3980,7 @@ mod tests {
             Address::zero_context_hash(crate::hash::hash_slice(b"content")),
             Some(7),
             None,
-            &ContentSource::File(path),
+            &ContentSource::file(&path),
             &ContentHashes::default(),
         )
         .await
@@ -4402,9 +4346,12 @@ mod tests {
         content: &[u8],
         chunks: &[FragmentReference],
     ) -> FileMatch {
-        let (file, file_size) = crate::chunker::open_read(path).await.expect("open");
+        let (file, file_size) = crate::content::ContentSource::file(path)
+            .open()
+            .await
+            .expect("open");
         assert_eq!(file_size, content.len() as u64);
-        let source = ContentSource::File(path.to_path_buf());
+        let source = ContentSource::file(path);
 
         compare_previous_chunks(
             SublistSource {

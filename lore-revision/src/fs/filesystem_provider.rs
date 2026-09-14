@@ -362,6 +362,17 @@ pub trait InstanceOperation: Send + Sync {
         name: &str,
     ) -> impl Future<Output = Result<Vec<String>, FsError>> + Send;
 
+    /// Where the content at `path` is read from, in this operation's view of the working tree.
+    ///
+    /// The provider's own business is where content is held, so it answers with a source rather
+    /// than with content, a hash or a comparison: nothing here commits it to reading. Whether a
+    /// file holds content already stored is [`file_holds_content`](Self::file_holds_content),
+    /// which a provider keeping its own record answers without reading at all.
+    ///
+    /// A caller that needs the bytes — to address content matching nothing stored — takes its
+    /// source from here rather than naming a host path the provider may not read through.
+    fn content_source(&self, path: &RelativePath) -> lore_storage::ContentSource<'static>;
+
     /// Whether the file at `path` holds the content `previous` addresses, and `previous_size`
     /// bytes of it.
     ///
@@ -573,6 +584,14 @@ impl InstanceOperation for InstanceOperationImpl {
             #[cfg(test)]
             StaticDispatchInstanceOperation::Test(this) => this.names_folding_to(path, name).await,
             StaticDispatchInstanceOperation::Os(this) => this.names_folding_to(path, name).await,
+        }
+    }
+
+    fn content_source(&self, path: &RelativePath) -> lore_storage::ContentSource<'static> {
+        match &self.dispatch {
+            #[cfg(test)]
+            StaticDispatchInstanceOperation::Test(_this) => panic!(),
+            StaticDispatchInstanceOperation::Os(this) => this.content_source(path),
         }
     }
 
@@ -914,6 +933,10 @@ pub mod tests {
             } else {
                 vec![]
             })
+        }
+
+        fn content_source(&self, _path: &RelativePath) -> lore_storage::ContentSource<'static> {
+            panic!("Test operation unimplemented except finalize")
         }
 
         async fn file_holds_content(

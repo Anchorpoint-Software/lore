@@ -1977,8 +1977,8 @@ mod is_file_modified_chunking_compat {
     /// The directory outlives `body`, which is what lets it write the files to hash.
     /// The content a file the test wrote holds, for exercising the storage comparison directly.
     /// Logic outside the provider names no file; these tests are the comparison's own.
-    fn file_content(path: &std::path::Path) -> lore_storage::ContentSource {
-        lore_storage::ContentSource::File(path.to_path_buf())
+    fn file_content(path: &std::path::Path) -> lore_storage::ContentSource<'_> {
+        lore_storage::ContentSource::file(path)
     }
 
     /// An operation on the repository, which is what every caller compares a file through.

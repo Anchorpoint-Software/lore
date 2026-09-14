@@ -120,6 +120,10 @@ impl InstanceOperation for OsOperation {
         Ok(crate::util::fs::names_folding_to(path, name).await?)
     }
 
+    fn content_source(&self, path: &RelativePath) -> lore_storage::ContentSource<'static> {
+        lore_storage::ContentSource::owned_file(self.absolute(path))
+    }
+
     /// Measures the file the operation's root holds at `path` against the stored object's own
     /// fragmentation, which is the only comparison that holds: a commit may reuse a previous
     /// fragmentation, so the stored hash is a function of the content and of how it came to be
@@ -138,7 +142,7 @@ impl InstanceOperation for OsOperation {
         previous_size: u64,
         established: &lore_storage::ContentHashes,
     ) -> Result<NodeComparison, FsError> {
-        let source = lore_storage::ContentSource::File(self.absolute(path));
+        let source = lore_storage::ContentSource::owned_file(self.absolute(path));
         let matched = crate::immutable::file_matches(
             repository,
             previous,
