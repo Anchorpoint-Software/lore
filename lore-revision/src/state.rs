@@ -5506,7 +5506,8 @@ async fn add_change(
 /// Coalesce the add/delete pairs that name one file into moves.
 ///
 /// A file is identified by the context in its node address, so an add and a delete sharing a
-/// non-zero context are the two halves of a move.
+/// non-zero context are the two halves of a move. A change offering no identity, which
+/// `NodeChange::move_identity` reports as a zero context, is left as it is.
 ///
 /// The vector is modified in place: the add becomes the move, taking the delete's `from` as its
 /// source, and the delete is dropped. Changes that are not coalesced keep their order.
@@ -5516,13 +5517,13 @@ pub fn detect_and_coalesce_moves(changes: &mut Vec<NodeChange>) {
     let mut coalesced: Vec<usize> = Vec::new();
 
     for index in 0..changes.len() {
+        let context = changes[index].move_identity();
+        if context.is_zero() {
+            continue;
+        }
+
         match changes[index].action {
             FileAction::Add => {
-                let context = changes[index].to.address.context;
-                if context.is_zero() {
-                    continue;
-                }
-
                 let matching_delete_pos = deletes
                     .iter()
                     .position(|(_, delete_context)| *delete_context == context);
@@ -5549,11 +5550,6 @@ pub fn detect_and_coalesce_moves(changes: &mut Vec<NodeChange>) {
                 }
             }
             FileAction::Delete => {
-                let context = changes[index].from.address.context;
-                if context.is_zero() {
-                    continue;
-                }
-
                 let matching_add_pos = adds
                     .iter()
                     .position(|(_, add_context)| *add_context == context);

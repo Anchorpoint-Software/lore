@@ -1355,6 +1355,35 @@ mod single_file_compare_result_tests {
         }
     }
 
+    /// A mount of the repository `link_repository` names, added or deleted at `path`.
+    fn make_link_change(
+        repository: Arc<RepositoryContext>,
+        action: FileAction,
+        path: &str,
+        link_repository: Context,
+    ) -> NodeChange {
+        let mut change = if action == FileAction::Delete {
+            make_change(
+                repository,
+                action,
+                path,
+                link_repository,
+                Context::default(),
+            )
+        } else {
+            make_change(
+                repository,
+                action,
+                path,
+                Context::default(),
+                link_repository,
+            )
+        };
+        change.from.flags = NodeFlags::Link;
+        change.to.flags = NodeFlags::Link;
+        change
+    }
+
     /// Create a Context from a u128 value for testing
     fn context_from_u128(value: u128) -> Context {
         Context::from(value.to_ne_bytes())
@@ -1459,6 +1488,31 @@ mod single_file_compare_result_tests {
             changes[0].move_source().map(|p| p.as_str()),
             Some("old/path.txt")
         );
+    }
+
+    #[tokio::test]
+    async fn mounts_of_one_repository_stay_separate_add_and_delete() {
+        let repo = new_test_context().await;
+        let link_repository = context_from_u128(42);
+
+        let mut changes = vec![
+            make_link_change(
+                repo.clone(),
+                FileAction::Delete,
+                "vendor/part",
+                link_repository,
+            ),
+            make_link_change(repo, FileAction::Add, "vendor/whole", link_repository),
+        ];
+
+        detect_and_coalesce_moves(&mut changes);
+
+        assert_eq!(changes.len(), 2);
+        assert_eq!(changes[0].action, FileAction::Delete);
+        assert_eq!(changes[0].path().as_str(), "vendor/part");
+        assert_eq!(changes[1].action, FileAction::Add);
+        assert_eq!(changes[1].path().as_str(), "vendor/whole");
+        assert!(changes.iter().all(|change| change.move_source().is_none()));
     }
 
     #[tokio::test]

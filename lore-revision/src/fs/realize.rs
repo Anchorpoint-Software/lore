@@ -574,7 +574,7 @@ pub async fn verify_filesystem(
     }
 
     let is_delete = change.action == change::FileAction::Delete;
-    let was_link = change.from.flags.bits() & NodeFlags::Link != 0;
+    let was_link = change.from.is_link();
 
     if is_delete && was_link {
         lore_debug!("Link is for delete, skipping filesystem verification");
@@ -1274,7 +1274,7 @@ async fn realize_changes_delete(
 
         let change_path = change.path().clone();
 
-        let is_link = change.from.flags.bits() & NodeFlags::Link != 0;
+        let is_link = change.from.is_link();
 
         let is_file = if is_link {
             false
