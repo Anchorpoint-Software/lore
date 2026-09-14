@@ -1117,12 +1117,14 @@ fn stage_delete_recurse(
 ///
 /// In `Error` mode (default `stage` without `--case`), no resolution is attempted so the
 /// downstream code can report the mismatch to the user.
+#[allow(clippy::too_many_arguments)]
 async fn resolve_case_variant_collisions(
+    operation: &Arc<InstanceOperationImpl>,
     items: &mut Vec<util::fs::FileListItem>,
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
     directory_node: NodeID,
-    absolute_path: &Path,
+    relative_path: &RelativePathBuf,
     options: StageOptions,
 ) -> Result<(), StageError> {
     if matches!(options.case_change, StageCaseChange::Error) {
@@ -1184,14 +1186,10 @@ async fn resolve_case_variant_collisions(
         if let Some(ref winner_name) = winner {
             for entry in group {
                 if entry.name != *winner_name {
-                    let from_path = absolute_path.join(&entry.name);
-                    let to_path = absolute_path.join(winner_name);
-                    lore_debug!(
-                        "Case variant collision: unifying {} into {}",
-                        from_path.display(),
-                        to_path.display()
-                    );
-                    let _ = util::fs::unify_name_case_rename(&from_path, &to_path).await;
+                    let from_path = relative_path.clone().push_and_freeze(&entry.name);
+                    let to_path = relative_path.clone().push_and_freeze(winner_name);
+                    lore_debug!("Case variant collision: unifying {from_path} into {to_path}");
+                    let _ = operation.unify_case_rename(&from_path, &to_path).await;
                 }
             }
         }
@@ -1407,11 +1405,12 @@ pub(crate) async fn stage_directory(
     }
 
     resolve_case_variant_collisions(
+        &operation,
         &mut items,
         repository.clone(),
         state.clone(),
         directory_node,
-        absolute_path,
+        &relative_path,
         options,
     )
     .await?;
@@ -2194,9 +2193,6 @@ pub(crate) async fn stage_node_from_metadata(
     };
 
     if let Some(node_name) = case_mismatch {
-        // Only a case mismatch reaches the file system by name, so the path it renames under is
-        // built here rather than for every child.
-        let absolute_path = relative_path.to_absolute_path(repository.require_path()?);
         match options.case_change {
             StageCaseChange::Keep => {
                 // Keep the state name, update the file system to match
@@ -2205,18 +2201,17 @@ pub(crate) async fn stage_node_from_metadata(
                     node_name
                 );
 
-                let from_path = absolute_path.join(name);
+                let from_path = relative_path.join(name);
 
                 name = node_name;
-                let to_path = absolute_path.join(&name);
+                let to_path = relative_path.join(&name);
 
-                util::fs::unify_name_case_rename(from_path.as_path(), to_path.as_path())
+                operation
+                    .unify_case_rename(&from_path, &to_path)
                     .await
                     .map_err(|e| {
                         StageError::internal(format!(
-                            "Unable to rename file system path {} to {}: {e}",
-                            from_path.display(),
-                            to_path.display()
+                            "Unable to rename file system path {from_path} to {to_path}: {e}"
                         ))
                     })?;
             }
@@ -2233,26 +2228,25 @@ pub(crate) async fn stage_node_from_metadata(
                 // stage picks up contents from both.
                 // Re-read rather than reused from the parent's listing: staging a sibling renames
                 // entries in this directory, so an earlier snapshot answers a stale question.
-                let old_path = absolute_path.join(&node_name);
-                let new_path = absolute_path.join(&name);
+                let old_path = relative_path.join(&node_name);
+                let new_path = relative_path.join(&name);
                 if util::fs::filesystem_names_all_exist(
-                    absolute_path.as_path(),
+                    relative_path
+                        .to_absolute_path(repository.require_path()?)
+                        .as_path(),
                     &[node_name.as_str(), name.as_str()],
                 )
                 .await
                 {
                     lore_debug!(
-                        "Case rename: old path {} still exists alongside {}, unifying file system",
-                        old_path.display(),
-                        new_path.display()
+                        "Case rename: old path {old_path} still exists alongside {new_path}, unifying file system"
                     );
-                    util::fs::unify_name_case_rename(old_path.as_path(), new_path.as_path())
+                    operation
+                        .unify_case_rename(&old_path, &new_path)
                         .await
                         .map_err(|e| {
                             StageError::internal(format!(
-                                "Unable to rename file system path {} to {}: {e}",
-                                old_path.display(),
-                                new_path.display()
+                                "Unable to rename file system path {old_path} to {new_path}: {e}"
                             ))
                         })?;
                 }
@@ -2871,8 +2865,7 @@ async fn stage_from_parent_revision_in_operation(
                 options: StageOptions,
                 preserve_conflict_files: bool,
             ) -> Result<(), StageError> {
-                let absolute_path = relative_path.to_absolute_path(repository.require_path()?);
-                let _ = util::fs::unlink_recursive(absolute_path.as_path()).await;
+                let _ = operation.remove_recursive(&relative_path).await;
 
                 Box::pin(stage_filesystem_path(
                     operation,
@@ -2888,7 +2881,10 @@ async fn stage_from_parent_revision_in_operation(
                 .await?;
 
                 if !preserve_conflict_files {
-                    sync::unlink_merge_mine_theirs_base(absolute_path.as_path()).await;
+                    sync::unlink_merge_mine_theirs_base(
+                        relative_path.to_absolute_path(repository.require_path()?),
+                    )
+                    .await;
                 }
                 Ok(())
             }
@@ -3386,8 +3382,7 @@ pub(crate) async fn stage_link_paths_from_parent_revision(
             if !target_node_link.is_valid() {
                 // No file at the path → `stage_filesystem_path` stages a
                 // delete; we just clear the on-disk file first.
-                let absolute = link_relative.to_absolute_path(mount_base_absolute.as_path());
-                let _ = util::fs::unlink_recursive(absolute.as_path()).await;
+                let _ = operation.remove_recursive(mount_path).await;
                 Box::pin(stage_filesystem_path(
                     operation.clone(),
                     NodeMapping {
@@ -3405,7 +3400,10 @@ pub(crate) async fn stage_link_paths_from_parent_revision(
                     None, // No discard queue
                 ))
                 .await?;
-                sync::unlink_merge_mine_theirs_base(absolute.as_path()).await;
+                sync::unlink_merge_mine_theirs_base(
+                    link_relative.to_absolute_path(mount_base_absolute.as_path()),
+                )
+                .await;
                 continue;
             }
 

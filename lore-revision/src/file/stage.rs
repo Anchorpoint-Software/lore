@@ -11,6 +11,7 @@ use tokio::task::JoinSet;
 use crate::MAX_CONCURRENT_TREE_TASKS;
 use crate::event;
 use crate::filter::FilterMode;
+use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::with_operation;
 use crate::hash::hash_string;
@@ -1209,17 +1210,23 @@ pub async fn stage_move(
         .await
         .unwrap_or_default();
 
-    // Get target file/directory metadata
-    let to_absolute_path = to_path.to_absolute_path(repository.require_path()?);
-    let to_metadata = lore_io::IoDriver::global()
-        .metadata(to_absolute_path)
-        .await
-        .internal_with(|| format!("Path {to_path} does not exist in repository "))?;
+    let to_info = with_operation(repository.file_system(), false, async |operation| {
+        operation
+            .file_info(&to_path)
+            .await
+            .forward::<StageError>("Failed to read the move target")
+    })
+    .await?;
+    if !to_info.exists() {
+        return Err(StageError::internal(format!(
+            "Path {to_path} does not exist in repository "
+        )));
+    }
 
-    if from_node.is_directory() && !to_metadata.is_dir() {
+    if from_node.is_directory() && !to_info.is_dir() {
         return Err(StageError::internal("Cannot move a directory to a file"));
     }
-    if !from_node.is_directory() && to_metadata.is_dir() {
+    if !from_node.is_directory() && to_info.is_dir() {
         return Err(StageError::internal("Cannot move a file to a directory"));
     }
 
