@@ -11,8 +11,7 @@
 //! - Otherwise: `write_content` with `remote_session = None` and `WriteOptions` derived from the
 //!   item's `fixed_size_chunk`; the computed address is reported back in `PUT_ITEM_COMPLETE`.
 //!
-//! Items run concurrently on a `JoinSet`; all per-item tasks are awaited before the closure
-//! returns, so no per-item work outlives the call.
+//! All per-item work is awaited before the closure returns, so none of it outlives the call.
 
 use std::sync::Arc;
 
@@ -131,7 +130,7 @@ async fn put_local(
         args,
         put,
         async move |store, args| {
-            let items = args.items.as_slice().to_vec();
+            let items = args.items.as_slice();
 
             if items.is_empty() {
                 return Ok::<(), PutError>(());
@@ -141,8 +140,19 @@ async fn put_local(
 
             let total = items.len();
             let mut reuse = crate::storage::store::SessionReuse::default();
+
+            if let [item] = items {
+                let session = reuse.session_for(
+                    &store,
+                    item.partition,
+                    item.remote_write != 0 && !effective.no_remote,
+                );
+                let code = put_item(store, *item, session).await;
+                return crate::storage::build_call_error(&[code], total, "put");
+            }
+
             let mut tasks: JoinSet<LoreErrorCode> = JoinSet::new();
-            for item in items {
+            for item in items.iter().copied() {
                 let session = reuse.session_for(
                     &store,
                     item.partition,

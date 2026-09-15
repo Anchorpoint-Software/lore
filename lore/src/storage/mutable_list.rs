@@ -100,7 +100,7 @@ async fn mutable_list_local(
         args,
         mutable_list,
         async move |store, args| {
-            let items = args.items.as_slice().to_vec();
+            let items = args.items.as_slice();
             if items.is_empty() {
                 return Ok::<(), MutableListError>(());
             }
@@ -113,8 +113,14 @@ async fn mutable_list_local(
                 }));
             }
             let total = items.len();
+
+            if let [item] = items {
+                let code = list_item(store, *item).await;
+                return crate::storage::build_call_error(&[code], total, "mutable_list");
+            }
+
             let mut tasks: JoinSet<LoreErrorCode> = JoinSet::new();
-            for item in items {
+            for item in items.iter().copied() {
                 let store = store.clone();
                 lore_spawn!(tasks, async move { list_item(store, item).await });
             }

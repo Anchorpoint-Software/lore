@@ -105,7 +105,7 @@ async fn mutable_store_impl(
         args,
         mutable_store,
         async move |store, args| {
-            let items = args.items.as_slice().to_vec();
+            let items = args.items.as_slice();
             if items.is_empty() {
                 return Ok::<(), MutableStoreError>(());
             }
@@ -118,8 +118,15 @@ async fn mutable_store_impl(
             }
             let total = items.len();
             let mut reuse = crate::storage::store::SessionReuse::default();
+
+            if let [item] = items {
+                let session = reuse.session_for(&store, item.partition, effective.no_local);
+                let code = store_item(store, *item, effective, session).await;
+                return crate::storage::build_call_error(&[code], total, "mutable_store");
+            }
+
             let mut tasks: JoinSet<LoreErrorCode> = JoinSet::new();
-            for item in items {
+            for item in items.iter().copied() {
                 let session = reuse.session_for(&store, item.partition, effective.no_local);
                 let store = store.clone();
                 lore_spawn!(tasks, async move {

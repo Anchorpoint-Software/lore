@@ -141,15 +141,22 @@ async fn get_file_local(
         args,
         get_file,
         async move |store, args| {
-            let items = args.items.as_slice().to_vec();
+            let items = args.items.as_slice();
             if items.is_empty() {
                 return Ok::<(), GetFileError>(());
             }
             let effective = store.effective_flags(per_call)?;
             let total = items.len();
             let mut reuse = crate::storage::store::SessionReuse::default();
+
+            if let [item] = items {
+                let session = reuse.session_for(&store, item.partition, !effective.no_remote);
+                let code = get_file_item(store, item.clone(), effective, session).await;
+                return crate::storage::build_call_error(&[code], total, "get_file");
+            }
+
             let mut tasks: JoinSet<LoreErrorCode> = JoinSet::new();
-            for item in items {
+            for item in items.iter().cloned() {
                 let session = reuse.session_for(&store, item.partition, !effective.no_remote);
                 let store = store.clone();
                 lore_spawn!(tasks, async move {

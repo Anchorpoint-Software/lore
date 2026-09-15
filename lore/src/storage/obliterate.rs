@@ -104,14 +104,20 @@ async fn obliterate_local(
         args,
         obliterate,
         async move |store, args| {
-            let items = args.items.as_slice().to_vec();
+            let items = args.items.as_slice();
             if items.is_empty() {
                 return Ok::<(), ObliterateError>(());
             }
             let effective = store.effective_flags(per_call)?;
             let total = items.len();
+
+            if let [item] = items {
+                let code = obliterate_item(store, *item, effective).await;
+                return crate::storage::build_call_error(&[code], total, "obliterate");
+            }
+
             let mut tasks: JoinSet<LoreErrorCode> = JoinSet::new();
-            for item in items {
+            for item in items.iter().copied() {
                 let store = store.clone();
                 lore_spawn!(tasks, async move {
                     obliterate_item(store, item, effective).await

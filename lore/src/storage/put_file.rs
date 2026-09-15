@@ -131,15 +131,26 @@ async fn put_file_local(
         args,
         put_file,
         async move |store, args| {
-            let items = args.items.as_slice().to_vec();
+            let items = args.items.as_slice();
             if items.is_empty() {
                 return Ok::<(), PutFileError>(());
             }
             let effective = store.effective_flags(per_call)?;
             let total = items.len();
             let mut reuse = crate::storage::store::SessionReuse::default();
+
+            if let [item] = items {
+                let session = reuse.session_for(
+                    &store,
+                    item.partition,
+                    item.remote_write != 0 && !effective.no_remote,
+                );
+                let code = put_file_item(store, item.clone(), session).await;
+                return crate::storage::build_call_error(&[code], total, "put_file");
+            }
+
             let mut tasks: JoinSet<LoreErrorCode> = JoinSet::new();
-            for item in items {
+            for item in items.iter().cloned() {
                 let session = reuse.session_for(
                     &store,
                     item.partition,

@@ -123,15 +123,22 @@ async fn upload_local(
                 }));
             }
 
-            let items = args.items.as_slice().to_vec();
+            let items = args.items.as_slice();
             if items.is_empty() {
                 return Ok::<(), UploadError>(());
             }
 
             let total = items.len();
             let mut reuse = crate::storage::store::SessionReuse::default();
+
+            if let [item] = items {
+                let session = reuse.session_for(&store, item.partition, true);
+                let code = upload_item(store, *item, session).await;
+                return crate::storage::build_call_error(&[code], total, "upload");
+            }
+
             let mut tasks: JoinSet<LoreErrorCode> = JoinSet::new();
-            for item in items {
+            for item in items.iter().copied() {
                 let session = reuse.session_for(&store, item.partition, true);
                 let store = store.clone();
                 lore_spawn!(

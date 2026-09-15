@@ -135,7 +135,7 @@ async fn copy_local(
         args,
         copy,
         async move |store, args| {
-            let items = args.items.as_slice().to_vec();
+            let items = args.items.as_slice();
             if items.is_empty() {
                 return Ok::<(), CopyError>(());
             }
@@ -147,7 +147,7 @@ async fn copy_local(
             if store.remote.is_some() && !effective.no_remote {
                 let mut unique_sources: std::collections::HashSet<Partition> =
                     std::collections::HashSet::new();
-                for item in &items {
+                for item in items {
                     if item.source_partition != Partition::default()
                         && item.source_partition != item.target_partition
                     {
@@ -161,34 +161,38 @@ async fn copy_local(
 
             let total = items.len();
             let mut reuse = crate::storage::store::SessionReuse::default();
-            let mut tasks: JoinSet<CopyOutcome> = JoinSet::new();
-            for item in items {
-                let session =
-                    reuse.session_for(&store, item.target_partition, !effective.no_remote);
-                let store = store.clone();
-                lore_spawn!(tasks, async move {
-                    copy_item(store, item, effective, session).await
-                });
-            }
             let mut codes: Vec<LoreErrorCode> = Vec::with_capacity(total);
             let mut local_mirror_errors = 0usize;
-            while let Some(result) = tasks.join_next().await {
-                let outcome = result.unwrap_or(CopyOutcome::failed(LoreErrorCode::Internal));
+
+            if let [item] = items {
+                let session =
+                    reuse.session_for(&store, item.target_partition, !effective.no_remote);
+                let outcome = copy_item(store, *item, effective, session).await;
                 codes.push(outcome.code);
-                if outcome.local_mirror_failed {
-                    local_mirror_errors += 1;
+                local_mirror_errors += usize::from(outcome.local_mirror_failed);
+            } else {
+                let mut tasks: JoinSet<CopyOutcome> = JoinSet::new();
+                for item in items.iter().copied() {
+                    let session =
+                        reuse.session_for(&store, item.target_partition, !effective.no_remote);
+                    let store = store.clone();
+                    lore_spawn!(tasks, async move {
+                        copy_item(store, item, effective, session).await
+                    });
+                }
+                while let Some(result) = tasks.join_next().await {
+                    let outcome = result.unwrap_or(CopyOutcome::failed(LoreErrorCode::Internal));
+                    codes.push(outcome.code);
+                    local_mirror_errors += usize::from(outcome.local_mirror_failed);
                 }
             }
+
             if local_mirror_errors > 0 {
                 lore_debug!(
                     "copy: {local_mirror_errors}/{total} items had benign local-mirror failures (remote was authoritative)"
                 );
             }
-            crate::storage::build_call_error(
-                &codes,
-                total,
-                "copy",
-            )
+            crate::storage::build_call_error(&codes, total, "copy")
         },
     )
     .await

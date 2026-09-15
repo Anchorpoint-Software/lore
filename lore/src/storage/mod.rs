@@ -11,6 +11,15 @@
 //! `lore_revision::event`. The handle type [`handle::LoreStore`] is defined
 //! here.
 //!
+//! # Item fan-out
+//!
+//! Every entry point takes a batch. A batch of several runs one task per item and awaits them
+//! all before returning; a batch of one runs on the calling task. Spawning a single item would
+//! hand it to a worker thread and wait to be woken — a thread round trip to do work the calling
+//! thread is already blocked waiting for, and one address or key is the shape most calls arrive
+//! in. `LORE_CONTEXT` is a task-local and the work stays in the caller's task, so it needs no
+//! propagating; `ObservedTask` is skipped because there is no task to report the lifecycle of.
+//!
 //! # Callback contract
 //!
 //! Every entry point in this module accepts a `LoreEventCallback` that the runtime invokes

@@ -149,7 +149,7 @@ async fn get_local(
         args,
         get,
         async move |store, args| {
-            let items = args.items.as_slice().to_vec();
+            let items = args.items.as_slice();
             if items.is_empty() {
                 return Ok::<(), GetError>(());
             }
@@ -157,8 +157,15 @@ async fn get_local(
 
             let total = items.len();
             let mut reuse = crate::storage::store::SessionReuse::default();
+
+            if let [item] = items {
+                let session = reuse.session_for(&store, item.partition, !effective.no_remote);
+                let code = get_item(store, *item, effective, session).await;
+                return crate::storage::build_call_error(&[code], total, "get");
+            }
+
             let mut tasks: JoinSet<LoreErrorCode> = JoinSet::new();
-            for item in items {
+            for item in items.iter().copied() {
                 let session = reuse.session_for(&store, item.partition, !effective.no_remote);
                 let store = store.clone();
                 lore_spawn!(tasks, async move {

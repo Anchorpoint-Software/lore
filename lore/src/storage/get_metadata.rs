@@ -7,13 +7,15 @@
 //! carries `flags`, `size_payload`, and `size_content`. On miss `error_code ==
 //! ADDRESS_NOT_FOUND` and `fragment` is the default value.
 //!
-//! Items run in parallel via `JoinSet` (mirroring `lore_storage_get`). Per item the
-//! resolution path is:
+//! Per item the resolution path is:
 //! 1. Local probe via `ImmutableStore::query(partition, address, MatchFull)`. On exact match,
 //!    emit the resolved `Fragment` and short-circuit.
 //! 2. On local miss, fall through to the configured remote (if any) via
 //!    `StorageSession::get_metadata`. The wire op carries no payload bytes — only Fragment.
 //! 3. On remote miss or no remote configured, emit `ADDRESS_NOT_FOUND`.
+//!
+//! Only step 2 costs a task: the local probe runs in the calling task for every item, so a batch
+//! whose items all hit locally spawns nothing.
 //!
 //! Short-circuits: `address.hash == Hash::default()` emits an empty `Fragment` with
 //! `error_code = None` and no store work — symmetric with `lore_storage_get`.
@@ -48,6 +50,8 @@ use crate::interface::LoreEventCallback;
 use crate::interface::LoreGlobalArgs;
 use crate::storage::call::storage_call;
 use crate::storage::handle::LoreStore;
+use crate::storage::store::EffectiveFlags;
+use crate::storage::store::SessionReuse;
 use crate::storage::store::StoreInternal;
 
 /// One `get_metadata` item — the `(partition, address)` to look up.
@@ -114,59 +118,33 @@ async fn get_metadata_local(
         args,
         get_metadata,
         async move |store, args| {
-            let items = args.items.as_slice().to_vec();
+            let items = args.items.as_slice();
             if items.is_empty() {
                 return Ok::<(), GetMetadataError>(());
             }
             let effective = store.effective_flags(per_call)?;
 
             let total = items.len();
-            // Local hits and rejections emit their terminal event in-line and push their code
-            // straight into `codes`; only items that miss locally spawn into the JoinSet.
             let mut remote_tasks: JoinSet<LoreErrorCode> = JoinSet::new();
             let mut codes: Vec<LoreErrorCode> = Vec::with_capacity(total);
             let mut reuse = crate::storage::store::SessionReuse::default();
 
-            for item in items {
-                if effective.no_local {
-                    if let Some(session) = reuse.session_for(&store, item.partition, true) {
-                        lore_spawn!(
-                            remote_tasks,
-                            async move { resolve_remote(session, item).await }
-                        );
-                    } else {
-                        codes.push(emit_complete(
-                            &item,
-                            Fragment::default(),
-                            LoreErrorCode::AddressNotFound,
-                        ));
+            for item in items.iter().copied() {
+                let session = match item_backend(&store, &item, effective, &mut reuse).await {
+                    ItemBackend::Done(code) => {
+                        codes.push(code);
+                        continue;
                     }
-                    continue;
-                }
+                    ItemBackend::Remote(session) => session,
+                };
 
-                match resolve_local(&store, &item).await {
-                    LocalOutcome::Done { code } => codes.push(code),
-                    LocalOutcome::NeedRemote => {
-                        if effective.no_remote {
-                            codes.push(emit_complete(
-                                &item,
-                                Fragment::default(),
-                                LoreErrorCode::AddressNotFound,
-                            ));
-                        } else if let Some(session) =
-                            reuse.session_for(&store, item.partition, true)
-                        {
-                            lore_spawn!(remote_tasks, async move {
-                                resolve_remote(session, item).await
-                            });
-                        } else {
-                            codes.push(emit_complete(
-                                &item,
-                                Fragment::default(),
-                                LoreErrorCode::AddressNotFound,
-                            ));
-                        }
-                    }
+                if total == 1 {
+                    codes.push(resolve_remote(session, item).await);
+                } else {
+                    lore_spawn!(
+                        remote_tasks,
+                        async move { resolve_remote(session, item).await }
+                    );
                 }
             }
 
@@ -177,17 +155,49 @@ async fn get_metadata_local(
     .await
 }
 
-/// Outcome of the in-line local probe: either the item is fully resolved (and its terminal
-/// event already emitted), or it missed locally and the caller should consult the remote.
-enum LocalOutcome {
-    Done { code: LoreErrorCode },
-    NeedRemote,
+/// Where one item's answer comes from, once the local store has had its say.
+enum ItemBackend {
+    /// The item is settled — its terminal event is emitted and this is the code it carried.
+    Done(LoreErrorCode),
+    /// The item missed locally and this session is the only place left to ask.
+    Remote(Arc<lore_transport::StorageSession>),
 }
 
-/// Local probe — runs in the calling task without spawning. Emits the terminal event on hit,
-/// on invalid args, on zero-hash short-circuit, or on a non-not-found local error. Returns
-/// `NeedRemote` only when the item missed locally with `AddressNotFound` and may still be
-/// satisfied by the remote.
+/// Route one item to the backend that can answer it. `Done` covers every outcome the local store
+/// settles plus a miss with no remote to consult, all of which have emitted their terminal event
+/// already; `Remote` is the sole outcome that still owes a wire round trip, and so the only one
+/// worth a task.
+///
+/// `no_local` skips the probe: the local store is not this call's to read. It cannot coincide with
+/// `no_remote` — `effective_flags` rejects a request for both — so a `want_remote` of
+/// `!no_remote` resolves a session on the remote-bound path and suppresses one on the
+/// local-bound path, where a local miss is the final answer.
+async fn item_backend(
+    store: &Arc<StoreInternal>,
+    item: &LoreStorageGetMetadataItem,
+    effective: EffectiveFlags,
+    reuse: &mut SessionReuse,
+) -> ItemBackend {
+    if !effective.no_local
+        && let Some(code) = resolve_local(store, item).await
+    {
+        return ItemBackend::Done(code);
+    }
+
+    match reuse.session_for(store, item.partition, !effective.no_remote) {
+        Some(session) => ItemBackend::Remote(session),
+        None => ItemBackend::Done(emit_complete(
+            item,
+            Fragment::default(),
+            LoreErrorCode::AddressNotFound,
+        )),
+    }
+}
+
+/// Probe the local store for one item, emitting its terminal event and returning the code on
+/// every outcome the local store settles: a rejected argument, the zero-hash short-circuit, a
+/// hit, and a non-not-found error, which is surfaced rather than masked by a remote attempt.
+/// `None` means the item missed and the remote may still answer it.
 ///
 /// Any match the store made is a hit, not just a full one. This operation answers what a payload
 /// *is*, and a weaker level names the same bytes under the same hash — reached under a context or
@@ -197,15 +207,21 @@ enum LocalOutcome {
 async fn resolve_local(
     store: &Arc<StoreInternal>,
     item: &LoreStorageGetMetadataItem,
-) -> LocalOutcome {
+) -> Option<LoreErrorCode> {
     if item.partition == Partition::default() {
-        let code = emit_complete(item, Fragment::default(), LoreErrorCode::InvalidArguments);
-        return LocalOutcome::Done { code };
+        return Some(emit_complete(
+            item,
+            Fragment::default(),
+            LoreErrorCode::InvalidArguments,
+        ));
     }
 
     if item.address.hash == Hash::default() {
-        let code = emit_complete(item, Fragment::default(), LoreErrorCode::None);
-        return LocalOutcome::Done { code };
+        return Some(emit_complete(
+            item,
+            Fragment::default(),
+            LoreErrorCode::None,
+        ));
     }
 
     match store
@@ -215,27 +231,21 @@ async fn resolve_local(
         .await
     {
         Ok(result) if result.match_made != StoreMatch::MatchNone => {
-            let code = emit_complete(item, result.fragment, LoreErrorCode::None);
-            LocalOutcome::Done { code }
+            Some(emit_complete(item, result.fragment, LoreErrorCode::None))
         }
-        Ok(_) => LocalOutcome::NeedRemote,
-        Err(err) if err.is_address_not_found() => LocalOutcome::NeedRemote,
-        Err(err) => {
-            // Non-not-found local errors (slow-down, internal) shouldn't be masked by a
-            // remote attempt — the operator wants to see them.
-            let code = emit_complete(
-                item,
-                Fragment::default(),
-                crate::storage::store_error_to_code(&err),
-            );
-            LocalOutcome::Done { code }
-        }
+        Ok(_) => None,
+        Err(err) if err.is_address_not_found() => None,
+        Err(err) => Some(emit_complete(
+            item,
+            Fragment::default(),
+            crate::storage::store_error_to_code(&err),
+        )),
     }
 }
 
-/// Remote-only resolution — runs in a spawned task per item that missed locally. Emits the
-/// terminal event with the wire-fetched Fragment on success, or a mapped error code via the
-/// canonical `protocol_error_to_storage` → `storage_error_to_code` chain on any failure.
+/// Resolve one item against the remote. Emits the terminal event with the wire-fetched Fragment
+/// on success, or a mapped error code via the canonical `protocol_error_to_storage` →
+/// `storage_error_to_code` chain on any failure.
 async fn resolve_remote(
     session: Arc<lore_transport::StorageSession>,
     item: LoreStorageGetMetadataItem,
