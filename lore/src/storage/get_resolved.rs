@@ -17,6 +17,10 @@
 //! byte-count check against `size_content` as a backstop, so a partial delivery is never
 //! reported as success.
 //!
+//! With `data_out` supplied the content lands in the caller's buffer instead: `GET_HEADER` then
+//! `GET_ITEM_COMPLETE`, no `GET_DATA`, and `streaming` ignored. Content exceeding the buffer's
+//! stated capacity fails the item with `LORE_ERROR_CODE_INVALID_ARGUMENTS`.
+//!
 //! `address` is the resolved address (`{ resolved_hash, context }`), so callers may cache the
 //! key->hash mapping from the event stream.
 //!
@@ -42,6 +46,7 @@ use lore_macro::LoreArgs;
 use lore_macro::ValidateText;
 use lore_revision::event::EventError;
 use lore_revision::event::LoreBytes;
+use lore_revision::event::LoreBytesMut;
 use lore_revision::event::LoreErrorCode;
 use lore_revision::event::LoreEvent;
 use lore_revision::interface::LoreArray;
@@ -86,6 +91,15 @@ pub struct LoreStorageGetResolvedItem {
     /// Cache fetched bytes back to the local store even without the producer's
     /// `PayloadLocalCachePriority` hint
     pub local_cache: u8,
+    /// Writable buffer receiving the content, `len` stating its capacity. Zero-initialized selects
+    /// `GET_DATA` delivery.
+    ///
+    /// The capacity is the limit: content exceeding it fails the item with
+    /// `LORE_ERROR_CODE_INVALID_ARGUMENTS` rather than truncating. `GET_HEADER` reports the content
+    /// size, no `GET_DATA` follows, and `streaming` is ignored. The buffer holds unspecified bytes
+    /// when the item fails.
+    #[serde(skip)]
+    pub data_out: LoreBytesMut,
 }
 
 impl core::fmt::Debug for LoreStorageGetResolvedItem {
@@ -94,6 +108,7 @@ impl core::fmt::Debug for LoreStorageGetResolvedItem {
             .field("id", &self.id)
             .field("streaming", &self.streaming)
             .field("local_cache", &self.local_cache)
+            .field("data_out", &self.data_out)
             .finish()
     }
 }
@@ -190,6 +205,10 @@ async fn get_resolved_item(
         read_options = read_options.with_cache();
     }
 
+    if item.data_out.is_supplied() {
+        return get_resolved_item_into(store, item, read_options, remote_session).await;
+    }
+
     if item.streaming != 0 {
         return get_resolved_item_streaming(store, item, read_options, remote_session).await;
     }
@@ -215,6 +234,51 @@ async fn get_resolved_item(
             let size = bytes.len() as u64;
             emit_header(item, address, size);
             emit_data(item, address, bytes, 0);
+            emit_item_complete(item, address, LoreErrorCode::None);
+            LoreErrorCode::None
+        }
+        Err(err) => {
+            let code = crate::storage::storage_error_to_code(&err);
+            emit_item_complete(item, Address::default(), code);
+            code
+        }
+    }
+}
+
+/// Counterpart of [`get_resolved_item`] delivering the content into `data_out`. Emits
+/// `GET_HEADER` with the number of bytes written, then `GET_ITEM_COMPLETE`; content exceeding the
+/// stated capacity fails the item rather than truncating.
+async fn get_resolved_item_into(
+    store: Arc<StoreInternal>,
+    item: &LoreStorageGetResolvedItem,
+    read_options: lore_storage::ReadOptions,
+    remote_session: Option<Arc<lore_transport::StorageSession>>,
+) -> LoreErrorCode {
+    // SAFETY: `data_out` names caller memory that stays valid, and untouched by anyone else, for
+    // the duration of the call this future is wholly within. `len` bounds the read.
+    let mut dst = unsafe {
+        lore_storage::CallerBuffer::new(item.data_out.ptr.cast::<u8>(), item.data_out.len)
+    };
+
+    match lore_storage::read_resolved_into_buffer(
+        store.immutable.clone(),
+        store.mutable.clone(),
+        item.partition,
+        item.key,
+        item.context,
+        get_resolved_flags::NONE,
+        &mut dst,
+        read_options,
+        remote_session,
+    )
+    .await
+    {
+        Ok((resolved, written)) => {
+            let address = Address {
+                hash: resolved,
+                context: item.context,
+            };
+            emit_header(item, address, written as u64);
             emit_item_complete(item, address, LoreErrorCode::None);
             LoreErrorCode::None
         }

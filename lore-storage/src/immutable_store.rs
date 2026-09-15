@@ -27,6 +27,7 @@ use crate::errors::NotSupported;
 use crate::errors::Oversized;
 use crate::errors::PayloadNotFound;
 use crate::errors::SlowDown;
+use crate::store_types::PayloadRead;
 use crate::store_types::StoreGetData;
 use crate::store_types::StoreMatch;
 use crate::store_types::StoreMatchResult;
@@ -96,6 +97,31 @@ pub fn validate_fragment_payload(
         return Err(StoreError::internal(format!(
             "fragment payload length mismatch: buffer {payload_len} vs size_payload {size_payload}"
         )));
+    }
+    Ok(())
+}
+
+/// Whether the stored payload is the content itself, needing neither reassembly nor expansion, so
+/// a read of it can be handed over as it lies.
+///
+/// The sizes have to agree for that to hold. [`validate_fragment_metadata`] refuses a fragment
+/// where they do not, but only at ingress, and a store may already hold one from before that
+/// boundary existed: its payload is shorter than the content it claims, so it is not the content.
+pub(crate) fn payload_is_content(fragment: &Fragment) -> bool {
+    let fragmented =
+        (fragment.flags & FragmentFlags::PayloadFragmented) == FragmentFlags::PayloadFragmented;
+    let compressed = (fragment.flags & FragmentFlags::PayloadCompressed) != 0;
+    !fragmented && !compressed && fragment.size_payload as u64 == fragment.size_content
+}
+
+/// Refuse content the destination has no room for, rather than truncating it.
+pub(crate) fn validate_buffer_capacity(size: usize, capacity: usize) -> Result<(), StoreError> {
+    if size > capacity {
+        return Err(StoreError::from(Oversized {
+            context: format!(
+                "content of {size} bytes exceeds the {capacity} byte destination buffer"
+            ),
+        }));
     }
     Ok(())
 }
@@ -372,6 +398,47 @@ pub trait ImmutableStore: Any + Send + Sync {
         partition: Partition,
         address: Address,
     ) -> Result<StoreGetData, StoreError>;
+
+    /// Read the payload stored under `address`, into `dst` when the payload is the content itself
+    /// and into a buffer of its own otherwise, reporting the fragment that describes it.
+    ///
+    /// One lookup settles where the payload belongs and reads it there, so a reader that already
+    /// has somewhere for the content to go pays no second lookup either way. What a returned
+    /// payload has to become — expanded, or walked as a fragment list — is the reader's to do; this
+    /// only decides where the stored bytes land. A payload `dst` has no room for is [`Oversized`];
+    /// a returned one is the reader's to size.
+    ///
+    /// The default implementation goes through [`get`](ImmutableStore::get) and copies. A store
+    /// overrides it to read its index once and have the read itself land in `dst`.
+    async fn get_into(
+        self: Arc<Self>,
+        partition: Partition,
+        address: Address,
+        dst: &mut crate::CallerBuffer,
+    ) -> Result<(Fragment, PayloadRead), StoreError> {
+        let data = self.get(partition, address).await?;
+        let fragment = data.fragment;
+        let payload = data
+            .payload
+            .ok_or_else(|| StoreError::from(PayloadNotFound::from(address.hash)))?;
+        validate_fragment_payload(&fragment, payload.len())?;
+
+        if !payload_is_content(&fragment) {
+            return Ok((fragment, PayloadRead::Returned(payload)));
+        }
+
+        let capacity = dst.len();
+        let Some(target) = dst.as_mut_slice().get_mut(..payload.len()) else {
+            return Err(StoreError::from(Oversized {
+                context: format!(
+                    "payload of {} bytes exceeds the {capacity} byte destination buffer",
+                    payload.len()
+                ),
+            }));
+        };
+        target.copy_from_slice(&payload);
+        Ok((fragment, PayloadRead::IntoBuffer))
+    }
 
     /// Check if this store is available for service
     async fn is_available(self: Arc<Self>, _timeout: Duration) -> bool {

@@ -993,6 +993,309 @@ mod storage_remote_tests {
             .await
     }
 
+    /// What an item delivering into its own buffer reported: whether any `GET_DATA` arrived, the
+    /// content size the header carried, and the code the item completed with.
+    #[derive(Clone, Copy, Default)]
+    struct DataOutOutcome {
+        data_events: usize,
+        size_content: Option<u64>,
+        code: Option<lore_revision::event::LoreErrorCode>,
+    }
+
+    fn data_out_sink() -> (Arc<Mutex<DataOutOutcome>>, LoreEventCallback) {
+        let outcome: Arc<Mutex<DataOutOutcome>> = Arc::new(Mutex::new(DataOutOutcome::default()));
+        let outcome_for_cb = outcome.clone();
+        let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
+            let mut outcome = outcome_for_cb.lock().unwrap();
+            match event {
+                LoreEvent::StorageGetData(_) => outcome.data_events += 1,
+                LoreEvent::StorageGetHeader(d) => outcome.size_content = Some(d.size_content),
+                LoreEvent::StorageGetItemComplete(d) => outcome.code = Some(d.error_code),
+                _ => {}
+            }
+        }));
+        (outcome, callback)
+    }
+
+    /// A payload only the remote holds reaches the caller's buffer, and no `GET_DATA` is emitted
+    /// for it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_data_out_fills_the_buffer_from_remote_on_local_miss() -> TestResult {
+        use bytes::Bytes;
+        use lore::storage::get;
+        use lore::storage::get::LoreStorageGetArgs;
+        use lore::storage::get::LoreStorageGetItem;
+        use lore_base::types::Address;
+        use lore_base::types::Context;
+        use lore_base::types::Fragment;
+        use lore_base::types::Partition;
+        use lore_revision::event::LoreBytesMut;
+        use lore_revision::event::LoreErrorCode;
+        use lore_revision::interface::LoreArray;
+
+        let execution = setup_execution("storage-remote-get-data-out".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                for transport in TRANSPORTS {
+                    let server = start_server(transport).await;
+
+                    let content = b"remote payload landing in the caller's buffer".to_vec();
+                    let payload = Bytes::from(content.clone());
+                    let partition = Partition::from([0xc1u8; 16]);
+                    let address = Address {
+                        hash: lore_storage::hash_slice(payload.as_ref()),
+                        context: Context::default(),
+                    };
+                    server
+                        .backend_immutable
+                        .clone()
+                        .put(
+                            partition,
+                            address,
+                            Fragment {
+                                flags: 0,
+                                size_payload: payload.len() as u32,
+                                size_content: payload.len() as u64,
+                            },
+                            Some(payload),
+                            false,
+                        )
+                        .await
+                        .expect("seed server with payload");
+
+                    let handle_id = open_remote_handle(&server).await;
+                    let mut buffer = vec![0u8; content.len()];
+                    let (outcome, callback) = data_out_sink();
+                    let status = get::get(
+                        LoreGlobalArgs::default(),
+                        LoreStorageGetArgs {
+                            handle: lore::storage::handle::LoreStore { handle_id },
+                            items: LoreArray::from_vec(vec![LoreStorageGetItem {
+                                id: 11,
+                                partition,
+                                address,
+                                data_out: LoreBytesMut {
+                                    ptr: buffer.as_mut_ptr().cast(),
+                                    len: buffer.len(),
+                                },
+                                ..Default::default()
+                            }]),
+                        },
+                        callback,
+                    )
+                    .await;
+                    assert_eq!(status, 0, "get must succeed against a remote-only address");
+
+                    let outcome = *outcome.lock().unwrap();
+                    assert_eq!(outcome.code, Some(LoreErrorCode::None));
+                    assert_eq!(outcome.data_events, 0, "no GET_DATA may be emitted");
+                    assert_eq!(outcome.size_content, Some(content.len() as u64));
+                    assert_eq!(buffer, content, "the buffer must hold the remote content");
+
+                    close_handle(handle_id).await;
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    /// A compressed payload only the remote holds expands into the caller's buffer rather than
+    /// into a buffer of its own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_data_out_expands_a_compressed_remote_payload() -> TestResult {
+        use lore::storage::get;
+        use lore::storage::get::LoreStorageGetArgs;
+        use lore::storage::get::LoreStorageGetItem;
+        use lore_base::types::Address;
+        use lore_base::types::Context;
+        use lore_base::types::Fragment;
+        use lore_base::types::Partition;
+        use lore_revision::event::LoreBytesMut;
+        use lore_revision::event::LoreErrorCode;
+        use lore_revision::interface::LoreArray;
+
+        let execution = setup_execution("storage-remote-get-data-out-lz4".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                for transport in TRANSPORTS {
+                    let server = start_server(transport).await;
+
+                    let content: Vec<u8> = (0..4096).map(|index| (index / 64) as u8).collect();
+                    let plain = Fragment {
+                        flags: 0,
+                        size_payload: content.len() as u32,
+                        size_content: content.len() as u64,
+                    };
+                    let (fragment, payload) = lore_storage::compress::compress(
+                        plain,
+                        &content,
+                        lore_storage::CompressionMode::Lz4,
+                    )
+                    .expect("compress seed content");
+                    assert!(
+                        (payload.len() as u64) < fragment.size_content,
+                        "seed must compress to fewer bytes than it expands to",
+                    );
+
+                    let partition = Partition::from([0xc2u8; 16]);
+                    let address = Address {
+                        hash: lore_storage::hash_slice(&content),
+                        context: Context::default(),
+                    };
+                    server
+                        .backend_immutable
+                        .clone()
+                        .put(partition, address, fragment, Some(payload), false)
+                        .await
+                        .expect("seed server with compressed payload");
+
+                    let handle_id = open_remote_handle(&server).await;
+                    let mut buffer = vec![0u8; content.len()];
+                    let (outcome, callback) = data_out_sink();
+                    let status = get::get(
+                        LoreGlobalArgs::default(),
+                        LoreStorageGetArgs {
+                            handle: lore::storage::handle::LoreStore { handle_id },
+                            items: LoreArray::from_vec(vec![LoreStorageGetItem {
+                                id: 12,
+                                partition,
+                                address,
+                                data_out: LoreBytesMut {
+                                    ptr: buffer.as_mut_ptr().cast(),
+                                    len: buffer.len(),
+                                },
+                                ..Default::default()
+                            }]),
+                        },
+                        callback,
+                    )
+                    .await;
+                    assert_eq!(
+                        status, 0,
+                        "get must succeed against a compressed remote address"
+                    );
+
+                    let outcome = *outcome.lock().unwrap();
+                    assert_eq!(outcome.code, Some(LoreErrorCode::None));
+                    assert_eq!(outcome.data_events, 0, "no GET_DATA may be emitted");
+                    assert_eq!(outcome.size_content, Some(content.len() as u64));
+                    assert_eq!(buffer, content, "the buffer must hold the expanded content");
+
+                    close_handle(handle_id).await;
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    /// Content the remote holds as a list of fragments is written into the caller's buffer leaf by
+    /// leaf, with no buffer holding the whole of it on the way.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_resolved_data_out_assembles_remote_fragments_into_the_buffer() -> TestResult {
+        use lore::storage::get_resolved;
+        use lore::storage::get_resolved::LoreStorageGetResolvedArgs;
+        use lore::storage::get_resolved::LoreStorageGetResolvedItem;
+        use lore::storage::put_resolved;
+        use lore::storage::put_resolved::LoreStoragePutResolvedArgs;
+        use lore::storage::put_resolved::LoreStoragePutResolvedItem;
+        use lore_base::types::Context;
+        use lore_base::types::Hash;
+        use lore_base::types::Partition;
+        use lore_revision::event::LoreBytes;
+        use lore_revision::event::LoreBytesMut;
+        use lore_revision::event::LoreErrorCode;
+        use lore_revision::interface::LoreArray;
+
+        let execution = setup_execution("storage-remote-resolved-data-out".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                for transport in TRANSPORTS {
+                    let server = start_server(transport).await;
+                    let partition = Partition::from([0xc3u8; 16]);
+                    let key = Hash::hash_buffer(b"fragmented-into-caller-buffer");
+                    let content: Vec<u8> = (0..(512 * 1024u32))
+                        .map(|index| (index % 251) as u8)
+                        .collect();
+
+                    let writer = open_remote_handle(&server).await;
+                    let put_codes: Arc<Mutex<Vec<LoreErrorCode>>> =
+                        Arc::new(Mutex::new(Vec::new()));
+                    let put_cb = put_codes.clone();
+                    let callback: LoreEventCallback = Some(Box::new(move |e: &LoreEvent| {
+                        if let LoreEvent::StoragePutItemComplete(d) = e {
+                            put_cb.lock().unwrap().push(d.error_code);
+                        }
+                    }));
+                    put_resolved::put_resolved(
+                        LoreGlobalArgs::default(),
+                        LoreStoragePutResolvedArgs {
+                            handle: lore::storage::handle::LoreStore { handle_id: writer },
+                            items: LoreArray::from_vec(vec![LoreStoragePutResolvedItem {
+                                id: 1,
+                                partition,
+                                key,
+                                context: Context::default(),
+                                data: LoreBytes {
+                                    ptr: content.as_ptr().cast(),
+                                    len: content.len(),
+                                },
+                                remote_write: 1,
+                                local_cache: 0,
+                                fixed_size_chunk: 64 * 1024,
+                            }]),
+                        },
+                        callback,
+                    )
+                    .await;
+                    assert_eq!(put_codes.lock().unwrap().clone(), vec![LoreErrorCode::None]);
+                    close_handle(writer).await;
+
+                    // A fresh handle so the content is reached across the wire rather than out of
+                    // the writer's own store.
+                    let reader = open_remote_handle(&server).await;
+                    let mut buffer = vec![0u8; content.len()];
+                    let (outcome, callback) = data_out_sink();
+                    let status = get_resolved::get_resolved(
+                        LoreGlobalArgs::default(),
+                        LoreStorageGetResolvedArgs {
+                            handle: lore::storage::handle::LoreStore { handle_id: reader },
+                            items: LoreArray::from_vec(vec![LoreStorageGetResolvedItem {
+                                data_out: LoreBytesMut {
+                                    ptr: buffer.as_mut_ptr().cast(),
+                                    len: buffer.len(),
+                                },
+                                id: 13,
+                                partition,
+                                key,
+                                context: Context::default(),
+                                local_cache: 0,
+                                streaming: 0,
+                            }]),
+                        },
+                        callback,
+                    )
+                    .await;
+                    assert_eq!(
+                        status, 0,
+                        "get_resolved must succeed against remote content"
+                    );
+
+                    let outcome = *outcome.lock().unwrap();
+                    assert_eq!(outcome.code, Some(LoreErrorCode::None));
+                    assert_eq!(outcome.data_events, 0, "no GET_DATA may be emitted");
+                    assert_eq!(outcome.size_content, Some(content.len() as u64));
+                    assert_eq!(
+                        buffer, content,
+                        "the buffer must hold the assembled content"
+                    );
+
+                    close_handle(reader).await;
+                }
+                Ok(())
+            })
+            .await
+    }
+
     /// `get` does not blanket-cache remote-fetched payloads, but a producer-side write hint
     /// (`PayloadLocalCachePriority` set on the seed fragment) opts the payload into local
     /// caching via `load_fragment`'s `should_store` gate. Verify the gate fires for that
@@ -3788,6 +4091,7 @@ mod storage_remote_tests {
 
                 let items = vec![
                     LoreStorageGetResolvedItem {
+                        data_out: Default::default(),
                         id: 1,
                         partition,
                         key: missing,
@@ -3796,6 +4100,7 @@ mod storage_remote_tests {
                         streaming: 0,
                     },
                     LoreStorageGetResolvedItem {
+                        data_out: Default::default(),
                         id: 2,
                         partition,
                         key: present,
@@ -3854,6 +4159,7 @@ mod storage_remote_tests {
                     LoreStorageGetResolvedArgs {
                         handle: lore::storage::handle::LoreStore { handle_id },
                         items: LoreArray::from_vec(vec![LoreStorageGetResolvedItem {
+                        data_out: Default::default(),
                             id: 3,
                             partition,
                             key: present,
@@ -4008,6 +4314,7 @@ mod storage_remote_tests {
                                 handle_id: reader_handle,
                             },
                             items: LoreArray::from_vec(vec![LoreStorageGetResolvedItem {
+                                data_out: Default::default(),
                                 id: 2,
                                 partition,
                                 key,
@@ -4118,6 +4425,7 @@ mod storage_remote_tests {
                             LoreStorageGetResolvedArgs {
                                 handle: lore::storage::handle::LoreStore { handle_id },
                                 items: LoreArray::from_vec(vec![LoreStorageGetResolvedItem {
+                                    data_out: Default::default(),
                                     id: 2,
                                     partition,
                                     key,
@@ -4310,6 +4618,7 @@ mod storage_remote_tests {
 
                     let items = vec![
                         LoreStorageGetResolvedItem {
+                            data_out: Default::default(),
                             id: 1,
                             partition,
                             key: cached_key,
@@ -4318,6 +4627,7 @@ mod storage_remote_tests {
                             streaming: 0,
                         },
                         LoreStorageGetResolvedItem {
+                            data_out: Default::default(),
                             id: 2,
                             partition,
                             key: uncached_key,
@@ -4471,6 +4781,7 @@ mod storage_remote_tests {
                         LoreStorageGetResolvedArgs {
                             handle: lore::storage::handle::LoreStore { handle_id: reader },
                             items: LoreArray::from_vec(vec![LoreStorageGetResolvedItem {
+                                data_out: Default::default(),
                                 id: 9,
                                 partition,
                                 key: keys[1],
@@ -4792,6 +5103,7 @@ mod storage_remote_tests {
                         LoreStorageGetResolvedArgs {
                             handle: lore::storage::handle::LoreStore { handle_id: reader },
                             items: LoreArray::from_vec(vec![LoreStorageGetResolvedItem {
+                                data_out: Default::default(),
                                 id: 2,
                                 partition,
                                 key,
@@ -4909,6 +5221,7 @@ mod storage_remote_tests {
                         LoreStorageGetResolvedArgs {
                             handle: lore::storage::handle::LoreStore { handle_id: reader },
                             items: LoreArray::from_vec(vec![LoreStorageGetResolvedItem {
+                                data_out: Default::default(),
                                 id: 2,
                                 partition,
                                 key,

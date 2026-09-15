@@ -1235,6 +1235,200 @@ mod open_tests {
         }
     }
 
+    /// A writable buffer for `data_out`, alongside the vector that owns it.
+    fn caller_buffer(capacity: usize) -> (Vec<u8>, lore_revision::event::LoreBytesMut) {
+        let mut buffer = vec![0u8; capacity];
+        let data_out = lore_revision::event::LoreBytesMut {
+            ptr: buffer.as_mut_ptr().cast(),
+            len: buffer.len(),
+        };
+        (buffer, data_out)
+    }
+
+    /// With `data_out` supplied the content lands in the caller's buffer and no `GET_DATA` is
+    /// emitted for it, while `GET_HEADER` still reports the whole content's size.
+    #[tokio::test]
+    async fn get_data_out_fills_the_buffer_and_emits_no_data() {
+        use lore_base::types::Context;
+        use lore_base::types::Partition;
+
+        let (open_sink, open_cb) = make_sink();
+        assert_eq!(open_in_memory(open_cb).await, 0);
+        let id = take_opened(&open_sink.lock().unwrap()).unwrap();
+        let handle = lore::storage::handle::LoreStore { handle_id: id };
+
+        let payload = b"delivered straight into the caller's buffer".to_vec();
+        let partition = Partition::from([0x21u8; 16]);
+        let context = Context::from([0x22u8; 16]);
+        let address = put_once(handle, partition, context, &payload).await;
+
+        let (buffer, data_out) = caller_buffer(payload.len());
+        let item = lore::storage::get::LoreStorageGetItem {
+            id: 200,
+            partition,
+            address,
+            data_out,
+            ..Default::default()
+        };
+        let (sink, callback) = make_get_sink();
+        let status = lore::storage::get::get(
+            globals(),
+            lore::storage::get::LoreStorageGetArgs {
+                handle,
+                items: lore_revision::interface::LoreArray::from_vec(vec![item]),
+            },
+            callback,
+        )
+        .await;
+        assert_eq!(status, 0);
+        assert_eq!(buffer, payload, "the caller's buffer must hold the content");
+
+        let events = sink.lock().unwrap().clone();
+        assert!(
+            !events.iter().any(|e| matches!(e, GetCaptured::Data { .. })),
+            "an item delivering into its own buffer emits no GET_DATA, got {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                GetCaptured::Header { id: 200, size_content, .. }
+                    if *size_content == payload.len() as u64
+            )),
+            "GET_HEADER must report the content size, got {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                GetCaptured::ItemComplete {
+                    id: 200,
+                    error_code: lore_revision::event::LoreErrorCode::None,
+                    ..
+                }
+            )),
+            "the item must complete without error, got {events:?}"
+        );
+    }
+
+    /// The capacity `data_out` states is the limit: content that does not fit fails the item
+    /// rather than arriving truncated or falling back to `GET_DATA`.
+    #[tokio::test]
+    async fn get_data_out_shorter_than_the_content_fails_the_item() {
+        use lore_base::types::Context;
+        use lore_base::types::Partition;
+
+        let (open_sink, open_cb) = make_sink();
+        assert_eq!(open_in_memory(open_cb).await, 0);
+        let id = take_opened(&open_sink.lock().unwrap()).unwrap();
+        let handle = lore::storage::handle::LoreStore { handle_id: id };
+
+        let payload = b"longer than the buffer the caller offers".to_vec();
+        let partition = Partition::from([0x23u8; 16]);
+        let context = Context::from([0x24u8; 16]);
+        let address = put_once(handle, partition, context, &payload).await;
+
+        let (_buffer, data_out) = caller_buffer(payload.len() - 1);
+        let item = lore::storage::get::LoreStorageGetItem {
+            id: 201,
+            partition,
+            address,
+            data_out,
+            ..Default::default()
+        };
+        let (sink, callback) = make_get_sink();
+        lore::storage::get::get(
+            globals(),
+            lore::storage::get::LoreStorageGetArgs {
+                handle,
+                items: lore_revision::interface::LoreArray::from_vec(vec![item]),
+            },
+            callback,
+        )
+        .await;
+
+        let events = sink.lock().unwrap().clone();
+        assert!(
+            !events.iter().any(|e| matches!(e, GetCaptured::Data { .. })),
+            "a refused item must not fall back to GET_DATA, got {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                GetCaptured::ItemComplete {
+                    id: 201,
+                    error_code: lore_revision::event::LoreErrorCode::InvalidArguments,
+                    ..
+                }
+            )),
+            "a buffer short of the content must fail the item, got {events:?}"
+        );
+    }
+
+    /// The zero-hash short-circuit is empty content, so an item delivering into its own buffer
+    /// completes without the empty `GET_DATA` a buffer-less item receives.
+    #[tokio::test]
+    async fn get_zero_hash_with_data_out_emits_no_data() {
+        use lore_base::types::Address;
+        use lore_base::types::Context;
+        use lore_base::types::Hash;
+        use lore_base::types::Partition;
+
+        let (open_sink, open_cb) = make_sink();
+        assert_eq!(open_in_memory(open_cb).await, 0);
+        let id = take_opened(&open_sink.lock().unwrap()).unwrap();
+        let handle = lore::storage::handle::LoreStore { handle_id: id };
+
+        let (_buffer, data_out) = caller_buffer(8);
+        let item = lore::storage::get::LoreStorageGetItem {
+            id: 202,
+            partition: Partition::from([0x25u8; 16]),
+            address: Address {
+                hash: Hash::default(),
+                context: Context::from([0x26u8; 16]),
+            },
+            data_out,
+            ..Default::default()
+        };
+        let (sink, callback) = make_get_sink();
+        let status = lore::storage::get::get(
+            globals(),
+            lore::storage::get::LoreStorageGetArgs {
+                handle,
+                items: lore_revision::interface::LoreArray::from_vec(vec![item]),
+            },
+            callback,
+        )
+        .await;
+        assert_eq!(status, 0);
+
+        let events = sink.lock().unwrap().clone();
+        assert!(
+            !events.iter().any(|e| matches!(e, GetCaptured::Data { .. })),
+            "empty content must not arrive as an empty GET_DATA here, got {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                GetCaptured::Header {
+                    id: 202,
+                    size_content: 0,
+                    ..
+                }
+            )),
+            "GET_HEADER must report empty content, got {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                GetCaptured::ItemComplete {
+                    id: 202,
+                    error_code: lore_revision::event::LoreErrorCode::None,
+                    ..
+                }
+            )),
+            "the item must complete without error, got {events:?}"
+        );
+    }
+
     /// `LoreBytes` on `GET_DATA` events is valid only for the callback's invocation. This
     /// test pins two halves of that contract: (a) reading through the `ptr/len` pair inside
     /// the callback returns the expected bytes, and (b) once the callback returns, the

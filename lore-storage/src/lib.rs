@@ -90,6 +90,8 @@ pub use hash::hash_string_bytes;
 // Re-export store traits
 pub use immutable_store::ImmutableStore;
 pub use immutable_store::StoreError;
+pub(crate) use immutable_store::payload_is_content;
+pub(crate) use immutable_store::validate_buffer_capacity;
 pub use immutable_store::validate_fragment_list;
 pub use immutable_store::validate_fragment_metadata;
 pub use immutable_store::validate_fragment_payload;
@@ -116,6 +118,7 @@ pub use mutable_store::MutableStore;
 pub use options::ReadOptions;
 pub use options::WriteOptions;
 // Re-export packstore
+pub use packstore::CallerBuffer;
 pub use packstore::PackStore;
 pub use packstore::PackStoreRef;
 pub use packstore::PackfileError;
@@ -125,9 +128,11 @@ pub use read::load_fragment;
 pub use read::load_raw_local;
 pub use read::read;
 pub use read::read_into;
+pub use read::read_into_buffer;
 pub use read::read_into_file;
 pub use read::read_raw;
 pub use read::read_resolved;
+pub use read::read_resolved_into_buffer;
 pub use read::read_resolved_into_file;
 pub use read::read_resolved_stream;
 pub use read::read_stream;
@@ -136,6 +141,7 @@ pub use read::write_all_to_file;
 // Re-export store types
 pub use store_types::KeyType;
 pub use store_types::KeyValueStream;
+pub use store_types::PayloadRead;
 pub use store_types::StoreGetData;
 pub use store_types::StoreMatch;
 pub use store_types::StoreMatchResult;

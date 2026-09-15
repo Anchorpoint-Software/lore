@@ -403,6 +403,80 @@ impl<'de> serde::Deserialize<'de> for LoreBytes {
     }
 }
 
+/// Borrowed writable byte slice the caller hands to the library. The counterpart of
+/// `lore_bytes_t`: the caller owns the memory and the library fills it.
+///
+/// A null pointer or zero length means no buffer is supplied, which is what a zero-initialized
+/// value says, as does a length no allocation can have.
+///
+/// The memory must stay valid, and reach nobody else, for the duration of the call it is passed to.
+/// The buffers supplied by the items of one call must not overlap: the items run alongside each
+/// other, so two covering the same byte would write it at once.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct LoreBytesMut {
+    /// Pointer to the start of the writable slice.
+    pub ptr: *mut core::ffi::c_void,
+    /// Number of bytes available behind `ptr`.
+    pub len: usize,
+}
+
+// SAFETY: as `LoreBytes`, with the caller owning the memory; the call it is handed to bounds the
+// lifetime.
+unsafe impl Send for LoreBytesMut {}
+unsafe impl Sync for LoreBytesMut {}
+
+impl Default for LoreBytesMut {
+    fn default() -> Self {
+        LoreBytesMut {
+            ptr: core::ptr::null_mut(),
+            len: 0,
+        }
+    }
+}
+
+impl LoreBytesMut {
+    /// Whether a buffer is supplied.
+    ///
+    /// A length above `isize::MAX` describes no allocation Rust can address, and reading it as one
+    /// is undefined rather than merely wrong, so such a value is taken as no buffer at all and the
+    /// item is answered the way it is answered without one.
+    pub fn is_supplied(&self) -> bool {
+        !self.ptr.is_null() && self.len > 0 && isize::try_from(self.len).is_ok()
+    }
+}
+
+impl PartialEq for LoreBytesMut {
+    fn eq(&self, other: &Self) -> bool {
+        // Compared as a destination rather than as contents: nothing has written the bytes yet.
+        self.ptr == other.ptr && self.len == other.len
+    }
+}
+
+impl core::fmt::Debug for LoreBytesMut {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("LoreBytesMut")
+            .field("supplied", &self.is_supplied())
+            .field("len", &self.len)
+            .finish()
+    }
+}
+
+impl serde::Serialize for LoreBytesMut {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // Only the capacity is part of the request; the library writes the contents.
+        serializer.serialize_u64(self.len as u64)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for LoreBytesMut {
+    fn deserialize<D: serde::Deserializer<'de>>(_deserializer: D) -> Result<Self, D::Error> {
+        Err(serde::de::Error::custom(
+            "LoreBytesMut cannot be deserialized — it names caller memory",
+        ))
+    }
+}
+
 /// Small discriminator enum for per-item terminal events in the
 /// content-addressed storage API.
 ///

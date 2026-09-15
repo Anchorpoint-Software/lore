@@ -205,7 +205,7 @@ pub async fn load_raw_store_retry(
     repository: Partition,
     address: Address,
 ) -> Result<(Fragment, Bytes), ImmutableError> {
-    lore_storage::read::read_raw(store, repository, address)
+    lore_storage::read::read_raw(store, repository, address, false)
         .await
         .forward("loading raw fragment from store")
 }

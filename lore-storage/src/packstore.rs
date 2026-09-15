@@ -40,6 +40,88 @@ async fn packfile_read(file: &IoFile, offset: usize, size: usize) -> Result<Byte
     )
 }
 
+/// A caller-owned destination for a scattering read. The pointer and length stay valid and
+/// untouched for the duration of the read.
+pub struct CallerBuffer {
+    ptr: *mut u8,
+    len: usize,
+}
+
+impl CallerBuffer {
+    /// # Safety
+    ///
+    /// `ptr` must point to `len` writable bytes that stay valid, and are not
+    /// read or written by anyone else, until the read using this buffer
+    /// completes.
+    pub unsafe fn new(ptr: *mut u8, len: usize) -> Self {
+        CallerBuffer { ptr, len }
+    }
+
+    /// The address the buffer starts at, for a read that takes ownership of its destination.
+    fn address(&self) -> usize {
+        self.ptr as usize
+    }
+
+    /// The capacity available, in bytes.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the buffer has no capacity.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The destination as a slice.
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: as CallerBuffer::new.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+
+    /// Split at `at`, keeping `..at` and returning `at..`, as [`bytes::BytesMut::split_off`] does.
+    ///
+    /// The two name disjoint memory, so each can be written on its own.
+    pub fn split_off(&mut self, at: usize) -> CallerBuffer {
+        assert!(at <= self.len, "split index out of bounds");
+        // SAFETY: `at` is within this buffer, so the tail names a part of the memory the contract
+        // on `new` already covers, and the head gives it up by shrinking.
+        let tail = unsafe { CallerBuffer::new(self.ptr.add(at), self.len - at) };
+        self.len = at;
+        tail
+    }
+}
+
+// SAFETY: one read holds the buffer at a time, and the contract on `new` makes the memory
+// exclusive for that read's duration.
+unsafe impl Send for CallerBuffer {}
+
+impl lore_io::StableBufListMut for CallerBuffer {
+    fn byte_segments_mut(&mut self) -> impl Iterator<Item = &mut [u8]> {
+        // SAFETY: as CallerBuffer::new.
+        std::iter::once(unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) })
+    }
+}
+
+/// Read `len` bytes at `offset` into `dst`, scattering straight into it and allocating nothing.
+async fn packfile_read_into(
+    file: &IoFile,
+    offset: usize,
+    dst: &mut CallerBuffer,
+    len: usize,
+) -> Result<(), PackfileError> {
+    let address = dst.address();
+    crate::fs_util::retry_transient(move || {
+        // SAFETY: `dst` is borrowed for this whole call, so the memory it names stays valid and
+        // reaches nobody else. A scattering read consumes the buffer it is given, so each attempt
+        // takes its own handle to that memory; `retry_transient` never overlaps two of them.
+        let buffer = unsafe { CallerBuffer::new(address as *mut u8, len) };
+        file.read_exact_vectored_at(buffer, offset as u64)
+    })
+    .await
+    .internal("Failed reading from packstore file into caller buffer")?;
+    Ok(())
+}
+
 async fn packfile_write(file: &IoFile, buffer: Bytes, offset: usize) -> Result<(), PackfileError> {
     crate::fs_util::retry_transient(|| file.write_all_at(buffer.clone(), offset as u64))
         .await
@@ -402,6 +484,69 @@ impl PackStore {
         Ok(Bytes::copy_from_slice(
             &packfile.buffer[offset..(offset + size)],
         ))
+    }
+
+    /// As [`load`](Self::load), reading into `dst` instead of allocating a buffer.
+    pub async fn load_into(
+        &self,
+        id: u32,
+        offset: u32,
+        size: u32,
+        dst: &mut CallerBuffer,
+    ) -> Result<(), PackfileError> {
+        if size == 0 {
+            return Ok(());
+        }
+        if id == 0 {
+            return Err(PackfileError::internal("Invalid packfile"));
+        }
+        if size as usize > dst.len() {
+            return Err(PackfileError::internal(
+                "Destination buffer is smaller than the payload to read",
+            ));
+        }
+
+        let index = (id - 1) as usize;
+        let size = size as usize;
+        let offset = offset as usize;
+
+        let mut packfiles = self.packfile.read().await;
+        if packfiles.is_empty() {
+            drop(packfiles);
+            self.resume().await?;
+            packfiles = self.packfile.read().await;
+        }
+
+        if index >= packfiles.len() {
+            return Err(PackfileError::internal("Invalid packfile"));
+        }
+
+        let packfile = packfiles[index].read().await;
+        if packfile.id != id {
+            return Err(PackfileError::internal("Packfile ID mismatch index"));
+        }
+
+        if let Some(file) = packfile.file.as_ref() {
+            return packfile_read_into(file, offset, dst, size).await;
+        }
+
+        let Some(stored) = offset
+            .checked_add(size)
+            .and_then(|end| packfile.buffer.get(offset..end))
+        else {
+            return Err(PackfileError::internal(
+                "Failed reading from packstore buffer, boundary violation",
+            ));
+        };
+        let Some(target) = dst.as_mut_slice().get_mut(..size) else {
+            return Err(PackfileError::internal(
+                "Destination buffer is smaller than the payload to read",
+            ));
+        };
+
+        // An in-memory packstore holds the bytes already, so this copy is unavoidable.
+        target.copy_from_slice(stored);
+        Ok(())
     }
 
     pub async fn store(&self, buffer: Bytes) -> Result<PackStoreRef, PackfileError> {

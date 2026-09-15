@@ -28,6 +28,7 @@ use zerocopy::IntoBytes;
 
 use crate::change::FileAction;
 use crate::event::LoreBytes;
+use crate::event::LoreBytesMut;
 pub use crate::event::LoreEvent;
 pub use crate::logging::LoreLogLevel;
 use crate::lore::Address;
@@ -494,7 +495,7 @@ impl<T: ValidateText> ValidateText for LoreArray<T> {
     }
 }
 
-lore_base::carries_no_text!(LoreBinary, LoreBytes, LoreMetadataType);
+lore_base::carries_no_text!(LoreBinary, LoreBytes, LoreBytesMut, LoreMetadataType);
 
 impl ValidateText for LoreGlobalArgs {
     fn validate_text(&self) -> Result<(), TextNotUtf8> {

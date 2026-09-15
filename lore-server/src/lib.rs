@@ -161,7 +161,7 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(10),
-            lore_storage::read_raw(store, Partition::default(), address),
+            lore_storage::read_raw(store, Partition::default(), address, false),
         )
         .await
         .expect("read_raw did not return within 10s — server retry policy may not be active");

@@ -16,6 +16,21 @@ use crate::Hash;
 use crate::Partition;
 use crate::immutable_store::StoreError;
 
+/// Where an [`ImmutableStore::get_into`] read put the payload it found.
+///
+/// The store chooses by what it stores, not by what the payload means: bytes that are already the
+/// content go where the reader wants them, and bytes that are not come back on their own. Landing
+/// the latter in the reader's buffer would only force a copy back out of it to expand them.
+///
+/// [`ImmutableStore::get_into`]: crate::immutable_store::ImmutableStore::get_into
+pub enum PayloadRead {
+    /// The stored payload is the content itself, and the caller's buffer holds it.
+    IntoBuffer,
+    /// The stored payload, read into a buffer of its own, for a reader that has to expand it or
+    /// walk it as a list of further fragments. The caller's buffer is untouched.
+    Returned(Bytes),
+}
+
 /// Progressive match hierarchy for store lookups.
 ///
 /// When querying the store, callers specify a minimum match level.

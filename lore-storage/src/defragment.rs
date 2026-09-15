@@ -1135,15 +1135,86 @@ pub async fn defragment_pipeline(
     }
 }
 
+/// A destination a defragmenting read divides among the leaves it walks.
+///
+/// Each leaf writes one disjoint piece, so a target only has to hand those pieces out and let each
+/// be written on its own. [`BytesMut`] holds the pieces of a buffer the read allocates;
+/// [`CallerBuffer`](crate::CallerBuffer) holds the pieces of one the caller already owns, which the
+/// leaves then write without the content being assembled anywhere else first.
+pub trait DefragmentTarget: Send + 'static {
+    /// The bytes this piece covers.
+    fn len(&self) -> usize;
+
+    /// Whether this piece covers no bytes.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Split at `at`, keeping `..at` and returning `at..`.
+    fn split_off(&mut self, at: usize) -> Self;
+
+    /// The piece as a slice, for a leaf that holds its bytes and only has to place them.
+    fn as_mut_slice(&mut self) -> &mut [u8];
+
+    /// This piece as memory a read can land in, for a leaf that can be read into place rather than
+    /// loaded and copied.
+    ///
+    /// `None` for a target the read has no way to write into directly, which is answered by loading
+    /// the leaf and copying it in. The handle names the same memory as the piece it was taken from,
+    /// so the piece must not be written through while it is alive.
+    fn as_caller_buffer(&mut self) -> Option<crate::CallerBuffer>;
+}
+
+impl DefragmentTarget for BytesMut {
+    fn len(&self) -> usize {
+        BytesMut::len(self)
+    }
+
+    fn split_off(&mut self, at: usize) -> Self {
+        BytesMut::split_off(self, at)
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        self
+    }
+
+    fn as_caller_buffer(&mut self) -> Option<crate::CallerBuffer> {
+        None
+    }
+}
+
+impl DefragmentTarget for crate::CallerBuffer {
+    fn len(&self) -> usize {
+        crate::CallerBuffer::len(self)
+    }
+
+    fn split_off(&mut self, at: usize) -> Self {
+        crate::CallerBuffer::split_off(self, at)
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        crate::CallerBuffer::as_mut_slice(self)
+    }
+
+    fn as_caller_buffer(&mut self) -> Option<crate::CallerBuffer> {
+        let piece = crate::CallerBuffer::as_mut_slice(self);
+        let (ptr, len) = (piece.as_mut_ptr(), piece.len());
+        // SAFETY: the handle names exactly this piece and nothing wider, so it inherits the contract
+        // `CallerBuffer::new` was first constructed under. Its user drops it before this piece is
+        // written through again.
+        Some(unsafe { crate::CallerBuffer::new(ptr, len) })
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-pub async fn read_defragment(
+pub async fn read_defragment<Target: DefragmentTarget>(
     store: Arc<dyn ImmutableStore>,
     partition: Partition,
     address: Address,
     range: Range<usize>,
     fragment: Fragment,
     source_buffer: Bytes,
-    mut target: BytesMut,
+    mut target: Target,
     options: ReadOptions,
     depth: usize,
     remote_session: Option<Arc<StorageSession>>,
@@ -1267,18 +1338,78 @@ pub async fn read_defragment(
     result
 }
 
+/// Read the leaf at `address` into `target`'s own memory, so nothing is allocated for its payload
+/// and nothing is copied out of it.
+///
+/// `false` leaves the leaf to be loaded and cut instead: the range clips it, so it is not the whole
+/// content its address names; the leaf is not the size the list claimed for it; `target` is memory
+/// the read cannot write into directly; or the read declined, which the assembling path answers by
+/// reaching the remote and healing.
 #[allow(clippy::too_many_arguments)]
-fn read_defragment_subread(
+async fn place_whole_leaf<Target: DefragmentTarget>(
+    store: Arc<dyn ImmutableStore>,
+    partition: Partition,
+    address: Address,
+    range: &Range<usize>,
+    target: &mut Target,
+    options: ReadOptions,
+    depth: usize,
+    remote_session: Option<Arc<StorageSession>>,
+) -> Result<bool, StorageError> {
+    if range.start != 0 {
+        return Ok(false);
+    }
+    let Some(mut dst) = target.as_caller_buffer() else {
+        return Ok(false);
+    };
+
+    let piece = dst.len();
+    match crate::read::read_content_into_buffer(
+        store,
+        partition,
+        address,
+        &mut dst,
+        options,
+        crate::read::RootSource::LocalOrRemote,
+        depth,
+        remote_session,
+    )
+    .await
+    {
+        Ok(Some((_, written))) => Ok(written == piece),
+        Ok(None) => Ok(false),
+        Err(err) if err.is_oversized() => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_defragment_subread<Target: DefragmentTarget>(
     store: Arc<dyn ImmutableStore>,
     partition: Partition,
     address: Address,
     range: Range<usize>,
-    mut target: BytesMut,
+    mut target: Target,
     options: ReadOptions,
     depth: usize,
     remote_session: Option<Arc<StorageSession>>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), StorageError>> + Send>> {
     Box::pin(async move {
+        if place_whole_leaf(
+            store.clone(),
+            partition,
+            address,
+            &range,
+            &mut target,
+            options,
+            depth,
+            remote_session.clone(),
+        )
+        .await?
+        {
+            return Ok(());
+        }
+
         let (fragment, buffer) = load_fragment(
             store.clone(),
             partition,
@@ -1302,21 +1433,21 @@ fn read_defragment_subread(
                 remote_session,
             )
             .await
-        } else if buffer.len() < range.end {
-            Err(StorageError::internal(format!(
-                "unexpected size: buffer {} vs range end {}",
-                buffer.len(),
-                range.end
-            )))
         } else {
-            if target.len() < range.len() {
+            let available = target.len();
+            let Some(leaf) = buffer.get(range.clone()) else {
                 return Err(StorageError::internal(format!(
-                    "unexpected size: target {} vs range {}",
-                    target.len(),
-                    range.len()
+                    "unexpected size: buffer {} vs range {range:?}",
+                    buffer.len()
                 )));
-            }
-            target[..range.len()].copy_from_slice(&buffer.as_ref()[range]);
+            };
+            let Some(place) = target.as_mut_slice().get_mut(..leaf.len()) else {
+                return Err(StorageError::internal(format!(
+                    "unexpected size: target {available} vs range {}",
+                    leaf.len()
+                )));
+            };
+            place.copy_from_slice(leaf);
             Ok(())
         }
     })

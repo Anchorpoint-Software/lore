@@ -5108,6 +5108,22 @@ typedef struct lore_storage_put_args_t {
   struct lore_storage_put_item_array_t items;
 } lore_storage_put_args_t;
 
+// Borrowed writable byte slice the caller hands to the library. The counterpart of
+// `lore_bytes_t`: the caller owns the memory and the library fills it.
+//
+// A null pointer or zero length means no buffer is supplied, which is what a zero-initialized
+// value says, as does a length no allocation can have.
+//
+// The memory must stay valid, and reach nobody else, for the duration of the call it is passed to.
+// The buffers supplied by the items of one call must not overlap: the items run alongside each
+// other, so two covering the same byte would write it at once.
+typedef struct lore_bytes_mut_t {
+  // Pointer to the start of the writable slice.
+  void *ptr;
+  // Number of bytes available behind `ptr`.
+  uintptr_t len;
+} lore_bytes_mut_t;
+
 // One get item — the `(partition, address)` to read, and the range of it to read.
 typedef struct lore_storage_get_item_t {
   // Caller-chosen id echoed back in every event for this item
@@ -5129,6 +5145,14 @@ typedef struct lore_storage_get_item_t {
   // Cache fetched bytes back to the local store even without the producer's
   // `PayloadLocalCachePriority` hint
   uint8_t local_cache;
+  // Writable buffer receiving the requested range, `len` stating its capacity. Zero-initialized
+  // selects `GET_DATA` delivery.
+  //
+  // The capacity is the limit: a range exceeding it fails the item with
+  // `LORE_ERROR_CODE_INVALID_ARGUMENTS` rather than truncating. `GET_HEADER` reports the whole
+  // content's size, which with `offset` and `length` gives the bytes written; no `GET_DATA`
+  // follows, and `streaming` is ignored. The buffer holds unspecified bytes when the item fails.
+  struct lore_bytes_mut_t data_out;
 } lore_storage_get_item_t;
 
 // A contiguous array of elements described by a pointer and a count.
@@ -5169,6 +5193,14 @@ typedef struct lore_storage_get_resolved_item_t {
   // Cache fetched bytes back to the local store even without the producer's
   // `PayloadLocalCachePriority` hint
   uint8_t local_cache;
+  // Writable buffer receiving the content, `len` stating its capacity. Zero-initialized selects
+  // `GET_DATA` delivery.
+  //
+  // The capacity is the limit: content exceeding it fails the item with
+  // `LORE_ERROR_CODE_INVALID_ARGUMENTS` rather than truncating. `GET_HEADER` reports the content
+  // size, no `GET_DATA` follows, and `streaming` is ignored. The buffer holds unspecified bytes
+  // when the item fails.
+  struct lore_bytes_mut_t data_out;
 } lore_storage_get_resolved_item_t;
 
 // A contiguous array of elements described by a pointer and a count.

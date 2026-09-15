@@ -231,6 +231,7 @@ include = [
 "LoreBranchUnprotectArgs" = "lore_branch_unprotect_args_t"
 "LoreBranchUnprotectEventData" = "lore_branch_unprotect_event_data_t"
 "LoreBytes" = "lore_bytes_t"
+"LoreBytesMut" = "lore_bytes_mut_t"
 "LoreCompleteEventData" = "lore_complete_event_data_t"
 "LoreEndEventData" = "lore_end_event_data_t"
 "LoreErrorCode" = "lore_error_code_t"

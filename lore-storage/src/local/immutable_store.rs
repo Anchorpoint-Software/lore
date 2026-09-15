@@ -68,6 +68,7 @@ use crate::hash;
 use crate::immutable_store::StoreError;
 use crate::immutable_store::sanitise_fragment_behavior_flags;
 use crate::local::fan_out::GroupLevel;
+use crate::store_types::PayloadRead;
 use crate::store_types::StoreGetData;
 use crate::store_types::StoreMatch;
 use crate::store_types::StoreMatchResult;
@@ -3768,6 +3769,74 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
             partition: find.partition,
             payload: Some(payload),
         })
+    }
+
+    /// One index lookup settles where the payload belongs and reads it there. A payload that is the
+    /// content scatters straight into `dst` and allocates nothing; any other is read into its own
+    /// buffer, which the reader needs to expand or walk it. Applies the same gating as `get`.
+    async fn get_into(
+        self: Arc<Self>,
+        partition: Partition,
+        address: Address,
+        dst: &mut crate::CallerBuffer,
+    ) -> Result<(Fragment, PayloadRead), StoreError> {
+        let find = self
+            .find(partition, address)
+            .await
+            .forward_with::<StoreError, _>(|| {
+                format!(
+                    "Failed to query immutable store for get_into {}.",
+                    address.hash
+                )
+            })?;
+
+        let obliterated = find.data.flags & FragmentFlags::PayloadObliterated.bits() != 0;
+        if obliterated || find.matching < self.read_scope() {
+            return Err(StoreError::from(AddressNotFound::from(address)));
+        }
+
+        let mut local_flags = 0;
+        if self.settings.implicit_durable_stored {
+            local_flags |= FragmentFlags::PayloadStoredDurable.bits();
+        }
+
+        let fragment = Fragment {
+            flags: find.data.flags | local_flags,
+            size_payload: find.data.size_payload,
+            size_content: find.data.size_content,
+        };
+
+        crate::validate_fragment_size(&fragment)?;
+
+        if find.data.pack_file == 0 {
+            return Err(StoreError::from(PayloadNotFound::from(address.hash)));
+        }
+
+        if !crate::payload_is_content(&fragment) {
+            let payload = Self::load(&self.group[find.group].packstore, find.data)
+                .await
+                .forward::<StoreError>("Failed to load payload from local storage.")?;
+            crate::validate_fragment_payload(&fragment, payload.len())?;
+            return Ok((fragment, PayloadRead::Returned(payload)));
+        }
+
+        let size_payload = find.data.size_payload as usize;
+        crate::validate_buffer_capacity(size_payload, dst.len())?;
+
+        self.group[find.group]
+            .packstore
+            .load_into(
+                find.data.pack_file,
+                find.data.pack_offset,
+                find.data.size_payload,
+                dst,
+            )
+            .await
+            .forward::<StoreError>(
+                "Failed to load payload into caller buffer from local storage.",
+            )?;
+
+        Ok((fragment, PayloadRead::IntoBuffer))
     }
 
     async fn put(
