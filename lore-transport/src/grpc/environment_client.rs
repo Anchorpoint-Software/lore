@@ -11,10 +11,10 @@ use super::UnauthenticatedService;
 use super::grpc_retry;
 use super::handle_error;
 use crate::error::ProtocolError;
-use crate::types::CompressionMode;
 use crate::types::Endpoint;
 use crate::types::EnvironmentConfig;
 use crate::types::EnvironmentServerConfig;
+use crate::types::ServerCompressionMode;
 
 impl From<lore_proto::lore::environment::v1::Environment> for EnvironmentConfig {
     fn from(value: lore_proto::lore::environment::v1::Environment) -> Self {
@@ -59,7 +59,7 @@ impl From<lore_proto::lore::environment::v1::Environment> for EnvironmentConfig 
                 },
                 compression_mode: config
                     .compression_mode
-                    .map(|mode| CompressionMode::from_u32(mode as u32)),
+                    .map(|mode| ServerCompressionMode::from_u32(mode as u32)),
             }),
         }
     }

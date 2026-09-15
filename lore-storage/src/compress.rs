@@ -5,10 +5,12 @@
 
 #[cfg(feature = "oodle")]
 use std::alloc::Layout;
+use std::ops::RangeInclusive;
 use std::sync::Once;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
 use bytes::BytesMut;
@@ -31,14 +33,25 @@ pub enum FragmentError {
     NotSupported,
 }
 
-#[repr(u32)]
+/// cbindgen:prefix-with-name
+/// cbindgen:rename-all=ScreamingSnakeCase
+#[repr(C)]
+/// The codec a payload is compressed with before it is stored.
+///
+/// Every stored fragment records the codec it was written with, so a mode selected here decides
+/// what later writes use and never what already stored content is read back as.
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq)]
 #[serde(bound(deserialize = "'de: 'static"))]
 pub enum CompressionMode {
+    /// No mode was selected; the built-in default applies, which is Zstd.
     NotSpecified = 0,
+    /// Store payloads verbatim, compressing nothing.
     NoCompression = 1,
+    /// LZ4, which costs less to compress than Zstd and stores more bytes.
     Lz4 = 2,
+    /// Oodle, deprecated and refused: a write under this mode fails.
     Oodle = 3,
+    /// Zstandard, at the configured level.
     Zstd = 4,
 }
 
@@ -55,6 +68,124 @@ impl CompressionMode {
 }
 
 pub static COMPRESSION_MODE: AtomicU32 = AtomicU32::new(0);
+
+/// The mode `value` names, if it names one a payload can be written under.
+///
+/// Read on the value rather than through [`CompressionMode::from_u32`], which answers
+/// `NotSpecified` for anything it does not recognize: a caller that passed a typo would be told
+/// the default had been selected for it. `Oodle` answers `None` with the values no variant
+/// carries, [`compress`] refusing that mode as deprecated whether or not the `oodle` feature is
+/// compiled in, so taking it would only move the failure to the first write.
+pub fn writable_compression_mode(value: u32) -> Option<CompressionMode> {
+    const NOT_SPECIFIED: u32 = CompressionMode::NotSpecified as u32;
+    const NO_COMPRESSION: u32 = CompressionMode::NoCompression as u32;
+    const LZ4: u32 = CompressionMode::Lz4 as u32;
+    const ZSTD: u32 = CompressionMode::Zstd as u32;
+
+    match value {
+        NOT_SPECIFIED => Some(CompressionMode::NotSpecified),
+        NO_COMPRESSION => Some(CompressionMode::NoCompression),
+        LZ4 => Some(CompressionMode::Lz4),
+        ZSTD => Some(CompressionMode::Zstd),
+        _ => None,
+    }
+}
+
+/// Offers `mode` as the mode payloads are compressed under, reporting whether it was taken.
+///
+/// This is how a preference a server states is applied. A mode already selected in this process
+/// outranks it, whether that selection came from the API or from a server reached earlier, and
+/// `NotSpecified` states no preference at all.
+pub fn suggest_compression_mode(mode: CompressionMode) -> bool {
+    apply_mode_suggestion(&COMPRESSION_MODE, mode)
+}
+
+/// Selects `mode` in `selection` unless one has already been made there.
+fn apply_mode_suggestion(selection: &AtomicU32, mode: CompressionMode) -> bool {
+    if matches!(mode, CompressionMode::NotSpecified) {
+        return false;
+    }
+    selection
+        .compare_exchange(
+            CompressionMode::NotSpecified as u32,
+            mode as u32,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        )
+        .is_ok()
+}
+
+/// Selects the level each codec defaults to, no level having been chosen for it.
+pub const DEFAULT_COMPRESSION_LEVEL: i32 = -1;
+
+/// The levels zstd accepts.
+const ZSTD_LEVELS: RangeInclusive<i32> = 1..=22;
+
+/// The level zstd compresses at where nothing configures one.
+const ZSTD_DEFAULT_LEVEL: i32 = 6;
+
+/// The levels Oodle accepts.
+#[cfg(feature = "oodle")]
+const OODLE_LEVELS: RangeInclusive<i32> = 0..=9;
+
+/// The level Oodle compresses at where nothing configures one, `OodleLZ_CompressionLevel_Fast`.
+#[cfg(feature = "oodle")]
+const OODLE_DEFAULT_LEVEL: i32 = 3;
+
+/// Selects the level the codecs compress at, reporting whether the selection is the one in force.
+///
+/// Each codec fixes its level once, the workspace every compression after the first is built in
+/// being sized for it. The level is installed here rather than left for that first compression to
+/// resolve, so a payload racing this call either finds the selection or fixes the level ahead of
+/// it, with no reading of a level this call is about to replace. `false` reports that a payload
+/// fixed the level first, leaving the selection deciding nothing.
+///
+/// [`DEFAULT_COMPRESSION_LEVEL`] installs the level each codec defaults to.
+pub fn set_compression_level(level: i32) -> bool {
+    let selected = selected_level(level);
+    #[cfg(feature = "oodle")]
+    let _ = OODLE_COMPRESSION_LEVEL.set(oodle_level(selected));
+    ZSTD_COMPRESSION_LEVEL.set(zstd_level(selected)).is_ok()
+}
+
+/// The level `level` selects, [`DEFAULT_COMPRESSION_LEVEL`] selecting none.
+fn selected_level(level: i32) -> Option<i32> {
+    (level != DEFAULT_COMPRESSION_LEVEL).then_some(level)
+}
+
+/// The level zstd compresses at, given what was selected for the codecs.
+fn zstd_level(selected: Option<i32>) -> std::ffi::c_int {
+    accepted_compression_level(environment_compression_level(), selected, ZSTD_LEVELS)
+        .unwrap_or(ZSTD_DEFAULT_LEVEL) as std::ffi::c_int
+}
+
+/// The level Oodle compresses at, given what was selected for the codecs.
+#[cfg(feature = "oodle")]
+fn oodle_level(selected: Option<i32>) -> u32 {
+    accepted_compression_level(environment_compression_level(), selected, OODLE_LEVELS)
+        .unwrap_or(OODLE_DEFAULT_LEVEL) as u32
+}
+
+/// The level `LORE_COMPRESSION_LEVEL` names, whether or not a codec accepts it.
+fn environment_compression_level() -> Option<i32> {
+    std::env::var("LORE_COMPRESSION_LEVEL").ok()?.parse().ok()
+}
+
+/// Resolves the level a codec accepting `range` compresses at from the two sources that name one.
+///
+/// `environment` outranks `selected`, so an operator can pin the level of a build that selects one
+/// of its own, and is passed over where it names a level outside `range`. A selection is clamped
+/// into `range` instead: one setting serves every codec and each accepts its own, so a level meant
+/// for one is brought within the other's rather than dropped for it.
+fn accepted_compression_level(
+    environment: Option<i32>,
+    selected: Option<i32>,
+    range: RangeInclusive<i32>,
+) -> Option<i32> {
+    environment
+        .filter(|level| range.contains(level))
+        .or_else(|| selected.map(|level| level.clamp(*range.start(), *range.end())))
+}
 
 pub use lore_base::types::FRAGMENT_SIZE_THRESHOLD;
 
@@ -813,20 +944,13 @@ pub fn decompress_into_slice(
 }
 
 #[cfg(feature = "oodle")]
-static COMPRESSION_LEVEL: OnceLock<u32> = OnceLock::new();
+static OODLE_COMPRESSION_LEVEL: OnceLock<u32> = OnceLock::new();
 
+/// The Oodle level, fixed by whichever of the first payload compressed and
+/// [`set_compression_level`] reaches it first.
 #[cfg(feature = "oodle")]
-fn compression_level() -> u32 {
-    *COMPRESSION_LEVEL.get_or_init(|| {
-        if let Ok(level) = std::env::var("LORE_COMPRESSION_LEVEL")
-            && let Ok(level) = level.parse::<u32>()
-            && level < 10
-        {
-            level
-        } else {
-            3 /* OodleLZ_CompressionLevel_Fast */
-        }
-    })
+fn oodle_compression_level() -> u32 {
+    *OODLE_COMPRESSION_LEVEL.get_or_init(|| oodle_level(None))
 }
 
 /// Returns the maximum compressed size for the given payload length and
@@ -946,7 +1070,7 @@ fn compress_oodle_impl(
     // Save at least 5% to be worth compressing
     let compressed_size_threshold = ((fragment.size_payload as usize) * 95) / 100;
     let compressor = 8 /* OodleLZ_Compressor_Kraken */;
-    let level = compression_level();
+    let level = oodle_compression_level();
 
     let mut scratch_buffer = compress_scratch_buffer();
 
@@ -1026,17 +1150,10 @@ fn compress_lz4_impl(
 
 static ZSTD_COMPRESSION_LEVEL: OnceLock<std::ffi::c_int> = OnceLock::new();
 
+/// The zstd level, fixed by whichever of the first payload compressed and
+/// [`set_compression_level`] reaches it first.
 fn zstd_compression_level() -> std::ffi::c_int {
-    *ZSTD_COMPRESSION_LEVEL.get_or_init(|| {
-        if let Ok(level) = std::env::var("LORE_COMPRESSION_LEVEL")
-            && let Ok(level) = level.parse::<std::ffi::c_int>()
-            && (1..=22).contains(&level)
-        {
-            level
-        } else {
-            6
-        }
-    })
+    *ZSTD_COMPRESSION_LEVEL.get_or_init(|| zstd_level(None))
 }
 
 /// The name zstd gives a return code.
@@ -1505,6 +1622,146 @@ mod tests {
                 0,
                 "the decompressed fragment still carries a compression flag"
             );
+        }
+    }
+
+    /// What a mode a server states it prefers does to the mode payloads are written under.
+    mod suggestions {
+        use super::*;
+
+        /// A selection standing where a suggestion arrives, as one made through the API does.
+        fn selected(mode: CompressionMode) -> AtomicU32 {
+            AtomicU32::new(mode as u32)
+        }
+
+        #[test]
+        fn a_suggestion_is_taken_where_no_mode_is_selected() {
+            let selection = selected(CompressionMode::NotSpecified);
+
+            assert!(apply_mode_suggestion(&selection, CompressionMode::Lz4));
+            assert_eq!(
+                selection.load(Ordering::Relaxed),
+                CompressionMode::Lz4 as u32
+            );
+        }
+
+        #[test]
+        fn a_suggestion_does_not_displace_a_selected_mode() {
+            let selection = selected(CompressionMode::NoCompression);
+
+            assert!(!apply_mode_suggestion(&selection, CompressionMode::Zstd));
+            assert_eq!(
+                selection.load(Ordering::Relaxed),
+                CompressionMode::NoCompression as u32
+            );
+        }
+
+        /// `NotSpecified` states no preference, so it is not a suggestion and leaves the selection
+        /// where it is rather than reporting itself as the mode now in force.
+        #[test]
+        fn no_preference_is_not_a_suggestion() {
+            let selection = selected(CompressionMode::NotSpecified);
+
+            assert!(!apply_mode_suggestion(
+                &selection,
+                CompressionMode::NotSpecified
+            ));
+            assert_eq!(
+                selection.load(Ordering::Relaxed),
+                CompressionMode::NotSpecified as u32
+            );
+        }
+
+        #[test]
+        fn only_the_first_suggestion_decides() {
+            let selection = selected(CompressionMode::NotSpecified);
+
+            assert!(apply_mode_suggestion(&selection, CompressionMode::Lz4));
+            assert!(!apply_mode_suggestion(&selection, CompressionMode::Zstd));
+            assert_eq!(
+                selection.load(Ordering::Relaxed),
+                CompressionMode::Lz4 as u32
+            );
+        }
+
+        #[test]
+        fn every_mode_a_payload_can_be_written_under_is_named() {
+            for (value, mode) in [
+                (0, CompressionMode::NotSpecified),
+                (1, CompressionMode::NoCompression),
+                (2, CompressionMode::Lz4),
+                (4, CompressionMode::Zstd),
+            ] {
+                assert_eq!(writable_compression_mode(value), Some(mode));
+            }
+        }
+
+        /// Oodle and any number no variant carries answer `None` alike, so neither a server nor a
+        /// caller can select a mode the first write would fail on.
+        #[test]
+        fn a_mode_no_payload_can_be_written_under_is_refused() {
+            assert_eq!(writable_compression_mode(3), None);
+            assert_eq!(writable_compression_mode(5), None);
+            assert_eq!(writable_compression_mode(u32::MAX), None);
+        }
+    }
+
+    /// What each source contributes to the level a codec ends up at, over zstd's range and
+    /// Oodle's, which is the narrower of the two.
+    mod levels {
+        use super::*;
+
+        #[test]
+        fn a_level_the_environment_names_outranks_a_selection() {
+            assert_eq!(
+                accepted_compression_level(Some(3), Some(19), 1..=22),
+                Some(3)
+            );
+        }
+
+        #[test]
+        fn a_selection_decides_where_the_environment_names_nothing() {
+            assert_eq!(accepted_compression_level(None, Some(19), 1..=22), Some(19));
+        }
+
+        #[test]
+        fn a_level_outside_the_range_is_not_taken_from_the_environment() {
+            assert_eq!(
+                accepted_compression_level(Some(99), Some(19), 1..=22),
+                Some(19)
+            );
+            assert_eq!(accepted_compression_level(Some(99), None, 1..=22), None);
+        }
+
+        #[test]
+        fn a_selection_outside_the_range_is_clamped_into_it() {
+            assert_eq!(accepted_compression_level(None, Some(99), 1..=22), Some(22));
+            assert_eq!(accepted_compression_level(None, Some(0), 1..=22), Some(1));
+            assert_eq!(accepted_compression_level(None, Some(19), 0..=9), Some(9));
+        }
+
+        #[test]
+        fn nothing_configured_leaves_the_codec_at_its_default() {
+            assert_eq!(accepted_compression_level(None, None, 1..=22), None);
+        }
+
+        #[test]
+        fn the_default_level_selects_none() {
+            assert_eq!(selected_level(DEFAULT_COMPRESSION_LEVEL), None);
+        }
+
+        /// A level below every codec's range is a level, not the absence of one: it selects, and
+        /// each codec clamps it to the lowest that codec accepts.
+        #[test]
+        fn a_level_below_every_range_still_selects() {
+            let selected = selected_level(-5);
+
+            assert_eq!(selected, Some(-5));
+            assert_eq!(
+                accepted_compression_level(None, selected, ZSTD_LEVELS),
+                Some(1)
+            );
+            assert_eq!(accepted_compression_level(None, selected, 0..=9), Some(0));
         }
     }
 }

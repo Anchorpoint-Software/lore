@@ -248,6 +248,23 @@ typedef enum lore_node_staged_action_t {
   LORE_NODE_STAGED_ACTION_COPY = 5,
 } lore_node_staged_action_t;
 
+// The codec a payload is compressed with before it is stored.
+//
+// Every stored fragment records the codec it was written with, so a mode selected here decides
+// what later writes use and never what already stored content is read back as.
+typedef enum lore_compression_mode_t {
+  // No mode was selected; the built-in default applies, which is Zstd.
+  LORE_COMPRESSION_MODE_NOT_SPECIFIED = 0,
+  // Store payloads verbatim, compressing nothing.
+  LORE_COMPRESSION_MODE_NO_COMPRESSION = 1,
+  // LZ4, which costs less to compress than Zstd and stores more bytes.
+  LORE_COMPRESSION_MODE_LZ4 = 2,
+  // Oodle, deprecated and refused: a write under this mode fails.
+  LORE_COMPRESSION_MODE_OODLE = 3,
+  // Zstandard, at the configured level.
+  LORE_COMPRESSION_MODE_ZSTD = 4,
+} lore_compression_mode_t;
+
 // Data for a generic progress event.
 typedef struct lore_progress_event_data_t {
   // Placeholder field; carries no meaningful value.
@@ -12232,3 +12249,45 @@ int32_t lore_revision_tree_commit(const struct lore_global_args_t *globals,
 void lore_revision_tree_commit_async(const struct lore_global_args_t *globals,
                                      const struct lore_revision_tree_commit_args_t *args,
                                      struct lore_event_callback_config_t callback);
+
+// Select how payloads are compressed before they are stored, over
+// `lore_storage::COMPRESSION_MODE`.
+//
+// `mode` is a `lore_compression_mode_t` value, which names what each mode does.
+//
+// The default attempts compression, which is wasted work for a caller whose
+// payloads arrive already compressed: the attempt reads every byte written and
+// buys nothing back. A caller that knows the shape of its own data can say so.
+//
+// Applies to payloads written after the call. Content already stored keeps the
+// encoding it was written with, since every fragment records its own.
+//
+// A mode selected here outranks the one a server states it prefers in the
+// environment it answers a connection with: that preference is taken only where
+// no mode has been selected yet, so a call made before the first connection
+// stands.
+//
+// Returns `0` when the mode was applied and `3`
+// (`LORE_ERROR_CODE_INVALID_ARGUMENTS`) when it was not, in which case the call
+// does nothing. Rejected are any value the enum does not name, and
+// `LORE_COMPRESSION_MODE_OODLE`: `compress` refuses that mode as deprecated
+// whether or not the `oodle` feature is compiled in, so accepting it here would
+// only move the failure to the first write.
+int32_t lore_set_compression_mode(uint32_t mode);
+
+// Select the level payloads are compressed at.
+//
+// `level` is a zstd level, `1` through `22`, trading time spent per byte for
+// bytes stored, or `-1` for the level each codec defaults to, `6` for zstd. A
+// level outside the range a codec accepts is clamped into it, one level serving
+// every codec and each accepting its own, so `0` selects the lowest zstd has.
+//
+// The `LORE_COMPRESSION_LEVEL` environment variable outranks this selection where
+// it names a level the codec accepts.
+//
+// Call before the first payload is written: the level is read once, by the first
+// compression, which sizes the workspace every later one is built in.
+//
+// Returns `0` when the level was selected and `1` when a payload had already
+// fixed it, in which case the selection decides nothing.
+int32_t lore_set_compression_level(int32_t level);

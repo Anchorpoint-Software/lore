@@ -8343,3 +8343,61 @@ pub extern "C" fn lore_revision_tree_commit_async(
         crate::revision_tree::commit::commit,
     );
 }
+
+/// Select how payloads are compressed before they are stored, over
+/// `lore_storage::COMPRESSION_MODE`.
+///
+/// `mode` is a `lore_compression_mode_t` value, which names what each mode does.
+///
+/// The default attempts compression, which is wasted work for a caller whose
+/// payloads arrive already compressed: the attempt reads every byte written and
+/// buys nothing back. A caller that knows the shape of its own data can say so.
+///
+/// Applies to payloads written after the call. Content already stored keeps the
+/// encoding it was written with, since every fragment records its own.
+///
+/// A mode selected here outranks the one a server states it prefers in the
+/// environment it answers a connection with: that preference is taken only where
+/// no mode has been selected yet, so a call made before the first connection
+/// stands.
+///
+/// Returns `0` when the mode was applied and `3`
+/// (`LORE_ERROR_CODE_INVALID_ARGUMENTS`) when it was not, in which case the call
+/// does nothing. Rejected are any value the enum does not name, and
+/// `LORE_COMPRESSION_MODE_OODLE`: `compress` refuses that mode as deprecated
+/// whether or not the `oodle` feature is compiled in, so accepting it here would
+/// only move the failure to the first write.
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_set_compression_mode(mode: u32) -> i32 {
+    use lore_revision::event::LoreErrorCode;
+
+    if lore_storage::writable_compression_mode(mode).is_none() {
+        return LoreErrorCode::InvalidArguments as i32;
+    }
+    lore_storage::COMPRESSION_MODE.store(mode, std::sync::atomic::Ordering::Relaxed);
+    LoreErrorCode::None as i32
+}
+
+/// Select the level payloads are compressed at.
+///
+/// `level` is a zstd level, `1` through `22`, trading time spent per byte for
+/// bytes stored, or `-1` for the level each codec defaults to, `6` for zstd. A
+/// level outside the range a codec accepts is clamped into it, one level serving
+/// every codec and each accepting its own, so `0` selects the lowest zstd has.
+///
+/// The `LORE_COMPRESSION_LEVEL` environment variable outranks this selection where
+/// it names a level the codec accepts.
+///
+/// Call before the first payload is written: the level is read once, by the first
+/// compression, which sizes the workspace every later one is built in.
+///
+/// Returns `0` when the level was selected and `1` when a payload had already
+/// fixed it, in which case the selection decides nothing.
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_set_compression_level(level: i32) -> i32 {
+    if lore_storage::set_compression_level(level) {
+        lore_revision::event::LoreErrorCode::None as i32
+    } else {
+        1
+    }
+}

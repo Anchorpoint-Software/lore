@@ -74,10 +74,13 @@ exclude = ["FileInfo", "FilterState", "FilterStates"]
 # `LoreNodeStagedAction` names the values of the `staged_action` field on the
 # child and node-info records; the field is a `uint32_t` there, as `kind` is, so
 # nothing declares the enum type and cbindgen cannot reach it on its own.
+# `CompressionMode` names the values `lore_set_compression_mode` takes, whose
+# parameter is a `uint32_t` for the same reason.
 include = [
     "LoreStore",
     "LoreRevisionTree",
     "LoreNodeStagedAction",
+    "CompressionMode",
     "LoreRevisionTreeLoadArgs",
     "LoreRevisionTreeCloseArgs",
     "LoreRevisionTreeResolvePathArgs",
@@ -99,6 +102,7 @@ include = [
 [export.rename]
 "Address" = "lore_address_t"
 "BranchId" = "lore_branch_id_t"
+"CompressionMode" = "lore_compression_mode_t"
 "Context" = "lore_context_t"
 "Fragment" = "lore_fragment_t"
 "Hash" = "lore_hash_t"

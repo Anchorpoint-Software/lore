@@ -44,6 +44,9 @@ pub use compress::FragmentError;
 pub use compress::compress;
 pub use compress::decompress;
 pub use compress::decompress_into_slice;
+pub use compress::set_compression_level;
+pub use compress::suggest_compression_mode;
+pub use compress::writable_compression_mode;
 // Re-export concurrency primitives
 pub use concurrency::FILE_COUNT_LIMIT_DEFAULT;
 pub use concurrency::FRAGMENT_BUDGET_KIB;

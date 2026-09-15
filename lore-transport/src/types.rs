@@ -20,6 +20,15 @@ impl EnvironmentConfig {
         self.config.as_ref().and_then(|c| c.max_query_batch)
     }
 
+    /// The compression mode the server states it prefers, as the number it sent. The codec that
+    /// number names is `lore_storage::CompressionMode`, which this crate does not depend on.
+    pub fn compression_mode(&self) -> Option<u32> {
+        self.config
+            .as_ref()
+            .and_then(|config| config.compression_mode.as_ref())
+            .map(ServerCompressionMode::as_u32)
+    }
+
     /// Per-service endpoint URL. If the environment's `endpoint.storage_url`
     /// is set and non-empty, it overrides `fallback`; otherwise `fallback` is
     /// returned unchanged. Same contract for the other `*_url` methods below.
@@ -85,13 +94,15 @@ pub struct Endpoint {
     pub notification_url: Option<String>,
 }
 
+/// A compression mode as it arrives from a server, held as the number it was sent as: the codec
+/// it names is `lore_storage::CompressionMode`, which this crate does not depend on.
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(bound(deserialize = "'de: 'static"))]
-pub struct CompressionMode(u32);
+pub struct ServerCompressionMode(u32);
 
-impl CompressionMode {
+impl ServerCompressionMode {
     pub fn from_u32(value: u32) -> Self {
-        CompressionMode(value)
+        ServerCompressionMode(value)
     }
 
     pub fn as_u32(&self) -> u32 {
@@ -103,7 +114,7 @@ impl CompressionMode {
 #[serde(bound(deserialize = "'de: 'static"))]
 pub struct EnvironmentServerConfig {
     pub max_query_batch: Option<usize>,
-    pub compression_mode: Option<CompressionMode>,
+    pub compression_mode: Option<ServerCompressionMode>,
 }
 
 // ---------------------------------------------------------------------------
