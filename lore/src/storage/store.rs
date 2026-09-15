@@ -23,7 +23,6 @@ use lore_base::types::Partition;
 use lore_storage::ImmutableStore;
 use lore_storage::MutableStore;
 use lore_storage::options::ReadOptions;
-use lore_transport::ProtocolError;
 use lore_transport::StorageSession;
 use tokio::sync::Notify;
 
@@ -244,12 +243,7 @@ impl StoreInternal {
         let remote = self.remote.clone()?;
         let session = StorageSession::pending(move || {
             let remote = remote.clone();
-            async move {
-                remote
-                    .session(partition)
-                    .await
-                    .map_err(|err| ProtocolError::internal(format!("remote session: {err}")))
-            }
+            async move { remote.session(partition).await }
         });
         Some(Arc::new(session))
     }
