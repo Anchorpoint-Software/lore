@@ -23,6 +23,7 @@ use crate::filter::FilterMode;
 use crate::find;
 use crate::fs::filesystem_provider::FilesystemProvider;
 use crate::fs::filesystem_provider::FsError;
+use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::with_operation;
 use crate::history;
@@ -42,16 +43,13 @@ use crate::lore_trace;
 use crate::node::Node;
 use crate::progress::DiscoveryStats;
 use crate::repository;
-use crate::repository::BASE_SUFFIX;
-use crate::repository::MINE_SUFFIX;
+use crate::repository::MERGE_ARTIFACT_SUFFIXES;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
-use crate::repository::THEIRS_SUFFIX;
 use crate::revision;
 use crate::state;
 use crate::state::RecordedModifiedTimes;
 use crate::state::State;
-use crate::util;
 use crate::util::path::RelativePath;
 use crate::util::serde::u8_as_bool;
 
@@ -1107,68 +1105,164 @@ pub async fn realize_scratch_file(
     crate::fs::realize::realize_scratch_file(repository, path, node, stats).await
 }
 
-pub async fn exist_merge_mine_theirs_base(absolute_path: impl AsRef<Path>) -> bool {
-    if let Some(file_name) = absolute_path.as_ref().file_name() {
-        let mut mine_name = file_name.to_os_string();
-        mine_name.push(MINE_SUFFIX);
-
-        let mut absolute_path = absolute_path.as_ref().to_path_buf();
-        absolute_path.set_file_name(mine_name);
-        if lore_io::IoDriver::global()
-            .metadata(&absolute_path)
+/// Whether the working tree holds any of the copies a conflicted merge left beside `path`.
+pub async fn exist_merge_artifacts(operation: &InstanceOperationImpl, path: &RelativePath) -> bool {
+    for suffix in MERGE_ARTIFACT_SUFFIXES {
+        let artifact = path.append_into_buf(suffix).freeze();
+        if operation
+            .untracked_file_info(&artifact)
             .await
-            .is_ok_and(|m| m.is_file())
+            .is_ok_and(|info| info.is_file())
         {
             return true;
         }
+    }
+    false
+}
 
-        let mut theirs_name = file_name.to_os_string();
-        theirs_name.push(THEIRS_SUFFIX);
-
-        absolute_path.set_file_name(theirs_name);
-        if lore_io::IoDriver::global()
-            .metadata(&absolute_path)
-            .await
-            .is_ok_and(|m| m.is_file())
-        {
-            return true;
-        }
-
-        let mut base_name = file_name.to_os_string();
-        base_name.push(BASE_SUFFIX);
-
-        absolute_path.set_file_name(base_name);
-        lore_io::IoDriver::global()
-            .metadata(absolute_path)
-            .await
-            .is_ok_and(|m| m.is_file())
-    } else {
-        false
+/// Removes the copies a conflicted merge left beside `path`.
+///
+/// Failures are ignored: a copy that cannot be removed is left for the next existence check
+/// to find.
+pub async fn unlink_merge_artifacts(operation: &InstanceOperationImpl, path: &RelativePath) {
+    for suffix in MERGE_ARTIFACT_SUFFIXES {
+        let artifact = path.append_into_buf(suffix).freeze();
+        lore_trace!("Delete merge artifact file {artifact}");
+        let _ = operation.remove(&artifact).await;
     }
 }
 
-pub async fn unlink_merge_mine_theirs_base(absolute_path: impl AsRef<Path>) {
-    if let Some(file_name) = absolute_path.as_ref().file_name() {
-        let mut mine_name = file_name.to_os_string();
-        mine_name.push(MINE_SUFFIX);
+/// [`unlink_merge_artifacts`] for a caller holding no filesystem operation to remove the
+/// copies through.
+///
+/// A commit holds none: it names the files it fragments by absolute path throughout.
+pub async fn unlink_merge_artifacts_by_path(absolute_path: &Path) {
+    let Some(file_name) = absolute_path.file_name() else {
+        return;
+    };
+    let mut artifact = absolute_path.to_path_buf();
+    for suffix in MERGE_ARTIFACT_SUFFIXES {
+        let mut name = file_name.to_os_string();
+        name.push(suffix);
+        artifact.set_file_name(name);
+        lore_trace!("Delete merge artifact file {}", artifact.display());
+        let _ = crate::util::fs::unlink(artifact.as_path()).await;
+    }
+}
 
-        let mut theirs_name = file_name.to_os_string();
-        theirs_name.push(THEIRS_SUFFIX);
+#[cfg(test)]
+#[allow(clippy::disallowed_methods)] // Test fixtures writing the copies in a temporary directory.
+mod tests {
+    use lore_base::test_util::TempDir;
 
-        let mut base_name = file_name.to_os_string();
-        base_name.push(BASE_SUFFIX);
+    use super::*;
+    use crate::fs::filesystem_provider::tests::TestFilesystemProvider;
+    use crate::fs::os::OsFilesystem;
+    use crate::repository::MINE_SUFFIX;
 
-        let mut absolute_path = absolute_path.as_ref().to_path_buf();
-        absolute_path.set_file_name(mine_name);
-        lore_trace!("Delete merge artifact file {}", absolute_path.display());
-        let _ = util::fs::unlink(absolute_path.as_path()).await;
+    /// An operation rooted at `root`, which is what the helpers name their paths against.
+    async fn os_operation(root: &Path) -> Arc<InstanceOperationImpl> {
+        FilesystemProvider::begin_operation(&OsFilesystem::new(root))
+            .await
+            .expect("beginning an operation over the OS filesystem")
+    }
 
-        absolute_path.set_file_name(theirs_name);
-        lore_trace!("Delete merge artifact file {}", absolute_path.display());
-        let _ = util::fs::unlink(absolute_path.as_path()).await;
+    fn relative(path: &str) -> RelativePath {
+        RelativePath::new_from_initial_path(path).expect("relative path")
+    }
 
-        absolute_path.set_file_name(base_name);
-        lore_trace!("Delete merge artifact file {}", absolute_path.display());
-        let _ = util::fs::unlink(absolute_path.as_path()).await;
+    /// Every copy on its own, so a helper that reads one suffix and stops is not mistaken for
+    /// one that reads all three.
+    #[tokio::test]
+    async fn a_copy_under_any_suffix_is_found() {
+        for suffix in MERGE_ARTIFACT_SUFFIXES {
+            let dir = TempDir::new("lore-merge-artifact-");
+            let operation = os_operation(dir.path()).await;
+            std::fs::write(dir.path().join(format!("file.txt{suffix}")), b"side")
+                .expect("write copy");
+
+            assert!(
+                exist_merge_artifacts(&operation, &relative("file.txt")).await,
+                "the copy under {suffix} was not found"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_file_no_merge_left_copies_beside_reports_none() {
+        let dir = TempDir::new("lore-merge-artifact-");
+        let operation = os_operation(dir.path()).await;
+        std::fs::write(dir.path().join("file.txt"), b"merged").expect("write file");
+
+        assert!(!exist_merge_artifacts(&operation, &relative("file.txt")).await);
+    }
+
+    /// The file the copies belong to is not one of them, and stays.
+    #[tokio::test]
+    async fn removing_takes_every_copy_and_leaves_the_file() {
+        let dir = TempDir::new("lore-merge-artifact-");
+        let operation = os_operation(dir.path()).await;
+        std::fs::write(dir.path().join("file.txt"), b"merged").expect("write file");
+        for suffix in MERGE_ARTIFACT_SUFFIXES {
+            std::fs::write(dir.path().join(format!("file.txt{suffix}")), b"side")
+                .expect("write copy");
+        }
+
+        unlink_merge_artifacts(&operation, &relative("file.txt")).await;
+
+        assert!(!exist_merge_artifacts(&operation, &relative("file.txt")).await);
+        for suffix in MERGE_ARTIFACT_SUFFIXES {
+            assert!(
+                !dir.path().join(format!("file.txt{suffix}")).exists(),
+                "the copy under {suffix} was left behind"
+            );
+        }
+        assert!(
+            dir.path().join("file.txt").exists(),
+            "the file the copies belong to was removed"
+        );
+    }
+
+    /// Read from the working tree rather than from the tree the path is tracked in: a
+    /// provider serving tracked content virtually holds no node for a sidecar, so one asked
+    /// through [`InstanceOperation::file_info`] answers that every copy is absent.
+    #[tokio::test]
+    async fn a_copy_is_looked_for_outside_the_tracked_tree() {
+        let provider = Arc::new(TestFilesystemProvider::holding_every_path());
+        let operation = provider
+            .begin_operation()
+            .await
+            .expect("beginning an operation over the test provider");
+
+        assert!(exist_merge_artifacts(&operation, &relative("file.txt")).await);
+        assert_eq!(
+            0,
+            provider.file_infos(),
+            "the copies were looked up through the tracked tree"
+        );
+    }
+
+    /// A path under a directory, so the suffix lands on the name rather than anywhere in the
+    /// path it is reached by.
+    #[tokio::test]
+    async fn a_copy_beside_a_nested_file_is_found_and_removed() {
+        let dir = TempDir::new("lore-merge-artifact-");
+        let operation = os_operation(dir.path()).await;
+        std::fs::create_dir_all(dir.path().join("sub")).expect("create directory");
+        let copy = dir
+            .path()
+            .join("sub")
+            .join(format!("file.txt{MINE_SUFFIX}"));
+        std::fs::write(&copy, b"side").expect("write copy");
+
+        let nested = relative("sub/file.txt");
+        assert!(exist_merge_artifacts(&operation, &nested).await);
+
+        unlink_merge_artifacts(&operation, &nested).await;
+
+        assert!(
+            !copy.exists(),
+            "the copy beside a nested file was left behind"
+        );
     }
 }

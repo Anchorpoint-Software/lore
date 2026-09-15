@@ -61,7 +61,9 @@ pub use concurrency::file_count_limit_acquire;
 pub use concurrency::file_count_limiter;
 pub use concurrency::fragment_limiter;
 pub use concurrency::fragment_permit_count;
+pub use content::ContentHandle;
 pub use content::ContentSource;
+pub use content::WindowRead;
 // Re-export new read/write/defragment types
 pub use defragment::DefragmentSink;
 pub use error::StorageError;

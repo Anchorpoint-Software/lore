@@ -1050,12 +1050,58 @@ async fn mark_children_moved(
     mark_children_moved_recursive(repository, state, parent_node, move_flag).await
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Marks each of `paths` as merged, reporting the counts staged so far while one runs.
+///
+/// One ticker covers the whole run rather than one per path, so the progress reported is
+/// periodic in time rather than in paths.
+async fn stage_merge_paths(
+    operation: &Arc<InstanceOperationImpl>,
+    repository: &Arc<RepositoryContext>,
+    state_stage: &Arc<State>,
+    state_merge: &Arc<State>,
+    paths: &LoreArray<LoreString>,
+    stats: &Arc<StageStats>,
+) -> Result<(), StageError> {
+    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(500));
+    for path in paths.as_slice() {
+        let Some(relative_path) = normalize_stage_path(repository, path).await else {
+            continue;
+        };
+
+        // TODO(mjansson): Layers
+
+        // TODO(vri): UCS-17955 - Merging and conflict resolution for links
+        let mut task = lore_spawn!(stage::stage_merge_path(
+            operation.clone(),
+            repository.clone(),
+            state_stage.clone(),
+            state_merge.clone(),
+            relative_path.clone(),
+            stats.clone(),
+        ));
+
+        let result = loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    event::LoreEvent::FileStageProgress(LoreFileStageProgressEventData {
+                        count: LoreFileStageCountData::new(stats.clone()),
+                    }).send();
+                },
+                result = &mut task => {
+                    break result.map_err(|e| StageError::internal_with_context(e, "Failed to join task"))?;
+                }
+            }
+        };
+
+        result?;
+    }
+    Ok(())
+}
+
 pub async fn stage_merge(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     paths: LoreArray<LoreString>,
-    options: StageOptions,
 ) -> Result<Hash, StageError> {
     let (state_current, state_staged, _branch) =
         state::State::deserialize_current_and_staged(repository.clone())
@@ -1076,41 +1122,21 @@ pub async fn stage_merge(
     })
     .send();
 
-    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(500));
     let stats = Arc::new(StageStats::default());
-    for path in paths.as_slice() {
-        let Some(relative_path) = normalize_stage_path(&repository, path).await else {
-            continue;
-        };
-
-        // TODO(mjansson): Layers
-
-        lore_debug!("Stage merge options: {:?}", options);
-        let mut task = lore_spawn!(stage::stage_merge_path(
-            repository.clone(),
-            state_stage.clone(),
-            state_merge.clone(),
-            relative_path.clone(),
-            stats.clone(),
-            options,
-            None, // TODO(vri): UCS-17955 - Merging and conflict resolution for links
-        ));
-
-        let result = loop {
-            tokio::select! {
-                _ = ticker.tick() => {
-                    event::LoreEvent::FileStageProgress(LoreFileStageProgressEventData {
-                        count: LoreFileStageCountData::new(stats.clone()),
-                    }).send();
-                },
-                result = &mut task => {
-                    break result.map_err(|e| StageError::internal_with_context(e, "Failed to join task"))?;
-                }
-            }
-        };
-
-        result?;
-    }
+    // One operation covers every path: one per path would freeze a filesystem per path.
+    // Nothing is written: the conflict is recorded in the staged state.
+    with_operation(repository.file_system(), false, async |operation| {
+        stage_merge_paths(
+            &operation,
+            &repository,
+            &state_stage,
+            &state_merge,
+            &paths,
+            &stats,
+        )
+        .await
+    })
+    .await?;
 
     // TODO(vri): UCS-17955 - Merging and conflict resolution for links
     // Serialize all staged links states recursively

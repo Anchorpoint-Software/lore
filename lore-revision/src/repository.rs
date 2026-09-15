@@ -1456,6 +1456,13 @@ pub const BASE_SUFFIX: &str = "~base";
 pub const THEIRS_SUFFIX: &str = "~theirs";
 pub const MINE_SUFFIX: &str = "~mine";
 
+/// The suffixes a conflicted merge names its copies of a file with, beside the file itself in
+/// the working tree.
+///
+/// A conflict writes only the sides it has, so fewer than three may be present, and a clean
+/// automerge removes the ones it wrote.
+pub const MERGE_ARTIFACT_SUFFIXES: [&str; 3] = [MINE_SUFFIX, THEIRS_SUFFIX, BASE_SUFFIX];
+
 pub fn get_dot_lore_path(path: &std::path::Path) -> Result<PathBuf, InvalidPath> {
     if let Some(mount_manager) = MountManagerState::mount_manager() {
         match mount_manager.check_for_external_lore_dir(path) {

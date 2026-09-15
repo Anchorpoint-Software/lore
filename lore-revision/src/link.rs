@@ -18,7 +18,7 @@ use crate::errors::*;
 use crate::event;
 use crate::event::EventError;
 use crate::filter::FilterMode;
-use crate::fs::filesystem_provider::InstanceOperation;
+use crate::fs::filesystem_provider::with_operation;
 use crate::interface::LoreError;
 use crate::interface::LoreFileAction;
 use crate::interface::LoreString;
@@ -1086,7 +1086,7 @@ pub async fn drain_link_tracker(
 /// mount path, regardless of any state-to-state diff.
 ///
 /// Restore on-disk content for `paths` (link-relative) from `link_state`
-/// and unlink any `.mine`/`.theirs`/`.base` sidecars at the same paths.
+/// and unlink any `~mine`/`~theirs`/`~base` sidecars at the same paths.
 ///
 /// Used during merge abort to clean up filesystem-only artifacts: marker
 /// bytes inside conflicted file contents and sidecar files. The
@@ -1095,7 +1095,8 @@ pub async fn drain_link_tracker(
 /// produced by `realize_changes` — they're produced by `realize_conflicts`).
 ///
 /// `link_path` is the link's mount path in the parent repository. Paths
-/// are remapped under it for absolute filesystem access.
+/// are mount-prefixed under it, which is how the parent's filesystem
+/// operation names them.
 pub async fn restore_link_paths_from_state(
     repository: Arc<RepositoryContext>,
     link_context: Arc<RepositoryContext>,
@@ -1107,51 +1108,40 @@ pub async fn restore_link_paths_from_state(
         return Ok(());
     }
 
-    let operation = repository
-        .file_system()
-        .begin_operation()
-        .await
-        .forward::<LinkError>("Failed starting filesystem operation")?;
+    with_operation(repository.file_system(), true, async |operation| {
+        for link_relative in paths {
+            let mount_path = link_path.join(link_relative.as_str());
+            sync::unlink_merge_artifacts(&operation, &mount_path).await;
 
-    for link_relative in paths {
-        let mount_path = link_path.join(link_relative.as_str());
-        sync::unlink_merge_mine_theirs_base(
-            mount_path.to_absolute_path(repository.require_path()?),
-        )
-        .await;
-
-        let node_link = link_state
-            .find_node_link(link_context.clone(), link_relative.as_str())
+            let node_link = link_state
+                .find_node_link(link_context.clone(), link_relative.as_str())
+                .await
+                .forward::<LinkError>("Failed resolving link node")?;
+            if !node_link.is_valid_or_root() {
+                continue;
+            }
+            let block = link_state
+                .block(link_context.clone(), NodeBlock::index(node_link.node))
+                .await
+                .forward::<LinkError>("Failed deserializing state node block")?;
+            let node = block.node(Node::index(node_link.node));
+            if !node.is_file() {
+                continue;
+            }
+            crate::fs::realize::realize_file(
+                link_context.clone(),
+                operation.clone(),
+                &mount_path,
+                node,
+                Arc::default(),
+            )
             .await
-            .forward::<LinkError>("Failed resolving link node")?;
-        if !node_link.is_valid_or_root() {
-            continue;
+            .forward::<LinkError>("Failed synchronizing link changes")?;
         }
-        let block = link_state
-            .block(link_context.clone(), NodeBlock::index(node_link.node))
-            .await
-            .forward::<LinkError>("Failed deserializing state node block")?;
-        let node = block.node(Node::index(node_link.node));
-        if !node.is_file() {
-            continue;
-        }
-        crate::fs::realize::realize_file(
-            link_context.clone(),
-            operation.clone(),
-            &mount_path,
-            node,
-            Arc::default(),
-        )
-        .await
-        .forward::<LinkError>("Failed synchronizing link changes")?;
-    }
 
-    operation
-        .finalize(true)
-        .await
-        .forward::<LinkError>("Failed finalizing filesystem operation")?;
-
-    Ok(())
+        Ok(())
+    })
+    .await
 }
 
 /// Returns the absolute path of every staged link node (add, delete, or
@@ -1367,61 +1357,53 @@ pub async fn realize_link_pin_change(
     .forward::<LinkError>("Failed syncing target link")?;
     let changes = Arc::new(changes);
 
-    let operation = repository
-        .file_system()
-        .begin_operation()
-        .await
-        .forward::<LinkError>("Failed starting filesystem operation")?;
+    with_operation(repository.file_system(), true, async |operation| {
+        let changes = if !changes.is_empty() {
+            lore_info!(
+                "Verifying {} link changes with local file system",
+                changes.len()
+            );
 
-    let changes = if !changes.is_empty() {
-        lore_info!(
-            "Verifying {} link changes with local file system",
-            changes.len()
-        );
+            let options = Arc::new(SyncOptions {
+                revision: Some(new_sig.to_string()),
+                ..Default::default()
+            });
 
-        let options = Arc::new(SyncOptions {
-            revision: Some(new_sig.to_string()),
-            ..Default::default()
-        });
+            sync_verify_filesystem(
+                link_context.clone(),
+                Arc::new(SyncVerifyArgs {
+                    changes: changes.clone(),
+                    repository_current: link_context.clone(),
+                    operation: operation.clone(),
+                    current: current_tree,
+                    options: options.clone(),
+                }),
+            )
+            .await
+            .forward::<LinkError>("Failed verifying local file system")?
+        } else {
+            changes
+        };
 
-        sync_verify_filesystem(
-            link_context.clone(),
-            Arc::new(SyncVerifyArgs {
-                changes: changes.clone(),
-                repository_current: link_context.clone(),
-                operation: operation.clone(),
-                current: current_tree,
-                options: options.clone(),
-            }),
+        let stats: Arc<sync::SyncRealizeStats> = Arc::default();
+
+        lore_debug!("Realize link changes");
+
+        crate::fs::realize::realize_changes(
+            repository,
+            operation.clone(),
+            changes,
+            None,
+            false, /* Not dry run */
+            false, /* Not a merge */
+            stats,
         )
         .await
-        .forward::<LinkError>("Failed verifying local file system")?
-    } else {
-        changes
-    };
+        .forward::<LinkError>("Failed synchronizing link changes")?;
 
-    let stats: Arc<sync::SyncRealizeStats> = Arc::default();
-
-    lore_debug!("Realize link changes");
-
-    crate::fs::realize::realize_changes(
-        repository,
-        operation.clone(),
-        changes,
-        None,
-        false, /* Not dry run */
-        false, /* Not a merge */
-        stats,
-    )
+        Ok(())
+    })
     .await
-    .forward::<LinkError>("Failed synchronizing link changes")?;
-
-    operation
-        .finalize(true)
-        .await
-        .forward::<LinkError>("Failed finalizing filesystem operation")?;
-
-    Ok(())
 }
 
 /// Result of resolving a link path to its full context.

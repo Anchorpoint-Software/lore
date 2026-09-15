@@ -2787,7 +2787,7 @@ async fn try_auto_resolve_conflict(
             .await;
     }
 
-    if !crate::infer::infer_is_diffable_by_path(&theirs_path)
+    if !crate::infer::infer_is_diffable(&lore_storage::ContentSource::file(&theirs_path))
         .await
         .unwrap_or(false)
     {

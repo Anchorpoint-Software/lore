@@ -614,15 +614,7 @@ async fn stage_merge_local(
         args,
         stage_merge,
         move |repository, token, args| async move {
-            let options = StageOptions {
-                case_change: stage::StageCaseChange::Error,
-                node_flags: node::NodeFlags::NoFlags,
-                file_id: None,
-                no_children: false,
-                scan: true,
-            };
-
-            file::stage::stage_merge(repository, &token, args.paths, options).await
+            file::stage::stage_merge(repository, &token, args.paths).await
         },
     )
     .await

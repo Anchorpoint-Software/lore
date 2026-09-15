@@ -480,36 +480,34 @@ pub async fn add(
         .await
         .internal("Failed to create the target directory for layer")?;
 
-    let layer_operation = layer_repository
-        .file_system()
-        .begin_operation()
-        .await
-        .forward::<LayerError>("Failed to start operation")?;
-    let clone_ctx = CloneContext {
-        repository: layer_repository.clone(),
-        state: layer_state,
-        operation: layer_operation.clone(),
-        options: Arc::new(clone::CloneOptions {
-            ignore_existing: false,
-            ..Default::default()
-        }),
-        stats: Arc::default(),
-        modified_times: Arc::new(crate::state::RecordedModifiedTimes::default()),
-    };
-    let target_states = layer_repository.filter.mount_states(&target_path);
-    clone::clone_node(
-        clone_ctx,
-        layer_storage,
-        target_path,
-        layer_node_link.node,
-        target_states,
+    with_operation(
+        layer_repository.file_system(),
+        true,
+        async |layer_operation| {
+            let clone_ctx = CloneContext {
+                repository: layer_repository.clone(),
+                state: layer_state,
+                operation: layer_operation.clone(),
+                options: Arc::new(clone::CloneOptions {
+                    ignore_existing: false,
+                    ..Default::default()
+                }),
+                stats: Arc::default(),
+                modified_times: Arc::new(crate::state::RecordedModifiedTimes::default()),
+            };
+            let target_states = layer_repository.filter.mount_states(&target_path);
+            clone::clone_node(
+                clone_ctx,
+                layer_storage,
+                target_path,
+                layer_node_link.node,
+                target_states,
+            )
+            .await
+            .forward::<LayerError>("Failed cloning target layer")
+        },
     )
-    .await
-    .forward::<LayerError>("Failed cloning target layer")?;
-    layer_operation
-        .finalize(true)
-        .await
-        .forward::<LayerError>("Failed to finalize operation")?;
+    .await?;
 
     save_config(token, &config_path, &config).await?;
 

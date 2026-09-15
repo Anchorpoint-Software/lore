@@ -151,6 +151,10 @@ impl InstanceOperation for SwfsOperation {
 
     fake_with_os!(remove, (), _path: &RelativePath,);
 
+    // A file the revision does not track is written to disk rather than to the mount, which
+    // holds no node to answer for it.
+    fake_with_os!(untracked_file_info, FileInfo, _path: &RelativePath,);
+
     fake_with_os!(copy_file, (),
         _source_path: &RelativePath,
         _destination_path: &RelativePath,

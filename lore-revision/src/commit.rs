@@ -2424,7 +2424,7 @@ async fn commit_file(
         }
         // Check if file has conflict markers remaining
         let absolute_path = relative_path.to_absolute_path(repository.require_path()?);
-        if infer::infer_is_conflicted_by_path(absolute_path.as_path())
+        if infer::infer_is_conflicted(&lore_storage::ContentSource::file(absolute_path.as_path()))
             .await
             .internal_with(|| format!("Failed reading file {}", relative_path.as_str()))?
         {
@@ -2435,7 +2435,7 @@ async fn commit_file(
         }
         // Clean up theirs/base files
         if !execution_context().globals().dry_run() {
-            sync::unlink_merge_mine_theirs_base(absolute_path.as_path()).await;
+            sync::unlink_merge_artifacts_by_path(absolute_path.as_path()).await;
         }
     }
 

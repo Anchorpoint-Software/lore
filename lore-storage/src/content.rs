@@ -16,10 +16,22 @@ use crate::errors::InvalidArguments;
 /// The window a read fills, owned by the operation for its whole flight and handed back
 /// with it. A single segment: the read lands in `buffer[start..start + want]`, leaving
 /// anything in front of it as headroom for bytes the caller carries over itself.
-pub(crate) struct WindowRead {
+pub struct WindowRead {
     pub(crate) buffer: BytesMut,
     pub(crate) start: usize,
     pub(crate) want: usize,
+}
+
+impl WindowRead {
+    /// A read of `want` bytes landing at `start`, which `buffer` must already hold room for:
+    /// the read fills what it was asked for or fails, and never grows the buffer to do it.
+    pub fn new(buffer: BytesMut, start: usize, want: usize) -> Self {
+        Self {
+            buffer,
+            start,
+            want,
+        }
+    }
 }
 
 impl lore_io::StableBufListMut for WindowRead {
@@ -111,8 +123,8 @@ impl<'a> ContentSource<'a> {
         let path = self.host_path();
         let mut retry = crate::retry(10, 10_000, 10);
         loop {
-            match open_read(path).await {
-                Ok((file, size)) => return Ok((ContentHandle::File(file), size)),
+            match self.open_once().await {
+                Ok(opened) => return Ok(opened),
                 Err(err)
                     if matches!(
                         err.kind(),
@@ -133,6 +145,16 @@ impl<'a> ContentSource<'a> {
                 }
             }
         }
+    }
+
+    /// One attempt at what [`open`](Self::open) retries, for a caller whose answer to a failed
+    /// open is to stop rather than to wait.
+    ///
+    /// A scan reporting content it cannot read as clean spends nothing on a back-off it will
+    /// discard the outcome of, and one running per path in a walk would spend it per path.
+    pub async fn open_once(&self) -> std::io::Result<(ContentHandle, u64)> {
+        let (file, size) = open_read(self.host_path()).await?;
+        Ok((ContentHandle::File(file), size))
     }
 
     /// The host path the content is read from, where it is read from one.
@@ -169,10 +191,11 @@ impl std::fmt::Display for ContentSource<'_> {
 /// A chunker issues the next read while the current window is being cut, so it reads through a
 /// handle of its own: cloning one is cheap and a read borrows nothing.
 ///
-/// Produced by [`ContentSource::open`] and read by chunking and comparison, none of which is
-/// outside this crate, so naming one is not part of a caller's vocabulary.
+/// Produced by [`ContentSource::open`] or [`ContentSource::open_once`]. Read by chunking and
+/// comparison here, and by a caller elsewhere scanning content it must not name a host path
+/// for.
 #[derive(Clone)]
-pub(crate) enum ContentHandle {
+pub enum ContentHandle {
     /// A file on the host, read through the IO driver.
     File(lore_io::IoFile),
     /// Content a virtualizing library holds, open. Unreachable until one is named.
@@ -185,15 +208,13 @@ impl ContentHandle {
     ///
     /// Reads through the handle rather than naming the content again, so opening it is what the
     /// open already did.
-    pub(crate) async fn read_all(&self, size: usize) -> std::io::Result<Bytes> {
+    pub async fn read_all(&self, size: usize) -> std::io::Result<Bytes> {
         // SAFETY: the read fills the buffer whole before anything reads a byte of it.
         let buffer = unsafe { lore_io::uninit_buffer(size) };
-        let window = WindowRead {
-            buffer,
-            start: 0,
-            want: size,
-        };
-        Ok(self.read_window(window, 0).await?.freeze())
+        Ok(self
+            .read_window(WindowRead::new(buffer, 0, size), 0)
+            .await?
+            .freeze())
     }
 
     /// Fills `window.buffer[window.start .. window.start + window.want]` from `offset` and hands
@@ -201,11 +222,7 @@ impl ContentHandle {
     ///
     /// Exact: a read either fills what was asked for or fails, so no caller reasons about a short
     /// one. The buffer is the caller's, so a walk reuses it rather than allocating per window.
-    pub(crate) async fn read_window(
-        &self,
-        window: WindowRead,
-        offset: u64,
-    ) -> std::io::Result<BytesMut> {
+    pub async fn read_window(&self, window: WindowRead, offset: u64) -> std::io::Result<BytesMut> {
         match self {
             ContentHandle::File(file) => {
                 Ok(file.read_exact_vectored_at(window, offset).await?.buffer)

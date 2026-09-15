@@ -31,7 +31,7 @@ use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::with_operation;
 use crate::hash;
-use crate::infer::infer_is_conflicted_by_path;
+use crate::infer::infer_is_conflicted;
 use crate::interface::LoreArray;
 use crate::interface::LoreFileAction;
 use crate::interface::LoreString;
@@ -247,6 +247,21 @@ pub struct StageStats {
     directory_checked_count: AtomicU64,
     file_checked_count: AtomicU64,
     task_count: AtomicU64,
+}
+
+impl StageStats {
+    /// Counts one node staged under `action`, against the directory tally or the file one as
+    /// its kind asks.
+    fn record_action(&self, action: LoreFileAction, is_directory: bool) {
+        let (directory, file) = match action {
+            LoreFileAction::Add => (&self.directory_add_count, &self.file_add_count),
+            LoreFileAction::Copy => (&self.directory_copy_count, &self.file_copy_count),
+            LoreFileAction::Delete => (&self.directory_delete_count, &self.file_delete_count),
+            LoreFileAction::Keep => (&self.directory_modify_count, &self.file_modify_count),
+            LoreFileAction::Move => (&self.directory_move_count, &self.file_move_count),
+        };
+        if is_directory { directory } else { file }.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// How a change in path letter case is handled during staging.
@@ -862,13 +877,12 @@ pub(crate) async fn stage_single_node(
 
 /// Stage the given nodes as merged. Requires all paths to be repository relative paths.
 pub(crate) async fn stage_merge_path(
+    operation: Arc<InstanceOperationImpl>,
     repository: Arc<RepositoryContext>,
     state_stage: Arc<State>,
     state_merge: Arc<State>,
     relative_path: RelativePath,
-    _stats: Arc<StageStats>,
-    _options: StageOptions,
-    _link_tracker: Option<Arc<crate::link::LinkTracker>>,
+    stats: Arc<StageStats>,
 ) -> Result<(), StageError> {
     lore_debug!(
         "Staging merge path: {}/{}",
@@ -906,12 +920,10 @@ pub(crate) async fn stage_merge_path(
             change.to.mapping.node
         );
 
-        let absolute_path = change.path().to_absolute_path(repository.require_path()?);
-
         let mut merge_flags = NodeFlags::StagedMerge;
 
-        if sync::exist_merge_mine_theirs_base(absolute_path.as_path()).await
-            || infer_is_conflicted_by_path(absolute_path.as_path())
+        if sync::exist_merge_artifacts(&operation, change.path()).await
+            || infer_is_conflicted(&operation.content_source(change.path()))
                 .await
                 .unwrap_or_default()
         {
@@ -931,6 +943,11 @@ pub(crate) async fn stage_merge_path(
             )
             .await
             .forward::<StageError>("Failed to mark node as staged")?;
+
+        stats.record_action(
+            LoreFileAction::from(change.action),
+            change.resolved_side().flags.is_directory(),
+        );
     }
 
     for conflict in diff.conflicts.iter() {
@@ -952,6 +969,11 @@ pub(crate) async fn stage_merge_path(
             )
             .await
             .forward::<StageError>("Failed to mark node as staged")?;
+
+        stats.record_action(
+            LoreFileAction::from(change.action),
+            change.resolved_side().flags.is_directory(),
+        );
     }
 
     Ok(())
@@ -2416,43 +2438,7 @@ pub(crate) async fn stage_node_from_metadata(
     }
 
     if let Some(action) = event_action {
-        match action {
-            LoreFileAction::Add => {
-                if node.is_directory() {
-                    stats.directory_add_count.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    stats.file_add_count.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-            LoreFileAction::Copy => {
-                if node.is_directory() {
-                    stats.directory_copy_count.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    stats.file_copy_count.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-            LoreFileAction::Delete => {
-                if node.is_directory() {
-                    stats.directory_delete_count.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    stats.file_delete_count.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-            LoreFileAction::Keep => {
-                if node.is_directory() {
-                    stats.directory_modify_count.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    stats.file_modify_count.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-            LoreFileAction::Move => {
-                if node.is_directory() {
-                    stats.directory_move_count.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    stats.file_move_count.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-        }
+        stats.record_action(action, node.is_directory());
         if !node.is_directory() {
             event::LoreEvent::FileStageFile(LoreFileStageFileEventData {
                 from_path: from_path.into(),
@@ -2851,10 +2837,7 @@ async fn stage_from_parent_revision_in_operation(
 
             // Check if conflict files exist before any work is done, so we can
             // preserve them for potential unresolve. Commit and abort clean them up.
-            let had_conflict_files = sync::exist_merge_mine_theirs_base(
-                relative_path.to_absolute_path(repository.require_path()?),
-            )
-            .await;
+            let had_conflict_files = sync::exist_merge_artifacts(&operation, &relative_path).await;
 
             async fn unlink_and_stage(
                 operation: Arc<InstanceOperationImpl>,
@@ -2868,7 +2851,7 @@ async fn stage_from_parent_revision_in_operation(
                 let _ = operation.remove_recursive(&relative_path).await;
 
                 Box::pin(stage_filesystem_path(
-                    operation,
+                    operation.clone(),
                     NodeMapping::root(repository.clone(), state.clone()),
                     relative_path.clone(),
                     stats.clone(),
@@ -2881,10 +2864,7 @@ async fn stage_from_parent_revision_in_operation(
                 .await?;
 
                 if !preserve_conflict_files {
-                    sync::unlink_merge_mine_theirs_base(
-                        relative_path.to_absolute_path(repository.require_path()?),
-                    )
-                    .await;
+                    sync::unlink_merge_artifacts(&operation, &relative_path).await;
                 }
                 Ok(())
             }
@@ -3046,10 +3026,7 @@ async fn stage_from_parent_revision_in_operation(
                 .await?;
 
                 if !had_conflict_files {
-                    sync::unlink_merge_mine_theirs_base(
-                        relative_path.to_absolute_path(repository.require_path()?),
-                    )
-                    .await;
+                    sync::unlink_merge_artifacts(&operation, &relative_path).await;
                 }
             } else {
                 lore_spawn!(tasks, {
@@ -3293,14 +3270,6 @@ pub(crate) async fn stage_link_paths_from_parent_revision(
     let stats = Arc::new(StageStats::default());
 
     for group in &groups {
-        // On-disk anchor for this link. Files inside live at
-        // `<base>/<link_relative>`; passing this to `stage_filesystem_path`
-        // makes its on-disk lookup mount-prefixed while state staging stays
-        // at the link-relative path against the link's state.
-        let mount_base_absolute = group
-            .link_path_rel
-            .to_absolute_path(repository.require_path()?);
-
         for (mount_path, link_relative) in &group.files {
             let staged_node_link = group
                 .link_state_staged
@@ -3400,10 +3369,7 @@ pub(crate) async fn stage_link_paths_from_parent_revision(
                     None, // No discard queue
                 ))
                 .await?;
-                sync::unlink_merge_mine_theirs_base(
-                    link_relative.to_absolute_path(mount_base_absolute.as_path()),
-                )
-                .await;
+                sync::unlink_merge_artifacts(&operation, mount_path).await;
                 continue;
             }
 
@@ -3450,8 +3416,7 @@ pub(crate) async fn stage_link_paths_from_parent_revision(
                 ))
                 .await?;
 
-                let abs = link_relative.to_absolute_path(mount_base_absolute.as_path());
-                sync::unlink_merge_mine_theirs_base(abs.as_path()).await;
+                sync::unlink_merge_artifacts(&operation, mount_path).await;
             }
         }
 

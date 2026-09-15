@@ -27,6 +27,7 @@ use crate::event::EventError;
 use crate::filter::Filter;
 use crate::filter::FilterMode;
 use crate::find;
+use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::with_operation;
 use crate::infer;
@@ -3017,25 +3018,31 @@ pub async fn merge_abort(
 
     lore_debug!("Merge abort found {} changes to revert", changes.len());
 
-    // Clean up theirs/base files
-    for change in changes.iter() {
-        sync::unlink_merge_mine_theirs_base(
-            change.path().to_absolute_path(repository.require_path()?),
-        )
-        .await;
-    }
+    let dry_run = execution_context().globals().dry_run();
+    // One operation covers the abort: the merge artifacts it removes and the changes it
+    // reverts are in the same working tree.
+    let modified_times = with_operation(repository.file_system(), true, async |operation| {
+        if !dry_run {
+            for change in changes.iter() {
+                sync::unlink_merge_artifacts(&operation, change.path()).await;
+            }
+        }
 
-    let stats = Arc::new(sync::SyncRealizeStats::default());
-    sync::realize_changes(
-        repository.clone(),
-        changes.clone(),
-        None,
-        execution_context().globals().dry_run(),
-        false, /* Not a merge */
-        stats.clone(),
-    )
-    .await
-    .forward::<MergeError>("realizing abort changes")?;
+        crate::fs::realize::realize_changes(
+            repository.clone(),
+            operation.clone(),
+            changes.clone(),
+            None,
+            dry_run,
+            false, /* Not a merge */
+            Arc::new(sync::SyncRealizeStats::default()),
+        )
+        .await
+        .forward::<MergeError>("realizing abort changes")?;
+
+        Ok::<_, MergeError>(operation.take_modified_times())
+    })
+    .await?;
 
     match merge_type {
         MergeType::CherryPick => {
@@ -3054,6 +3061,12 @@ pub async fn merge_abort(
     }
 
     let _ = crate::instance::delete_staged_anchor(&repository).await;
+
+    // The times the revert wrote with speak for the current revision, which is what the abort
+    // restored the working tree to and what it leaves current.
+    if !dry_run {
+        modified_times.store(repository.clone()).await;
+    }
 
     // Aborting cancels the merge, not the user's unrelated dirty edits: restore
     // the pre-existing dirty-only carry's tracking (its on-disk content was left
@@ -3474,6 +3487,7 @@ pub async fn branch_merge_resolve(
 }
 
 async fn resolve_single_file(
+    operation: &Arc<InstanceOperationImpl>,
     repository: &Arc<RepositoryContext>,
     state_staged: &Arc<State>,
     relative_path: RelativePath,
@@ -3502,9 +3516,8 @@ async fn resolve_single_file(
         return Ok(());
     }
 
-    // Check if file still has conflict markers on disk
-    let absolute_path = relative_path.to_absolute_path(repository.require_path()?);
-    if infer::infer_is_conflicted_by_path(absolute_path.as_path())
+    // Check if the file still has conflict markers
+    if infer::infer_is_conflicted(&operation.content_source(&relative_path))
         .await
         .unwrap_or(false)
     {
@@ -3587,6 +3600,7 @@ async fn resolve_single_file(
 /// `state`, then strips `mount` to derive the state-relative path before
 /// calling `resolve_single_file`.
 async fn resolve_path_in_state(
+    operation: &Arc<InstanceOperationImpl>,
     context: &Arc<RepositoryContext>,
     state: &Arc<State>,
     mount: &str,
@@ -3601,7 +3615,15 @@ async fn resolve_path_in_state(
     let node = block.node(Node::index(node_link.node));
 
     if node.is_file() {
-        resolve_single_file(context, state, user_relative, node_link, merge_type).await?;
+        resolve_single_file(
+            operation,
+            context,
+            state,
+            user_relative,
+            node_link,
+            merge_type,
+        )
+        .await?;
         return Ok(());
     }
     if !node.is_directory() {
@@ -3638,7 +3660,139 @@ async fn resolve_path_in_state(
         if !file_node_link.is_valid() {
             continue;
         }
-        resolve_single_file(context, state, file_path, file_node_link, merge_type).await?;
+        resolve_single_file(
+            operation,
+            context,
+            state,
+            file_path,
+            file_node_link,
+            merge_type,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// A link a resolve has reached, deserialized once however many of its paths are named.
+struct TouchedLink {
+    link_state: Arc<State>,
+    link_context: Arc<RepositoryContext>,
+    link_branch: BranchId,
+    mount_path: String,
+}
+
+/// What resolving one path leaves for the next: each link's state deserialized once, and the
+/// parent's link list read once.
+///
+/// The pin update is deferred to the caller, so paths into one link share a single final write.
+#[derive(Default)]
+struct ResolveCache {
+    touched_links: std::collections::HashMap<RepositoryId, TouchedLink>,
+    link_list: Option<Vec<state::LinkReference>>,
+}
+
+/// Resolves each of `paths` against the state that holds it, which for a path inside a link is
+/// the link's own rather than the parent's.
+async fn resolve_paths(
+    operation: &Arc<InstanceOperationImpl>,
+    repository: &Arc<RepositoryContext>,
+    state_staged: &Arc<State>,
+    paths: &LoreArray<LoreString>,
+    merge_type: MergeType,
+    cache: &mut ResolveCache,
+) -> Result<(), MergeError> {
+    for path in paths.as_slice().iter() {
+        let Ok(relative_path) =
+            RelativePath::new_from_user_path(repository.require_path()?, path.as_str())
+        else {
+            emit_path_ignore(path.as_str()).await;
+            lore_warn!("Ignoring invalid path: {path}");
+            continue;
+        };
+        lore_debug!(
+            "User path [{}] transformed to relative path [{}] in repository {}",
+            path.as_str(),
+            relative_path.as_str(),
+            repository.path_for_display()
+        );
+
+        // Filter out paths that don't have a staged node - they can't be a merged change.
+        // Use is_valid_or_root() since directory/root paths are now supported.
+        let node_link = state_staged
+            .find_node_link(repository.clone(), relative_path.as_str())
+            .await
+            .unwrap_or_default();
+        if !node_link.is_valid_or_root() {
+            emit_path_ignore(path.as_str()).await;
+            lore_warn!("Ignoring invalid path, does not exist in staged state: {path}");
+            continue;
+        }
+
+        if node_link.repository != repository.id {
+            let link_list = if let Some(ref list) = cache.link_list {
+                list
+            } else {
+                let list = state_staged
+                    .link_list(repository.clone())
+                    .await
+                    .forward::<MergeError>("listing links")?;
+                cache.link_list = Some(list);
+                cache.link_list.as_ref().unwrap()
+            };
+
+            let touched = match cache.touched_links.entry(node_link.repository) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    let link_context = repository.to_link_context(node_link.repository).await;
+                    let link_state =
+                        state::State::deserialize(link_context.clone(), node_link.revision)
+                            .await
+                            .forward::<MergeError>("deserializing link state")?;
+                    let link_ref = link_list
+                        .iter()
+                        .find(|l| l.repository == node_link.repository)
+                        .copied();
+                    let (mount_path, link_branch) = if let Some(link_ref) = link_ref {
+                        let mount = state_staged
+                            .node_path(repository.clone(), link_ref.local_node)
+                            .await
+                            .forward::<MergeError>("resolving link mount path")?;
+                        (mount, link_ref.branch)
+                    } else {
+                        (String::new(), BranchId::default())
+                    };
+                    e.insert(TouchedLink {
+                        link_state,
+                        link_context,
+                        link_branch,
+                        mount_path,
+                    })
+                }
+            };
+
+            resolve_path_in_state(
+                operation,
+                &touched.link_context,
+                &touched.link_state,
+                &touched.mount_path,
+                relative_path,
+                node_link,
+                merge_type,
+            )
+            .await?;
+            continue;
+        }
+
+        resolve_path_in_state(
+            operation,
+            repository,
+            state_staged,
+            "",
+            relative_path,
+            node_link,
+            merge_type,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -3667,116 +3821,27 @@ pub async fn merge_resolve(
         paths
     };
 
-    // Cache per-link state across the path loop so multiple paths into the
-    // same link share one deserialize and one re-serialize.
-    struct TouchedLink {
-        link_state: Arc<State>,
-        link_context: Arc<RepositoryContext>,
-        link_branch: BranchId,
-        mount_path: String,
-    }
-    let mut touched_links: std::collections::HashMap<RepositoryId, TouchedLink> =
-        std::collections::HashMap::new();
-    let mut cached_link_list: Option<Vec<state::LinkReference>> = None;
+    let mut cache = ResolveCache::default();
 
-    for path in paths.as_slice().iter() {
-        let Ok(relative_path) =
-            RelativePath::new_from_user_path(repository.require_path()?, path.as_str())
-        else {
-            emit_path_ignore(path.as_str()).await;
-            lore_warn!("Ignoring invalid path: {path}");
-            continue;
-        };
-        lore_debug!(
-            "User path [{}] transformed to relative path [{}] in repository {}",
-            path.as_str(),
-            relative_path.as_str(),
-            repository.path_for_display()
-        );
-
-        // Filter out paths that don't have a staged node - they can't be a merged change.
-        // Use is_valid_or_root() since directory/root paths are now supported.
-        let node_link = state_staged
-            .find_node_link(repository.clone(), relative_path.as_str())
-            .await
-            .unwrap_or_default();
-        if !node_link.is_valid_or_root() {
-            emit_path_ignore(path.as_str()).await;
-            lore_warn!("Ignoring invalid path, does not exist in staged state: {path}");
-            continue;
-        }
-
-        // Route through the link's state; pin update is deferred to the
-        // post-loop block so multiple paths into the same link share one
-        // final write.
-        if node_link.repository != repository.id {
-            let link_list = if let Some(ref ll) = cached_link_list {
-                ll
-            } else {
-                let ll = state_staged
-                    .link_list(repository.clone())
-                    .await
-                    .forward::<MergeError>("listing links")?;
-                cached_link_list = Some(ll);
-                cached_link_list.as_ref().unwrap()
-            };
-
-            let touched = match touched_links.entry(node_link.repository) {
-                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    let link_context = repository.to_link_context(node_link.repository).await;
-                    let link_state =
-                        state::State::deserialize(link_context.clone(), node_link.revision)
-                            .await
-                            .forward::<MergeError>("deserializing link state")?;
-                    let link_ref = link_list
-                        .iter()
-                        .find(|l| l.repository == node_link.repository)
-                        .copied();
-                    let (mount_path, link_branch) = if let Some(link_ref) = link_ref {
-                        let mp = state_staged
-                            .node_path(repository.clone(), link_ref.local_node)
-                            .await
-                            .forward::<MergeError>("resolving link mount path")?;
-                        (mp, link_ref.branch)
-                    } else {
-                        (String::new(), BranchId::default())
-                    };
-                    e.insert(TouchedLink {
-                        link_state,
-                        link_context,
-                        link_branch,
-                        mount_path,
-                    })
-                }
-            };
-
-            resolve_path_in_state(
-                &touched.link_context,
-                &touched.link_state,
-                &touched.mount_path,
-                relative_path,
-                node_link,
-                merge_type,
-            )
-            .await?;
-            continue;
-        }
-
-        resolve_path_in_state(
+    // One operation covers every path: resolving reads the working copy to tell a conflict
+    // still marked up from one settled. Nothing is written: the resolution is recorded in the
+    // staged state.
+    with_operation(repository.file_system(), false, async |operation| {
+        resolve_paths(
+            &operation,
             &repository,
             &state_staged,
-            "",
-            relative_path,
-            node_link,
+            &paths,
             merge_type,
+            &mut cache,
         )
-        .await?;
-    }
+        .await
+    })
+    .await?;
 
     // Re-serialize each touched link once and update the parent's pin; the
     // parent serialize+anchor below picks up all of these in a single write.
-    for (_repo_id, touched) in touched_links {
+    for (_repo_id, touched) in cache.touched_links {
         if touched.mount_path.is_empty() {
             continue;
         }

@@ -106,6 +106,12 @@ impl InstanceOperation for OsOperation {
         }
     }
 
+    /// The same lookup as [`file_info`](Self::file_info): the working tree is the only view
+    /// this provider has, so a tracked path and an untracked one are read alike.
+    async fn untracked_file_info(&self, path: &RelativePath) -> Result<FileInfo, FsError> {
+        self.file_info(path).await
+    }
+
     async fn holds_name_exactly(&self, path: &RelativePath) -> Option<bool> {
         let path = self.absolute(path);
         crate::util::fs::holds_name_exactly(path).await
@@ -290,8 +296,7 @@ impl InstanceOperation for OsOperation {
     }
 
     async fn infer_is_diffable(&self, path: &RelativePath) -> Result<bool, FsError> {
-        let path = self.absolute(path);
-        Ok(crate::infer::infer_is_diffable_by_path(&path)
+        Ok(crate::infer::infer_is_diffable(&self.content_source(path))
             .await
             .unwrap_or(false))
     }

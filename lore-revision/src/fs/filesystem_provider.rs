@@ -352,6 +352,19 @@ pub trait InstanceOperation: Send + Sync {
         path: &RelativePath,
     ) -> impl Future<Output = Result<FileInfo, FsError>> + Send;
 
+    /// What [`file_info`](Self::file_info) reports, read from the working tree rather than
+    /// from the tree the path is tracked in.
+    ///
+    /// For a path known to lie outside the tracked revision tree and to exist in the
+    /// filesystem alone — a merge sidecar, a scratch file. A provider serving tracked content
+    /// virtually holds no node for one, so it cannot answer for it from what it tracks, and
+    /// [`file_info`](Self::file_info) reports it absent. A caller asking about a path the
+    /// revision does track asks there instead.
+    fn untracked_file_info(
+        &self,
+        path: &RelativePath,
+    ) -> impl Future<Output = Result<FileInfo, FsError>> + Send;
+
     /// Whether the directory holding `path` holds a child named exactly as `path` spells it.
     ///
     /// The question a case resolution nearly always has, and one lookup answers it: no
@@ -579,6 +592,15 @@ impl InstanceOperation for InstanceOperationImpl {
             StaticDispatchInstanceOperation::Test(this) => this.file_info(path).await,
             StaticDispatchInstanceOperation::Os(this) => this.file_info(path).await,
             StaticDispatchInstanceOperation::Swfs(this) => this.file_info(path).await,
+        }
+    }
+
+    async fn untracked_file_info(&self, path: &RelativePath) -> Result<FileInfo, FsError> {
+        match &self.dispatch {
+            #[cfg(test)]
+            StaticDispatchInstanceOperation::Test(this) => this.untracked_file_info(path).await,
+            StaticDispatchInstanceOperation::Os(this) => this.untracked_file_info(path).await,
+            StaticDispatchInstanceOperation::Swfs(this) => this.untracked_file_info(path).await,
         }
     }
 
@@ -924,6 +946,22 @@ pub mod tests {
         holds_paths: bool,
     }
 
+    impl TestOperation {
+        /// What the provider was told to hold, which for the default is a path the filesystem
+        /// does not hold.
+        fn held(&self) -> FileInfo {
+            if self.holds_paths {
+                FileInfo::File {
+                    executable: None,
+                    size: 0,
+                    mtime: 0,
+                }
+            } else {
+                FileInfo::NotExist
+            }
+        }
+    }
+
     impl InstanceOperation for TestOperation {
         /// Members beyond finalizing, the walk and the name lookups are unimplemented, which will
         /// fail any test that calls them.
@@ -944,20 +982,17 @@ pub mod tests {
             ChangeStream::nothing()
         }
 
-        /// Counts the lookup and reports what the provider was told to hold, which for the
-        /// default is a path the filesystem does not hold — what a caller acts on without
-        /// needing content behind it.
+        /// Counts the lookup and reports what the provider was told to hold — what a caller
+        /// acts on without needing content behind it.
         async fn file_info(&self, _path: &RelativePath) -> Result<FileInfo, FsError> {
             self.file_info_count.fetch_add(1, Ordering::AcqRel);
-            Ok(if self.holds_paths {
-                FileInfo::File {
-                    executable: None,
-                    size: 0,
-                    mtime: 0,
-                }
-            } else {
-                FileInfo::NotExist
-            })
+            Ok(self.held())
+        }
+
+        /// Reports what the provider was told to hold, without counting: the lookup counts
+        /// read what went through the tracked tree, which this did not.
+        async fn untracked_file_info(&self, _path: &RelativePath) -> Result<FileInfo, FsError> {
+            Ok(self.held())
         }
 
         /// Counts the lookup and reports the spelling asked about as the one held, so a

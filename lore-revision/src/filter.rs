@@ -20,12 +20,10 @@ use crate::bitflagsops;
 use crate::event::LoreEvent;
 use crate::interface::LoreString;
 use crate::lore_warn;
-use crate::repository::BASE_SUFFIX;
 use crate::repository::DOT_LORE;
 use crate::repository::DOT_URC;
-use crate::repository::MINE_SUFFIX;
+use crate::repository::MERGE_ARTIFACT_SUFFIXES;
 use crate::repository::TEMP_FILE_EXTENSION;
-use crate::repository::THEIRS_SUFFIX;
 use crate::util::path::RelativePath;
 use crate::util::path::RelativePathBuf;
 
@@ -215,9 +213,9 @@ pub fn load(
     let mut ignore = load_filter(ignore_path)?;
     ignore.add_exclusion(DOT_URC)?;
     ignore.add_exclusion(DOT_LORE)?;
-    ignore.add_exclusion(&format!("*{MINE_SUFFIX}"))?;
-    ignore.add_exclusion(&format!("*{THEIRS_SUFFIX}"))?;
-    ignore.add_exclusion(&format!("*{BASE_SUFFIX}"))?;
+    for suffix in MERGE_ARTIFACT_SUFFIXES {
+        ignore.add_exclusion(&format!("*{suffix}"))?;
+    }
     ignore.add_exclusion(&format!("*{TEMP_FILE_EXTENSION}"))?;
 
     let view = load_filter(view_path)?;
