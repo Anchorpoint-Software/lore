@@ -1021,8 +1021,23 @@ async fn collect_fragments_and_push(
 
     let mut current_latest = Hash::default();
     let mut fast_forward_merged = false;
-    for current_revision in full_local_history.iter().rev() {
-        let mut current_revision = *current_revision;
+    // The revision pushed on the previous iteration, as (the signature it has
+    // in local history, the signature it ended up with on the server). Set
+    // only when the server accepted that revision as it stood and merely
+    // renumbered it, so the two names denote the same content and the same
+    // lineage. That is the one situation in which the next revision's parent
+    // pointer may be moved.
+    //
+    // Deliberately NOT `current_latest`: that also holds a revision the head
+    // moved to for entirely different reasons — a server-side fast-forward
+    // merge, which is a new revision carrying somebody else's work. Pointing
+    // the next revision at that one keeps this revision's tree while claiming
+    // to descend from theirs, so the server sees an ordinary fast-forward and
+    // the push silently drops everything the other side added. Nothing
+    // reports it: the push succeeds and their commit is still in the history.
+    let mut renumbered_previous: Option<(Hash, Hash)> = None;
+    for original_revision in full_local_history.iter().rev() {
+        let mut current_revision = *original_revision;
 
         let state = State::deserialize(repository.clone(), current_revision)
             .await
@@ -1030,22 +1045,35 @@ async fn collect_fragments_and_push(
 
         push_revision_links(&repository, token, &options, &state, branch).await?;
 
-        if !current_latest.is_zero() && state.parent_self() != current_latest {
-            // Rebase on new latest revision
-            // TODO(mjansson): This only handles revision number rewrite for now, implement proper
-            //                 automatic rebase if the push resulted in a clean rebase
-            // ...
-
+        if let Some((local, stored)) = renumbered_previous
+            && local != stored
+            && state.parent_self() == local
+        {
+            // The parent this revision descends from was stored under a
+            // different signature (the server rewrites the revision number
+            // and re-serializes). Same content, same lineage, new name — so
+            // follow it. Any other mismatch is left alone: pushing the
+            // revision as it stands lets the server three-way merge it
+            // against a base it holds, which is what keeps both sides.
+            //
+            // TODO(mjansson): this still only follows a revision the server
+            //   renamed — a real automatic rebase, applying this revision's
+            //   delta onto a head that moved for other reasons, is not
+            //   implemented. The result today is one server merge revision
+            //   per pushed revision rather than a linear history. Note that
+            //   a rebase cannot be done on the server alone: the merge is
+            //   what keeps the pushed revision reachable there, and the next
+            //   revision in the same push needs it as its diff base.
             event::LoreEvent::BranchPushRevisionUpdateBegin(
                 LoreBranchPushRevisionUpdateBeginEventData {
                     revision: state.revision(),
                     old_parent: state.parent_self(),
-                    new_parent: current_latest,
+                    new_parent: stored,
                 },
             )
             .send();
 
-            state.set_parent_self(current_latest);
+            state.set_parent_self(stored);
             current_revision = state
                 .serialize(repository.clone(), token)
                 .await
@@ -1157,6 +1185,12 @@ async fn collect_fragments_and_push(
 
                 remote_latest = response.revision;
                 current_latest = response.revision;
+                // The head moved to a merge the server built, not to a
+                // renumbered copy of what we sent. The revision we pushed is
+                // on the server unchanged (as the merge's second parent), so
+                // the next revision's parent is already resolvable there and
+                // must keep pointing at it.
+                renumbered_previous = None;
 
                 event::LoreEvent::BranchPushRevisionPushEnd(
                     LoreBranchPushRevisionPushEndEventData {
@@ -1201,8 +1235,13 @@ async fn collect_fragments_and_push(
 
             remote_latest = response.revision;
             current_latest = response.revision;
+            // The server took this revision as it stood — it only rewrote the
+            // revision number, which changes the signature. Record both names
+            // so the next revision can follow its parent to the stored one.
+            renumbered_previous = Some((*original_revision, response.revision));
         } else {
             current_latest = current_revision;
+            renumbered_previous = Some((*original_revision, current_revision));
         }
 
         let current_number = State::deserialize(repository.clone(), current_latest)
