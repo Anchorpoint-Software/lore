@@ -474,39 +474,36 @@ pub async fn add(
     })
     .send();
 
-    // Ensure the target path exist to clone into
-    lore_io::IoDriver::global()
-        .create_dir_all(target_path.to_absolute_path(repository.require_path()?))
-        .await
-        .internal("Failed to create the target directory for layer")?;
-
-    with_operation(
-        layer_repository.file_system(),
-        true,
-        async |layer_operation| {
-            let clone_ctx = CloneContext {
-                repository: layer_repository.clone(),
-                state: layer_state,
-                operation: layer_operation.clone(),
-                options: Arc::new(clone::CloneOptions {
-                    ignore_existing: false,
-                    ..Default::default()
-                }),
-                stats: Arc::default(),
-                modified_times: Arc::new(crate::state::RecordedModifiedTimes::default()),
-            };
-            let target_states = layer_repository.filter.mount_states(&target_path);
-            clone::clone_node(
-                clone_ctx,
-                layer_storage,
-                target_path,
-                layer_node_link.node,
-                target_states,
-            )
+    let target_states = layer_repository.filter.mount_states(&target_path);
+    // The target directory and the files cloned under it are in the same filesystem, so one
+    // operation covers both.
+    with_operation(layer_repository.file_system(), true, async |operation| {
+        operation
+            .create_dir_all(&target_path)
             .await
-            .forward::<LayerError>("Failed cloning target layer")
-        },
-    )
+            .forward::<LayerError>("Failed to create the target directory for layer")?;
+
+        let clone_ctx = CloneContext {
+            repository: layer_repository.clone(),
+            state: layer_state,
+            operation,
+            options: Arc::new(clone::CloneOptions {
+                ignore_existing: false,
+                ..Default::default()
+            }),
+            stats: Arc::default(),
+            modified_times: Arc::new(crate::state::RecordedModifiedTimes::default()),
+        };
+        clone::clone_node(
+            clone_ctx,
+            layer_storage,
+            target_path,
+            layer_node_link.node,
+            target_states,
+        )
+        .await
+        .forward::<LayerError>("Failed cloning target layer")
+    })
     .await?;
 
     save_config(token, &config_path, &config).await?;
@@ -545,6 +542,46 @@ fn resolve_layer_index(
                 layer.repository == source_repository && layer.target_path.as_str() == target_path
             })
             .ok_or_else(|| LayerNotFound.into())
+    }
+}
+
+/// Removes the files and directories a layer materialized at `target_path`.
+///
+/// Directories are removed in reverse path order, which places a directory before its ancestors
+/// so each is empty when it is removed. One still holding untracked content remains: only what
+/// the layer put there is removed. `purge` removes the whole subtree instead. Failures are
+/// logged and do not stop the removal.
+async fn remove_layer_mount(
+    operation: &InstanceOperationImpl,
+    target_path: &RelativePath,
+    tracked_files: &[RelativePath],
+    tracked_directories: &mut [RelativePath],
+    purge: bool,
+) {
+    if purge {
+        if let Err(err) = operation.remove_recursive(target_path).await {
+            lore_warn!("Failed to purge layer root {target_path}: {err}");
+        }
+        return;
+    }
+
+    for file in tracked_files {
+        if let Err(err) = operation.remove(file).await {
+            lore_warn!("Failed to remove layer file {file}: {err}");
+        }
+    }
+
+    tracked_directories.sort_unstable_by(|a, b| b.as_str().cmp(a.as_str()));
+    for directory in tracked_directories.iter() {
+        if let Err(err) = operation.remove(directory).await {
+            lore_debug!("Skip non-empty or unremovable layer directory {directory}: {err}");
+        }
+    }
+
+    if !target_path.is_empty()
+        && let Err(err) = operation.remove(target_path).await
+    {
+        lore_debug!("Skip non-empty or unremovable layer root {target_path}: {err}");
     }
 }
 
@@ -592,94 +629,55 @@ pub async fn remove(
     let mut tracked_directories: Vec<RelativePath> = Vec::new();
     let mut modified: Vec<String> = Vec::new();
 
-    with_operation(
-        repository.file_system(),
-        false, /* Reads the layer's files to report them, and removes them below */
-        async |operation| {
-            walk_layer_subtree(
-                &operation,
-                layer_repository.clone(),
-                layer_state.clone(),
-                source_node_link.node,
-                target_path.clone(),
-                &mut tracked_files,
-                &mut tracked_directories,
-                &mut modified,
-            )
-            .await
-        },
-    )
-    .await?;
-
-    // Both reasons are reported before returning so a layer that is both staged
-    // and modified does not hide one behind the other across two --force runs.
     let force = execution_context().globals().force();
-    if !force && (staged_file_count > 0 || !modified.is_empty()) {
-        if staged_file_count > 0 {
-            lore_warn!(
-                "Layer at '{}' has {staged_file_count} staged file(s) (use --force to discard)",
-                target_path.as_str()
-            );
+    // The walk reads the same files the removal then deletes, so one operation covers both.
+    with_operation(repository.file_system(), true, async |operation| {
+        walk_layer_subtree(
+            &operation,
+            layer_repository.clone(),
+            layer_state.clone(),
+            source_node_link.node,
+            target_path.clone(),
+            &mut tracked_files,
+            &mut tracked_directories,
+            &mut modified,
+        )
+        .await?;
+
+        // Both reasons are reported before returning so a layer that is both staged
+        // and modified does not hide one behind the other across two --force runs.
+        if !force && (staged_file_count > 0 || !modified.is_empty()) {
+            if staged_file_count > 0 {
+                lore_warn!(
+                    "Layer at '{}' has {staged_file_count} staged file(s) (use --force to discard)",
+                    target_path.as_str()
+                );
+            }
+            if !modified.is_empty() {
+                lore_warn!(
+                    "Layer at '{}' has locally modified files (use --force to discard): {}",
+                    target_path.as_str(),
+                    modified.join(", ")
+                );
+            }
+            return Err(LocalModifications.into());
         }
-        if !modified.is_empty() {
-            lore_warn!(
-                "Layer at '{}' has locally modified files (use --force to discard): {}",
-                target_path.as_str(),
-                modified.join(", ")
-            );
-        }
-        return Err(LocalModifications.into());
-    }
+
+        remove_layer_mount(
+            &operation,
+            &target_path,
+            &tracked_files,
+            &mut tracked_directories,
+            purge,
+        )
+        .await;
+        Ok::<(), LayerError>(())
+    })
+    .await?;
 
     let modified_count = modified.len() as u64;
     let file_count = tracked_files.len() as u64;
     let directory_count = tracked_directories.len() as u64;
-    let absolute_root = target_path.to_absolute_path(repository.require_path()?);
-
-    if purge {
-        // Full nuke: delete the entire target subtree including untracked
-        // content. Force is independent — if there were modifications without
-        // --force we already returned above.
-        if let Err(err) = crate::util::fs::unlink_recursive(&absolute_root).await {
-            lore_warn!(
-                "Failed to purge layer root {}: {err}",
-                absolute_root.display()
-            );
-        }
-    } else {
-        for file in &tracked_files {
-            let absolute = file.to_absolute_path(repository.require_path()?);
-            if let Err(err) = crate::util::fs::unlink(&absolute).await {
-                lore_warn!("Failed to remove layer file {}: {err}", absolute.display());
-            }
-        }
-
-        // Bottom-up: deepest directories first so empty dirs collapse when
-        // their children are gone. Untracked files keep their parent dirs
-        // alive — remove_dir fails on non-empty dirs and is skipped silently.
-        tracked_directories.sort_by_key(|p| std::cmp::Reverse(p.as_str().split('/').count()));
-        for dir in &tracked_directories {
-            let absolute = dir.to_absolute_path(repository.require_path()?);
-            if let Err(err) = lore_io::IoDriver::global().remove_dir(&absolute).await
-                && err.kind() != tokio::io::ErrorKind::NotFound
-            {
-                lore_debug!(
-                    "Skip non-empty or unremovable layer directory {}: {err}",
-                    absolute.display()
-                );
-            }
-        }
-
-        if !target_path.is_empty()
-            && let Err(err) = lore_io::IoDriver::global().remove_dir(&absolute_root).await
-            && err.kind() != tokio::io::ErrorKind::NotFound
-        {
-            lore_debug!(
-                "Skip non-empty or unremovable layer root {}: {err}",
-                absolute_root.display()
-            );
-        }
-    }
 
     config.layers.remove(layer_index);
     save_config(token, &config_path, &config).await?;
@@ -702,7 +700,7 @@ pub async fn remove(
 
 #[allow(clippy::too_many_arguments)]
 fn walk_layer_subtree<'a>(
-    operation: &'a Arc<InstanceOperationImpl>,
+    operation: &'a InstanceOperationImpl,
     layer_repository: Arc<RepositoryContext>,
     layer_state: Arc<State>,
     node: NodeID,
