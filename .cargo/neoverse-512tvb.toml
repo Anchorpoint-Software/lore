@@ -1,0 +1,5 @@
+# Adds Graviton3+ (Neoverse V1) tuning. Use with --features lore-base/neoverse-512tvb:
+#   cargo build --target aarch64-unknown-linux-gnu \
+#     --config .cargo/neoverse-512tvb.toml --features lore-base/neoverse-512tvb
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=neoverse-512tvb"]

@@ -13,6 +13,8 @@ trace_log = []
 # need scratch space on disk enable it from their dev-dependencies, so it stays
 # out of every normal build.
 test-util = ["dep:tempfile"]
+# Tells build.rs to compile the rpmalloc C code with -mcpu=neoverse-512tvb.
+neoverse-512tvb = []
 
 [dependencies]
 # allocator

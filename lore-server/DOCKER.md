@@ -7,7 +7,8 @@ telemetry integration, or replication is configured.
 
 - Docker with BuildKit support
 - On Apple Silicon (M-series Macs), builds must target `linux/amd64` due to Graviton-specific
-  compiler flags in `.cargo/config.toml` for `aarch64-unknown-linux-gnu`
+  compiler flags `Dockerfile` applies for `aarch64-unknown-linux-gnu` (see
+  `.cargo/neoverse-512tvb.toml`)
 
 `lore-server/Dockerfile` is the one to build from source, and is what the rest of this section
 describes. `lore-server/Dockerfile.release` packages a binary already published as a release asset
@@ -44,8 +45,8 @@ never takes them.
 
 Releases ship no baseline `armv8-a` Linux binary. The only `aarch64-unknown-linux-gnu` build is
 tuned for Graviton3+, and the `aarch64-apple-darwin` build is a macOS Mach-O executable, which
-cannot go into a Linux image at all. So arm64 is offered only under the suffixed tag, where the
-name says what it is: nothing in the pull path consults CPU features, so an unsuffixed tag
+cannot go into a Linux image at all. So arm64 is offered only under the suffixed tag, where the name says what it is: nothing in the
+pull path consults CPU features, so an unsuffixed tag
 carrying that binary would hand it to Apple Silicon and Ampere hosts, which fault on it with
 `SIGILL`.
 

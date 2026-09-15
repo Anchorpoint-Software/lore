@@ -8,10 +8,17 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /build
 COPY . .
 
+# arm64 always builds Graviton3+/Neoverse V1-tuned.
+ARG TARGETARCH
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/target \
-    cargo build --release --bin loreserver && \
+    if [ "$TARGETARCH" = "arm64" ]; then \
+        cargo build --release --bin loreserver \
+            --config .cargo/neoverse-512tvb.toml --features lore-base/neoverse-512tvb; \
+    else \
+        cargo build --release --bin loreserver; \
+    fi && \
     cp /build/target/release/loreserver /build/loreserver-bin
 
 FROM debian:trixie-slim
