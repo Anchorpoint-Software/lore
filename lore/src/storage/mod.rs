@@ -473,6 +473,7 @@ mod tests {
                 mutable,
                 None,
                 crate::storage::store::BoundFlags::default(),
+                false,
             )
             .with_connection_id(connection_id),
         )

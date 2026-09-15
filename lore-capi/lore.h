@@ -5030,6 +5030,15 @@ typedef struct lore_storage_open_args_t {
   struct lore_storage_remote_config_t remote_config;
   // Activate `remote_config`; otherwise the handle has no remote
   uint8_t has_remote_config;
+  // Skip re-hashing a loaded payload and checking it against the address it was read from.
+  //
+  // Zero keeps the check, which is the default: a store handing back bytes under a content
+  // address should be able to say they are the bytes that address names. A caller whose own
+  // layer already assures integrity - one that scrubs its store on a schedule, say - pays for
+  // the check on every byte of every read and learns nothing new from it, and can set this.
+  //
+  // Applies to every read on the handle.
+  uint8_t skip_verify;
   // Soft cap on total immutable-store bytes (compactor target). A non-zero cache target enables
   // incremental background GC for the handle; `0` then selects the default. Shared disk backends
   // inherit the first opener's value

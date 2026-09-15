@@ -73,6 +73,15 @@ pub struct LoreStorageOpenArgs {
     pub remote_config: LoreStorageRemoteConfig,
     /// Activate `remote_config`; otherwise the handle has no remote
     pub has_remote_config: u8,
+    /// Skip re-hashing a loaded payload and checking it against the address it was read from.
+    ///
+    /// Zero keeps the check, which is the default: a store handing back bytes under a content
+    /// address should be able to say they are the bytes that address names. A caller whose own
+    /// layer already assures integrity - one that scrubs its store on a schedule, say - pays for
+    /// the check on every byte of every read and learns nothing new from it, and can set this.
+    ///
+    /// Applies to every read on the handle.
+    pub skip_verify: u8,
     /// Soft cap on total immutable-store bytes (compactor target). A non-zero cache target enables
     /// incremental background GC for the handle; `0` then selects the default. Shared disk backends
     /// inherit the first opener's value
@@ -91,7 +100,7 @@ pub struct LoreStorageOpenArgs {
 //   repository_path: LoreString { ptr, len }              → 16 bytes
 //   in_memory: u8 + 7-byte tail pad                       →  8 bytes
 //   remote_config: LoreStorageRemoteConfig { LoreString } → 16 bytes
-//   has_remote_config: u8 + 7-byte tail pad               →  8 bytes
+//   has_remote_config: u8, skip_verify: u8 + 6-byte pad   →  8 bytes
 //   cache_target_bytes: u64                               →  8 bytes
 //   cache_target_fragments: u64                           →  8 bytes
 //                                                  total  → 64 bytes
@@ -304,6 +313,7 @@ async fn open_local(
             mutable,
             remote,
             bound_flags,
+            args.skip_verify != 0,
         ));
         let handle = handle::register(store);
         LoreEvent::StorageOpened(LoreStorageOpenedEventData {
