@@ -15,7 +15,6 @@
 use std::sync::Arc;
 
 use lore_base::error::InvalidArguments;
-use lore_base::lore_spawn;
 use lore_base::types::Address;
 use lore_base::types::Partition;
 use lore_error_set::prelude::*;
@@ -31,7 +30,6 @@ use lore_storage::store_types::StoreObliterateStats;
 use lore_transport::ProtocolError;
 use serde::Deserialize;
 use serde::Serialize;
-use tokio::task::JoinSet;
 
 use crate::call_delegation::dispatch_call;
 use crate::interface::LoreEventCallback;
@@ -109,22 +107,11 @@ async fn obliterate_local(
                 return Ok::<(), ObliterateError>(());
             }
             let effective = store.effective_flags(per_call)?;
-            let total = items.len();
 
-            if let [item] = items {
-                let code = obliterate_item(store, *item, effective).await;
-                return crate::storage::build_call_error(&[code], total, "obliterate");
-            }
-
-            let mut tasks: JoinSet<LoreErrorCode> = JoinSet::new();
-            for item in items.iter().copied() {
+            crate::storage::fan_out_items!(items, "obliterate", |item| {
                 let store = store.clone();
-                lore_spawn!(tasks, async move {
-                    obliterate_item(store, item, effective).await
-                });
-            }
-            let codes = crate::storage::drain_codes(tasks).await;
-            crate::storage::build_call_error(&codes, total, "obliterate")
+                async move { obliterate_item(store, &item, effective).await }
+            })
         },
     )
     .await
@@ -149,12 +136,12 @@ enum LegOutcome {
 /// errors, but they also do not falsely report success.
 async fn obliterate_item(
     store: Arc<StoreInternal>,
-    item: LoreStorageObliterateItem,
+    item: &LoreStorageObliterateItem,
     effective: crate::storage::store::EffectiveFlags,
 ) -> LoreErrorCode {
     if item.partition == Partition::default() {
         return emit_complete(
-            &item,
+            item,
             LegOutcome::Failed(LoreErrorCode::InvalidArguments),
             LegOutcome::Skipped,
             LoreErrorCode::InvalidArguments,
@@ -217,7 +204,7 @@ async fn obliterate_item(
         (LegOutcome::Failed(code), _) | (_, LegOutcome::Failed(code)) => *code,
         _ => LoreErrorCode::None,
     };
-    emit_complete(&item, local_outcome, remote_outcome, error_code)
+    emit_complete(item, local_outcome, remote_outcome, error_code)
 }
 
 /// Emit the item's terminal event and return the `error_code` that was sent, so callers can

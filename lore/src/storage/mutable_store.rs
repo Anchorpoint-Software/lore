@@ -12,7 +12,6 @@
 use std::sync::Arc;
 
 use lore_base::error::InvalidArguments;
-use lore_base::lore_spawn;
 use lore_base::types::Hash;
 use lore_base::types::KeyType;
 use lore_base::types::Partition;
@@ -27,7 +26,6 @@ use lore_revision::interface::LoreError;
 use lore_revision::store::event::LoreStorageMutableStoreItemCompleteEventData;
 use serde::Deserialize;
 use serde::Serialize;
-use tokio::task::JoinSet;
 
 use crate::call_delegation::dispatch_call;
 use crate::interface::LoreEventCallback;
@@ -116,25 +114,13 @@ async fn mutable_store_impl(
                         .into(),
                 }));
             }
-            let total = items.len();
             let mut reuse = crate::storage::store::SessionReuse::default();
 
-            if let [item] = items {
-                let session = reuse.session_for(&store, item.partition, effective.no_local);
-                let code = store_item(store, *item, effective, session).await;
-                return crate::storage::build_call_error(&[code], total, "mutable_store");
-            }
-
-            let mut tasks: JoinSet<LoreErrorCode> = JoinSet::new();
-            for item in items.iter().copied() {
+            crate::storage::fan_out_items!(items, "mutable_store", |item| {
                 let session = reuse.session_for(&store, item.partition, effective.no_local);
                 let store = store.clone();
-                lore_spawn!(tasks, async move {
-                    store_item(store, item, effective, session).await
-                });
-            }
-            let codes = crate::storage::drain_codes(tasks).await;
-            crate::storage::build_call_error(&codes, total, "mutable_store")
+                async move { store_item(store, &item, effective, session).await }
+            })
         },
     )
     .await
@@ -144,24 +130,24 @@ async fn mutable_store_impl(
 /// remote mutable store via the handle's session; otherwise the local mutable store answers.
 async fn store_item(
     store: Arc<StoreInternal>,
-    item: LoreStorageMutableStoreItem,
+    item: &LoreStorageMutableStoreItem,
     effective: EffectiveFlags,
     session: Option<Arc<lore_transport::StorageSession>>,
 ) -> LoreErrorCode {
     if item.partition == Partition::default() {
-        return emit_complete(&item, LoreErrorCode::InvalidArguments);
+        return emit_complete(item, LoreErrorCode::InvalidArguments);
     }
 
     if effective.no_local {
         let Some(session) = session else {
-            return emit_complete(&item, LoreErrorCode::Internal);
+            return emit_complete(item, LoreErrorCode::Internal);
         };
         match session
             .mutable_store(item.key, item.value, item.key_type)
             .await
         {
-            Ok(()) => emit_complete(&item, LoreErrorCode::None),
-            Err(err) => emit_complete(&item, crate::storage::protocol_error_to_code(&err)),
+            Ok(()) => emit_complete(item, LoreErrorCode::None),
+            Err(err) => emit_complete(item, crate::storage::protocol_error_to_code(&err)),
         }
     } else {
         match store
@@ -170,8 +156,8 @@ async fn store_item(
             .store(item.partition, item.key, item.value, item.key_type)
             .await
         {
-            Ok(()) => emit_complete(&item, LoreErrorCode::None),
-            Err(err) => emit_complete(&item, crate::storage::store_error_to_code(&err)),
+            Ok(()) => emit_complete(item, LoreErrorCode::None),
+            Err(err) => emit_complete(item, crate::storage::store_error_to_code(&err)),
         }
     }
 }

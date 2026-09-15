@@ -17,7 +17,6 @@
 use std::sync::Arc;
 
 use lore_base::error::InvalidArguments;
-use lore_base::lore_spawn;
 use lore_base::types::Address;
 use lore_base::types::Hash;
 use lore_base::types::Partition;
@@ -37,7 +36,6 @@ use lore_storage::store_types::StoreMatch;
 use lore_storage::write::store_fragment;
 use serde::Deserialize;
 use serde::Serialize;
-use tokio::task::JoinSet;
 
 use crate::call_delegation::dispatch_call;
 use crate::interface::LoreEventCallback;
@@ -128,26 +126,13 @@ async fn upload_local(
                 return Ok::<(), UploadError>(());
             }
 
-            let total = items.len();
             let mut reuse = crate::storage::store::SessionReuse::default();
 
-            if let [item] = items {
-                let session = reuse.session_for(&store, item.partition, true);
-                let code = upload_item(store, *item, session).await;
-                return crate::storage::build_call_error(&[code], total, "upload");
-            }
-
-            let mut tasks: JoinSet<LoreErrorCode> = JoinSet::new();
-            for item in items.iter().copied() {
+            crate::storage::fan_out_items!(items, "upload", |item| {
                 let session = reuse.session_for(&store, item.partition, true);
                 let store = store.clone();
-                lore_spawn!(
-                    tasks,
-                    async move { upload_item(store, item, session).await }
-                );
-            }
-            let codes = crate::storage::drain_codes(tasks).await;
-            crate::storage::build_call_error(&codes, total, "upload")
+                async move { upload_item(store, &item, session).await }
+            })
         },
     )
     .await
@@ -155,14 +140,14 @@ async fn upload_local(
 
 async fn upload_item(
     store: Arc<StoreInternal>,
-    item: LoreStorageUploadItem,
+    item: &LoreStorageUploadItem,
     session: Option<Arc<lore_transport::StorageSession>>,
 ) -> LoreErrorCode {
     if item.partition == Partition::default() {
-        return emit_complete(&item, 0, LoreErrorCode::InvalidArguments);
+        return emit_complete(item, 0, LoreErrorCode::InvalidArguments);
     }
     if item.address.hash == Hash::default() {
-        return emit_complete(&item, 1, LoreErrorCode::None);
+        return emit_complete(item, 1, LoreErrorCode::None);
     }
 
     // Anything weaker than `MatchFull` means the local entry is incomplete and must be
@@ -179,10 +164,10 @@ async fn upload_item(
     };
 
     if already_durable {
-        return emit_complete(&item, 1, LoreErrorCode::None);
+        return emit_complete(item, 1, LoreErrorCode::None);
     }
     if !has_local_payload {
-        return emit_complete(&item, 0, LoreErrorCode::AddressNotFound);
+        return emit_complete(item, 0, LoreErrorCode::AddressNotFound);
     }
 
     // `no_remote()` is load-bearing: we must not pull from a third party to satisfy a
@@ -198,7 +183,7 @@ async fn upload_item(
     let (fragment, payload) = match load {
         Ok(pair) => pair,
         Err(err) => {
-            return emit_complete(&item, 0, crate::storage::storage_error_to_code(&err));
+            return emit_complete(item, 0, crate::storage::storage_error_to_code(&err));
         }
     };
 
@@ -217,8 +202,8 @@ async fn upload_item(
     )
     .await
     {
-        Ok(_) => emit_complete(&item, 0, LoreErrorCode::None),
-        Err(err) => emit_complete(&item, 0, crate::storage::storage_error_to_code(&err)),
+        Ok(_) => emit_complete(item, 0, LoreErrorCode::None),
+        Err(err) => emit_complete(item, 0, crate::storage::storage_error_to_code(&err)),
     }
 }
 

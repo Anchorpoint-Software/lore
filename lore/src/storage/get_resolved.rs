@@ -33,7 +33,6 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use lore_base::error::InvalidArguments;
-use lore_base::lore_spawn;
 use lore_base::types::Address;
 use lore_base::types::Context;
 use lore_base::types::Hash;
@@ -56,7 +55,6 @@ use lore_storage::read::read_resolved_stream;
 use lore_transport::quic::storage_service::get_resolved_flags;
 use serde::Deserialize;
 use serde::Serialize;
-use tokio::task::JoinSet;
 
 use crate::call_delegation::dispatch_call;
 use crate::interface::LoreEventCallback;
@@ -157,26 +155,13 @@ async fn get_resolved_local(
                 return Ok::<(), GetResolvedError>(());
             }
             let effective = store.effective_flags(per_call)?;
-
-            let total = items.len();
             let mut reuse = crate::storage::store::SessionReuse::default();
 
-            if let [item] = items {
-                let session = reuse.session_for(&store, item.partition, !effective.no_remote);
-                let code = get_resolved_item(store, *item, effective, session).await;
-                return crate::storage::build_call_error(&[code], total, "get_resolved");
-            }
-
-            let mut tasks: JoinSet<LoreErrorCode> = JoinSet::new();
-            for item in items.iter().copied() {
+            crate::storage::fan_out_items!(items, "get_resolved", |item| {
                 let session = reuse.session_for(&store, item.partition, !effective.no_remote);
                 let store = store.clone();
-                lore_spawn!(tasks, async move {
-                    get_resolved_item(store, item, effective, session).await
-                });
-            }
-            let codes = crate::storage::drain_codes(tasks).await;
-            crate::storage::build_call_error(&codes, total, "get_resolved")
+                async move { get_resolved_item(store, &item, effective, session).await }
+            })
         },
     )
     .await
@@ -186,17 +171,17 @@ async fn get_resolved_local(
 /// Returns the per-item `LoreErrorCode` for the call-level aggregator.
 async fn get_resolved_item(
     store: Arc<StoreInternal>,
-    item: LoreStorageGetResolvedItem,
+    item: &LoreStorageGetResolvedItem,
     effective: crate::storage::store::EffectiveFlags,
     remote_session: Option<Arc<lore_transport::StorageSession>>,
 ) -> LoreErrorCode {
     if item.partition == Partition::default() {
-        emit_item_complete(&item, Address::default(), LoreErrorCode::InvalidArguments);
+        emit_item_complete(item, Address::default(), LoreErrorCode::InvalidArguments);
         return LoreErrorCode::InvalidArguments;
     }
 
     if item.key == Hash::default() {
-        emit_item_complete(&item, Address::default(), LoreErrorCode::InvalidArguments);
+        emit_item_complete(item, Address::default(), LoreErrorCode::InvalidArguments);
         return LoreErrorCode::InvalidArguments;
     }
 
@@ -228,14 +213,14 @@ async fn get_resolved_item(
                 context: item.context,
             };
             let size = bytes.len() as u64;
-            emit_header(&item, address, size);
-            emit_data(&item, address, bytes, 0);
-            emit_item_complete(&item, address, LoreErrorCode::None);
+            emit_header(item, address, size);
+            emit_data(item, address, bytes, 0);
+            emit_item_complete(item, address, LoreErrorCode::None);
             LoreErrorCode::None
         }
         Err(err) => {
             let code = crate::storage::storage_error_to_code(&err);
-            emit_item_complete(&item, Address::default(), code);
+            emit_item_complete(item, Address::default(), code);
             code
         }
     }
@@ -246,7 +231,7 @@ async fn get_resolved_item(
 /// until the key resolves, so `GET_HEADER` follows the resolve rather than preceding it.
 async fn get_resolved_item_streaming(
     store: Arc<StoreInternal>,
-    item: LoreStorageGetResolvedItem,
+    item: &LoreStorageGetResolvedItem,
     read_options: lore_storage::options::ReadOptions,
     remote_session: Option<Arc<lore_transport::StorageSession>>,
 ) -> LoreErrorCode {
@@ -267,7 +252,7 @@ async fn get_resolved_item_streaming(
         Ok(result) => result,
         Err(err) => {
             let code = crate::storage::storage_error_to_code(&err);
-            emit_item_complete(&item, Address::default(), code);
+            emit_item_complete(item, Address::default(), code);
             return code;
         }
     };
@@ -276,7 +261,7 @@ async fn get_resolved_item_streaming(
         hash: resolved,
         context: item.context,
     };
-    emit_header(&item, address, size_content);
+    emit_header(item, address, size_content);
 
     let mut offset: u64 = 0;
     let mut code = LoreErrorCode::None;
@@ -284,7 +269,7 @@ async fn get_resolved_item_streaming(
         match chunk {
             Ok(chunk) => {
                 let len = chunk.len() as u64;
-                emit_data(&item, address, chunk, offset);
+                emit_data(item, address, chunk, offset);
                 offset += len;
             }
             Err(err) => {
@@ -297,7 +282,7 @@ async fn get_resolved_item_streaming(
     if code == LoreErrorCode::None && offset != size_content {
         code = LoreErrorCode::Internal;
     }
-    emit_item_complete(&item, address, code);
+    emit_item_complete(item, address, code);
     code
 }
 

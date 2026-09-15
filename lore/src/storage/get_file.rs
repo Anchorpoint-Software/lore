@@ -27,7 +27,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 use lore_base::error::InvalidArguments;
-use lore_base::lore_spawn;
 use lore_base::types::Address;
 use lore_base::types::Hash;
 use lore_base::types::Partition;
@@ -45,7 +44,6 @@ use lore_storage::read::read_into_file;
 use lore_storage::read::write_all_to_file;
 use serde::Deserialize;
 use serde::Serialize;
-use tokio::task::JoinSet;
 
 use crate::call_delegation::dispatch_call;
 use crate::interface::LoreEventCallback;
@@ -146,25 +144,13 @@ async fn get_file_local(
                 return Ok::<(), GetFileError>(());
             }
             let effective = store.effective_flags(per_call)?;
-            let total = items.len();
             let mut reuse = crate::storage::store::SessionReuse::default();
 
-            if let [item] = items {
-                let session = reuse.session_for(&store, item.partition, !effective.no_remote);
-                let code = get_file_item(store, item.clone(), effective, session).await;
-                return crate::storage::build_call_error(&[code], total, "get_file");
-            }
-
-            let mut tasks: JoinSet<LoreErrorCode> = JoinSet::new();
-            for item in items.iter().cloned() {
+            crate::storage::fan_out_items!(items, "get_file", |item| {
                 let session = reuse.session_for(&store, item.partition, !effective.no_remote);
                 let store = store.clone();
-                lore_spawn!(tasks, async move {
-                    get_file_item(store, item, effective, session).await
-                });
-            }
-            let codes = crate::storage::drain_codes(tasks).await;
-            crate::storage::build_call_error(&codes, total, "get_file")
+                async move { get_file_item(store, &item, effective, session).await }
+            })
         },
     )
     .await
@@ -172,11 +158,11 @@ async fn get_file_local(
 
 async fn get_file_item(
     store: Arc<StoreInternal>,
-    item: LoreStorageGetFileItem,
+    item: &LoreStorageGetFileItem,
     effective: crate::storage::store::EffectiveFlags,
     session: Option<Arc<lore_transport::StorageSession>>,
 ) -> LoreErrorCode {
-    let error_code = resolve_get_file_item(store, &item, effective, session).await;
+    let error_code = resolve_get_file_item(store, item, effective, session).await;
     let address = if error_code == LoreErrorCode::None {
         item.address
     } else {

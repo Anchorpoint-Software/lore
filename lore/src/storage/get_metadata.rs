@@ -8,17 +8,17 @@
 //! ADDRESS_NOT_FOUND` and `fragment` is the default value.
 //!
 //! Per item the resolution path is:
-//! 1. Local probe via `ImmutableStore::query(partition, address, MatchFull)`. On exact match,
-//!    emit the resolved `Fragment` and short-circuit.
-//! 2. On local miss, fall through to the configured remote (if any) via
+//! 1. A zero partition rejects with `INVALID_ARGUMENTS`, and `address.hash == Hash::default()`
+//!    emits an empty `Fragment` with `error_code = None` and no store work — symmetric with
+//!    `lore_storage_get`. Both answer the same whichever store the call is bound to.
+//! 2. Local probe via `ImmutableStore::get_metadata(partition, address)`. Any match the store made
+//!    is a hit, not only a full one — see `resolve_local` for why.
+//! 3. On local miss, fall through to the configured remote (if any) via
 //!    `StorageSession::get_metadata`. The wire op carries no payload bytes — only Fragment.
-//! 3. On remote miss or no remote configured, emit `ADDRESS_NOT_FOUND`.
+//! 4. On remote miss or no remote configured, emit `ADDRESS_NOT_FOUND`.
 //!
-//! Only step 2 costs a task: the local probe runs in the calling task for every item, so a batch
-//! whose items all hit locally spawns nothing.
-//!
-//! Short-circuits: `address.hash == Hash::default()` emits an empty `Fragment` with
-//! `error_code = None` and no store work — symmetric with `lore_storage_get`.
+//! Only step 3 costs a task, and only in a batch of several: the probe runs on the calling task for
+//! every item, and a lone item's remote leg runs there too.
 //!
 //! Successful remote fetches are not cached locally — there is no payload to cache, and
 //! re-fetching metadata is cheap.
@@ -125,26 +125,27 @@ async fn get_metadata_local(
             let effective = store.effective_flags(per_call)?;
 
             let total = items.len();
-            let mut remote_tasks: JoinSet<LoreErrorCode> = JoinSet::new();
-            let mut codes: Vec<LoreErrorCode> = Vec::with_capacity(total);
             let mut reuse = crate::storage::store::SessionReuse::default();
 
-            for item in items.iter().copied() {
-                let session = match item_backend(&store, &item, effective, &mut reuse).await {
-                    ItemBackend::Done(code) => {
-                        codes.push(code);
-                        continue;
-                    }
-                    ItemBackend::Remote(session) => session,
+            if let [item] = items {
+                let code = match item_backend(&store, item, effective, &mut reuse).await {
+                    ItemBackend::Done(code) => code,
+                    ItemBackend::Remote(session) => resolve_remote(session, *item).await,
                 };
+                return crate::storage::build_call_error(&[code], total, "get_metadata");
+            }
 
-                if total == 1 {
-                    codes.push(resolve_remote(session, item).await);
-                } else {
-                    lore_spawn!(
-                        remote_tasks,
-                        async move { resolve_remote(session, item).await }
-                    );
+            let mut remote_tasks: JoinSet<LoreErrorCode> = JoinSet::new();
+            let mut codes: Vec<LoreErrorCode> = Vec::with_capacity(total);
+            for item in items.iter().copied() {
+                match item_backend(&store, &item, effective, &mut reuse).await {
+                    ItemBackend::Done(code) => codes.push(code),
+                    ItemBackend::Remote(session) => {
+                        lore_spawn!(
+                            remote_tasks,
+                            async move { resolve_remote(session, item).await }
+                        );
+                    }
                 }
             }
 
@@ -163,21 +164,39 @@ enum ItemBackend {
     Remote(Arc<lore_transport::StorageSession>),
 }
 
-/// Route one item to the backend that can answer it. `Done` covers every outcome the local store
-/// settles plus a miss with no remote to consult, all of which have emitted their terminal event
-/// already; `Remote` is the sole outcome that still owes a wire round trip, and so the only one
-/// worth a task.
+/// Route one item to the backend that can answer it. `Done` covers a rejected argument, the
+/// zero-hash short-circuit, every outcome the local store settles, and a miss with no remote to
+/// consult, all of which have emitted their terminal event already; `Remote` is the sole outcome
+/// that still owes a wire round trip, and so the only one worth a task.
 ///
-/// `no_local` skips the probe: the local store is not this call's to read. It cannot coincide with
-/// `no_remote` — `effective_flags` rejects a request for both — so a `want_remote` of
-/// `!no_remote` resolves a session on the remote-bound path and suppresses one on the
-/// local-bound path, where a local miss is the final answer.
+/// Argument checks precede the backend choice, so a zero partition and the zero hash answer the
+/// same whichever store would have served the item. `no_local` then skips the probe: the local
+/// store is not this call's to read. It cannot coincide with `no_remote` — `effective_flags`
+/// rejects a request for both — so a `want_remote` of `!no_remote` resolves a session on the
+/// remote-bound path and suppresses one on the local-bound path, where a local miss is the final
+/// answer.
 async fn item_backend(
     store: &Arc<StoreInternal>,
     item: &LoreStorageGetMetadataItem,
     effective: EffectiveFlags,
     reuse: &mut SessionReuse,
 ) -> ItemBackend {
+    if item.partition == Partition::default() {
+        return ItemBackend::Done(emit_complete(
+            item,
+            Fragment::default(),
+            LoreErrorCode::InvalidArguments,
+        ));
+    }
+
+    if item.address.hash == Hash::default() {
+        return ItemBackend::Done(emit_complete(
+            item,
+            Fragment::default(),
+            LoreErrorCode::None,
+        ));
+    }
+
     if !effective.no_local
         && let Some(code) = resolve_local(store, item).await
     {
@@ -194,10 +213,9 @@ async fn item_backend(
     }
 }
 
-/// Probe the local store for one item, emitting its terminal event and returning the code on
-/// every outcome the local store settles: a rejected argument, the zero-hash short-circuit, a
-/// hit, and a non-not-found error, which is surfaced rather than masked by a remote attempt.
-/// `None` means the item missed and the remote may still answer it.
+/// Probe the local store for one item, emitting its terminal event and returning the code when the
+/// store settles it: a hit, or a non-not-found error, which is surfaced rather than masked by a
+/// remote attempt. `None` means the item missed and the remote may still answer it.
 ///
 /// Any match the store made is a hit, not just a full one. This operation answers what a payload
 /// *is*, and a weaker level names the same bytes under the same hash — reached under a context or
@@ -208,22 +226,6 @@ async fn resolve_local(
     store: &Arc<StoreInternal>,
     item: &LoreStorageGetMetadataItem,
 ) -> Option<LoreErrorCode> {
-    if item.partition == Partition::default() {
-        return Some(emit_complete(
-            item,
-            Fragment::default(),
-            LoreErrorCode::InvalidArguments,
-        ));
-    }
-
-    if item.address.hash == Hash::default() {
-        return Some(emit_complete(
-            item,
-            Fragment::default(),
-            LoreErrorCode::None,
-        ));
-    }
-
     match store
         .immutable
         .clone()

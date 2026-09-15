@@ -2549,6 +2549,56 @@ mod open_tests {
         );
     }
 
+    #[tokio::test]
+    async fn obliterate_batch_reports_each_item_independently() {
+        use lore_base::types::Address;
+        use lore_base::types::Context;
+        use lore_base::types::Hash;
+        use lore_base::types::Partition;
+
+        let handle = open_in_memory_handle().await;
+        let partition = Partition::from([0x2Au8; 16]);
+        let context = Context::from([0x2Bu8; 16]);
+        let payload = b"batched obliterate".to_vec();
+        let address = put_once(handle, partition, context, &payload).await;
+
+        let (status, events) = obliterate_items(
+            handle,
+            vec![
+                lore::storage::obliterate::LoreStorageObliterateItem {
+                    id: 1,
+                    partition,
+                    address,
+                },
+                lore::storage::obliterate::LoreStorageObliterateItem {
+                    id: 2,
+                    partition: Partition::default(),
+                    address: Address {
+                        hash: Hash::from([0x2Cu8; 32]),
+                        context,
+                    },
+                },
+            ],
+        )
+        .await;
+        assert_ne!(status, 0, "the rejected item fails the call");
+
+        // Items resolve concurrently, so the events are correlated by id rather than by position.
+        let code_for = |want: u64| {
+            events.iter().find_map(|e| match e {
+                ObliterateCaptured::Complete { id, error_code, .. } if *id == want => {
+                    Some(*error_code)
+                }
+                _ => None,
+            })
+        };
+        assert_eq!(code_for(1), Some(lore_revision::event::LoreErrorCode::None));
+        assert_eq!(
+            code_for(2),
+            Some(lore_revision::event::LoreErrorCode::InvalidArguments),
+        );
+    }
+
     /// Capture for copy items.
     #[derive(Debug, Clone, PartialEq)]
     enum CopyCaptured {
@@ -3714,6 +3764,63 @@ mod open_tests {
     }
 
     #[tokio::test]
+    async fn put_file_batch_reports_each_item_independently() {
+        use lore_base::types::Context;
+        use lore_base::types::Partition;
+
+        let handle = open_in_memory_handle().await;
+        let payload = b"batched put_file contents".to_vec();
+        let file = write_temp_file(&payload, "batch");
+        let partition = Partition::from([0x72u8; 16]);
+        let context = Context::from([0x82u8; 16]);
+
+        let (status, completes) = put_file_items(
+            handle,
+            vec![
+                lore::storage::put_file::LoreStoragePutFileItem {
+                    id: 1,
+                    partition,
+                    context,
+                    path: LoreString::from(file.path().display().to_string().as_str()),
+                    remote_write: 0,
+                    local_cache: 0,
+                    fixed_size_chunk: 0,
+                },
+                lore::storage::put_file::LoreStoragePutFileItem {
+                    id: 2,
+                    partition,
+                    context,
+                    path: LoreString::default(),
+                    remote_write: 0,
+                    local_cache: 0,
+                    fixed_size_chunk: 0,
+                },
+            ],
+        )
+        .await;
+        assert_ne!(status, 0, "the empty path fails the call");
+
+        // Items resolve concurrently, so the events are correlated by id rather than by position.
+        let stored = completes
+            .iter()
+            .find(|c| c.id == 1)
+            .expect("stored item complete missing");
+        assert_eq!(stored.error_code, lore_revision::event::LoreErrorCode::None);
+        assert_eq!(
+            stored.address.hash,
+            lore_storage::hash_slice(payload.as_slice()),
+        );
+        let rejected = completes
+            .iter()
+            .find(|c| c.id == 2)
+            .expect("rejected item complete missing");
+        assert_eq!(
+            rejected.error_code,
+            lore_revision::event::LoreErrorCode::InvalidArguments,
+        );
+    }
+
+    #[tokio::test]
     async fn put_file_round_trips_via_get() {
         // put_file round-trip: file content lands in the store at the same
         // address `write_from_file` would produce; get returns the
@@ -3951,6 +4058,64 @@ mod open_tests {
         .await;
         let events = sink.lock().unwrap().clone();
         (status, events)
+    }
+
+    #[tokio::test]
+    async fn get_file_batch_reports_each_item_independently() {
+        use lore_base::types::Context;
+        use lore_base::types::Partition;
+
+        let handle = open_in_memory_handle().await;
+        let partition = Partition::from([0xC5u8; 16]);
+        let context = Context::from([0xC6u8; 16]);
+        let first_payload = b"first batched destination".to_vec();
+        let second_payload = b"second batched destination".to_vec();
+        let first_address = put_once(handle, partition, context, &first_payload).await;
+        let second_address = put_once(handle, partition, context, &second_payload).await;
+
+        let (_first_guard, first_path) = temp_file_path("get-file-batch-1");
+        let (_second_guard, second_path) = temp_file_path("get-file-batch-2");
+        let (status, events) = get_file_items(
+            handle,
+            vec![
+                lore::storage::get_file::LoreStorageGetFileItem {
+                    id: 1,
+                    partition,
+                    address: first_address,
+                    path: LoreString::from(first_path.display().to_string().as_str()),
+                    ..Default::default()
+                },
+                lore::storage::get_file::LoreStorageGetFileItem {
+                    id: 2,
+                    partition,
+                    address: second_address,
+                    path: LoreString::from(second_path.display().to_string().as_str()),
+                    ..Default::default()
+                },
+            ],
+        )
+        .await;
+        assert_eq!(status, 0);
+        assert_eq!(std::fs::read(&first_path).unwrap(), first_payload);
+        assert_eq!(std::fs::read(&second_path).unwrap(), second_payload);
+
+        // Items resolve concurrently, so the events are correlated by id rather than by position.
+        let mut codes: Vec<(u64, lore_revision::event::LoreErrorCode)> = events
+            .iter()
+            .filter_map(|e| match e {
+                GetCaptured::ItemComplete { id, error_code, .. } => Some((*id, *error_code)),
+                _ => None,
+            })
+            .collect();
+        codes.sort_by_key(|(id, _)| *id);
+        assert_eq!(
+            codes,
+            vec![
+                (1, lore_revision::event::LoreErrorCode::None),
+                (2, lore_revision::event::LoreErrorCode::None),
+            ],
+            "one terminal event per item",
+        );
     }
 
     #[tokio::test]
@@ -4225,6 +4390,98 @@ mod open_tests {
 
     /// The content never exists as a buffer on either side: it goes from one file into the store
     /// under a key, and out of the store into another file by that key alone.
+    #[tokio::test]
+    async fn file_resolved_batches_report_each_item_independently() {
+        use lore_base::types::Context;
+        use lore_base::types::Hash;
+        use lore_base::types::Partition;
+
+        let handle = open_in_memory_handle().await;
+        let partition = Partition::from([0x4Au8; 16]);
+        let context = Context::from([0x4Bu8; 16]);
+        let first_payload = b"first batched key contents".to_vec();
+        let second_payload = b"second batched key contents".to_vec();
+        let first_key = Hash::hash_buffer(b"file-resolved-batch-1");
+        let second_key = Hash::hash_buffer(b"file-resolved-batch-2");
+        let first_source = write_temp_file(&first_payload, "batch-publish-1");
+        let second_source = write_temp_file(&second_payload, "batch-publish-2");
+
+        let (put_status, mut put_completes) = put_file_resolved_items(
+            handle,
+            vec![
+                lore::storage::put_file_resolved::LoreStoragePutFileResolvedItem {
+                    id: 1,
+                    partition,
+                    key: first_key,
+                    context,
+                    path: LoreString::from(first_source.path().display().to_string().as_str()),
+                    ..Default::default()
+                },
+                lore::storage::put_file_resolved::LoreStoragePutFileResolvedItem {
+                    id: 2,
+                    partition,
+                    key: second_key,
+                    context,
+                    path: LoreString::from(second_source.path().display().to_string().as_str()),
+                    ..Default::default()
+                },
+            ],
+        )
+        .await;
+        assert_eq!(put_status, 0);
+        // Items resolve concurrently, so the events are correlated by id rather than by position.
+        put_completes.sort_by_key(|c| c.id);
+        assert_eq!(
+            put_completes.len(),
+            2,
+            "one terminal event per published item"
+        );
+        assert_eq!(
+            put_completes[0].address.hash,
+            lore_storage::hash_slice(first_payload.as_slice()),
+        );
+        assert_eq!(
+            put_completes[1].address.hash,
+            lore_storage::hash_slice(second_payload.as_slice()),
+        );
+
+        let (_first_guard, first_path) = temp_file_path("get-file-resolved-batch-1");
+        let (_second_guard, second_path) = temp_file_path("get-file-resolved-batch-2");
+        let (get_status, events) = get_file_resolved_items(
+            handle,
+            vec![
+                lore::storage::get_file_resolved::LoreStorageGetFileResolvedItem {
+                    id: 3,
+                    partition,
+                    key: first_key,
+                    context,
+                    path: LoreString::from(first_path.display().to_string().as_str()),
+                    ..Default::default()
+                },
+                lore::storage::get_file_resolved::LoreStorageGetFileResolvedItem {
+                    id: 4,
+                    partition,
+                    key: second_key,
+                    context,
+                    path: LoreString::from(second_path.display().to_string().as_str()),
+                    ..Default::default()
+                },
+            ],
+        )
+        .await;
+        assert_eq!(get_status, 0);
+        assert_eq!(std::fs::read(&first_path).unwrap(), first_payload);
+        assert_eq!(std::fs::read(&second_path).unwrap(), second_payload);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, GetCaptured::ItemComplete { .. }))
+                .count(),
+            2,
+            "one terminal event per read item",
+        );
+    }
+
     #[tokio::test]
     async fn put_file_resolved_then_get_file_resolved_round_trips_through_files() {
         use lore_base::types::Context;

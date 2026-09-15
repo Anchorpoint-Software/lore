@@ -1783,10 +1783,9 @@ mod storage_remote_tests {
             .await
     }
 
-    async fn upload_one_item(
+    async fn upload_items(
         handle_id: u64,
-        partition: lore_base::types::Partition,
-        address: lore_base::types::Address,
+        items: Vec<lore::storage::upload::LoreStorageUploadItem>,
     ) -> (
         i32,
         Vec<(
@@ -1798,7 +1797,6 @@ mod storage_remote_tests {
     ) {
         use lore::storage::upload;
         use lore::storage::upload::LoreStorageUploadArgs;
-        use lore::storage::upload::LoreStorageUploadItem;
         use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
 
@@ -1820,17 +1818,112 @@ mod storage_remote_tests {
             LoreGlobalArgs::default(),
             LoreStorageUploadArgs {
                 handle: lore::storage::handle::LoreStore { handle_id },
-                items: LoreArray::from_vec(vec![LoreStorageUploadItem {
-                    id: 51,
-                    partition,
-                    address,
-                }]),
+                items: LoreArray::from_vec(items),
             },
             callback,
         )
         .await;
         let events = captured.lock().unwrap().clone();
         (status, events)
+    }
+
+    async fn upload_one_item(
+        handle_id: u64,
+        partition: lore_base::types::Partition,
+        address: lore_base::types::Address,
+    ) -> (
+        i32,
+        Vec<(
+            u64,
+            lore_base::types::Address,
+            u8,
+            lore_revision::event::LoreErrorCode,
+        )>,
+    ) {
+        upload_items(
+            handle_id,
+            vec![lore::storage::upload::LoreStorageUploadItem {
+                id: 51,
+                partition,
+                address,
+            }],
+        )
+        .await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn upload_batch_reports_each_item_independently() -> TestResult {
+        use lore::storage::upload::LoreStorageUploadItem;
+        use lore_base::types::Address;
+        use lore_base::types::Context;
+        use lore_base::types::Hash;
+        use lore_base::types::Partition;
+        use lore_revision::event::LoreErrorCode;
+        use lore_storage::immutable_store::query_one;
+        use lore_storage::store_types::StoreMatch;
+
+        let execution = setup_execution("storage-remote-upload-batch".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                for transport in TRANSPORTS {
+                    let server = start_server(transport).await;
+                    let partition = Partition::from([0xa9u8; 16]);
+                    let handle_id = open_remote_handle(&server).await;
+
+                    let payload = b"batched upload payload".to_vec();
+                    let stored =
+                        put_local_via_handle(handle_id, partition, payload.as_slice()).await;
+                    let absent = Address {
+                        hash: Hash::from([0xfbu8; 32]),
+                        context: Context::default(),
+                    };
+
+                    let (status, mut events) = upload_items(
+                        handle_id,
+                        vec![
+                            LoreStorageUploadItem {
+                                id: 1,
+                                partition,
+                                address: stored,
+                            },
+                            LoreStorageUploadItem {
+                                id: 2,
+                                partition,
+                                address: absent,
+                            },
+                        ],
+                    )
+                    .await;
+                    assert_ne!(status, 0, "the absent address fails the call");
+
+                    // Items resolve concurrently, so the events are not in the request order.
+                    events.sort_by_key(|(id, _, _, _)| *id);
+                    assert_eq!(events.len(), 2, "one terminal event per item");
+                    assert_eq!(
+                        (events[0].2, events[0].3),
+                        (0, LoreErrorCode::None),
+                        "the local-only payload uploads",
+                    );
+                    assert_eq!(
+                        (events[1].2, events[1].3),
+                        (0, LoreErrorCode::AddressNotFound),
+                        "the absent address reports its own miss",
+                    );
+
+                    let on_server = query_one(&server.backend_immutable.clone(), partition, stored)
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        on_server.match_made,
+                        StoreMatch::MatchFull,
+                        "the uploaded item must reach the server despite its neighbour failing",
+                    );
+
+                    close_handle(handle_id).await;
+                }
+                Ok(())
+            })
+            .await
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2714,6 +2807,87 @@ mod storage_remote_tests {
                     let events = captured.lock().unwrap().clone();
                     assert_eq!(events.len(), 1);
                     assert_eq!(events[0].1, LoreErrorCode::AddressNotFound);
+
+                    close_handle(handle_id).await;
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bound_remote_get_metadata_still_checks_arguments() -> TestResult {
+        use lore::storage::get_metadata;
+        use lore::storage::get_metadata::LoreStorageGetMetadataArgs;
+        use lore::storage::get_metadata::LoreStorageGetMetadataItem;
+        use lore_base::types::Address;
+        use lore_base::types::Context;
+        use lore_base::types::Hash;
+        use lore_base::types::Partition;
+        use lore_revision::event::LoreErrorCode;
+        use lore_revision::interface::LoreArray;
+
+        let execution = setup_execution("storage-remote-bound-remote-getmd-args".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                for transport in TRANSPORTS {
+                    let server = start_server(transport).await;
+                    let bound = LoreGlobalArgs {
+                        remote: 1,
+                        ..Default::default()
+                    };
+                    let handle_id = open_remote_handle_with_globals(&server, bound).await;
+
+                    let captured: Arc<Mutex<Vec<(u64, LoreErrorCode)>>> =
+                        Arc::new(Mutex::new(Vec::new()));
+                    let captured_for_cb = captured.clone();
+                    let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
+                        if let LoreEvent::StorageGetMetadataItemComplete(data) = event {
+                            captured_for_cb
+                                .lock()
+                                .unwrap()
+                                .push((data.id, data.error_code));
+                        }
+                    }));
+                    let status = get_metadata::get_metadata(
+                        LoreGlobalArgs::default(),
+                        LoreStorageGetMetadataArgs {
+                            handle: lore::storage::handle::LoreStore { handle_id },
+                            items: LoreArray::from_vec(vec![
+                                LoreStorageGetMetadataItem {
+                                    id: 1,
+                                    partition: Partition::default(),
+                                    address: Address {
+                                        hash: Hash::from([0x5au8; 32]),
+                                        context: Context::default(),
+                                    },
+                                },
+                                LoreStorageGetMetadataItem {
+                                    id: 2,
+                                    partition: Partition::from([0xcbu8; 16]),
+                                    address: Address {
+                                        hash: Hash::default(),
+                                        context: Context::default(),
+                                    },
+                                },
+                            ]),
+                        },
+                        callback,
+                    )
+                    .await;
+                    assert_ne!(status, 0, "the zero partition fails the call");
+
+                    let mut events = captured.lock().unwrap().clone();
+                    events.sort_by_key(|(id, _)| *id);
+                    assert_eq!(
+                        events,
+                        vec![
+                            (1, LoreErrorCode::InvalidArguments),
+                            (2, LoreErrorCode::None),
+                        ],
+                        "a remote-bound handle answers the argument checks as a local one does, \
+                         without reaching the wire",
+                    );
 
                     close_handle(handle_id).await;
                 }
@@ -6107,6 +6281,59 @@ mod storage_remote_tests {
     /// `RemoteImmutableStore::get_metadata` maps `NotFound` to `MatchNone`. The miss is
     /// dispatched first for the same reason as in the Get case.
     #[tokio::test]
+    async fn get_metadata_single_remote_item_resolves_without_spawning() -> TestResult {
+        use bytes::Bytes;
+        use lore_base::types::Partition;
+        use lore_revision::event::LoreErrorCode;
+
+        let execution = setup_execution("storage-remote-get-metadata-single".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let server = start_test_server().await;
+                let partition = Partition::from([0xc3u8; 16]);
+                let payload = Bytes::from_static(b"single remote metadata payload");
+                // Seeded on the server only, so the local probe misses and the item takes the
+                // remote leg — the one part of this op that a batch of several would spawn.
+                let address = seed_server(&server, partition, &payload).await;
+                let handle_id = open_remote_handle(&server).await;
+
+                let outcome: Arc<Mutex<Option<(LoreErrorCode, u32)>>> = Arc::new(Mutex::new(None));
+                let outcome_for_cb = outcome.clone();
+                let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
+                    if let LoreEvent::StorageGetMetadataItemComplete(data) = event {
+                        *outcome_for_cb.lock().unwrap() =
+                            Some((data.error_code, data.fragment.size_payload));
+                    }
+                }));
+
+                let status = lore::storage::get_metadata::get_metadata(
+                    LoreGlobalArgs::default(),
+                    lore::storage::get_metadata::LoreStorageGetMetadataArgs {
+                        handle: lore::storage::handle::LoreStore { handle_id },
+                        items: lore_revision::interface::LoreArray::from_vec(vec![
+                            lore::storage::get_metadata::LoreStorageGetMetadataItem {
+                                id: 1,
+                                partition,
+                                address,
+                            },
+                        ]),
+                    },
+                    callback,
+                )
+                .await;
+                assert_eq!(status, 0, "a server-held address must resolve");
+
+                let (code, size_payload) = outcome.lock().unwrap().expect("terminal event missing");
+                assert_eq!(code, LoreErrorCode::None);
+                assert!(size_payload > 0, "the wire fetch must carry the fragment");
+
+                close_handle(handle_id).await;
+                Ok(())
+            })
+            .await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn get_metadata_batch_survives_missing_address() -> TestResult {
         use bytes::Bytes;
         use lore_base::types::Address;

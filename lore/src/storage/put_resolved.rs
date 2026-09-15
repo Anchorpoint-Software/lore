@@ -40,7 +40,6 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use lore_base::error::InvalidArguments;
-use lore_base::lore_spawn;
 use lore_base::types::Context;
 use lore_base::types::Hash;
 use lore_base::types::Partition;
@@ -58,7 +57,6 @@ use lore_storage::options::WriteOptions;
 use lore_storage::write::write_resolved;
 use serde::Deserialize;
 use serde::Serialize;
-use tokio::task::JoinSet;
 
 use crate::call_delegation::dispatch_call;
 use crate::interface::LoreEventCallback;
@@ -166,34 +164,17 @@ async fn put_resolved_local(
             }
 
             let effective = store.effective_flags(per_call)?;
-
-            let total = items.len();
             let mut reuse = crate::storage::store::SessionReuse::default();
 
-            if let [item] = items {
-                let session = reuse.session_for(
-                    &store,
-                    item.partition,
-                    item.remote_write != 0 && !effective.no_remote,
-                );
-                let code = put_resolved_item(store, *item, session).await;
-                return crate::storage::build_call_error(&[code], total, "put_resolved");
-            }
-
-            let mut tasks: JoinSet<LoreErrorCode> = JoinSet::new();
-            for item in items.iter().copied() {
+            crate::storage::fan_out_items!(items, "put_resolved", |item| {
                 let session = reuse.session_for(
                     &store,
                     item.partition,
                     item.remote_write != 0 && !effective.no_remote,
                 );
                 let store = store.clone();
-                lore_spawn!(tasks, async move {
-                    put_resolved_item(store, item, session).await
-                });
-            }
-            let codes = crate::storage::drain_codes(tasks).await;
-            crate::storage::build_call_error(&codes, total, "put_resolved")
+                async move { put_resolved_item(store, &item, session).await }
+            })
         },
     )
     .await
@@ -202,7 +183,7 @@ async fn put_resolved_local(
 /// Execute one item. Always emits a single `PUT_ITEM_COMPLETE` event.
 async fn put_resolved_item(
     store: Arc<StoreInternal>,
-    item: LoreStoragePutResolvedItem,
+    item: &LoreStoragePutResolvedItem,
     session: Option<Arc<lore_transport::StorageSession>>,
 ) -> LoreErrorCode {
     let outcome = store_and_publish(store, item, session).await;
@@ -219,7 +200,7 @@ async fn put_resolved_item(
 
 async fn store_and_publish(
     store: Arc<StoreInternal>,
-    item: LoreStoragePutResolvedItem,
+    item: &LoreStoragePutResolvedItem,
     remote_session: Option<Arc<lore_transport::StorageSession>>,
 ) -> PutItemOutcome {
     if item.partition == Partition::default() {
@@ -241,8 +222,8 @@ async fn store_and_publish(
         // - `item.data.ptr` is non-null (checked above) and the FFI contract requires
         //   `item.data.len` valid bytes behind it.
         // - The `'static` lifetime is fudged exactly as in `put`: the buffer's real lifetime is
-        //   bounded by the call's `Complete` event, which `storage_call` only emits after this
-        //   future and every spawned task has resolved.
+        //   bounded by the call's `Complete` event, which `storage_call` only emits after the op's
+        //   future, and every task it spawned, has resolved.
         let slice: &'static [u8] =
             unsafe { std::slice::from_raw_parts(item.data.ptr.cast::<u8>(), item.data.len) };
         Bytes::from_static(slice)

@@ -253,22 +253,27 @@ mod mutable_local_tests {
         (status, events)
     }
 
-    /// Run a list call and return `(status, entries (key, value), complete error_code)`.
-    async fn list_one(
+    /// Run a list call and return `(status, entries per item id, terminal code per item id)`.
+    async fn list_items(
         handle_id: u64,
-        partition: Partition,
-        key_type: KeyType,
-    ) -> (i32, Vec<(Hash, Hash)>, Option<LoreErrorCode>) {
-        let entries: Arc<Mutex<Vec<(Hash, Hash)>>> = Arc::new(Mutex::new(Vec::new()));
-        let complete: Arc<Mutex<Option<LoreErrorCode>>> = Arc::new(Mutex::new(None));
+        items: Vec<LoreStorageMutableListItem>,
+    ) -> (i32, Vec<(u64, Hash, Hash)>, Vec<(u64, LoreErrorCode)>) {
+        let entries: Arc<Mutex<Vec<(u64, Hash, Hash)>>> = Arc::new(Mutex::new(Vec::new()));
+        let completes: Arc<Mutex<Vec<(u64, LoreErrorCode)>>> = Arc::new(Mutex::new(Vec::new()));
         let entries_for_cb = entries.clone();
-        let complete_for_cb = complete.clone();
+        let completes_for_cb = completes.clone();
         let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| match event {
             LoreEvent::StorageMutableListEntry(data) => {
-                entries_for_cb.lock().unwrap().push((data.key, data.value));
+                entries_for_cb
+                    .lock()
+                    .unwrap()
+                    .push((data.id, data.key, data.value));
             }
             LoreEvent::StorageMutableListItemComplete(data) => {
-                *complete_for_cb.lock().unwrap() = Some(data.error_code);
+                completes_for_cb
+                    .lock()
+                    .unwrap()
+                    .push((data.id, data.error_code));
             }
             _ => {}
         }));
@@ -276,18 +281,39 @@ mod mutable_local_tests {
             globals(),
             LoreStorageMutableListArgs {
                 handle: handle(handle_id),
-                items: LoreArray::from_vec(vec![LoreStorageMutableListItem {
-                    id: 5,
-                    partition,
-                    key_type,
-                }]),
+                items: LoreArray::from_vec(items),
             },
             callback,
         )
         .await;
         let entries = entries.lock().unwrap().clone();
-        let complete = *complete.lock().unwrap();
-        (status, entries, complete)
+        let completes = completes.lock().unwrap().clone();
+        (status, entries, completes)
+    }
+
+    /// List one partition and return `(status, entries (key, value), complete error_code)`.
+    async fn list_one(
+        handle_id: u64,
+        partition: Partition,
+        key_type: KeyType,
+    ) -> (i32, Vec<(Hash, Hash)>, Option<LoreErrorCode>) {
+        let (status, entries, completes) = list_items(
+            handle_id,
+            vec![LoreStorageMutableListItem {
+                id: 5,
+                partition,
+                key_type,
+            }],
+        )
+        .await;
+        (
+            status,
+            entries
+                .into_iter()
+                .map(|(_, key, value)| (key, value))
+                .collect(),
+            completes.first().map(|(_, code)| *code),
+        )
     }
 
     #[tokio::test]
@@ -428,6 +454,148 @@ mod mutable_local_tests {
             load_one(handle_id, partition, key).await.0,
             current,
             "value must be unchanged after a mismatched CAS",
+        );
+    }
+
+    #[tokio::test]
+    async fn load_batch_reports_each_item_independently() {
+        let handle_id = open_in_memory().await;
+        let partition = Partition::from([0xb1u8; 16]);
+        let present = Hash::from([0xb2u8; 32]);
+        let absent = Hash::from([0xb3u8; 32]);
+        let value = Hash::from([0xb4u8; 32]);
+
+        store_one(handle_id, partition, present, value).await;
+
+        let (status, mut completes) = load_items(
+            handle_id,
+            vec![
+                LoreStorageMutableLoadItem {
+                    id: 1,
+                    partition,
+                    key: present,
+                    key_type: KEY_TYPE,
+                },
+                LoreStorageMutableLoadItem {
+                    id: 2,
+                    partition,
+                    key: absent,
+                    key_type: KEY_TYPE,
+                },
+            ],
+        )
+        .await;
+        assert_ne!(status, 0, "the missing key fails the call");
+        // Items resolve concurrently, so the event order is not the request order.
+        completes.sort_by_key(|(id, _, _)| *id);
+        assert_eq!(
+            completes,
+            vec![
+                (1, value, LoreErrorCode::None),
+                (2, Hash::default(), LoreErrorCode::AddressNotFound),
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_and_swap_batch_reports_each_item_independently() {
+        let handle_id = open_in_memory().await;
+        let partition = Partition::from([0xc1u8; 16]);
+        let absent = Hash::from([0xc2u8; 32]);
+        let occupied = Hash::from([0xc3u8; 32]);
+        let current = Hash::from([0xc4u8; 32]);
+        let next = Hash::from([0xc5u8; 32]);
+
+        store_one(handle_id, partition, occupied, current).await;
+
+        let (status, mut completes) = cas_items(
+            handle_id,
+            vec![
+                LoreStorageMutableCompareAndSwapItem {
+                    id: 1,
+                    partition,
+                    key: absent,
+                    expected: Hash::default(),
+                    value: next,
+                    key_type: KEY_TYPE,
+                },
+                LoreStorageMutableCompareAndSwapItem {
+                    id: 2,
+                    partition,
+                    key: occupied,
+                    expected: Hash::default(),
+                    value: next,
+                    key_type: KEY_TYPE,
+                },
+            ],
+        )
+        .await;
+        assert_eq!(status, 0, "a no-op CAS is still a successful call");
+        completes.sort_by_key(|(id, _, _)| *id);
+        assert_eq!(
+            completes,
+            vec![
+                (1, Hash::default(), LoreErrorCode::None),
+                (2, current, LoreErrorCode::None),
+            ],
+        );
+        assert_eq!(load_one(handle_id, partition, absent).await.0, next);
+        assert_eq!(
+            load_one(handle_id, partition, occupied).await.0,
+            current,
+            "the mismatched expectation must leave its key alone",
+        );
+    }
+
+    #[tokio::test]
+    async fn list_batch_reports_each_item_independently() {
+        let handle_id = open_in_memory().await;
+        let first_partition = Partition::from([0xd1u8; 16]);
+        let second_partition = Partition::from([0xd2u8; 16]);
+        // `list` returns typed keys (key_type written into key byte 2), so use fixed-point keys
+        // that already carry `KEY_TYPE` there and therefore round-trip exactly.
+        let typed_key = |byte: u8| {
+            let mut key = [byte; 32];
+            key[2] = KEY_TYPE as u8;
+            Hash::from(key)
+        };
+        let first_key = typed_key(0xd3u8);
+        let second_key = typed_key(0xd4u8);
+        let first_value = Hash::from([0xd5u8; 32]);
+        let second_value = Hash::from([0xd6u8; 32]);
+
+        store_one(handle_id, first_partition, first_key, first_value).await;
+        store_one(handle_id, second_partition, second_key, second_value).await;
+
+        let (status, mut entries, mut completes) = list_items(
+            handle_id,
+            vec![
+                LoreStorageMutableListItem {
+                    id: 1,
+                    partition: first_partition,
+                    key_type: KEY_TYPE,
+                },
+                LoreStorageMutableListItem {
+                    id: 2,
+                    partition: second_partition,
+                    key_type: KEY_TYPE,
+                },
+            ],
+        )
+        .await;
+        assert_eq!(status, 0);
+        // Items list concurrently, so neither the entries nor the terminal events arrive in the
+        // request order.
+        entries.sort_by_key(|(id, _, _)| *id);
+        completes.sort_by_key(|(id, _)| *id);
+        assert_eq!(
+            entries,
+            vec![(1, first_key, first_value), (2, second_key, second_value),],
+            "each item lists only its own partition",
+        );
+        assert_eq!(
+            completes,
+            vec![(1, LoreErrorCode::None), (2, LoreErrorCode::None)],
         );
     }
 

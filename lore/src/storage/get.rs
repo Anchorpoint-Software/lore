@@ -30,7 +30,6 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use lore_base::error::InvalidArguments;
-use lore_base::lore_spawn;
 use lore_base::types::Address;
 use lore_base::types::Hash;
 use lore_base::types::Partition;
@@ -51,7 +50,6 @@ use lore_storage::read::read;
 use lore_storage::read::read_stream;
 use serde::Deserialize;
 use serde::Serialize;
-use tokio::task::JoinSet;
 
 use crate::call_delegation::dispatch_call;
 use crate::interface::LoreEventCallback;
@@ -154,26 +152,13 @@ async fn get_local(
                 return Ok::<(), GetError>(());
             }
             let effective = store.effective_flags(per_call)?;
-
-            let total = items.len();
             let mut reuse = crate::storage::store::SessionReuse::default();
 
-            if let [item] = items {
-                let session = reuse.session_for(&store, item.partition, !effective.no_remote);
-                let code = get_item(store, *item, effective, session).await;
-                return crate::storage::build_call_error(&[code], total, "get");
-            }
-
-            let mut tasks: JoinSet<LoreErrorCode> = JoinSet::new();
-            for item in items.iter().copied() {
+            crate::storage::fan_out_items!(items, "get", |item| {
                 let session = reuse.session_for(&store, item.partition, !effective.no_remote);
                 let store = store.clone();
-                lore_spawn!(tasks, async move {
-                    get_item(store, item, effective, session).await
-                });
-            }
-            let codes = crate::storage::drain_codes(tasks).await;
-            crate::storage::build_call_error(&codes, total, "get")
+                async move { get_item(store, &item, effective, session).await }
+            })
         },
     )
     .await
@@ -183,19 +168,19 @@ async fn get_local(
 /// sequence. Returns the per-item `LoreErrorCode` for the call-level aggregator.
 async fn get_item(
     store: Arc<StoreInternal>,
-    item: LoreStorageGetItem,
+    item: &LoreStorageGetItem,
     effective: crate::storage::store::EffectiveFlags,
     remote_session: Option<Arc<lore_transport::StorageSession>>,
 ) -> LoreErrorCode {
     if item.partition == Partition::default() {
-        emit_item_complete(&item, LoreErrorCode::InvalidArguments);
+        emit_item_complete(item, LoreErrorCode::InvalidArguments);
         return LoreErrorCode::InvalidArguments;
     }
 
     if item.address.hash == Hash::default() {
-        emit_header(&item, 0);
-        emit_data(&item, Bytes::new(), 0);
-        emit_item_complete(&item, LoreErrorCode::None);
+        emit_header(item, 0);
+        emit_data(item, Bytes::new(), 0);
+        emit_item_complete(item, LoreErrorCode::None);
         return LoreErrorCode::None;
     }
 
@@ -222,17 +207,17 @@ async fn get_item(
             // Empty bytes here would be indistinguishable from content that is genuinely
             // empty, so a start past the end is reported rather than clamped.
             if item.offset > fragment.size_content {
-                emit_item_complete(&item, LoreErrorCode::InvalidArguments);
+                emit_item_complete(item, LoreErrorCode::InvalidArguments);
                 return LoreErrorCode::InvalidArguments;
             }
-            emit_header(&item, fragment.size_content);
-            emit_data(&item, bytes, item.offset);
-            emit_item_complete(&item, LoreErrorCode::None);
+            emit_header(item, fragment.size_content);
+            emit_data(item, bytes, item.offset);
+            emit_item_complete(item, LoreErrorCode::None);
             LoreErrorCode::None
         }
         Err(err) => {
             let code = crate::storage::storage_error_to_code(&err);
-            emit_item_complete(&item, code);
+            emit_item_complete(item, code);
             code
         }
     }
@@ -249,7 +234,7 @@ async fn get_item(
 /// both proportional to the range rather than to the content.
 async fn get_item_streaming(
     store: Arc<StoreInternal>,
-    item: LoreStorageGetItem,
+    item: &LoreStorageGetItem,
     effective: crate::storage::store::EffectiveFlags,
     remote_session: Option<Arc<lore_transport::StorageSession>>,
 ) -> LoreErrorCode {
@@ -272,7 +257,7 @@ async fn get_item_streaming(
         Ok(started) => started,
         Err(err) => {
             let code = crate::storage::storage_error_to_code(&err);
-            emit_item_complete(&item, code);
+            emit_item_complete(item, code);
             return code;
         }
     };
@@ -280,11 +265,11 @@ async fn get_item_streaming(
     // As in the buffered path. Nothing was spawned for an empty range, so dropping the
     // receiver here leaves no pipeline writing into a closed channel.
     if item.offset > fragment.size_content {
-        emit_item_complete(&item, LoreErrorCode::InvalidArguments);
+        emit_item_complete(item, LoreErrorCode::InvalidArguments);
         return LoreErrorCode::InvalidArguments;
     }
 
-    emit_header(&item, fragment.size_content);
+    emit_header(item, fragment.size_content);
 
     let mut offset = streamed.start;
     let mut code = LoreErrorCode::None;
@@ -292,7 +277,7 @@ async fn get_item_streaming(
         match chunk {
             Ok(chunk) => {
                 let len = chunk.len() as u64;
-                emit_data(&item, chunk, offset);
+                emit_data(item, chunk, offset);
                 offset += len;
             }
             Err(err) => {
@@ -305,7 +290,7 @@ async fn get_item_streaming(
     if code == LoreErrorCode::None && offset != streamed.end {
         code = LoreErrorCode::Internal;
     }
-    emit_item_complete(&item, code);
+    emit_item_complete(item, code);
     code
 }
 

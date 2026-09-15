@@ -13,12 +13,10 @@
 //!
 //! # Item fan-out
 //!
-//! Every entry point takes a batch. A batch of several runs one task per item and awaits them
-//! all before returning; a batch of one runs on the calling task. Spawning a single item would
-//! hand it to a worker thread and wait to be woken — a thread round trip to do work the calling
-//! thread is already blocked waiting for, and one address or key is the shape most calls arrive
-//! in. `LORE_CONTEXT` is a task-local and the work stays in the caller's task, so it needs no
-//! propagating; `ObservedTask` is skipped because there is no task to report the lifecycle of.
+//! The item-taking entry points fan out through `fan_out_items`: one task per item for a batch of
+//! several, the calling task for a batch of one. `lore_storage_copy` and
+//! `lore_storage_get_metadata` fan out by hand — the first carries a per-item outcome wider than
+//! an error code, the second spawns only the items its local probe missed.
 //!
 //! # Callback contract
 //!
@@ -302,6 +300,57 @@ pub(crate) fn aggregate_error_code(
         .filter(|c| *c != LoreErrorCode::None)
         .max_by_key(|c| severity(*c))
 }
+
+/// Run one batched op's items and reduce their per-item codes to the call-level result.
+///
+/// A batch of several runs one task per item and awaits them all before returning; a batch of one
+/// runs on the calling task. Spawning a single item would hand it to a worker thread and wait to be
+/// woken — a thread round trip to do work the calling thread is already blocked waiting for, and one
+/// address or key is the shape most calls arrive in. `LORE_CONTEXT` is a task-local and the work
+/// stays in the caller's task, so it needs no propagating; `ObservedTask` is skipped because there
+/// is no task to report the lifecycle of.
+///
+/// `$items` is the op's item slice. `$item` binds the item `$future` is to run: borrowed straight
+/// out of `$items` for a batch of one, and an owned clone per spawned item, which a `'static` task
+/// has to have. `$future` therefore takes it as `&$item`, and the per-item function takes the item
+/// by reference — a batch of one then copies nothing, which for an item owning a `LoreString` would
+/// otherwise cost an allocation on the path this exists to make cheap.
+///
+/// `$future` is evaluated once per item and must produce a `Send + 'static` future resolving to
+/// that item's `LoreErrorCode`; per-item setup that borrows the op's locals — resolving a session
+/// out of a `SessionReuse`, cloning the store — belongs inside it, as it runs before the future is
+/// spawned. That setup must be infallible: a `?` or `return` part-way through the loop would drop
+/// the `JoinSet` and abort the items already in flight.
+///
+/// Every spawned item is joined before returning, and a task that yields no code counts as
+/// `LoreErrorCode::Internal`, so no item's slot is lost.
+///
+/// A macro rather than a function because `ObservedTask` records `Location::caller()` and the server
+/// labels its task metrics with it: expanding at the op's own line keeps one label per op, where a
+/// shared function body would report every op at a single location.
+macro_rules! fan_out_items {
+    ($items:expr, $op_name:literal, |$item:ident| $future:expr) => {{
+        let items = $items;
+        let total = items.len();
+        if let [single] = items {
+            let $item = single;
+            // `&$item` is a re-borrow only here, where the binding is already a reference; the
+            // spawned arm needs that borrow to reach its owned clone.
+            #[allow(clippy::needless_borrow)]
+            let code = $future.await;
+            $crate::storage::build_call_error(&[code], total, $op_name)
+        } else {
+            let mut tasks: ::tokio::task::JoinSet<::lore_revision::event::LoreErrorCode> =
+                ::tokio::task::JoinSet::new();
+            for $item in items.iter().cloned() {
+                ::lore_base::lore_spawn!(tasks, $future);
+            }
+            let codes = $crate::storage::drain_codes(tasks).await;
+            $crate::storage::build_call_error(&codes, total, $op_name)
+        }
+    }};
+}
+pub(crate) use fan_out_items;
 
 /// Drain a `JoinSet<LoreErrorCode>` into a `Vec<LoreErrorCode>`, mapping `JoinError` (task
 /// panic / cancellation) to `LoreErrorCode::Internal` so the per-item slot is never lost.

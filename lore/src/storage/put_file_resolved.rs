@@ -24,7 +24,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 use lore_base::error::InvalidArguments;
-use lore_base::lore_spawn;
 use lore_base::types::Context;
 use lore_base::types::Hash;
 use lore_base::types::Partition;
@@ -42,7 +41,6 @@ use lore_storage::options::WriteOptions;
 use lore_storage::write::write_resolved_from_file;
 use serde::Deserialize;
 use serde::Serialize;
-use tokio::task::JoinSet;
 
 use crate::call_delegation::dispatch_call;
 use crate::interface::LoreEventCallback;
@@ -148,33 +146,17 @@ async fn put_file_resolved_local(
                 return Ok::<(), PutFileResolvedError>(());
             }
             let effective = store.effective_flags(per_call)?;
-            let total = items.len();
             let mut reuse = crate::storage::store::SessionReuse::default();
 
-            if let [item] = items {
-                let session = reuse.session_for(
-                    &store,
-                    item.partition,
-                    item.remote_write != 0 && !effective.no_remote,
-                );
-                let code = put_file_resolved_item(store, item.clone(), session).await;
-                return crate::storage::build_call_error(&[code], total, "put_file_resolved");
-            }
-
-            let mut tasks: JoinSet<LoreErrorCode> = JoinSet::new();
-            for item in items.iter().cloned() {
+            crate::storage::fan_out_items!(items, "put_file_resolved", |item| {
                 let session = reuse.session_for(
                     &store,
                     item.partition,
                     item.remote_write != 0 && !effective.no_remote,
                 );
                 let store = store.clone();
-                lore_spawn!(tasks, async move {
-                    put_file_resolved_item(store, item, session).await
-                });
-            }
-            let codes = crate::storage::drain_codes(tasks).await;
-            crate::storage::build_call_error(&codes, total, "put_file_resolved")
+                async move { put_file_resolved_item(store, &item, session).await }
+            })
         },
     )
     .await
@@ -182,10 +164,10 @@ async fn put_file_resolved_local(
 
 async fn put_file_resolved_item(
     store: Arc<StoreInternal>,
-    item: LoreStoragePutFileResolvedItem,
+    item: &LoreStoragePutFileResolvedItem,
     session: Option<Arc<lore_transport::StorageSession>>,
 ) -> LoreErrorCode {
-    let outcome = resolve_put_file_resolved_item(store, &item, session).await;
+    let outcome = resolve_put_file_resolved_item(store, item, session).await;
     LoreEvent::StoragePutItemComplete(LoreStoragePutItemCompleteEventData {
         id: item.id,
         address: outcome.address,
