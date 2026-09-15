@@ -23,6 +23,8 @@ use tonic::transport::Server;
 use tonic::transport::ServerTlsConfig;
 use tracing::info;
 
+use crate::auth::jwt::JwtVerifier;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::correlation::layer::CorrelationIdLayerBuilder;
 use crate::correlation::layer::TraceLayerConfig;
 use crate::grpc;
@@ -74,6 +76,7 @@ impl GrpcInternalServerBuilder<WantsComponents> {
         Self(WantsComponents(()))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn with_components(
         self,
         local_immutable_store: Arc<dyn ImmutableStore>,
@@ -82,6 +85,8 @@ impl GrpcInternalServerBuilder<WantsComponents> {
         notification_sender: Arc<dyn NotificationSender>,
         hook_dispatcher: Arc<HookDispatcher>,
         environment: EnvironmentConfig,
+        jwt_verifier: Option<JwtVerifier>,
+        repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     ) -> anyhow::Result<GrpcInternalServerBuilder<WantsTlsConfig>> {
         if !local_immutable_store.is_local() {
             return Err(anyhow!("Immutable store must be a local store"));
@@ -94,6 +99,8 @@ impl GrpcInternalServerBuilder<WantsComponents> {
             notification_sender,
             hook_dispatcher,
             environment,
+            jwt_verifier,
+            repository_authorizer,
         }))
     }
 }
@@ -105,6 +112,8 @@ pub struct WantsTlsConfig {
     notification_sender: Arc<dyn NotificationSender>,
     hook_dispatcher: Arc<HookDispatcher>,
     environment: EnvironmentConfig,
+    jwt_verifier: Option<JwtVerifier>,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
 }
 
 impl GrpcInternalServerBuilder<WantsTlsConfig> {
@@ -154,6 +163,8 @@ impl GrpcInternalServerBuilder<WantsTlsConfig> {
             notification_sender: self.0.notification_sender,
             hook_dispatcher: self.0.hook_dispatcher,
             environment: self.0.environment,
+            jwt_verifier: self.0.jwt_verifier,
+            repository_authorizer: self.0.repository_authorizer,
             tls_config,
         }))
     }
@@ -166,6 +177,8 @@ pub struct WantsHttp2Config {
     notification_sender: Arc<dyn NotificationSender>,
     hook_dispatcher: Arc<HookDispatcher>,
     environment: EnvironmentConfig,
+    jwt_verifier: Option<JwtVerifier>,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     tls_config: Option<ServerTlsConfig>,
 }
 
@@ -215,6 +228,8 @@ impl GrpcInternalServerBuilder<WantsHttp2Config> {
         router = router.add_service(ForwardedRepositoryServiceServer::new(
             LoreForwardedRepositoryV1Service::new(
                 self.0.environment,
+                self.0.jwt_verifier,
+                self.0.repository_authorizer,
                 self.0.immutable_store,
                 self.0.mutable_store,
                 self.0.hook_dispatcher,

@@ -24,6 +24,8 @@ use tracing::info;
 use tracing::warn;
 
 use super::record::build_repository;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::authnz::repository_authorizer::VerifiedToken;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_authorization_header;
@@ -31,22 +33,23 @@ use crate::grpc::extract_correlation_id;
 use crate::grpc::forwarded_requests::CallerContext;
 use crate::grpc::forwarded_requests::ForwardedRequests;
 use crate::grpc::get_user_id;
+use crate::grpc::get_verified_token;
 use crate::grpc::handlers::repository_query::check_repository_query_authorization;
 use crate::util::setup_execution;
 
 /// `lore.repository.v1.RepositoryService.RepositoryGet` handler.
 ///
 /// Resolves a repository by id or by name and returns the full
-/// `Repository` record. Honors auth when the environment configures an
-/// auth-service URL. Self-heals stale or missing name → id mappings the
-/// same way the legacy `RepositoryQuery` handler does.
+/// `Repository` record. Access is decided by the injected
+/// [`RepositoryAuthorizer`]. Self-heals stale or missing name → id mappings
+/// the same way the legacy `RepositoryQuery` handler does.
 ///
 /// Depending on server configuration, this request may get completely delegated to another server
 /// via `ForwardedRepositoryService`
 #[tracing::instrument(name = "RepositoryGet::v1::handle", skip_all)]
 pub async fn handler(
     request: Request<RepositoryGetRequest>,
-    auth_url: Option<String>,
+    authorizer: Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     forwarded_requests: &Option<Arc<dyn ForwardedRequests>>,
@@ -57,7 +60,7 @@ pub async fn handler(
         correlation_id: extract_correlation_id(&request).unwrap_or_default(),
         authorization: extract_authorization_header(&request),
     };
-    let req = request.into_inner();
+    let (_, extensions, req) = request.into_parts();
 
     if let Some(forwarded_requests) = forwarded_requests
         && forwarded_requests.rpc_flags().repository_get
@@ -67,7 +70,8 @@ pub async fn handler(
         repository_get_implementation(
             req,
             caller_context,
-            auth_url,
+            authorizer,
+            extensions,
             immutable_store,
             mutable_store,
         )
@@ -99,7 +103,8 @@ async fn forward_repository_get(
 pub async fn repository_get_implementation(
     req: RepositoryGetRequest,
     caller_context: CallerContext,
-    auth_url: Option<String>,
+    authorizer: Arc<dyn RepositoryAuthorizer>,
+    extensions: tonic::Extensions,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
 ) -> Result<Response<RepositoryGetResponse>, Status> {
@@ -109,7 +114,6 @@ pub async fn repository_get_implementation(
         ));
     };
 
-    let authorization = caller_context.authorization;
     let execution = setup_execution(
         module_path!(),
         caller_context.correlation_id,
@@ -124,17 +128,20 @@ pub async fn repository_get_implementation(
 
     LORE_CONTEXT
         .scope(execution, async move {
+            let token = get_verified_token(&extensions);
             let (id, metadata, metadata_hash) = match query {
                 Query::Id(id) => {
                     let id: RepositoryId = Context::from(id).into();
                     debug!(%id, "Get repository by id");
-                    let (metadata, metadata_hash) =
-                        repository_load_id(repository.clone(), id, auth_url, authorization)
-                            .await
-                            .filter_slow_down()?
-                            .map_err(|_err| {
-                                Status::not_found(format!("Repository {id} not found"))
-                            })?;
+                    let (metadata, metadata_hash) = repository_load_id(
+                        repository.clone(),
+                        id,
+                        Some(authorizer.as_ref()),
+                        token.as_ref(),
+                    )
+                    .await
+                    .filter_slow_down()?
+                    .map_err(|_err| Status::not_found(format!("Repository {id} not found")))?;
                     (id, metadata, metadata_hash)
                 }
                 Query::Name(name) => {
@@ -142,8 +149,8 @@ pub async fn repository_get_implementation(
                     let (id, metadata, metadata_hash) = repository_load_name(
                         repository.clone(),
                         name.as_str(),
-                        auth_url,
-                        authorization,
+                        Some(authorizer.as_ref()),
+                        token.as_ref(),
                     )
                     .await
                     .filter_slow_down()?
@@ -161,16 +168,17 @@ pub async fn repository_get_implementation(
 
 /// Resolve a repository by id, returning its metadata blob plus the
 /// metadata pointer hash. Performs the same authz check + name-mapping
-/// repair the legacy v0 handler does.
+/// repair the legacy v0 handler does. `authorizer: None` skips the access
+/// check for internal lookups.
 #[allow(clippy::map_err_ignore)]
 pub(super) async fn repository_load_id(
     repository: Arc<RepositoryContext>,
     id: RepositoryId,
-    auth_url: Option<String>,
-    authorization: Option<String>,
+    authorizer: Option<&dyn RepositoryAuthorizer>,
+    token: Option<&VerifiedToken<'_>>,
 ) -> Result<(RepositoryMetadata, Hash), RepositoryError> {
-    if let Some(auth_url) = auth_url {
-        check_repository_query_authorization(auth_url, authorization, id)
+    if let Some(authorizer) = authorizer {
+        check_repository_query_authorization(authorizer, token, id)
             .await
             .map_err(|status| {
                 debug!(%id, "User authorization failed: {status}");
@@ -226,20 +234,20 @@ pub(super) async fn repository_load_id(
 pub(super) async fn repository_load_name(
     repository: Arc<RepositoryContext>,
     name: &str,
-    auth_url: Option<String>,
-    authorization: Option<String>,
+    authorizer: Option<&dyn RepositoryAuthorizer>,
+    token: Option<&VerifiedToken<'_>>,
 ) -> Result<(RepositoryId, RepositoryMetadata, Hash), RepositoryError> {
     if let Ok(id) = RepositoryId::from_str(name) {
         let (metadata, metadata_hash) =
-            repository_load_id(repository, id, auth_url, authorization).await?;
+            repository_load_id(repository, id, authorizer, token).await?;
         return Ok((id, metadata, metadata_hash));
     }
 
     let name_repository = Arc::new(repository.to_server_context(RepositoryId::default()));
     let id = repository::id_from_name(name_repository, name).await?;
 
-    if let Some(auth_url) = auth_url {
-        check_repository_query_authorization(auth_url, authorization, id)
+    if let Some(authorizer) = authorizer {
+        check_repository_query_authorization(authorizer, token, id)
             .await
             .map_err(|status| {
                 debug!(%id, "User authorization failed: {status}");
@@ -286,6 +294,7 @@ mod tests {
         use rand::random;
 
         use super::super::*;
+        use crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
         use crate::grpc::forwarded_requests::ForwardedRequestResult;
         use crate::grpc::forwarded_requests::InternalClientError;
         use crate::grpc::forwarded_requests::RpcFlags;
@@ -425,7 +434,7 @@ mod tests {
             Box::pin(LORE_CONTEXT.scope(execution, async move {
                 let response = handler(
                     make_request("test-repo"),
-                    None, /* no auth */
+                    Arc::new(AllowAllRepositoryAuthorizer),
                     immutable_store,
                     mutable_store,
                     &Some(forwarded_requests as Arc<dyn ForwardedRequests>),
@@ -455,7 +464,7 @@ mod tests {
             Box::pin(LORE_CONTEXT.scope(execution, async move {
                 let err = handler(
                     make_request("test-repo"),
-                    None,
+                    Arc::new(AllowAllRepositoryAuthorizer),
                     immutable_store,
                     mutable_store,
                     &Some(forwarded_requests as Arc<dyn ForwardedRequests>),
@@ -482,7 +491,7 @@ mod tests {
             Box::pin(LORE_CONTEXT.scope(execution, async move {
                 let err = handler(
                     make_request("test-repo"),
-                    None,
+                    Arc::new(AllowAllRepositoryAuthorizer),
                     immutable_store,
                     mutable_store,
                     &Some(forwarded_requests as Arc<dyn ForwardedRequests>),
@@ -519,7 +528,7 @@ mod tests {
 
                 let response = handler(
                     make_request("my-repo"),
-                    None, /* no auth */
+                    Arc::new(AllowAllRepositoryAuthorizer),
                     immutable_store,
                     mutable_store,
                     &Some(forwarded_requests as Arc<dyn ForwardedRequests>),
@@ -533,6 +542,53 @@ mod tests {
                     .expect("response should include Repository");
                 assert_eq!(repository.name, "my-repo");
                 assert_eq!(repository.id, bytes::Bytes::from(id));
+            }))
+            .await;
+        }
+
+        /// Denial answers `RepositoryNotFound`, not `permission_denied`: a
+        /// distinct status would let an unauthorized caller distinguish a
+        /// partition that exists from one that does not.
+        #[tokio::test]
+        async fn denied_get_answers_not_found_for_an_existing_repository() {
+            struct DenyAllRepositoryAuthorizer;
+
+            #[async_trait]
+            impl RepositoryAuthorizer for DenyAllRepositoryAuthorizer {
+                async fn check_repository_access(
+                    &self,
+                    _token: Option<&VerifiedToken<'_>>,
+                    _repository_id: lore_base::types::RepositoryId,
+                    _action: Option<&str>,
+                ) -> Result<(), Status> {
+                    Err(Status::permission_denied("denied"))
+                }
+            }
+
+            let id = random::<RepositoryId>();
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("Failed to create stores");
+
+            Box::pin(LORE_CONTEXT.scope(execution, async move {
+                seed_repository(
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    id,
+                    "my-repo",
+                )
+                .await;
+
+                let err = handler(
+                    make_request("my-repo"),
+                    Arc::new(DenyAllRepositoryAuthorizer),
+                    immutable_store,
+                    mutable_store,
+                    &None,
+                )
+                .await
+                .expect_err("denied get must fail");
+
+                assert_eq!(err.code(), tonic::Code::NotFound, "{err:?}");
             }))
             .await;
         }

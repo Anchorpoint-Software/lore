@@ -71,9 +71,8 @@ impl AuthClientAuthorizer {
         Self { auth_url }
     }
 
-    /// The pre-`VerifiedToken` entry point: takes the `authorization` header
-    /// value verbatim.
-    pub(crate) async fn check_access_with_header(
+    /// Takes the `authorization` header value verbatim.
+    async fn check_access_with_header(
         &self,
         authorization: Option<String>,
         repository_id: RepositoryId,

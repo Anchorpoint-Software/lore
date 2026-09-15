@@ -91,8 +91,8 @@ async fn repository_delete(
     let Ok(data) = repository_query_id(
         repository.clone(),
         repository.id,
-        None, /* auth url */
-        None, /* authorization */
+        None, /* skip authz */
+        None, /* token */
     )
     .await
     .filter_slow_down()?

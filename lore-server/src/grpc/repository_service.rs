@@ -107,10 +107,7 @@ impl RepositoryService for LoreRepositoryService {
             self.rpc_timeout,
             repository_query::handler(
                 request,
-                self.environment
-                    .endpoint
-                    .as_ref()
-                    .and_then(|endpoint| endpoint.auth_url.clone()),
+                self.authorizer.clone(),
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
             ),

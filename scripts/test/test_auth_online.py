@@ -28,13 +28,20 @@ import uuid
 from pathlib import Path
 from types import SimpleNamespace
 
+import grpc
 import pytest
 from error_types import LoreException
+from grpc_probe import call
 from lore_server import (
     _kill_server_by_pid,
     allocate_free_port,
     generate_server_config,
     launch_lore_server,
+)
+from test_forwarded_requests import (
+    REPOSITORY_GET,
+    repository_get_by_name_request,
+    repository_name_in_response,
 )
 from mock_auth_server import (
     USER1,
@@ -73,6 +80,23 @@ endpoint = "{jwks_url}"
 """
 
 
+def append_auth_config(server_root: Path, mock: MockAuthServer) -> None:
+    """Point a generated server config at the stub.
+
+    jwt_audience is a list, which the LORE__ env source cannot carry, so the
+    auth settings ride in the per-test copy of the gha config instead."""
+    config_path = server_root / "lore-server" / "config" / "gha.toml"
+    config_path.write_text(
+        config_path.read_text()
+        + AUTH_CONFIG.format(
+            auth_url=mock.auth_url,
+            issuer=mock.issuer,
+            audience=mock.audience[0],
+            jwks_url=mock.jwks_url,
+        )
+    )
+
+
 @pytest.fixture(scope="module")
 def auth_env(request, tmp_path_factory, lore_server_executable_path):
     """A lore server with authentication enabled, backed by the stub.
@@ -91,19 +115,7 @@ def auth_env(request, tmp_path_factory, lore_server_executable_path):
         "internal": allocate_free_port(),
     }
     server_root, server_env = generate_server_config(request, tmp_path_factory, ports)
-
-    # jwt_audience is a list, which the LORE__ env source cannot carry, so the
-    # auth settings ride in the per-test copy of the gha config instead.
-    config_path = server_root / "lore-server" / "config" / "gha.toml"
-    config_path.write_text(
-        config_path.read_text()
-        + AUTH_CONFIG.format(
-            auth_url=mock.auth_url,
-            issuer=mock.issuer,
-            audience=mock.audience[0],
-            jwks_url=mock.jwks_url,
-        )
-    )
+    append_auth_config(server_root, mock)
 
     server_proc, server_log_path, server_log_fd = launch_lore_server(
         server_root, server_env, lore_server_executable_path
@@ -599,3 +611,191 @@ def test_garbage_token_is_rejected(auth_env, make_actor):
     for garbage in ("not-a-jwt", "aaaa.bbbb.cccc"):
         with pytest.raises(LoreException):
             metadata_probe(owner.repo, garbage, "garbage")
+
+
+# ---------------------------------------------------------------------------
+# Forwarded requests under authentication
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.smoke
+class TestForwardedRepositoryGetWithAuth:
+    """The forwarded repository-get path under authentication.
+
+    The internal endpoint runs no JWT interceptor, so the target server must
+    itself verify the end-user token the origin stamped into
+    `on-behalf-of-authorization` and make its own online CheckUserPermission
+    call. Two authenticated servers share the module's stub: the origin
+    forwards RepositoryGet to the target, whose store is the only one holding
+    the repository, so a get that succeeds through the origin proves the
+    delegation, and the stub's records prove the token crossed the hop and
+    was re-checked at the target — the origin never checks permissions for a
+    get it forwards, so every recorded check for these probes is the
+    target's."""
+
+    @pytest.fixture(scope="class")
+    def server_hostname(self, request):
+        return request.config.getoption("--lore-server-hostname")
+
+    @pytest.fixture(scope="class")
+    def target_server(
+        self,
+        request,
+        tmp_path_factory,
+        auth_env,
+        server_hostname,
+        lore_server_executable_path,
+    ):
+        """The delegation target: authenticated against the module's stub,
+        internal gRPC endpoint enabled without mTLS so the origin can reach it
+        over plain HTTP/2."""
+        shared_port = allocate_free_port()
+        ports = {
+            "quic": shared_port,
+            "grpc": shared_port,
+            "http": allocate_free_port(),
+            "internal": allocate_free_port(),
+        }
+        server_root, server_env = generate_server_config(
+            request, tmp_path_factory, ports
+        )
+        server_env["LORE__SERVER__GRPC_INTERNAL__ENABLED"] = "true"
+        server_env["LORE__SERVER__GRPC_INTERNAL__VERIFY_CLIENT_CERTS"] = "false"
+        append_auth_config(server_root, auth_env.mock)
+
+        server_proc, log_path, log_fd = launch_lore_server(
+            server_root, server_env, lore_server_executable_path
+        )
+        try:
+            yield SimpleNamespace(
+                remote_url=f"lore://{server_hostname}:{shared_port}/",
+                internal_port=ports["internal"],
+            )
+        finally:
+            _kill_server_by_pid(
+                server_proc.pid, log_path, label="forwarded-auth target server"
+            )
+            log_fd.close()
+
+    @pytest.fixture(scope="class")
+    def origin_server(
+        self,
+        request,
+        tmp_path_factory,
+        auth_env,
+        target_server,
+        server_hostname,
+        lore_server_executable_path,
+    ):
+        """The delegation origin: authenticated against the same stub, and
+        forwarding RepositoryGet to the target's internal port. Depends on
+        `target_server` because a delegating server connects to its peer while
+        starting up."""
+        shared_port = allocate_free_port()
+        ports = {
+            "quic": shared_port,
+            "grpc": shared_port,
+            "http": allocate_free_port(),
+            "internal": allocate_free_port(),
+        }
+        server_root, server_env = generate_server_config(
+            request, tmp_path_factory, ports
+        )
+        append_auth_config(server_root, auth_env.mock)
+
+        local_toml = server_root / "lore-server" / "config" / "local.toml"
+        with open(local_toml, "a", encoding="utf-8") as f:
+            f.write("[server.grpc_public_services.forwarded_requests.client]\n")
+            f.write(f'url = "http://{server_hostname}:{target_server.internal_port}"\n')
+            f.write("[server.grpc_public_services.forwarded_requests.enabled_rpcs]\n")
+            f.write("repository_get = true\n")
+
+        server_proc, log_path, log_fd = launch_lore_server(
+            server_root, server_env, lore_server_executable_path
+        )
+        try:
+            yield SimpleNamespace(grpc_target=f"{server_hostname}:{shared_port}")
+        finally:
+            _kill_server_by_pid(
+                server_proc.pid, log_path, label="forwarded-auth origin server"
+            )
+            log_fd.close()
+
+    @pytest.mark.smoke
+    def test_forwarded_get_rechecks_the_token_at_the_target(
+        self, auth_env, target_server, origin_server, make_actor
+    ):
+        """A granted user's get resolves through the origin and the stub
+        records the target's online check carrying the exact token the client
+        sent; a verifiable token with no grant is denied at the target and the
+        caller sees NOT_FOUND, the same shape a direct denial answers."""
+        mock = auth_env.mock
+
+        # USER1 provisions a repository on the target, exactly as
+        # provision_owner does against the module server.
+        repo_id = uuid.uuid4().hex
+        resource_id = f"urc-{repo_id}"
+        api_key = "user1-forwarded-key"
+        login_token = mock.mint_token(USER1)
+        authz_token = mock.mint_token(USER1, resources=authz_resources(resource_id))
+        script_api_key_login(mock, USER1, login_token, api_key)
+        script_repository_lifecycle(mock, resource_id)
+        script_partition_access(mock, USER1, login_token, resource_id, authz_token)
+
+        actor = make_actor("forwarded-user1")
+        login_api_key(
+            actor.make_repo(remote_url=target_server.remote_url),
+            target_server.remote_url,
+            api_key,
+        )
+        repo = actor.make_repo(remote_url=target_server.remote_url, repo_id=repo_id)
+        repo.repository_create(repo_id=repo_id, identity=USER1.user_id)
+
+        # Granted: the origin's own store never held the repository, so the
+        # answer comes from the delegation.
+        checks_before = len(mock.requests_for("CheckUserPermission"))
+        code, body, details = call(
+            origin_server.grpc_target,
+            REPOSITORY_GET,
+            repository_get_by_name_request(repo.name),
+            metadata=(("authorization", f"Bearer {authz_token}"),),
+        )
+        assert code == grpc.StatusCode.OK, (
+            f"the forwarded get should succeed for a granted user, got {code} '{details}'"
+        )
+        assert repository_name_in_response(body) == repo.name
+
+        rechecks = [
+            check
+            for check in mock.requests_for("CheckUserPermission")[checks_before:]
+            if check["bearer"] == authz_token and resource_id in check["resource_id"]
+        ]
+        assert rechecks, (
+            "the target must re-check the forwarded token online, with the "
+            "exact bearer the client sent"
+        )
+
+        # Denied: the token verifies (same issuer and JWKS) but holds no
+        # grant, so the target's check denies it. The caller sees NOT_FOUND,
+        # not PERMISSION_DENIED. Denial must not disclose that the
+        # repository exists, on the forwarded path as on the direct one.
+        denied_token = mock.mint_token(USER2)
+        code, _body, details = call(
+            origin_server.grpc_target,
+            REPOSITORY_GET,
+            repository_get_by_name_request(repo.name),
+            metadata=(("authorization", f"Bearer {denied_token}"),),
+        )
+        assert code == grpc.StatusCode.NOT_FOUND, (
+            f"a denied forwarded get must answer NOT_FOUND, got {code} '{details}'"
+        )
+
+        denied_checks = [
+            check
+            for check in mock.requests_for("CheckUserPermission")
+            if check["bearer"] == denied_token
+        ]
+        assert denied_checks, (
+            "the denial must come from the target's online check, not from an "
+            "earlier failure on the way there"
+        )

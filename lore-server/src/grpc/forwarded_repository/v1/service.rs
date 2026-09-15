@@ -17,6 +17,8 @@ use tonic::Status;
 
 use super::repository_create;
 use super::repository_get;
+use crate::auth::jwt::JwtVerifier;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::timeout_grpc;
 use crate::hooks::HookDispatcher;
 
@@ -33,6 +35,8 @@ impl InstrumentProvider for ForwardedRepositoryServiceInstrumentProvider {
 #[derive(Clone)]
 pub struct LoreForwardedRepositoryV1Service {
     environment: EnvironmentConfig,
+    jwt_verifier: Option<JwtVerifier>,
+    authorizer: Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     hook_dispatcher: Arc<HookDispatcher>,
@@ -43,6 +47,8 @@ pub struct LoreForwardedRepositoryV1Service {
 impl LoreForwardedRepositoryV1Service {
     pub fn new(
         environment: EnvironmentConfig,
+        jwt_verifier: Option<JwtVerifier>,
+        authorizer: Arc<dyn RepositoryAuthorizer>,
         immutable_store: Arc<dyn lore_storage::ImmutableStore>,
         mutable_store: Arc<dyn lore_storage::MutableStore>,
         hook_dispatcher: Arc<HookDispatcher>,
@@ -51,6 +57,8 @@ impl LoreForwardedRepositoryV1Service {
         let instrument_provider = ForwardedRepositoryServiceInstrumentProvider;
         Self {
             environment,
+            jwt_verifier,
+            authorizer,
             immutable_store,
             mutable_store,
             hook_dispatcher,
@@ -95,7 +103,8 @@ impl ForwardedRepositoryService for LoreForwardedRepositoryV1Service {
             self.rpc_timeout,
             repository_get::handler(
                 request,
-                self.auth_url(),
+                self.jwt_verifier.clone(),
+                self.authorizer.clone(),
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
             ),
