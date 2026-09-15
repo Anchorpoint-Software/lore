@@ -860,6 +860,9 @@ pub struct LoreBranchPushArgs {
     pub branch: LoreString,
     /// Allow the server to fast-forward merge if the target branch head has moved
     pub fast_forward_merge: u8,
+    /// Allow the server to rebase onto the target branch head if it has moved,
+    /// keeping the branch linear. Mutually exclusive with `fast_forward_merge`.
+    pub rebase: u8,
 }
 
 /// Pushes the current or specified branch and its revisions to the remote.
@@ -929,6 +932,7 @@ async fn push_impl(
     let options = PushOptions {
         branch: args.branch.into(),
         fast_forward_merge: args.fast_forward_merge != 0,
+        rebase: args.rebase != 0,
     };
 
     // Push is never local

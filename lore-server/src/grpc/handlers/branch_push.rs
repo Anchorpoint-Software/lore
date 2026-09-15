@@ -160,6 +160,9 @@ pub async fn handler(
                 bypass_protection,
                 force,
                 fast_forward_merge,
+                // The deprecated request has no rebase field, so this path
+                // always integrates by merging.
+                false,
                 history_step_size,
                 acceleration,
             )
@@ -290,6 +293,7 @@ pub async fn push(
     bypass_protection: bool,
     force: bool,
     fast_forward_merge: bool,
+    rebase: bool,
     history_step_size: u64,
     acceleration: crate::grpc::server::RevisionListAcceleration,
 ) -> Result<PushResult, Status> {
@@ -365,7 +369,7 @@ pub async fn push(
                 return Err(Status::not_found("Branch not found"));
             }
 
-            if !fast_forward_merge {
+            if !fast_forward_merge && !rebase {
                 return Ok(PushResult {
                     success: false,
                     fast_forward_merged: false,
@@ -374,14 +378,17 @@ pub async fn push(
                 });
             }
 
-            // Fast-forward merge: the incoming revision's parent_self no longer matches
-            // the branch head. Attempt to create a new merge revision with
-            // parent_self=current_head and parent_other=incoming_revision.
-            return try_fast_forward_merge(
+            // The incoming revision's parent_self no longer matches the branch
+            // head. Integrate it with a three-way diff against its own parent:
+            // with parent_self=current_head, and parent_other=incoming_revision
+            // unless the caller asked for a rebase, which keeps the branch
+            // linear by recording only the head as the parent.
+            return try_integrate_onto_head(
                 repository.clone(),
                 branch,
                 state.clone(),
                 current_head,
+                rebase,
                 history_step_size,
                 acceleration,
             )
@@ -463,24 +470,32 @@ pub async fn push(
     })
 }
 
-/// Attempts a server-side fast-forward merge when the target branch head has moved
-/// since the client created the merge revision.
+/// Integrates a push whose parent is no longer the branch head, by applying the
+/// incoming revision's changes onto the head.
 ///
-/// Creates a new merge revision with:
-/// - `parent_self` = current branch head (target branch)
-/// - `parent_other` = the incoming merge revision
+/// Uses a three-way diff between the incoming revision's own parent, the
+/// incoming revision, and the current head, and applies the non-conflicting
+/// changes to the head's state. If conflicts are detected, returns failure so
+/// the client can resolve locally.
 ///
-/// Uses a three-way diff between the original merge base, the incoming revision,
-/// and the current head. If conflicts are detected, returns failure so the client
-/// can resolve locally.
+/// The result records:
+/// - `parent_self` = current branch head (target branch), always
+/// - `parent_other` = the incoming revision, unless `rebase`
+///
+/// That single difference is what separates the two shapes. Merging keeps the
+/// pushed revision reachable as a second parent, which is also what lets the
+/// next revision of the same push use it as a diff base. Rebasing keeps the
+/// branch linear and drops it, so the pushed revision survives only as long as
+/// the store holds it — long enough for the rest of this push, not beyond.
 ///
 /// Retries via CAS loop if the branch head moves again during processing.
 #[instrument(level = "debug", skip_all)]
-async fn try_fast_forward_merge(
+async fn try_integrate_onto_head(
     repository: Arc<RepositoryContext>,
     branch: BranchId,
     incoming_state: Arc<State>,
     mut current_head: Hash,
+    rebase: bool,
     history_step_size: u64,
     acceleration: crate::grpc::server::RevisionListAcceleration,
 ) -> Result<PushResult, Status> {
@@ -577,9 +592,13 @@ async fn try_fast_forward_merge(
             ))
         })?;
 
-        // Set parents: self=current head (target branch), other=incoming merge revision
+        // Set parents: self=current head (target branch), other=incoming
+        // revision — the latter only when merging. A rebase records no second
+        // parent, which is what keeps the branch linear.
         state_current.set_parent_self(current_head);
-        state_current.set_parent_other(incoming_revision);
+        if !rebase {
+            state_current.set_parent_other(incoming_revision);
+        }
 
         // Compute revision number from both parents
         let parent_state = State::deserialize(repository.clone(), current_head)
@@ -589,13 +608,23 @@ async fn try_fast_forward_merge(
                 Status::internal(format!("Failed to load current head state: {err}"))
             })?;
 
+        // A rebased revision has one parent, so its number follows the head
+        // alone — the same arithmetic the ordinary push path uses when there
+        // is no second parent.
         let revision_number = next_revision_number(
             parent_state.revision_number(),
-            incoming_state.revision_number(),
+            if rebase {
+                0
+            } else {
+                incoming_state.revision_number()
+            },
         );
         state_current.set_revision_number(revision_number);
 
-        // Copy metadata from the incoming revision and set merged-by to "server"
+        // Copy metadata from the incoming revision. A merge is stamped as
+        // merged-by/fast-forward-merge; a rebase carries no merger — nothing
+        // was merged — and is marked as rebased instead, so a reader can tell
+        // the two apart rather than seeing a merge that has no second parent.
         let incoming_metadata_hash = incoming_state.metadata_hash();
         if !incoming_metadata_hash.is_zero() {
             let mut metadata = lore_revision::metadata::Metadata::deserialize(
@@ -611,20 +640,30 @@ async fn try_fast_forward_merge(
             metadata
                 .set_branch(branch)
                 .warn_map_err(|_| Status::internal("Failed to set branch in metadata"))?;
-            // Preserve the existing merged-by field if set, otherwise fall back to "server"
-            if metadata
-                .get_string(lore_revision::metadata::MERGED_BY)
-                .is_err()
-            {
+            if rebase {
                 metadata
-                    .set_string(lore_revision::metadata::MERGED_BY, "server")
-                    .warn_map_err(|_| Status::internal("Failed to set merged-by in metadata"))?;
+                    .set_u64(lore_revision::metadata::REBASED_ON_PUSH, 1)
+                    .warn_map_err(|_| {
+                        Status::internal("Failed to set rebased-on-push in metadata")
+                    })?;
+            } else {
+                // Preserve the existing merged-by field if set, otherwise fall back to "server"
+                if metadata
+                    .get_string(lore_revision::metadata::MERGED_BY)
+                    .is_err()
+                {
+                    metadata
+                        .set_string(lore_revision::metadata::MERGED_BY, "server")
+                        .warn_map_err(|_| {
+                            Status::internal("Failed to set merged-by in metadata")
+                        })?;
+                }
+                metadata
+                    .set_u64(lore_revision::metadata::FAST_FORWARD_MERGE, 1)
+                    .warn_map_err(|_| {
+                        Status::internal("Failed to set fast-forward-merge in metadata")
+                    })?;
             }
-            metadata
-                .set_u64(lore_revision::metadata::FAST_FORWARD_MERGE, 1)
-                .warn_map_err(|_| {
-                    Status::internal("Failed to set fast-forward-merge in metadata")
-                })?;
 
             let metadata_hash = metadata
                 .serialize(repository.clone())

@@ -288,6 +288,12 @@ pub struct PushOptions {
     pub branch: Option<String>,
     /// Allow the server to fast-forward merge if the target branch head has moved
     pub fast_forward_merge: bool,
+    /// Allow the server to rebase onto the branch head if it has moved. Same
+    /// three-way diff as `fast_forward_merge`, but the result keeps only the
+    /// head as its parent, so the branch stays linear. Setting both is an
+    /// error: they ask for different histories, and quietly preferring one
+    /// would leave the caller unable to tell which it got.
+    pub rebase: bool,
 }
 
 impl EventError for PushError {
@@ -480,6 +486,16 @@ pub async fn push(
     token: &RepositoryWriteToken,
     options: PushOptions,
 ) -> Result<(), PushError> {
+    // Rejected here rather than resolved by precedence: the two ask the server
+    // for different histories, and picking one silently would leave the caller
+    // unable to tell which it got. The CLI refuses the combination too, but
+    // embedders do not go through it.
+    if options.fast_forward_merge && options.rebase {
+        return Err(PushError::internal(
+            "fast_forward_merge and rebase are mutually exclusive",
+        ));
+    }
+
     let _stats_report = PushStatsReport::start();
 
     let branch;
@@ -906,12 +922,13 @@ async fn collect_fragments_and_push(
         return Ok(());
     }
 
-    // If the branch diverged, early out (unless fast-forward merge is enabled,
-    // in which case let the server attempt to resolve the divergence)
+    // If the branch diverged, early out (unless the caller asked the server to
+    // resolve the divergence — by merging or by rebasing)
     let force = execution_context().globals().force();
     if !current_branch_remote_history.is_empty()
         && !force
         && !options.fast_forward_merge
+        && !options.rebase
         && !repository.is_link()
     {
         lore_debug!(
@@ -1116,7 +1133,13 @@ async fn collect_fragments_and_push(
 
         if !dry_run && remote_latest != current_revision {
             let push_result = revision_protocol
-                .branch_push(branch, current_revision, force, options.fast_forward_merge)
+                .branch_push(
+                    branch,
+                    current_revision,
+                    force,
+                    options.fast_forward_merge,
+                    options.rebase,
+                )
                 .await;
 
             // If the server returns NotFound, the branch was deleted on the server.
@@ -1159,11 +1182,13 @@ async fn collect_fragments_and_push(
                                 current_revision,
                                 force,
                                 options.fast_forward_merge,
+                                options.rebase,
                             )
                             .await,
+                        options.rebase,
                     )?
                 }
-                result => forward_branch_push(result)?,
+                result => forward_branch_push(result, options.rebase)?,
             };
             if response.fast_forward_merged {
                 // Server performed a fast-forward merge — push succeeded with a new revision.
@@ -1302,7 +1327,10 @@ async fn collect_fragments_and_push(
 /// does not hold, and the address is the peer's answer rather than anything the attempt decides,
 /// so both report it the same way.
 #[track_caller]
-fn forward_branch_push<T>(result: Result<T, ProtocolError>) -> Result<T, PushError> {
+fn forward_branch_push<T>(
+    result: Result<T, ProtocolError>,
+    rebase_requested: bool,
+) -> Result<T, PushError> {
     match result {
         Err(ProtocolError::AddressNotFound(missing)) => {
             let address = Address::from(&missing.address[..]);
@@ -1310,6 +1338,18 @@ fn forward_branch_push<T>(result: Result<T, ProtocolError>) -> Result<T, PushErr
                 format!("pushing branch to remote, missing fragment {address}")
             })
         }
+        // A rebase was asked for and the server answered with the plain
+        // non-fast-forward refusal. A server that understands `rebase` would
+        // have rebased, or reported conflicts — the refusal only happens when
+        // it saw no integration opt-in at all, which means the field was
+        // ignored. Say so, rather than leave the user with a message about
+        // divergence they did not cause.
+        Err(err) if rebase_requested => Err(err).forward::<PushError>(concat!(
+            "pushing branch to remote: the server did not perform the rebase. ",
+            "If it does not support rebasing on push, nothing was pushed and ",
+            "nothing was merged — synchronize, or allow a fast-forward merge ",
+            "to let the server merge instead",
+        )),
         result => result.forward::<PushError>("pushing branch to remote"),
     }
 }

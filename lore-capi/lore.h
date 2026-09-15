@@ -4291,6 +4291,9 @@ typedef struct lore_branch_push_args_t {
   struct lore_string_t branch;
   // Allow the server to fast-forward merge if the target branch head has moved
   uint8_t fast_forward_merge;
+  // Allow the server to rebase onto the target branch head if it has moved,
+  // keeping the branch linear. Mutually exclusive with `fast_forward_merge`.
+  uint8_t rebase;
 } lore_branch_push_args_t;
 
 // Arguments for retrieving branch metadata (one key or all).

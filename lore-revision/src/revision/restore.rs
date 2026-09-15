@@ -563,7 +563,7 @@ pub async fn restore(
         .send();
 
         let response = revision_protocol
-            .branch_push(current_branch, signature, false, false)
+            .branch_push(current_branch, signature, false, false, false)
             .await
             .forward::<RestoreError>("pushing branch head pointer")?;
 

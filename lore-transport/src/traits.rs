@@ -274,12 +274,16 @@ pub trait Revision: Send + Sync {
     /// Push a new LATEST pointer for branch. Returns the (new) current LATEST pointer for the branch,
     /// if this is different from the given LATEST pointer the operation failed due to the
     /// LATEST pointer having moved.
+    /// `rebase` integrates by rebasing onto the head instead of merging onto
+    /// it, and is mutually exclusive with `fast_forward_merge` — callers are
+    /// expected to have rejected the combination before reaching here.
     async fn branch_push(
         &self,
         branch: BranchId,
         latest: Hash,
         force: bool,
         fast_forward_merge: bool,
+        rebase: bool,
     ) -> Result<BranchPushResponse, ProtocolError>;
 
     /// List all branches

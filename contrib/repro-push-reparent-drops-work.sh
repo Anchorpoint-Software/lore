@@ -40,6 +40,10 @@ set -euo pipefail
 
 LORE=${LORE:-lore}
 : "${LORE_SERVER:?set LORE_SERVER, e.g. lore://127.0.0.1:41337}"
+# merge  - integrate with --fast-forward-merge (the shape that ships today)
+# rebase - integrate with --rebase (linear history)
+MODE=${MODE:-merge}
+case "$MODE" in merge|rebase) ;; *) echo "MODE must be merge or rebase"; exit 2 ;; esac
 
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
@@ -74,8 +78,22 @@ echo "A pushed from-a.txt"
 # ── B, still on the old head, commits TWICE and pushes once ─────────────────
 add_commit "$WORK/b" from-b1.txt "B one" "B one"
 add_commit "$WORK/b" from-b2.txt "B two" "B two"
-lore_in "$WORK/b" push --fast-forward-merge >/dev/null
-echo "B pushed two revisions with --fast-forward-merge"
+if [ "$MODE" = rebase ]; then
+    if ! lore_in "$WORK/b" push --rebase; then
+        echo
+        echo "RESULT: REFUSED — the server did not integrate the push."
+        echo "  On a server that predates --rebase this is the expected answer:"
+        echo "  it ignores the unknown field, sees no integration opt-in and"
+        echo "  soft-rejects, rather than silently merging instead."
+        "$LORE" --no-pager clone "$REPO" "$WORK/c" </dev/null >/dev/null
+        [ -f "$WORK/c/from-a.txt" ] && echo "  A's file is untouched on the server." || echo "  UNEXPECTED: A's file is gone anyway."
+        exit 3
+    fi
+    echo "B pushed two revisions with --rebase"
+else
+    lore_in "$WORK/b" push --fast-forward-merge >/dev/null
+    echo "B pushed two revisions with --fast-forward-merge"
+fi
 echo
 
 # ── what does the server actually hold? ─────────────────────────────────────
@@ -91,6 +109,15 @@ rc=0
 for f in from-b1.txt from-b2.txt; do
     [ -f "$WORK/c/$f" ] || { echo "UNEXPECTED: B's own $f is missing too"; rc=1; }
 done
+if [ "$MODE" = rebase ]; then
+    if lore_in "$WORK/c" history 6 | grep -q '^Merge '; then
+        echo "RESULT: NOT LINEAR — a rebase must not leave a merge revision"
+        rc=1
+    else
+        echo "(history is linear: no merge revision)"
+    fi
+fi
+
 if [ -f "$WORK/c/from-a.txt" ]; then
     echo "RESULT: OK — A's file survived B's push"
 else

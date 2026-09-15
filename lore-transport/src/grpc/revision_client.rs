@@ -227,6 +227,7 @@ impl RevisionService {
         revision: Hash,
         force: bool,
         fast_forward_merge: bool,
+        rebase: bool,
     ) -> Result<BranchPushResponse, ProtocolError> {
         lore_debug!("Pushing branch: {} at {}", branch, revision);
         let _ = RequestScopedCounter::new(self.request_inflight.clone());
@@ -238,6 +239,7 @@ impl RevisionService {
                 revision_signature: revision.into(),
                 force,
                 fast_forward_merge,
+                rebase,
             };
 
             let mut client = self.client.clone();

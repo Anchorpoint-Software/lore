@@ -1444,6 +1444,7 @@ impl Revision for GRPCRevision {
         latest: Hash,
         force: bool,
         fast_forward_merge: bool,
+        rebase: bool,
     ) -> Result<BranchPushResponse, ProtocolError> {
         with_reconnect(
             &self.connection,
@@ -1451,7 +1452,7 @@ impl Revision for GRPCRevision {
                 self.client
                     .read()
                     .await
-                    .branch_push(branch, latest, force, fast_forward_merge)
+                    .branch_push(branch, latest, force, fast_forward_merge, rebase)
                     .await
             },
             |reconnect_id| self.reconnect(reconnect_id),

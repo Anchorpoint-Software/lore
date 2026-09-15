@@ -88,11 +88,22 @@ pub async fn handler(
     let revision = Hash::from(req.revision_signature);
     let force = req.force;
     let fast_forward_merge = req.fast_forward_merge;
+    let rebase = req.rebase;
 
     if revision.is_zero() {
         info!("Invalid branch push request, revision_signature is zero");
         return Err(Status::invalid_argument(
             "revision_signature must be non-zero",
+        ));
+    }
+
+    // The two ask for different histories. Integrating one way anyway would
+    // leave the client unable to tell which it got, so refuse the request
+    // rather than resolve it by precedence.
+    if fast_forward_merge && rebase {
+        info!("Invalid branch push request, fast_forward_merge and rebase both set");
+        return Err(Status::invalid_argument(
+            "fast_forward_merge and rebase are mutually exclusive",
         ));
     }
 
@@ -102,6 +113,7 @@ pub async fn handler(
         {BRANCH_ID} = %branch_id,
         force,
         fast_forward_merge,
+        rebase,
         "Handling branch push request",
     );
 
@@ -147,6 +159,7 @@ pub async fn handler(
                 bypass_protection,
                 force,
                 fast_forward_merge,
+                rebase,
                 history_step_size,
                 acceleration,
             )

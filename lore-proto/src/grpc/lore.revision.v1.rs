@@ -204,6 +204,21 @@ pub struct BranchPushRequest {
     /// `force`.
     #[prost(bool, tag = "4")]
     pub fast_forward_merge: bool,
+    /// When true and the new tip does not descend from the current tip,
+    /// the server rebases it: the same three-way diff `fast_forward_merge`
+    /// performs, but the result records only the current tip as its parent,
+    /// so the branch stays linear and the pushed revision is not retained
+    /// as a second parent. Mutually superseded by `force`; setting it
+    /// together with `fast_forward_merge` is INVALID_ARGUMENT, because the
+    /// two ask for different histories and silently picking one would hide
+    /// which was applied.
+    ///
+    /// A server that predates this field ignores it and sees a push with
+    /// no integration opt-in, so it soft-rejects rather than merging. That
+    /// is deliberate: a client asking to rebase must never be answered
+    /// with a merge it did not ask for.
+    #[prost(bool, tag = "5")]
+    pub rebase: bool,
 }
 impl ::prost::Name for BranchPushRequest {
     const NAME: &'static str = "BranchPushRequest";

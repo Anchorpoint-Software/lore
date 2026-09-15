@@ -127,6 +127,11 @@ pub const REVERTED_FROM: &str = "reverted-from";
 pub const CHANGE_REQUEST: &str = "change-request";
 /// Indicates the revision was created by a fast-forward merge ([`MetadataType::Numeric`])
 pub const FAST_FORWARD_MERGE: &str = "fast-forward-merge";
+/// Indicates the revision was rebased onto the branch head when it was pushed
+/// ([`MetadataType::Numeric`]). Set instead of [`FAST_FORWARD_MERGE`], never
+/// alongside it: the two describe the same integration resolved into different
+/// histories, and a reader has to be able to tell them apart.
+pub const REBASED_ON_PUSH: &str = "rebased-on-push";
 
 /// Keys describing the operation that creates a revision rather than the work
 /// it records, written by that operation.

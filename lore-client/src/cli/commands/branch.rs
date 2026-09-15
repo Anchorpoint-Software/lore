@@ -88,6 +88,12 @@ pub struct BranchPushArgs {
     /// Allow the server to fast-forward merge if the target branch head has moved
     #[clap(long)]
     fast_forward_merge: bool,
+
+    /// Allow the server to rebase onto the target branch head if it has moved,
+    /// keeping the branch linear instead of recording a merge. A server that
+    /// does not support this refuses the push rather than merging instead.
+    #[clap(long, conflicts_with = "fast_forward_merge")]
+    rebase: bool,
 }
 
 #[derive(Args)]
@@ -818,6 +824,7 @@ pub fn handle_branch_push(globals: LoreGlobalArgs, args: &BranchPushArgs) -> u8 
     let push_args = LoreBranchPushArgs {
         branch: args.name.clone().into(),
         fast_forward_merge: args.fast_forward_merge.into(),
+        rebase: args.rebase.into(),
     };
 
     let debug = progress_debug();

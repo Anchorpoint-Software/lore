@@ -4225,7 +4225,7 @@ async fn merge_into_link(
         .forward::<MergeError>("pushing fragments")?;
 
         let response = revision_protocol
-            .branch_push(target_branch, signature, false, false)
+            .branch_push(target_branch, signature, false, false, false)
             .await
             .forward::<MergeError>("pushing branch")?;
 
@@ -4616,7 +4616,7 @@ pub async fn merge_into(
         .send();
 
         let response = revision_protocol
-            .branch_push(branch, signature, false, false)
+            .branch_push(branch, signature, false, false, false)
             .await
             .forward::<MergeError>("pushing branch")?;
 
