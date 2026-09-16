@@ -369,6 +369,53 @@ def test_push_fast_forward_merge_non_merge(new_lore_repo):
 
 
 @pytest.mark.smoke
+def test_push_fast_forward_merge_two_local_revisions(new_lore_repo):
+    """A fast-forward merge push that carries more than one local revision keeps
+    the work another client pushed in between. The client may only follow a
+    parent the server renumbered, never a head the server moved for another
+    reason, or the second revision's stale tree replaces the branch."""
+    repo: Lore = new_lore_repo()
+
+    with repo.open_file("seed.txt", "w+") as f:
+        f.write("seed\n")
+    repo.stage(scan=True)
+    repo.commit("Seed", offline=True)
+    repo.push()
+
+    # Another client moves the branch head
+    other = repo.clone()
+    with other.open_file("from_other.txt", "w+") as f:
+        f.write("from the other client\n")
+    other.stage(scan=True, offline=True)
+    other.commit("Other client publishes", offline=True)
+    other.push()
+
+    # This client is still on the old head, and commits twice before it pushes
+    # once. The second revision is the one whose parent used to be bent onto the
+    # head the server had moved to, which kept its tree and dropped the other
+    # client's file.
+    with repo.open_file("first.txt", "w+") as f:
+        f.write("first\n")
+    repo.stage(scan=True, offline=True)
+    repo.commit("First", offline=True)
+    with repo.open_file("second.txt", "w+") as f:
+        f.write("second\n")
+    repo.stage(scan=True, offline=True)
+    repo.commit("Second", offline=True)
+    repo.push(fast_forward_merge=True)
+
+    expected_files = {"seed.txt", "from_other.txt", "first.txt", "second.txt"}
+
+    verify = repo.clone()
+    clone_files = _collect_repo_files(verify)
+    assert clone_files == expected_files, (
+        f"Files on the server differ from expected.\n"
+        f"  Extra: {clone_files - expected_files}\n"
+        f"  Missing: {expected_files - clone_files}"
+    )
+
+
+@pytest.mark.smoke
 def test_push_non_current_branch_preserves_anchor(new_lore_repo):
     """Pushing a branch that is not the current branch must not corrupt the
     workspace anchor. Regression test for UCS-19529: a previous bug had
