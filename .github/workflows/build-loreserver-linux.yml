@@ -1,0 +1,84 @@
+# SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+# SPDX-License-Identifier: MIT
+
+# An x86_64 Linux `loreserver` built from this branch, for deploying a server
+# that carries changes no release has yet. The published release assets are the
+# normal way to get one; this exists for the case where the point IS the
+# unreleased change, and building it on an arm64 Mac would mean an emulated
+# x86_64 toolchain.
+#
+# Triggered by pushing this branch, not `workflow_dispatch`: a dispatchable
+# workflow has to exist on the repository's DEFAULT branch to be dispatchable at
+# all, and this one is deliberately not on `main`. Rebase the branch onto
+# whatever should be built and push it.
+#
+# Needs no secrets. Mirrors pr-validate.yml's `unit` job for the parts that are
+# about the runner rather than the build (the /mnt target directory, the cache).
+name: Build loreserver (linux x86_64)
+
+on:
+  push:
+    branches: [ci/build-loreserver-linux]
+
+permissions: {}
+
+concurrency:
+  group: build-loreserver-linux-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (linux-x86_64)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # Check the branch out to build it
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # The release profile keeps line tables and the dependency graph is large;
+      # the runner's root filesystem is the smaller of its two volumes. Same
+      # reason and same placement as pr-validate.yml: before rust-cache, so the
+      # cache is keyed to this target directory.
+      - name: Build on the larger /mnt volume
+        run: |
+          sudo mkdir -p /mnt/cargo-target
+          sudo chown -R "$(id -u):$(id -g)" /mnt/cargo-target
+          echo "CARGO_TARGET_DIR=/mnt/cargo-target" >> "$GITHUB_ENV"
+          df -h / /mnt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: build-loreserver-linux-x86_64
+
+      # No target triple: ubuntu-latest IS x86_64-unknown-linux-gnu, so the host
+      # build picks up .cargo/config.toml's `[build]` rustflags. Passing
+      # --target would not change that here, and the repository has no
+      # `[target.x86_64-unknown-linux-gnu]` block whose flags could be missed.
+      - name: cargo build --release --bin loreserver
+        run: cargo build --release --locked --bin loreserver
+
+      # What was actually built, so a deployed binary can be traced back to a
+      # commit without unpacking it.
+      - name: Identify the binary
+        run: |
+          set -euo pipefail
+          bin="$CARGO_TARGET_DIR/release/loreserver"
+          "$bin" --version
+          file "$bin"
+          sha256sum "$bin"
+          ls -l "$bin"
+          echo "commit: $GITHUB_SHA"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: loreserver-linux-x86_64-${{ github.sha }}
+          path: ${{ env.CARGO_TARGET_DIR }}/release/loreserver
+          if-no-files-found: error
+          retention-days: 14
