@@ -492,6 +492,63 @@ pub async fn push(
     })
 }
 
+/// How far back to look for an integration of the incoming revision. The
+/// window between what a client last saw and the current head is the race it
+/// lost, which is small; this only has to be larger than that.
+const ALREADY_INTEGRATED_SEARCH_LIMIT: usize = 512;
+
+/// The revision that already carries `incoming`, if the branch has it.
+///
+/// Two traces to look for, because the two integrations leave different ones:
+///
+/// - a **merge** keeps the pushed revision as `parent_other`, so it is still
+///   reachable and the comparison is direct;
+/// - a **rebase** replaces it with a copy and records the original in
+///   [`REBASED_FROM`](lore_revision::metadata::REBASED_FROM), because there is
+///   nothing left to reach.
+///
+/// Walks `parent_self` only, which is enough for both: a merge sits on that
+/// line and is inspected as it is passed. Stops once the walk is older than the
+/// incoming revision, since whatever integrated it must be newer.
+///
+/// Fails closed. An unreadable state or metadata answers "not integrated",
+/// which costs a duplicate rather than a silently dropped push.
+async fn already_integrated(
+    repository: Arc<RepositoryContext>,
+    head: Hash,
+    incoming: Hash,
+    incoming_number: u64,
+) -> Option<Hash> {
+    let mut current = head;
+    for _ in 0..ALREADY_INTEGRATED_SEARCH_LIMIT {
+        if current.is_zero() {
+            return None;
+        }
+        let state = State::deserialize(repository.clone(), current).await.ok()?;
+
+        if state.parent_other() == incoming {
+            return Some(current);
+        }
+
+        let metadata_hash = state.metadata_hash();
+        if !metadata_hash.is_zero()
+            && let Ok(metadata) =
+                lore_revision::metadata::Metadata::deserialize(repository.clone(), metadata_hash)
+                    .await
+            && let Ok(from) = metadata.get_hash(lore_revision::metadata::REBASED_FROM)
+            && from == incoming
+        {
+            return Some(current);
+        }
+
+        if state.revision_number() < incoming_number {
+            return None;
+        }
+        current = state.parent_self();
+    }
+    None
+}
+
 /// Integrates a push whose parent is no longer the branch head, by applying the
 /// incoming revision's changes onto the head.
 ///
@@ -528,6 +585,40 @@ async fn try_integrate_onto_head(
         %incoming_revision, %original_base, %current_head,
         "Attempting fast-forward merge"
     );
+
+    // A client re-pushes a revision whenever it committed again before
+    // syncing: its own line still descends from the revision it pushed, so the
+    // walk that decides what is unpushed offers it a second time. Integrating
+    // it again would put the same work on the branch twice. Answer the cheap
+    // question first.
+    if let Some(carrier) = already_integrated(
+        repository.clone(),
+        current_head,
+        incoming_revision,
+        incoming_state.revision_number(),
+    )
+    .await
+    {
+        debug!(
+            %incoming_revision, %carrier, %current_head,
+            "Incoming revision is already on the branch, nothing to integrate"
+        );
+        let head_state = State::deserialize(repository.clone(), current_head)
+            .await
+            .filter_slow_down()?
+            .warn_map_err(|err| {
+                Status::internal(format!("Failed to load current head state: {err}"))
+            })?;
+        return Ok(PushResult {
+            success: true,
+            // The branch moved relative to what the client sent, which is what
+            // this flag means to it: store the head and sync. The client is no
+            // more up to date than after a real integration.
+            fast_forward_merged: true,
+            revision: current_head,
+            revision_number: head_state.revision_number(),
+        });
+    }
 
     // Verify that all new fragments from the incoming revision exist in the store,
     // matching the verification done in the normal push path. Without this check a
@@ -668,6 +759,13 @@ async fn try_integrate_onto_head(
                     .warn_map_err(|_| {
                         Status::internal("Failed to set rebased-on-push in metadata")
                     })?;
+                // The revision this was made from. A merge records it as
+                // `parent_other` and needs no note; a rebase drops it, so
+                // without this there is nothing to recognise it by when the
+                // same revision is pushed again. See `already_integrated`.
+                metadata
+                    .set_hash(lore_revision::metadata::REBASED_FROM, incoming_revision)
+                    .warn_map_err(|_| Status::internal("Failed to set rebased-from in metadata"))?;
             } else {
                 // Preserve the existing merged-by field if set, otherwise fall back to "server"
                 if metadata
@@ -1285,6 +1383,163 @@ mod tests {
 
     mod push {
         use super::*;
+
+        /// A revision stamped as the rebase of `from`, the way the server
+        /// stamps one.
+        async fn serialize_rebased_revision(
+            repository: &Arc<RepositoryContext>,
+            branch: BranchId,
+            parent_self: Hash,
+            revision_number: u64,
+            from: Hash,
+        ) -> Arc<State> {
+            let write_token = get_write_token();
+            let mut metadata = lore_revision::metadata::Metadata::new();
+            metadata.set_branch(branch).expect("set branch");
+            metadata
+                .set_u64(lore_revision::metadata::REBASED_ON_PUSH, 1)
+                .expect("set rebased-on-push");
+            metadata
+                .set_hash(lore_revision::metadata::REBASED_FROM, from)
+                .expect("set rebased-from");
+            let metadata_hash = metadata
+                .serialize(repository.clone())
+                .await
+                .expect("serialize metadata");
+
+            let state = Arc::new(State::new());
+            state.set_parent_self(parent_self);
+            state.set_revision_number(revision_number);
+            state.set_metadata_hash(metadata_hash);
+            state
+                .serialize(repository.clone(), &write_token)
+                .await
+                .expect("serialize state");
+            state
+        }
+
+        /// The two shapes an integration leaves behind, and the case where
+        /// there is none. A client re-offers a revision it already pushed
+        /// whenever it committed again before syncing, so recognising it is
+        /// what keeps the same work off the branch twice.
+        #[tokio::test]
+        async fn an_already_integrated_revision_is_recognised_by_both_traces() {
+            let repository_id = random::<RepositoryId>();
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("Failed to create stores");
+
+            Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+                let repository = Arc::new(RepositoryContext::new_server_context(
+                    immutable_store,
+                    mutable_store,
+                    repository_id,
+                ));
+                let branch = create_test_branch(&repository).await;
+
+                let base =
+                    serialize_revision(&repository, branch, Hash::default(), Hash::default(), 1)
+                        .await;
+                // What a client pushed and the server integrated.
+                let incoming =
+                    serialize_revision(&repository, branch, base.revision(), Hash::default(), 2)
+                        .await;
+
+                // A MERGE keeps it as the second parent.
+                let merged = serialize_revision(
+                    &repository,
+                    branch,
+                    base.revision(),
+                    incoming.revision(),
+                    3,
+                )
+                .await;
+                assert_eq!(
+                    already_integrated(
+                        repository.clone(),
+                        merged.revision(),
+                        incoming.revision(),
+                        incoming.revision_number(),
+                    )
+                    .await,
+                    Some(merged.revision()),
+                    "a merge keeps the pushed revision as parent_other"
+                );
+
+                // A REBASE drops it and writes down where it came from.
+                let rebased = serialize_rebased_revision(
+                    &repository,
+                    branch,
+                    base.revision(),
+                    3,
+                    incoming.revision(),
+                )
+                .await;
+                assert_eq!(
+                    already_integrated(
+                        repository.clone(),
+                        rebased.revision(),
+                        incoming.revision(),
+                        incoming.revision_number(),
+                    )
+                    .await,
+                    Some(rebased.revision()),
+                    "a rebase records the original in rebased-from"
+                );
+
+                // An unrelated head carries neither trace. Answering "already
+                // integrated" here would drop the push instead of merging it.
+                let unrelated =
+                    serialize_revision(&repository, branch, base.revision(), Hash::default(), 3)
+                        .await;
+                assert_eq!(
+                    already_integrated(
+                        repository.clone(),
+                        unrelated.revision(),
+                        incoming.revision(),
+                        incoming.revision_number(),
+                    )
+                    .await,
+                    None,
+                    "a head that never carried it must still be integrated into"
+                );
+            }))
+            .await;
+        }
+
+        /// The walk stops rather than running the whole branch: whatever
+        /// integrated a revision is newer than it, so once the walk is older
+        /// there is nothing left to find.
+        #[tokio::test]
+        async fn the_search_gives_up_once_it_is_older_than_the_incoming_revision() {
+            let repository_id = random::<RepositoryId>();
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("Failed to create stores");
+
+            Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+                let repository = Arc::new(RepositoryContext::new_server_context(
+                    immutable_store,
+                    mutable_store,
+                    repository_id,
+                ));
+                let branch = create_test_branch(&repository).await;
+
+                let old =
+                    serialize_revision(&repository, branch, Hash::default(), Hash::default(), 1)
+                        .await;
+                let head =
+                    serialize_revision(&repository, branch, old.revision(), Hash::default(), 2)
+                        .await;
+
+                // Numbered above everything on the branch, so nothing there can
+                // have integrated it.
+                let incoming = random::<Hash>();
+                assert_eq!(
+                    already_integrated(repository.clone(), head.revision(), incoming, 99).await,
+                    None
+                );
+            }))
+            .await;
+        }
 
         #[tokio::test]
         async fn push_unknown_revision_returns_not_found() {

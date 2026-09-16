@@ -132,6 +132,16 @@ pub const FAST_FORWARD_MERGE: &str = "fast-forward-merge";
 /// alongside it: the two describe the same integration resolved into different
 /// histories, and a reader has to be able to tell them apart.
 pub const REBASED_ON_PUSH: &str = "rebased-on-push";
+/// The revision a [`REBASED_ON_PUSH`] revision was made from
+/// ([`MetadataType::Hash`]).
+///
+/// A merge keeps the pushed revision reachable as `parent_other`, so "have I
+/// already integrated this?" is a question the history itself answers. A
+/// rebase replaces it with a copy and leaves nothing to reach, so the answer
+/// has to be written down. Without it a client that pushes the same revision
+/// again — which it will, whenever a commit was made before syncing — gets a
+/// second copy of work the branch already carries.
+pub const REBASED_FROM: &str = "rebased-from";
 
 /// Keys describing the operation that creates a revision rather than the work
 /// it records, written by that operation.
