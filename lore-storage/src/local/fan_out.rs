@@ -309,7 +309,7 @@ pub async fn commit_if_initial_level(
 /// # Returns
 /// * `true` when the directory holds a file named `index_<bb>`.
 /// * `false` when it holds none, or cannot be read at all.
-async fn group_has_buckets(group_path: &Path) -> bool {
+pub(crate) async fn group_has_buckets(group_path: &Path) -> bool {
     let Ok(mut entries) = lore_io::IoDriver::global().read_dir(group_path).await else {
         return false;
     };

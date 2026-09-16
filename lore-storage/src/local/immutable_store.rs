@@ -1,5 +1,9 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+
+mod info;
+#[cfg(feature = "oodle")]
+mod oodle_migration;
 use std::backtrace::Backtrace;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -68,6 +72,10 @@ use crate::hash;
 use crate::immutable_store::StoreError;
 use crate::immutable_store::sanitise_fragment_behavior_flags;
 use crate::local::fan_out::GroupLevel;
+use crate::local::immutable_store::info::ImmutableStoreInfo;
+use crate::local::immutable_store::info::get_or_init_disk_info;
+use crate::local::immutable_store::info::info_path_for_store_root;
+use crate::local::immutable_store::info::write_info_file;
 use crate::store_types::PayloadRead;
 use crate::store_types::StoreGetData;
 use crate::store_types::StoreMatch;
@@ -304,6 +312,7 @@ impl Drop for GcStopRequest<'_> {
 }
 
 pub struct LocalImmutableStore {
+    info: RwLock<ImmutableStoreInfo>,
     path: Option<Arc<PathBuf>>,
     pub group: Vec<Arc<ImmutableStoreGroup>>,
     eviction: Semaphore,
@@ -648,14 +657,14 @@ impl ImmutableStoreBucket {
                 || x == ImmutableStoreVersion::LastAccessInEntry as u32 =>
             {
                 size_of::<u32>() /* sorted index */
-                    + size_of::<ImmutableStoreEntry>() /* entry */
+                        + size_of::<ImmutableStoreEntry>() /* entry */
             }
             x if (x == ImmutableStoreVersion::PackfilePerGroup as u32)
                 || (x == ImmutableStoreVersion::LastAccessTimestamps as u32) =>
             {
                 size_of::<u32>() /* sorted index */
-                    + size_of::<ImmutableStoreEntryBeforeLastAccess>() /* entry */
-                    + size_of::<u32>() /* last access timestamp */
+                        + size_of::<ImmutableStoreEntryBeforeLastAccess>() /* entry */
+                        + size_of::<u32>() /* last access timestamp */
             }
             x if x == ImmutableStoreVersion::Initial as u32 => {
                 size_of::<u32>() /* sorted index */ + size_of::<ImmutableStoreEntry>() /* entry */
@@ -1079,6 +1088,7 @@ impl LocalImmutableStore {
         };
 
         let mut store = LocalImmutableStore {
+            info: Default::default(),
             path: immutable_path.clone(),
             lock,
             group: Vec::with_capacity(GROUP_COUNT),
@@ -1183,10 +1193,17 @@ impl LocalImmutableStore {
             store.settings.initial_fan_out_level,
         );
 
+        let mut _highest_materialized_group = -1;
         for (group_index, level) in group_levels.into_iter().enumerate() {
             let (count, committed) = match level {
-                GroupLevel::Marked(level) => (level, level),
-                GroupLevel::PreFanOut => (BUCKET_COUNT, 0),
+                GroupLevel::Marked(level) => {
+                    _highest_materialized_group = group_index as i32;
+                    (level, level)
+                }
+                GroupLevel::PreFanOut => {
+                    _highest_materialized_group = group_index as i32;
+                    (BUCKET_COUNT, 0)
+                }
                 GroupLevel::Unwritten => (unwritten_level, 0),
             };
             let packpath = immutable_path.as_deref().map(|path| {
@@ -1213,7 +1230,25 @@ impl LocalImmutableStore {
             }));
         }
 
+        if let Some(path) = immutable_path.as_deref() {
+            let index_to_oodle_migrate = {
+                // Assume that any store with groups that exist on disk were made by another
+                // Oodle-enabled binary before this one, and therefore may have data to migrate
+                #[cfg(feature = "oodle")]
+                {
+                    _highest_materialized_group
+                }
+                #[cfg(not(feature = "oodle"))]
+                {
+                    -1
+                }
+            };
+            let info = get_or_init_disk_info(path, index_to_oodle_migrate).await?;
+            store.info = info.into();
+        }
+
         let store = Arc::new(store);
+
         // The `Arc` only exists now (not when the groups were built above), so back-fill
         // the weak self-ref the load hooks need to fire a pass.
         let dyn_store: Arc<dyn crate::immutable_store::ImmutableStore> = store.clone();
@@ -1236,6 +1271,56 @@ impl LocalImmutableStore {
 
     pub fn packstore(&self, group_index: usize) -> &crate::PackStore {
         &self.group[group_index].packstore
+    }
+
+    pub async fn run_migrations(self: &Arc<Self>) -> Result<(), LocalImmutableStoreError> {
+        if let Some(_path) = self.path.as_ref() {
+            let oodle_group_to_migrate = self.info.read().await.next_group_index_to_migrate_oodle;
+            if oodle_group_to_migrate != -1 {
+                #[cfg(feature = "oodle")]
+                {
+                    let opted_out = std::env::var("LORE_IMMUTABLE_NO_OODLE_MIGRATION")
+                        .is_ok_and(|var| var == "1" || var.to_lowercase() == "true");
+                    if !opted_out {
+                        oodle_migration::migrate_groups(
+                            self.clone(),
+                            _path,
+                            oodle_group_to_migrate,
+                        )
+                        .await?;
+                    }
+                }
+                #[cfg(not(feature = "oodle"))]
+                {
+                    lore_base::lore_warn!(
+                        "Local Store Oodle migration needs to run, but this binary does not support Oodle. Eventually, Oodle support will be dropped and your local Oodle data will be irretrievable"
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub async fn update_store_info<F>(&self, accessor: F) -> Result<(), LocalImmutableStoreError>
+    where
+        F: FnOnce(&mut ImmutableStoreInfo),
+    {
+        let mut store = self.info.write().await;
+        accessor(&mut store);
+
+        if let Some(path) = self.path.as_deref() {
+            write_info_file(&store, &info_path_for_store_root(path))
+                .await
+                .map_err(|err| {
+                    LocalImmutableStoreError::internal_with_context(
+                        err,
+                        "Failed to store updated info file",
+                    )
+                })?;
+        }
+
+        Ok(())
     }
 
     async fn upgrade_global_packfiles(
@@ -3261,240 +3346,12 @@ impl LocalImmutableStore {
 
             let path = path.clone();
             lore_base::lore_spawn!(tasks, async move {
-                let mut first_err: Option<LocalImmutableStoreError> = None;
-
                 // One flusher per group at a time, held for the whole group flush so an
                 // overlapping flush cannot observe a half-finished level transition and
                 // take the other commit path. See `ImmutableStoreGroup::flush_lock`.
                 let _flush_guard = group.flush_lock.clone().lock_owned().await;
 
-                // Re-check under the lock: another flusher may have drained this group
-                // while we waited. The scan that got us here is lock-free and stale by
-                // now, so skip the redundant fan-out check, path selection and - in the
-                // two-phase branch - the needless level-marker write. A pending level
-                // transition (`committed_level != active_buckets`) still has to be
-                // completed even with no dirty bucket, so it is never skipped.
-                if !group
-                    .dirty
-                    .iter()
-                    .any(|flag| flag.load(atomic::Ordering::Relaxed))
-                    && group.committed_level.load(atomic::Ordering::Relaxed)
-                        == group.bucket_count.load(atomic::Ordering::Relaxed)
-                {
-                    // The packstore flush below is unconditional for `sync_data`, so it
-                    // still has to run on this path.
-                    if sync_data {
-                        group.flush_packstore(sync_data).await;
-                    }
-                    return Ok(());
-                }
-
-                // Fan-out trigger: if any dirty bucket exceeds threshold and we're below max level, redistribute entries before serializing.
-                if let Err(err) =
-                    maybe_fan_out_immutable_group(&group, path.as_ref(), group_index).await
-                {
-                    first_err = Some(err);
-                }
-
-                let active_buckets = group.bucket_count.load(atomic::Ordering::Relaxed);
-                let committed_level = group.committed_level.load(atomic::Ordering::Relaxed);
-                let group_path = {
-                    let mut p = path.as_path().to_path_buf();
-                    p.push("index");
-                    crate::local::fan_out::push_group_dir(&mut p, group_index);
-                    p
-                };
-                let fan_out_aware = group.serialize_version.load(atomic::Ordering::Relaxed)
-                    == ImmutableStoreVersion::LazyFanOut as u32;
-                let needs_two_phase_commit = fan_out_aware && committed_level != active_buckets;
-
-                // Always flush the packstore once per group when sync_data is set, regardless of which serialize path runs below.
-                if sync_data {
-                    group.flush_packstore(sync_data).await;
-                }
-
-                if needs_two_phase_commit && first_err.is_none() {
-                    // T10 two-phase commit. Every [0..active_buckets] bucket gets a .new file (skipping empties at index >= committed_level since no old file exists there to overwrite). After all .new files are durable, write level.pending as the commit point. Then rename .new -> final, write the level marker, delete level.pending. Recovery on the next store open rolls forward from any pending state.
-                    if let Err(e) = lore_io::IoDriver::global()
-                        .create_dir_all(&group_path)
-                        .await
-                        .map_err(|e| {
-                            LocalImmutableStoreError::internal_with_context(
-                                e,
-                                "Failed to create group directory for fan-out commit",
-                            )
-                        })
-                    {
-                        first_err = Some(e);
-                    }
-
-                    let mut wrote_new: Vec<usize> = Vec::new();
-                    if first_err.is_none() {
-                        for bucket_index in 0..active_buckets {
-                            // Fast path: skip the bucket entirely (no lock acquire) when it's neither dirty nor an old-level slot we need to overwrite. The dirty flag is the cheap proxy for "this bucket has data to flush"; combined with the index < committed_level check (which forces an empty .new to overwrite stale level-N files), this avoids 256× read-lock acquires per group on the common server-fresh-store first flush where most buckets are empty and committed_level == 0.
-                            let must_overwrite_old = bucket_index < committed_level;
-                            let dirty = group.dirty[bucket_index].load(atomic::Ordering::Relaxed);
-                            if !must_overwrite_old && !dirty {
-                                continue;
-                            }
-                            let bucket = group.bucket(bucket_index).clone().read_owned().await;
-                            // Re-check after lock acquire — concurrent paths may have just dirtied or undirtied this bucket.
-                            if bucket.entry.is_empty() && !must_overwrite_old {
-                                continue;
-                            }
-                            let res = ImmutableStoreBucket::serialize_to_new(
-                                bucket,
-                                group.clone(),
-                                path.as_ref(),
-                                group_index,
-                                bucket_index,
-                                sync_data,
-                            )
-                            .await;
-                            match res {
-                                Ok(()) => wrote_new.push(bucket_index),
-                                Err(err) => {
-                                    if first_err.is_none() {
-                                        first_err = Some(err);
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    if wrote_new.is_empty() {
-                        // No .new files written for this group — skip the level.pending sentinel entirely. The sentinel exists to drive roll-forward recovery of a partially-completed transition; with no .new files there is no in-progress state to recover, so a direct marker write is sufficient. Restores ~3x throughput on fresh-store-first-flush-with-sync_data when most groups are empty (the common shape on `lore repository create`).
-                        if first_err.is_none()
-                            && let Err(err) = crate::local::fan_out::write_level_marker(
-                                &group_path,
-                                active_buckets,
-                                sync_data,
-                            )
-                            .await
-                            .map_err(|e| {
-                                LocalImmutableStoreError::internal_with_context(
-                                    e,
-                                    "Failed to write level marker for empty group",
-                                )
-                            })
-                        {
-                            first_err = Some(err);
-                        }
-                        if first_err.is_none() {
-                            group
-                                .committed_level
-                                .store(active_buckets, atomic::Ordering::Relaxed);
-                        }
-                    } else {
-                        // Full two-phase commit: pending → renames → marker → delete pending.
-                        if first_err.is_none()
-                            && let Err(err) = crate::local::fan_out::write_level_pending(
-                                &group_path,
-                                active_buckets,
-                                sync_data,
-                            )
-                            .await
-                            .map_err(|e| {
-                                LocalImmutableStoreError::internal_with_context(
-                                    e,
-                                    "Failed to write level.pending",
-                                )
-                            })
-                        {
-                            first_err = Some(err);
-                        }
-
-                        if first_err.is_none() {
-                            for &bucket_index in &wrote_new {
-                                let new_path = crate::local::fan_out::bucket_new_path(
-                                    &group_path,
-                                    bucket_index,
-                                );
-                                let final_path =
-                                    crate::local::fan_out::bucket_path(&group_path, bucket_index);
-                                if let Err(err) = lore_io::IoDriver::global()
-                                    .rename(&new_path, &final_path)
-                                    .await
-                                    && first_err.is_none()
-                                {
-                                    first_err = Some(
-                                        LocalImmutableStoreError::internal_with_context(
-                                            err,
-                                            "Failed to rename .new bucket file during fan-out commit",
-                                        ),
-                                    );
-                                }
-                            }
-                        }
-
-                        if first_err.is_none()
-                            && let Err(err) = crate::local::fan_out::write_level_marker(
-                                &group_path,
-                                active_buckets,
-                                sync_data,
-                            )
-                            .await
-                            .map_err(|e| {
-                                LocalImmutableStoreError::internal_with_context(
-                                    e,
-                                    "Failed to write level marker",
-                                )
-                            })
-                        {
-                            first_err = Some(err);
-                        }
-
-                        if first_err.is_none()
-                            && let Err(err) =
-                                crate::local::fan_out::delete_level_pending(&group_path)
-                                    .await
-                                    .map_err(|e| {
-                                        LocalImmutableStoreError::internal_with_context(
-                                            e,
-                                            "Failed to delete level.pending",
-                                        )
-                                    })
-                        {
-                            first_err = Some(err);
-                        }
-
-                        if first_err.is_none() {
-                            group
-                                .committed_level
-                                .store(active_buckets, atomic::Ordering::Relaxed);
-                        }
-                    }
-                } else if first_err.is_none() {
-                    // Regular flush at unchanged level: per-file .tmp + atomic rename for dirty buckets only. No marker write — marker already reflects the current level.
-                    for bucket_index in 0..active_buckets {
-                        if !group.dirty[bucket_index].load(atomic::Ordering::Relaxed) {
-                            continue;
-                        }
-                        let Some(bucket) = group.try_bucket(bucket_index).cloned() else {
-                            continue;
-                        };
-                        let bucket = bucket.read_owned().await;
-                        let res = ImmutableStoreBucket::serialize(
-                            bucket,
-                            group.clone(),
-                            path.as_ref(),
-                            group_index,
-                            bucket_index,
-                            sync_data,
-                        )
-                        .await;
-                        if let Err(err) = res
-                            && first_err.is_none()
-                        {
-                            first_err = Some(err);
-                        }
-                    }
-                }
-
-                match first_err {
-                    Some(err) => Err(err),
-                    None => Ok(()),
-                }
+                flush_locked_group(group, group_index, path, sync_data).await
             });
         }
 
@@ -4846,6 +4703,235 @@ impl ImmutableStoreCreateOptions {
     }
 }
 
+pub(crate) async fn flush_locked_group(
+    group: Arc<ImmutableStoreGroup>,
+    group_index: usize,
+    path: Arc<PathBuf>,
+    sync_data: bool,
+) -> Result<(), LocalImmutableStoreError> {
+    let mut first_err: Option<LocalImmutableStoreError> = None;
+
+    // Re-check under the lock: another flusher may have drained this group
+    // while we waited. The scan that got us here is lock-free and stale by
+    // now, so skip the redundant fan-out check, path selection and - in the
+    // two-phase branch - the needless level-marker write. A pending level
+    // transition (`committed_level != active_buckets`) still has to be
+    // completed even with no dirty bucket, so it is never skipped.
+    if !group
+        .dirty
+        .iter()
+        .any(|flag| flag.load(atomic::Ordering::Relaxed))
+        && group.committed_level.load(atomic::Ordering::Relaxed)
+            == group.bucket_count.load(atomic::Ordering::Relaxed)
+    {
+        // The packstore flush below is unconditional for `sync_data`, so it
+        // still has to run on this path.
+        if sync_data {
+            group.flush_packstore(sync_data).await;
+        }
+        return Ok(());
+    }
+
+    // Fan-out trigger: if any dirty bucket exceeds threshold and we're below max level, redistribute entries before serializing.
+    if let Err(err) = maybe_fan_out_immutable_group(&group, path.as_ref(), group_index).await {
+        first_err = Some(err);
+    }
+
+    let active_buckets = group.bucket_count.load(atomic::Ordering::Relaxed);
+    let committed_level = group.committed_level.load(atomic::Ordering::Relaxed);
+    let group_path = {
+        let mut p = path.as_path().to_path_buf();
+        p.push("index");
+        crate::local::fan_out::push_group_dir(&mut p, group_index);
+        p
+    };
+    let fan_out_aware = group.serialize_version.load(atomic::Ordering::Relaxed)
+        == ImmutableStoreVersion::LazyFanOut as u32;
+    let needs_two_phase_commit = fan_out_aware && committed_level != active_buckets;
+
+    // Always flush the packstore once per group when sync_data is set, regardless of which serialize path runs below.
+    if sync_data {
+        group.flush_packstore(sync_data).await;
+    }
+
+    if needs_two_phase_commit && first_err.is_none() {
+        // T10 two-phase commit. Every [0..active_buckets] bucket gets a .new file (skipping empties at index >= committed_level since no old file exists there to overwrite). After all .new files are durable, write level.pending as the commit point. Then rename .new -> final, write the level marker, delete level.pending. Recovery on the next store open rolls forward from any pending state.
+        if let Err(e) = lore_io::IoDriver::global()
+            .create_dir_all(&group_path)
+            .await
+            .map_err(|e| {
+                LocalImmutableStoreError::internal_with_context(
+                    e,
+                    "Failed to create group directory for fan-out commit",
+                )
+            })
+        {
+            first_err = Some(e);
+        }
+
+        let mut wrote_new: Vec<usize> = Vec::new();
+        if first_err.is_none() {
+            for bucket_index in 0..active_buckets {
+                // Fast path: skip the bucket entirely (no lock acquire) when it's neither dirty nor an old-level slot we need to overwrite. The dirty flag is the cheap proxy for "this bucket has data to flush"; combined with the index < committed_level check (which forces an empty .new to overwrite stale level-N files), this avoids 256× read-lock acquires per group on the common server-fresh-store first flush where most buckets are empty and committed_level == 0.
+                let must_overwrite_old = bucket_index < committed_level;
+                let dirty = group.dirty[bucket_index].load(atomic::Ordering::Relaxed);
+                if !must_overwrite_old && !dirty {
+                    continue;
+                }
+                let bucket = group.bucket(bucket_index).clone().read_owned().await;
+                // Re-check after lock acquire — concurrent paths may have just dirtied or undirtied this bucket.
+                if bucket.entry.is_empty() && !must_overwrite_old {
+                    continue;
+                }
+                let res = ImmutableStoreBucket::serialize_to_new(
+                    bucket,
+                    group.clone(),
+                    path.as_ref(),
+                    group_index,
+                    bucket_index,
+                    sync_data,
+                )
+                .await;
+                match res {
+                    Ok(()) => wrote_new.push(bucket_index),
+                    Err(err) => {
+                        if first_err.is_none() {
+                            first_err = Some(err);
+                        }
+                    }
+                }
+            }
+        }
+
+        if wrote_new.is_empty() {
+            // No .new files written for this group — skip the level.pending sentinel entirely. The sentinel exists to drive roll-forward recovery of a partially-completed transition; with no .new files there is no in-progress state to recover, so a direct marker write is sufficient. Restores ~3x throughput on fresh-store-first-flush-with-sync_data when most groups are empty (the common shape on `lore repository create`).
+            if first_err.is_none()
+                && let Err(err) = crate::local::fan_out::write_level_marker(
+                    &group_path,
+                    active_buckets,
+                    sync_data,
+                )
+                .await
+                .map_err(|e| {
+                    LocalImmutableStoreError::internal_with_context(
+                        e,
+                        "Failed to write level marker for empty group",
+                    )
+                })
+            {
+                first_err = Some(err);
+            }
+            if first_err.is_none() {
+                group
+                    .committed_level
+                    .store(active_buckets, atomic::Ordering::Relaxed);
+            }
+        } else {
+            // Full two-phase commit: pending → renames → marker → delete pending.
+            if first_err.is_none()
+                && let Err(err) = crate::local::fan_out::write_level_pending(
+                    &group_path,
+                    active_buckets,
+                    sync_data,
+                )
+                .await
+                .map_err(|e| {
+                    LocalImmutableStoreError::internal_with_context(
+                        e,
+                        "Failed to write level.pending",
+                    )
+                })
+            {
+                first_err = Some(err);
+            }
+
+            if first_err.is_none() {
+                for &bucket_index in &wrote_new {
+                    let new_path =
+                        crate::local::fan_out::bucket_new_path(&group_path, bucket_index);
+                    let final_path = crate::local::fan_out::bucket_path(&group_path, bucket_index);
+                    if let Err(err) = lore_io::IoDriver::global()
+                        .rename(&new_path, &final_path)
+                        .await
+                        && first_err.is_none()
+                    {
+                        first_err = Some(LocalImmutableStoreError::internal_with_context(
+                            err,
+                            "Failed to rename .new bucket file during fan-out commit",
+                        ));
+                    }
+                }
+            }
+
+            if first_err.is_none()
+                && let Err(err) = crate::local::fan_out::write_level_marker(
+                    &group_path,
+                    active_buckets,
+                    sync_data,
+                )
+                .await
+                .map_err(|e| {
+                    LocalImmutableStoreError::internal_with_context(
+                        e,
+                        "Failed to write level marker",
+                    )
+                })
+            {
+                first_err = Some(err);
+            }
+
+            if first_err.is_none()
+                && let Err(err) = crate::local::fan_out::delete_level_pending(&group_path)
+                    .await
+                    .map_err(|e| {
+                        LocalImmutableStoreError::internal_with_context(
+                            e,
+                            "Failed to delete level.pending",
+                        )
+                    })
+            {
+                first_err = Some(err);
+            }
+
+            if first_err.is_none() {
+                group
+                    .committed_level
+                    .store(active_buckets, atomic::Ordering::Relaxed);
+            }
+        }
+    } else if first_err.is_none() {
+        // Regular flush at unchanged level: per-file .tmp + atomic rename for dirty buckets only. No marker write — marker already reflects the current level.
+        for bucket_index in 0..active_buckets {
+            if !group.dirty[bucket_index].load(atomic::Ordering::Relaxed) {
+                continue;
+            }
+            let Some(bucket) = group.try_bucket(bucket_index).cloned() else {
+                continue;
+            };
+            let bucket = bucket.read_owned().await;
+            let res = ImmutableStoreBucket::serialize(
+                bucket,
+                group.clone(),
+                path.as_ref(),
+                group_index,
+                bucket_index,
+                sync_data,
+            )
+            .await;
+            if let Err(err) = res
+                && first_err.is_none()
+            {
+                first_err = Some(err);
+            }
+        }
+    }
+
+    match first_err {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
 /// Inspect dirty buckets in `group` and, if any exceeds the per-store fan-out threshold and the
 /// group is not yet at max level, atomically redistribute entries to the next ladder level. Same
 /// shape as `maybe_fan_out_mutable_group` but operating on `ImmutableStoreEntry` (which references
@@ -5206,6 +5292,81 @@ mod tests {
                 .unwrap_or_else(|err| {
                     panic!("{address} was written and persisted but reads back as {err:?}")
                 });
+        }
+    }
+
+    mod oodle_migration_seed {
+        use super::*;
+
+        /// A store with fragments on disk and no info file, as one written by a binary predating
+        /// the file. Reports the highest group index holding data.
+        async fn store_predating_the_info_file(dir: &crate::test_util::TempDir) -> i32 {
+            let highest = {
+                let store =
+                    LocalImmutableStore::new(Some(dir.path().to_path_buf()), client_settings())
+                        .await
+                        .expect("store opens");
+                let addresses = put_fragments(&store, Partition::from([7u8; 16]), 32).await;
+                let dyn_store: Arc<dyn crate::immutable_store::ImmutableStore> = store.clone();
+                dyn_store.flush(true).await.expect("store flushes");
+                addresses
+                    .iter()
+                    .map(|address| address.hash.data()[0] as i32)
+                    .max()
+                    .expect("fragments were written")
+            };
+            std::fs::remove_file(info_path_for_store_root(&dir.path().join("immutable")))
+                .expect("the info file a newer binary wrote is removed");
+            highest
+        }
+
+        /// A group that was never written holds no payload of any codec, so a store made only of
+        /// them starts with nothing to migrate - and says so rather than sweeping all 256.
+        #[tokio::test]
+        async fn a_store_with_no_written_group_has_nothing_to_migrate() {
+            let dir = crate::test_util::TempDir::new("is_seed_fresh_");
+            let store = LocalImmutableStore::new(Some(dir.path().to_path_buf()), client_settings())
+                .await
+                .expect("store opens");
+
+            assert_eq!(
+                store.info.read().await.next_group_index_to_migrate_oodle,
+                -1
+            );
+        }
+
+        /// A store written before the info file existed is seeded from the groups actually on
+        /// disk, so the pass starts at the highest one holding data.
+        #[cfg(feature = "oodle")]
+        #[tokio::test]
+        async fn a_store_predating_the_info_file_is_seeded_from_its_written_groups() {
+            let dir = crate::test_util::TempDir::new("is_seed_existing_");
+            let highest = store_predating_the_info_file(&dir).await;
+
+            let store = LocalImmutableStore::new(Some(dir.path().to_path_buf()), client_settings())
+                .await
+                .expect("store reopens");
+            assert_eq!(
+                store.info.read().await.next_group_index_to_migrate_oodle,
+                highest
+            );
+        }
+
+        /// A binary that cannot decode Oodle can do nothing about a store that holds it, so it
+        /// records no work rather than a bookmark it could never act on.
+        #[cfg(not(feature = "oodle"))]
+        #[tokio::test]
+        async fn a_binary_without_oodle_records_no_migration() {
+            let dir = crate::test_util::TempDir::new("is_seed_no_oodle_");
+            store_predating_the_info_file(&dir).await;
+
+            let store = LocalImmutableStore::new(Some(dir.path().to_path_buf()), client_settings())
+                .await
+                .expect("store reopens");
+            assert_eq!(
+                store.info.read().await.next_group_index_to_migrate_oodle,
+                -1
+            );
         }
     }
 
