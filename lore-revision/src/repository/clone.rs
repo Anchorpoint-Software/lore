@@ -43,6 +43,7 @@ use crate::filter::FilterStates;
 use crate::fs::filesystem_provider::FileInfo;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
+use crate::fs::filesystem_provider::create_empty_directory;
 use crate::hash::hash_string_bytes;
 use crate::instance::InstanceId;
 use crate::interface::LoreArray;
@@ -532,20 +533,6 @@ async fn block_discover_task(
     }
 }
 
-/// Create `relative_path` and any missing ancestors, materializing a directory
-/// the view filter left without in-view content: one empty in the revision, or
-/// one whose children were all filtered out.
-async fn create_empty_directory(
-    operation: &Arc<InstanceOperationImpl>,
-    path: &RelativePath,
-) -> Result<(), CloneError> {
-    operation
-        .create_dir_all(path)
-        .await
-        .forward_with::<CloneError, _>(|| format!("Failed to create directory {path}"))?;
-    Ok(())
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn process_block_item(
     dispatcher: &Arc<BlockDiscoverDispatcher>,
@@ -656,7 +643,7 @@ async fn process_block_item(
                         visited_child: false,
                     });
                 } else if !execution_context().globals().dry_run() {
-                    create_empty_directory(&dispatcher.operation, &node_path).await?;
+                    create_empty_directory::<CloneError>(&dispatcher.operation, &node_path).await?;
                 }
             }
         }
@@ -687,7 +674,11 @@ async fn process_block_item(
                     && !item.repository_path.is_empty()
                     && !execution_context().globals().dry_run()
                 {
-                    create_empty_directory(&dispatcher.operation, &item.repository_path).await?;
+                    create_empty_directory::<CloneError>(
+                        &dispatcher.operation,
+                        &item.repository_path,
+                    )
+                    .await?;
                 }
                 break;
             }

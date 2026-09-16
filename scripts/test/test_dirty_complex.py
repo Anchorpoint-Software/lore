@@ -20,7 +20,7 @@ import logging
 import os
 
 import pytest
-from lore_parsers import parse_status_json
+from lore_parsers import parse_jsonl, parse_status_json
 from test_utils import to_posix
 
 from lore import Lore
@@ -9432,6 +9432,69 @@ def test_emptydir_reset_purge_removes_dir(new_lore_repo):
     assert not repo.path_exists("empty"), (
         "reset --purge removes the empty directory from disk"
     )
+
+
+@pytest.mark.smoke
+def test_emptydir_committed_reset_purge_removes_untracked_child(new_lore_repo):
+    """`reset --purge` of a committed empty directory removes the untracked
+    content the working tree holds under it, keeping the directory itself."""
+    repo: Lore = new_lore_repo()
+    commit_base(repo, {"base.txt": "base\n"})
+
+    repo.make_dirs("empty")
+    get_status_files_twice(repo, scan=True)
+    repo.stage(scan=True, offline=True)
+    repo.commit("empty directory", offline=True)
+
+    repo.write_files({"empty/junk.txt": "junk\n"})
+
+    repo.reset(["empty"], purge=True, offline=True)
+
+    assert repo.path_exists("empty"), (
+        "the directory the revision holds survives the purge"
+    )
+    assert not repo.path_exists("empty/junk.txt"), (
+        "reset --purge removes untracked content under a directory the revision holds empty"
+    )
+
+
+@pytest.mark.smoke
+def test_root_reset_purge_against_empty_revision(new_lore_repo):
+    """`reset . --purge` against a revision holding an empty root clears the
+    working tree, leaving the dot directory."""
+    repo: Lore = new_lore_repo()
+    commit_base(repo, {"base.txt": "base\n"})
+
+    repo.remove_file("base.txt")
+    repo.stage(scan=True, offline=True)
+    repo.commit("empty root", offline=True)
+
+    repo.write_files({"junk.txt": "junk\n"})
+
+    repo.reset(["."], purge=True, offline=True)
+
+    assert not repo.path_exists("junk.txt"), (
+        "reset --purge clears the working tree against an empty root revision"
+    )
+    assert repo.path_exists(".lore"), "the dot directory survives the purge"
+
+
+@pytest.mark.smoke
+def test_reset_purge_counts_directories_and_files_apart(new_lore_repo):
+    """The `reset --purge` summary counts a removed directory against the
+    directory tally and a removed file against the file tally."""
+    repo: Lore = new_lore_repo()
+    commit_base(repo, {"base.txt": "base\n"})
+
+    repo.write_files({"junk.txt": "junk\n", "junkdir/inner.txt": "inner\n"})
+
+    output = repo.reset(["."], purge=True, json=True, offline=True)
+
+    reset_ends = parse_jsonl(output, "fileResetEnd")
+    assert reset_ends, f"reset should emit a fileResetEnd event:\n{output}"
+    count = reset_ends[-1]["count"]
+    assert count["directoryDeleteCount"] == 1, count
+    assert count["fileDeleteCount"] == 1, count
 
 
 @pytest.mark.smoke

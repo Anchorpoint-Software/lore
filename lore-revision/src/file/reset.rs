@@ -25,6 +25,7 @@ use crate::filter::FilterMode;
 use crate::filter::FilterStates;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
+use crate::fs::filesystem_provider::create_empty_directory;
 use crate::fs::filesystem_provider::with_operation;
 use crate::interface::LoreArray;
 use crate::interface::LoreError;
@@ -207,6 +208,17 @@ impl Default for ResetStats {
     }
 }
 
+impl ResetStats {
+    /// The tally a removed path counts against, the two being reported apart.
+    fn delete_count(&self, is_directory: bool) -> &AtomicU64 {
+        if is_directory {
+            &self.directory_delete_count
+        } else {
+            &self.file_delete_count
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ResetOptions {
     /// Delete untracked files
@@ -309,14 +321,9 @@ async fn reset_walk_each_path(walk: ResetWalk) -> Option<ResetError> {
         };
 
         if let Err(err) = walked {
-            return wrap_path_error(
-                walk.repository.clone(),
-                relative_path,
-                relative_path.as_str(),
-                err,
-            )
-            .await
-            .err();
+            return wrap_path_error(&walk.operation, relative_path, err)
+                .await
+                .err();
         }
     }
 
@@ -338,14 +345,9 @@ async fn reset_walk_each_path(walk: ResetWalk) -> Option<ResetError> {
             .await;
 
             if let Err(err) = walked {
-                return wrap_path_error(
-                    walk.repository.clone(),
-                    mount_path,
-                    mount_path.as_str(),
-                    err,
-                )
-                .await
-                .err();
+                return wrap_path_error(&walk.operation, mount_path, err)
+                    .await
+                    .err();
             }
         }
     }
@@ -858,22 +860,25 @@ async fn reset_staged_links_under_paths(
     Ok(reset_count)
 }
 
+/// Names in `err` whether the working tree holds the path it failed on, which separates a path
+/// the user misspelled from one the reset could not apply.
 async fn wrap_path_error(
-    repository: Arc<RepositoryContext>,
+    operation: &InstanceOperationImpl,
     relative_path: &RelativePath,
-    user_path: &str,
     err: ResetError,
 ) -> Result<(), ResetError> {
-    let absolute = relative_path.to_absolute_path(repository.require_path()?);
-    let wrapped: Result<(), ResetError> = Err(err);
-    match lore_io::IoDriver::global().metadata(&absolute).await {
-        Ok(_) => wrapped.forward_with::<ResetError, _>(|| {
-            format!("Failed resetting an existing path: {user_path}")
-        }),
-        _ => wrapped.forward_with::<ResetError, _>(|| {
-            format!("Failed resetting a non-existent path: {user_path}")
-        }),
-    }
+    let existence = if operation
+        .file_info(relative_path)
+        .await
+        .is_ok_and(|info| info.exists())
+    {
+        "an existing"
+    } else {
+        "a non-existent"
+    };
+    Err::<(), ResetError>(err).forward_with::<ResetError, _>(|| {
+        format!("Failed resetting {existence} path: {relative_path}")
+    })
 }
 
 async fn resolve_last_merged_target(
@@ -1336,7 +1341,11 @@ async fn reset_walk_path(
             }
 
             if delete_path {
-                reset_delete_path(&repository, &stats, relative_path).await?;
+                let is_directory = operation
+                    .file_info(&relative_path)
+                    .await
+                    .is_ok_and(|info| info.is_dir());
+                reset_delete_path(&operation, &stats, &relative_path, is_directory).await?;
             }
 
             Ok(())
@@ -1345,23 +1354,29 @@ async fn reset_walk_path(
     }
 }
 
+/// Removes `relative_path` from the working tree, counted against the tally `is_directory`
+/// names it for.
 async fn reset_delete_path(
-    repository: &Arc<RepositoryContext>,
+    operation: &InstanceOperationImpl,
     stats: &Arc<ResetStats>,
-    relative_path: RelativePath,
+    relative_path: &RelativePath,
+    is_directory: bool,
 ) -> Result<(), ResetError> {
     lore_trace!("Reset removing path {}", relative_path.as_str());
-    stats.file_delete_count.fetch_add(1, Ordering::Relaxed);
+    stats
+        .delete_count(is_directory)
+        .fetch_add(1, Ordering::Relaxed);
     event::LoreEvent::FileResetFile(LoreFileResetFileEventData {
-        path: LoreString::from(&relative_path),
+        path: LoreString::from(relative_path),
         action: LoreFileAction::Delete,
         from_path: LoreString::default(),
     })
     .send();
 
-    util::fs::unlink_recursive(relative_path.to_absolute_path(repository.require_path()?))
+    operation
+        .remove_recursive(relative_path)
         .await
-        .internal("Failed to remove path")?;
+        .forward::<ResetError>("Failed to remove path")?;
     Ok(())
 }
 
@@ -1559,8 +1574,9 @@ async fn reset_walk_node(
 /// Walk the children of a directory node, dispatching each to
 /// `reset_walk_node`. Subdirectory walks are gated by the `directory_inflight`
 /// counter: spawn when under `RESET_DIRECTORY_MAX`, run inline (degrade to
-/// sync) once over. The directory itself is created on disk first; purge
-/// (when enabled) runs after all child directory tasks complete.
+/// sync) once over. A directory the revision holds with no children is created
+/// here, and purge (when enabled) runs for every directory once its child walks
+/// have completed.
 async fn reset_walk_directory(
     ctx: ResetContext,
     directory_path: RelativePath,
@@ -1581,39 +1597,22 @@ async fn reset_walk_directory(
 
     let mut child_node_iter = node.child();
 
-    // Empty directory in revision: must be created explicitly because no
-    // realize_file inside it will lazily create it. For non-empty
-    // directories, parent-dir creation happens in `realize_file` (the
-    // consumer side), matching clone's behaviour.
     if child_node_iter.is_none() {
         if !directory_path.is_empty() {
-            let absolute_path = directory_path.to_absolute_path(repository.require_path()?);
-            match lore_io::IoDriver::global()
-                .create_dir_all(absolute_path.as_path())
-                .await
-            {
-                Ok(_) => {
-                    lore_trace!("Created empty directory: {}", directory_path.as_str());
-                }
-                Err(err) => {
-                    if err.kind() == std::io::ErrorKind::AlreadyExists {
-                        lore_trace!("Directory already exists: {}", directory_path.as_str());
-                    } else if let Ok(metadata) = lore_io::IoDriver::global()
-                        .metadata(absolute_path.as_path())
-                        .await
-                    {
-                        if metadata.is_dir() {
-                            lore_trace!("Directory already exists: {}", directory_path.as_str());
-                        } else {
-                            return Err(err).internal("Failed to create directory")?;
-                        }
-                    } else {
-                        return Err(err).internal("Failed to create directory")?;
-                    }
-                }
-            }
+            create_empty_directory::<ResetError>(&operation, &directory_path).await?;
         }
-        return Ok(());
+        if !options.purge {
+            return Ok(());
+        }
+        return purge_untracked_children(
+            &operation,
+            &repository,
+            &stats,
+            &directory_path,
+            Vec::new(),
+            states,
+        )
+        .await;
     }
 
     let mut child_dirs: JoinSet<Result<(), ResetError>> = JoinSet::new();
@@ -1628,7 +1627,9 @@ async fn reset_walk_directory(
             .forward::<ResetError>("Failed to get node name")?;
 
         let child_node_path = directory_path.join(&child_node_name);
-        node_children_names.push(child_node_name.clone());
+        if options.purge {
+            node_children_names.push(child_node_name.clone());
+        }
 
         let Ok(child_node) = state_target.node(repository.clone(), child_node_id).await else {
             failure = Some(ResetError::internal(
@@ -1731,28 +1732,50 @@ async fn reset_walk_directory(
         return Ok(());
     }
 
-    // Find all filesystem children and check whether they have been reset,
-    // otherwise remove the path. The directory may not exist on disk if all
-    // its tracked children were filter-excluded — nothing to purge in that
-    // case.
-    let absolute_dir = directory_path.to_absolute_path(repository.require_path()?);
-    if lore_io::IoDriver::global()
-        .metadata(&absolute_dir)
+    purge_untracked_children(
+        &operation,
+        &repository,
+        &stats,
+        &directory_path,
+        node_children_names,
+        states,
+    )
+    .await
+}
+
+/// Removes the children the working tree holds under `directory_path` that the target revision
+/// does not, which is what `--purge` adds to restoring the ones it does.
+///
+/// `node_children_names` names the children the revision holds, each of them restored by the
+/// walk already, and is sorted here to be matched against each filesystem entry by binary
+/// search. A path the filter excludes is left alone whatever the revision holds, unless forced.
+///
+/// The children are read from the host: an operation answers questions about a path and offers
+/// no listing, so every path the entries name is acted on through the operation instead. A
+/// directory the working tree does not hold has nothing to purge, which is what all of its
+/// tracked children being filter-excluded leaves.
+async fn purge_untracked_children(
+    operation: &Arc<InstanceOperationImpl>,
+    repository: &Arc<RepositoryContext>,
+    stats: &Arc<ResetStats>,
+    directory_path: &RelativePath,
+    mut node_children_names: Vec<String>,
+    states: FilterStates,
+) -> Result<(), ResetError> {
+    if !operation
+        .file_info(directory_path)
         .await
-        .is_err()
+        .is_ok_and(|info| info.exists())
     {
         return Ok(());
     }
-    let mut filesystem_children =
-        util::fs::list_directory(absolute_dir)
-            .await
-            .internal_with(|| {
-                format!(
-                    "Failed to list directory files in {}",
-                    directory_path.as_str()
-                )
-            })?;
 
+    let absolute_dir = directory_path.to_absolute_path(repository.require_path()?);
+    let mut filesystem_children = util::fs::list_directory(absolute_dir)
+        .await
+        .internal_with(|| format!("Failed to list directory files in {directory_path}"))?;
+
+    node_children_names.sort_unstable();
     let force = execution_context().globals().force();
     let mut tasks = JoinSet::new();
     while let Some(entry) = filesystem_children.next().await {
@@ -1775,21 +1798,26 @@ async fn reset_walk_directory(
             FilterMode::Full,
         );
         if excluded {
-            lore_trace!("Path excluded by filter: {}", child_path.as_str());
+            lore_trace!("Path excluded by filter: {child_path}");
             continue;
         }
 
-        if !node_children_names.contains(&filesystem_child.name) {
+        if node_children_names
+            .binary_search(&filesystem_child.name)
+            .is_err()
+        {
             lore_trace!(
                 "Child node {} not found, removing path from disk",
                 filesystem_child.name.as_str()
             );
 
-            stats.directory_delete_count.fetch_add(1, Ordering::Relaxed);
+            stats
+                .delete_count(filesystem_child.metadata.is_dir())
+                .fetch_add(1, Ordering::Relaxed);
 
-            let absolute_path = child_path.to_absolute_path(repository.require_path()?);
+            let child_operation = operation.clone();
             lore_spawn!(tasks, async move {
-                util::fs::unlink_recursive(absolute_path.as_path()).await
+                child_operation.remove_recursive(&child_path).await
             });
         }
     }
@@ -1798,7 +1826,7 @@ async fn reset_walk_directory(
         result
             .internal("Recursion task failed")
             .map_err(ResetError::from)?
-            .internal("Failed to remove invalid node")?;
+            .forward::<ResetError>("Failed to remove invalid node")?;
     }
 
     Ok(())
@@ -1960,7 +1988,7 @@ async fn reset_file_realize(
     // If being reset from a directory to a file the directory must be deleted before the file is
     // created.
     if info.is_ok_and(|info| info.is_dir()) {
-        reset_delete_path(&repository, &stats, relative_path.clone()).await?;
+        reset_delete_path(&operation, &stats, &relative_path, true).await?;
     }
 
     stats.file_reset_count.fetch_add(1, Ordering::Relaxed);

@@ -23,6 +23,7 @@ use crate::fs::os::OsOperation;
 use crate::fs::swfs::filesystem::SwfsOperation;
 use crate::lore::Address;
 use crate::lore::Context;
+use crate::lore_trace;
 use crate::merge::MergeTextMode;
 use crate::node::Node;
 use crate::node::NodeFileMode;
@@ -319,6 +320,27 @@ where
         work(Some(operation)).await
     })
     .await
+}
+
+/// Creates `path` and any missing ancestor, for a directory no file written below it creates on
+/// the way: one the revision holds with nothing in it, or one whose every child the view filter
+/// leaves out.
+///
+/// A directory already standing there is the state asked for. Anything else standing there is
+/// reported, the caller holding a directory and nothing to put in that thing's place.
+pub async fn create_empty_directory<E>(
+    operation: &InstanceOperationImpl,
+    path: &RelativePath,
+) -> Result<(), E>
+where
+    E: ErrorSet,
+{
+    operation
+        .create_dir_all(path)
+        .await
+        .forward_any_with::<E, _>(|| format!("Failed to create directory {path}"))?;
+    lore_trace!("Created empty directory: {path}");
+    Ok(())
 }
 
 /// Instance operation trait - performs file operations within a context.
@@ -841,6 +863,7 @@ pub mod tests {
     use crate::fs::filesystem_provider::InstanceOperation;
     use crate::fs::filesystem_provider::InstanceOperationImpl;
     use crate::fs::filesystem_provider::StaticDispatchInstanceOperation;
+    use crate::fs::filesystem_provider::create_empty_directory;
     use crate::fs::filesystem_provider::with_operation;
     use crate::fs::filesystem_provider::with_operation_if;
     use crate::lore::Address;
@@ -1395,6 +1418,60 @@ pub mod tests {
 
         assert!(!info.exists());
         assert_eq!(1, filesystem.file_infos());
+    }
+
+    /// An operation rooted at `root`, which is what a caller names its paths against.
+    async fn os_operation(root: &Path) -> Arc<InstanceOperationImpl> {
+        FilesystemProvider::begin_operation(&crate::fs::os::OsFilesystem::new(root))
+            .await
+            .expect("beginning an operation over the OS filesystem")
+    }
+
+    fn relative(path: &str) -> RelativePath {
+        RelativePath::new_from_initial_path(path).expect("relative path")
+    }
+
+    #[tokio::test]
+    async fn a_missing_directory_is_created_with_its_ancestors() {
+        let dir = lore_base::test_util::TempDir::new("lore-fs-provider-empty-dir-");
+        let operation = os_operation(dir.path()).await;
+
+        create_empty_directory::<FsError>(&operation, &relative("outer/inner"))
+            .await
+            .expect("an empty directory is created");
+
+        assert!(dir.path().join("outer").join("inner").is_dir());
+    }
+
+    #[tokio::test]
+    async fn a_directory_already_there_is_the_state_asked_for() {
+        let dir = lore_base::test_util::TempDir::new("lore-fs-provider-empty-dir-");
+        let operation = os_operation(dir.path()).await;
+        std::fs::create_dir_all(dir.path().join("held")).expect("create directory");
+
+        create_empty_directory::<FsError>(&operation, &relative("held"))
+            .await
+            .expect("a directory already there is accepted");
+
+        assert!(dir.path().join("held").is_dir());
+    }
+
+    /// A file standing where a directory belongs is reported rather than passed over: the
+    /// caller holds a directory and has nothing to put in the file's place.
+    #[tokio::test]
+    async fn a_file_standing_where_the_directory_belongs_is_reported() {
+        let dir = lore_base::test_util::TempDir::new("lore-fs-provider-empty-dir-");
+        let operation = os_operation(dir.path()).await;
+        std::fs::write(dir.path().join("held"), b"content").expect("write file");
+
+        create_empty_directory::<FsError>(&operation, &relative("held"))
+            .await
+            .expect_err("a file standing there is not the state asked for");
+
+        assert!(
+            dir.path().join("held").is_file(),
+            "the file standing there was replaced"
+        );
     }
 
     #[tokio::test]
