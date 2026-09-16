@@ -42,7 +42,6 @@ use crate::revision;
 use crate::state;
 use crate::state::NodeComparison;
 use crate::state::State;
-use crate::util;
 use crate::util::path::RelativePath;
 use crate::util::serde::u8_as_bool;
 
@@ -499,12 +498,19 @@ async fn calculate_local_filtered_size_hash(
         // Get the local file sizes
         let local_size_repository = repository.clone();
         let local_size_relative_path = relative_path.clone();
+        let local_size_operation = operation.clone();
         let local_size_task = lore_spawn!(async move {
             if sizes.local {
                 lore_debug!("Calculating local size");
+                let local_info = local_size_operation
+                    .file_info(&local_size_relative_path)
+                    .await
+                    .unwrap_or(FileInfo::NotExist);
                 calculate_local_size_recurse(
+                    local_size_operation,
                     local_size_repository,
                     local_size_relative_path,
+                    local_info,
                     parent_states,
                 )
                 .await
@@ -559,80 +565,83 @@ async fn calculate_local_filtered_size_hash(
     }
 }
 
+/// `info` is what the working tree holds at `relative_path`, which the listing a directory is
+/// reached through already measured: a child is not measured again to be walked. A path holding
+/// nothing measures zero without the filter being asked about it.
+///
 /// `parent_states` is the filter verdict for the directory holding
 /// `relative_path`, which this walk steps once per node rather than folding the
 /// whole path per node.
 fn calculate_local_size_recurse(
+    operation: Arc<InstanceOperationImpl>,
     repository: Arc<RepositoryContext>,
     relative_path: RelativePath,
+    info: FileInfo,
     parent_states: FilterStates,
 ) -> Pin<Box<dyn Future<Output = Result<u64, InfoError>> + Send>> {
     Box::pin(async move {
         if relative_path.as_str() == DOT_URC || relative_path.as_str() == DOT_LORE {
             return Ok(0);
         }
-        let absolute_path = relative_path.to_absolute_path(repository.require_path()?);
+        if !info.exists() {
+            return Ok(0);
+        }
 
-        if let Ok(metadata) = lore_io::IoDriver::global()
-            .metadata(absolute_path.as_path())
+        let (states, excluded) = repository.filter.child_emit_excludes(
+            parent_states,
+            &relative_path,
+            info.is_dir(),
+            FilterMode::Full,
+        );
+        if excluded {
+            return Ok(0);
+        }
+
+        if !info.is_dir() {
+            return Ok(info.size());
+        }
+
+        let mut local_size = 0;
+        let mut local_size_tasks = JoinSet::new();
+        let mut list = operation
+            .read_directory(&relative_path)
             .await
-        {
-            let (states, excluded) = repository.filter.child_emit_excludes(
-                parent_states,
-                &relative_path,
-                metadata.is_dir(),
-                FilterMode::Full,
-            );
-            if excluded {
-                return Ok(0);
-            }
+            .forward_any_with::<InfoError, _>(|| {
+                format!("Failed to list directory: {relative_path}")
+            })?;
 
-            if metadata.is_file() {
-                return Ok(util::fs::file_size(&metadata));
-            } else if metadata.is_dir() {
-                let mut local_size = 0;
-                let mut local_size_tasks = JoinSet::new();
-                let mut list = util::fs::list_directory(absolute_path)
+        while let Some(item) = list.next().await {
+            let item = item.forward_any::<InfoError>("Unusable directory entry")?;
+            let operation = operation.clone();
+            let repository = repository.clone();
+            let child_path = relative_path.push_into_buf(item.name.as_str()).freeze();
+            lore_spawn!(local_size_tasks, async move {
+                calculate_local_size_recurse(operation, repository, child_path, item.info, states)
                     .await
-                    .internal_with(|| format!("Failed to list directory: {relative_path}"))?;
+            });
+        }
 
-                while let Some(entry) = list.next().await {
-                    let Some(item) = util::fs::file_list_item(entry)
-                        .forward::<InfoError>("Unusable directory entry")?
-                    else {
-                        continue;
-                    };
-                    let repository = repository.clone();
-                    let relative_path = relative_path.push_into_buf(item.name.as_str()).freeze();
-                    lore_spawn!(local_size_tasks, async move {
-                        calculate_local_size_recurse(repository, relative_path, states).await
-                    });
+        let mut failure: Option<InfoError> = None;
+        while let Some(result) = local_size_tasks.join_next().await {
+            let inner = result
+                .internal("Internal task failure")
+                .map_err(InfoError::from)
+                .flatten();
+            match inner {
+                Ok(size) => {
+                    local_size += size;
                 }
-
-                let mut failure: Option<InfoError> = None;
-                while let Some(result) = local_size_tasks.join_next().await {
-                    let inner = result
-                        .internal("Internal task failure")
-                        .map_err(InfoError::from)
-                        .flatten();
-                    match inner {
-                        Ok(size) => {
-                            local_size += size;
-                        }
-                        Err(err) => {
-                            failure = failure.or(Some(err));
-                        }
-                    }
+                Err(err) => {
+                    failure = failure.or(Some(err));
                 }
-
-                if let Some(err) = failure {
-                    return Err(err);
-                }
-
-                return Ok(local_size);
             }
         }
-        Ok(0)
+
+        if let Some(err) = failure {
+            return Err(err);
+        }
+
+        Ok(local_size)
     })
 }
 

@@ -8,6 +8,7 @@ use lore_base::types::Fragment;
 use lore_error_set::WrapInternal;
 use lore_error_set::error_set;
 
+use crate::fs::filesystem_provider::DirectoryListing;
 use crate::fs::filesystem_provider::FileInfo;
 use crate::fs::filesystem_provider::FilesystemDiffContext;
 use crate::fs::filesystem_provider::FilesystemProvider;
@@ -177,6 +178,8 @@ impl InstanceOperation for SwfsOperation {
     fake_with_os!(names_folding_to, Vec<String>,
         _path: &RelativePath,
         name: &str);
+
+    fake_with_os!(read_directory, DirectoryListing, _path: &RelativePath,);
 
     fake_with_os!(write_node, FileInfo,
         repository: Arc<RepositoryContext>,

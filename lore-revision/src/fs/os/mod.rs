@@ -14,12 +14,15 @@ use lore_base::types::Address;
 use lore_base::types::Fragment;
 use lore_error_set::prelude::*;
 
+use super::filesystem_provider::DirectoryEntry;
+use super::filesystem_provider::DirectoryListing;
 use super::filesystem_provider::FileInfo;
 use super::filesystem_provider::FilesystemDiffContext;
 use super::filesystem_provider::FilesystemProvider;
 use super::filesystem_provider::FsError;
 use super::filesystem_provider::InstanceOperation;
 use super::filesystem_provider::InstanceOperationImpl;
+use super::filesystem_provider::StaticDispatchDirectoryListing;
 use super::filesystem_provider::StaticDispatchInstanceOperation;
 use crate::immutable;
 use crate::merge::MergeTextMode;
@@ -78,6 +81,34 @@ impl OsOperation {
     }
 }
 
+/// A directory read from the OS file system, one chunk of entries and their metadata per
+/// dispatch to the io driver.
+pub struct OsDirectoryListing {
+    entries: lore_io::DirStream,
+}
+
+impl OsDirectoryListing {
+    /// The next entry the repository tracks, passing over every entry it holds nothing for.
+    pub(crate) async fn next(&mut self) -> Option<Result<DirectoryEntry, FsError>> {
+        while let Some(entry) = self.entries.next().await {
+            match util::fs::file_list_item(entry)
+                .forward_any::<FsError>("A directory entry names what is not text")
+            {
+                Ok(Some(item)) => {
+                    return Some(Ok(DirectoryEntry {
+                        name: item.name,
+                        info: FileInfo::from_metadata(&item.metadata),
+                        name_hash: item.name_hash,
+                    }));
+                }
+                Ok(None) => {}
+                Err(err) => return Some(Err(err)),
+            }
+        }
+        None
+    }
+}
+
 /// All operations delegate to the regular OS file system.
 impl InstanceOperation for OsOperation {
     fn changes_from_filesystem_to_state(
@@ -124,6 +155,15 @@ impl InstanceOperation for OsOperation {
     ) -> Result<Vec<String>, FsError> {
         let path = self.absolute(path);
         Ok(crate::util::fs::names_folding_to(path, name).await?)
+    }
+
+    async fn read_directory(&self, path: &RelativePath) -> Result<DirectoryListing, FsError> {
+        let path = self.absolute(path);
+        Ok(DirectoryListing::new(StaticDispatchDirectoryListing::Os(
+            OsDirectoryListing {
+                entries: lore_io::IoDriver::global().read_dir(path).await?,
+            },
+        )))
     }
 
     fn content_source(&self, path: &RelativePath) -> lore_storage::ContentSource<'static> {

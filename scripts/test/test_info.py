@@ -57,6 +57,28 @@ def test_info(new_lore_repo):
 
 
 @pytest.mark.smoke
+def test_info_local_size_counts_the_whole_working_tree_below_a_directory(new_lore_repo):
+    """The local size of a directory is what the working tree holds under it, down every
+    subdirectory and including a file the revision does not track."""
+    repo: Lore = new_lore_repo("InfoLocalSize")
+
+    repo.write_files(
+        {"tree/tracked.txt": "a" * 100, "tree/inner/tracked.txt": "b" * 50},
+    )
+    repo.stage(scan=True, offline=True)
+    repo.commit("Add the tree", offline=True)
+    repo.write_files({"tree/untracked.txt": "c" * 25})
+
+    output = repo.file_info("tree", local=True, json=True, offline=True)
+    described = [
+        event for event in parse_jsonl(output, "fileInfo") if event["path"] == "tree"
+    ]
+
+    assert len(described) == 1, f"Expected one entry for the directory, got {described}"
+    assert described[0]["localSize"] == 175, described[0]
+
+
+@pytest.mark.smoke
 def test_revision_info_delta_move_carries_the_source_path(new_lore_repo):
     """The delta entry for a moved file must name the path it moved from. The
     entry reports the node at its new path, so without the source path a

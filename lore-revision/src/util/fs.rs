@@ -786,19 +786,6 @@ pub async fn list_path(path: PathBuf) -> Result<PathListingResult, PathError> {
     }
 }
 
-/// Lists only directory children. Returns an error if path is not a directory.
-/// This is the preferred function when you know you're working with a directory.
-///
-/// # Arguments
-/// * `path` - The filesystem path to list (must be a directory)
-///
-/// # Returns
-/// * `Ok(listing)` - Yields an entry for each child; [`file_list_item`] describes one
-/// * `Err(_)` - If path doesn't exist, isn't accessible, or isn't a directory
-pub async fn list_directory(path: PathBuf) -> std::io::Result<lore_io::DirStream> {
-    lore_io::IoDriver::global().read_dir(path.as_path()).await
-}
-
 /// Helper function to rename files during name case unification handling. Will try to rename
 /// the "from" file/directory to "to" name. If the "to" name already exist in the file system
 /// it will try to handle it as follows:

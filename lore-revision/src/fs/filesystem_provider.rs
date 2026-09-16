@@ -19,6 +19,7 @@ use lore_error_set::prelude::*;
 
 use crate::filter::FilterMode;
 use crate::filter::FilterStates;
+use crate::fs::os::OsDirectoryListing;
 use crate::fs::os::OsOperation;
 use crate::fs::swfs::filesystem::SwfsOperation;
 use crate::lore::Address;
@@ -142,6 +143,45 @@ impl FileInfo {
     /// from.
     pub fn mode(&self, previous: u16) -> u16 {
         crate::util::fs::mode_from_observed(self.is_file(), self.executable(), previous)
+    }
+}
+
+/// One child of a directory listing.
+pub struct DirectoryEntry {
+    /// The child's name within its directory, not a path.
+    pub name: String,
+    /// What the listing measured at the name, which is a file or a directory: a listing yields
+    /// no entry for what the repository holds nothing for.
+    pub info: FileInfo,
+    /// The hash of the lowercase name, which is what claiming the child among a node's children
+    /// takes. Taken from the name this entry carries.
+    pub name_hash: u64,
+}
+
+/// Wraps every type a provider lists a directory with, so a listing dispatches statically for
+/// the same reason [`InstanceOperationImpl`] does.
+pub enum StaticDispatchDirectoryListing {
+    Os(OsDirectoryListing),
+}
+
+/// Directory entries, resolved as the consumer asks for them.
+pub struct DirectoryListing {
+    dispatch: StaticDispatchDirectoryListing,
+}
+
+impl DirectoryListing {
+    pub fn new(dispatch: StaticDispatchDirectoryListing) -> Self {
+        Self { dispatch }
+    }
+
+    /// The next entry, or `None` once the directory is exhausted.
+    ///
+    /// Reads no further than the entry asked for, so a consumer that stops early stops the walk
+    /// with it.
+    pub async fn next(&mut self) -> Option<Result<DirectoryEntry, FsError>> {
+        match &mut self.dispatch {
+            StaticDispatchDirectoryListing::Os(this) => this.next().await,
+        }
     }
 }
 
@@ -408,6 +448,22 @@ pub trait InstanceOperation: Send + Sync {
         name: &str,
     ) -> impl Future<Output = Result<Vec<String>, FsError>> + Send;
 
+    /// The children of the directory at `path`, described as the repository tracks them.
+    ///
+    /// A link, a device and anything else the repository holds nothing for is left out, as is a
+    /// name that could not be read: one unreadable name says nothing about the rest of the
+    /// directory. A name that is not text is reported, nothing being possible with such a name
+    /// that is not a guess.
+    ///
+    /// Returns rather than reads: the listing resolves entries as its consumer asks for them, so
+    /// a directory of any width costs the same to hold and a consumer that stops early stops the
+    /// walk with it. A path holding no directory is reported here rather than as a listing of
+    /// nothing.
+    fn read_directory(
+        &self,
+        path: &RelativePath,
+    ) -> impl Future<Output = Result<DirectoryListing, FsError>> + Send;
+
     /// Where the content at `path` is read from, in this operation's view of the working tree.
     ///
     /// The provider's own business is where content is held, so it answers with a source rather
@@ -648,6 +704,15 @@ impl InstanceOperation for InstanceOperationImpl {
         }
     }
 
+    async fn read_directory(&self, path: &RelativePath) -> Result<DirectoryListing, FsError> {
+        match &self.dispatch {
+            #[cfg(test)]
+            StaticDispatchInstanceOperation::Test(this) => this.read_directory(path).await,
+            StaticDispatchInstanceOperation::Os(this) => this.read_directory(path).await,
+            StaticDispatchInstanceOperation::Swfs(this) => this.read_directory(path).await,
+        }
+    }
+
     fn content_source(&self, path: &RelativePath) -> lore_storage::ContentSource<'static> {
         match &self.dispatch {
             #[cfg(test)]
@@ -854,6 +919,8 @@ pub mod tests {
     use lore_base::types::Fragment;
     use parking_lot::Mutex;
 
+    use crate::fs::filesystem_provider::DirectoryEntry;
+    use crate::fs::filesystem_provider::DirectoryListing;
     use crate::fs::filesystem_provider::FileInfo;
     use crate::fs::filesystem_provider::FilesystemDiffContext;
     use crate::fs::filesystem_provider::FilesystemDiffIntent;
@@ -1036,6 +1103,10 @@ pub mod tests {
             } else {
                 vec![]
             })
+        }
+
+        async fn read_directory(&self, _path: &RelativePath) -> Result<DirectoryListing, FsError> {
+            panic!("Test operation unimplemented except finalize")
         }
 
         fn content_source(&self, _path: &RelativePath) -> lore_storage::ContentSource<'static> {
@@ -1471,6 +1542,129 @@ pub mod tests {
         assert!(
             dir.path().join("held").is_file(),
             "the file standing there was replaced"
+        );
+    }
+
+    /// Every entry the operation lists at `path`, which is what a caller collecting a directory
+    /// before acting on it reads, in name order so a test can name the entry it means.
+    async fn read_all(operation: &InstanceOperationImpl, path: &str) -> Vec<DirectoryEntry> {
+        let mut listing = operation
+            .read_directory(&relative(path))
+            .await
+            .expect("a directory is listed");
+        let mut entries = vec![];
+        while let Some(entry) = listing.next().await {
+            entries.push(entry.expect("an entry is described"));
+        }
+        entries.sort_by(|left, right| left.name.cmp(&right.name));
+        entries
+    }
+
+    #[tokio::test]
+    async fn a_directory_lists_the_children_it_holds() {
+        let dir = lore_base::test_util::TempDir::new("lore-fs-provider-listing-");
+        let operation = os_operation(dir.path()).await;
+        std::fs::create_dir_all(dir.path().join("held").join("inner")).expect("create directory");
+        std::fs::write(dir.path().join("held").join("file.txt"), b"content").expect("write file");
+
+        let entries = read_all(&operation, "held").await;
+
+        assert_eq!(
+            vec!["file.txt", "inner"],
+            entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<&str>>()
+        );
+        assert_eq!(
+            7,
+            entries[0].info.size(),
+            "an entry carries what the listing measured at the name"
+        );
+        assert_eq!(
+            crate::hash::hash_string("file.txt"),
+            entries[0].name_hash,
+            "an entry carries the hash of the name it names"
+        );
+        assert!(entries[1].info.is_dir());
+    }
+
+    /// A listing describes the children the repository tracks and passes over the rest: a link
+    /// is left out rather than described as what it points at.
+    #[cfg(target_family = "unix")]
+    #[tokio::test]
+    async fn a_listing_passes_over_what_the_repository_holds_nothing_for() {
+        let dir = lore_base::test_util::TempDir::new("lore-fs-provider-listing-");
+        let operation = os_operation(dir.path()).await;
+        let held = dir.path().join("held");
+        std::fs::create_dir_all(&held).expect("create directory");
+        std::fs::write(held.join("file.txt"), b"content").expect("write file");
+        std::os::unix::fs::symlink(held.join("file.txt"), held.join("link.txt"))
+            .expect("create symlink");
+
+        let entries = read_all(&operation, "held").await;
+
+        assert_eq!(
+            vec!["file.txt"],
+            entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<&str>>()
+        );
+    }
+
+    /// A name that is not text is reported rather than passed over: it hashes to a node the tree
+    /// does not hold, so nothing can be done with it that is not a guess.
+    #[cfg(target_family = "unix")]
+    #[tokio::test]
+    async fn a_name_that_is_not_text_is_reported() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = lore_base::test_util::TempDir::new("lore-fs-provider-listing-");
+        let operation = os_operation(dir.path()).await;
+        let held = dir.path().join("held");
+        std::fs::create_dir_all(&held).expect("create directory");
+        std::fs::write(held.join(std::ffi::OsStr::from_bytes(b"\xff")), b"content")
+            .expect("write file");
+
+        let mut listing = operation
+            .read_directory(&relative("held"))
+            .await
+            .expect("a directory is listed");
+
+        assert!(
+            listing.next().await.expect("an entry").is_err(),
+            "a name that is not text is reported"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_directory_lists_nothing() {
+        let dir = lore_base::test_util::TempDir::new("lore-fs-provider-listing-");
+        let operation = os_operation(dir.path()).await;
+        std::fs::create_dir_all(dir.path().join("held")).expect("create directory");
+
+        assert!(read_all(&operation, "held").await.is_empty());
+    }
+
+    /// A path holding no directory is reported where it is read, rather than answering as a
+    /// directory holding nothing.
+    #[tokio::test]
+    async fn a_path_holding_no_directory_is_reported() {
+        let dir = lore_base::test_util::TempDir::new("lore-fs-provider-listing-");
+        let operation = os_operation(dir.path()).await;
+        std::fs::write(dir.path().join("held"), b"content").expect("write file");
+
+        assert!(
+            operation.read_directory(&relative("held")).await.is_err(),
+            "a file holds no children"
+        );
+        assert!(
+            operation
+                .read_directory(&relative("missing"))
+                .await
+                .is_err(),
+            "a path holding nothing holds no children"
         );
     }
 

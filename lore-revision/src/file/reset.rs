@@ -1750,9 +1750,7 @@ async fn reset_walk_directory(
 /// walk already, and is sorted here to be matched against each filesystem entry by binary
 /// search. A path the filter excludes is left alone whatever the revision holds, unless forced.
 ///
-/// The children are read from the host: an operation answers questions about a path and offers
-/// no listing, so every path the entries name is acted on through the operation instead. A
-/// directory the working tree does not hold has nothing to purge, which is what all of its
+/// A directory the working tree does not hold has nothing to purge, which is what all of its
 /// tracked children being filter-excluded leaves.
 async fn purge_untracked_children(
     operation: &Arc<InstanceOperationImpl>,
@@ -1770,20 +1768,19 @@ async fn purge_untracked_children(
         return Ok(());
     }
 
-    let absolute_dir = directory_path.to_absolute_path(repository.require_path()?);
-    let mut filesystem_children = util::fs::list_directory(absolute_dir)
+    let mut filesystem_children = operation
+        .read_directory(directory_path)
         .await
-        .internal_with(|| format!("Failed to list directory files in {directory_path}"))?;
+        .forward_any_with::<ResetError, _>(|| {
+            format!("Failed to list directory files in {directory_path}")
+        })?;
 
     node_children_names.sort_unstable();
     let force = execution_context().globals().force();
     let mut tasks = JoinSet::new();
-    while let Some(entry) = filesystem_children.next().await {
-        let Some(filesystem_child) =
-            util::fs::file_list_item(entry).forward::<ResetError>("Unusable directory entry")?
-        else {
-            continue;
-        };
+    while let Some(filesystem_child) = filesystem_children.next().await {
+        let filesystem_child =
+            filesystem_child.forward_any::<ResetError>("Unusable directory entry")?;
         if filesystem_child.name == DOT_URC || filesystem_child.name == DOT_LORE {
             continue;
         }
@@ -1794,7 +1791,7 @@ async fn purge_untracked_children(
             force,
             states,
             &child_path,
-            filesystem_child.metadata.is_dir(),
+            filesystem_child.info.is_dir(),
             FilterMode::Full,
         );
         if excluded {
@@ -1812,7 +1809,7 @@ async fn purge_untracked_children(
             );
 
             stats
-                .delete_count(filesystem_child.metadata.is_dir())
+                .delete_count(filesystem_child.info.is_dir())
                 .fetch_add(1, Ordering::Relaxed);
 
             let child_operation = operation.clone();

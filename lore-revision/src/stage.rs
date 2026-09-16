@@ -25,6 +25,7 @@ use crate::errors::*;
 use crate::event;
 use crate::filter::FilterMode;
 use crate::filter::FilterStates;
+use crate::fs::filesystem_provider::DirectoryEntry;
 use crate::fs::filesystem_provider::FileInfo;
 use crate::fs::filesystem_provider::FilesystemDiffIntent;
 use crate::fs::filesystem_provider::InstanceOperation;
@@ -1142,7 +1143,7 @@ fn stage_delete_recurse(
 #[allow(clippy::too_many_arguments)]
 async fn resolve_case_variant_collisions(
     operation: &Arc<InstanceOperationImpl>,
-    items: &mut Vec<util::fs::FileListItem>,
+    items: &mut Vec<DirectoryEntry>,
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
     directory_node: NodeID,
@@ -1169,7 +1170,7 @@ async fn resolve_case_variant_collisions(
         }
 
         let group = &items[group_start..group_end];
-        let all_dirs = group.iter().all(|e| e.metadata.is_dir());
+        let all_dirs = group.iter().all(|e| e.info.is_dir());
 
         if !all_dirs {
             let names: Vec<&str> = group.iter().map(|e| e.name.as_str()).collect();
@@ -1400,13 +1401,12 @@ pub(crate) async fn stage_directory(
             .forward::<StageError>("Failed to list directory node children")?,
     );
 
-    let mut file_list = util::fs::list_directory(absolute_path.to_path_buf())
+    let directory_path = relative_path.clone().freeze();
+    let mut file_list = operation
+        .read_directory(&directory_path)
         .await
-        .internal_with(|| {
-            format!(
-                "Failed to list directory files in {}",
-                absolute_path.to_string_lossy()
-            )
+        .forward_any_with::<StageError, _>(|| {
+            format!("Failed to list directory files in {directory_path}")
         })?;
 
     // Collect all filesystem entries, then resolve case variant collisions before staging.
@@ -1414,16 +1414,9 @@ pub(crate) async fn stage_directory(
     // (e.g., "Assets" and "assets"). Without resolution, processing both independently causes
     // the second to undo the case rename performed by the first, producing a nondeterministic
     // result depending on iteration order.
-    let mut items: Vec<util::fs::FileListItem> = Vec::new();
-    while let Some(entry) = file_list.next().await {
-        let Some(item) =
-            util::fs::file_list_item(entry).forward::<StageError>("Unusable directory entry")?
-        else {
-            continue;
-        };
-        if item.metadata.is_dir() || item.metadata.is_file() {
-            items.push(item);
-        }
+    let mut items: Vec<DirectoryEntry> = Vec::new();
+    while let Some(item) = file_list.next().await {
+        items.push(item.forward_any::<StageError>("Unusable directory entry")?);
     }
 
     resolve_case_variant_collisions(
@@ -1450,7 +1443,7 @@ pub(crate) async fn stage_directory(
     };
     let mut nested_probe: Option<PathBuf> = None;
     for item in items {
-        if item.metadata.is_dir() {
+        if item.info.is_dir() {
             let directory = item;
 
             // If this child directory is a configured layer mount, skip it
@@ -1533,11 +1526,11 @@ pub(crate) async fn stage_directory(
                 NodeMapping {
                     repository: repository.clone(),
                     state: state.clone(),
-                    path: relative_path.clone().freeze(),
+                    path: directory_path.clone(),
                     node: directory_node,
                 },
                 directory.name.clone(),
-                FileInfo::from_metadata(&directory.metadata),
+                directory.info,
                 options,
                 stats.clone(),
                 link_tracker.clone(),
@@ -1615,7 +1608,7 @@ pub(crate) async fn stage_directory(
                     .flatten()
                     .err());
             }
-        } else if item.metadata.is_file() {
+        } else if item.info.is_file() {
             let file = item;
 
             lore_trace!(
@@ -1646,11 +1639,11 @@ pub(crate) async fn stage_directory(
                 NodeMapping {
                     repository: repository.clone(),
                     state: state.clone(),
-                    path: relative_path.clone().freeze(),
+                    path: directory_path.clone(),
                     node: directory_node,
                 },
                 file.name.clone(),
-                FileInfo::from_metadata(&file.metadata),
+                file.info,
                 options,
                 stats.clone(),
                 link_tracker.clone(),
