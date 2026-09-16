@@ -637,7 +637,34 @@ pub async fn commit_impl(
         .await
         .unwrap_or_default();
     if !globals.force() && !branch_latest.is_zero() && branch_latest != current_revision {
-        return Err(BranchAdvanced.into());
+        // The rule this check exists for is "do not drop what another instance
+        // added", and an anchor that equals the latest is only the cheapest way
+        // of satisfying it. A staged state that already has the latest in its
+        // ancestry satisfies it too: committing it publishes that work rather
+        // than replacing it.
+        //
+        // Sync's own merge is exactly that state, and without this it cannot
+        // land: sync stages a merge of the remote target with the local
+        // revision, then commits it — and the commit was refused for the very
+        // divergence the merge resolves, telling the user to sync while they
+        // were inside a sync.
+        //
+        // Reached only when the cheap comparison already failed, so the
+        // ordinary commit path is unchanged.
+        if !incorporates_branch_latest(
+            repository.clone(),
+            current_branch,
+            staged_revision,
+            branch_latest,
+        )
+        .await
+        {
+            return Err(BranchAdvanced.into());
+        }
+        lore_debug!(
+            "Branch latest {branch_latest} is already part of staged revision {staged_revision}, \
+             committing on top of it"
+        );
     }
 
     let state_staged = State::deserialize(repository.clone(), staged_revision)
@@ -1613,6 +1640,68 @@ async fn commit_staged_revision(
         }
         Err(work_err) => Err(work_err),
     }
+}
+
+/// How far back the reachability walk below is willing to look for the branch
+/// latest. Generous for the shapes it exists to answer — a sync merge finds it
+/// one step in — and bounded so a pathological history cannot turn a commit
+/// into a long walk.
+const BRANCH_LATEST_SEARCH_LIMIT: usize = 512;
+
+/// Whether committing `staged` would publish `branch_latest` rather than
+/// replace it — i.e. whether the latest is already part of the staged state's
+/// ancestry.
+///
+/// Answers the question [`commit`]'s branch-advanced check actually cares
+/// about. The cheap cases are the two parents: a staged state built directly on
+/// the latest, and a merge that took it as its second parent. Otherwise walk
+/// first parents back from the staged state's own parent, stopping as soon as
+/// the revision numbers fall below the latest's, since nothing older can be it.
+/// In the shape this exists for — sync staging a merge of a remote target that
+/// descends from the latest — the walk ends on the first or second step, and
+/// for a plain commit on a stale anchor it stops immediately.
+///
+/// **Fails closed.** Anything that cannot be established — an unreadable state,
+/// a walk that runs past its bound, a history this clone only partly holds —
+/// answers `false` and the commit is refused. A gap here costs a refusal the
+/// user can resolve by syncing; the opposite mistake costs somebody's work.
+async fn incorporates_branch_latest(
+    repository: Arc<RepositoryContext>,
+    branch: BranchId,
+    staged: Hash,
+    branch_latest: Hash,
+) -> bool {
+    let Ok(state_staged) = State::deserialize(repository.clone(), staged).await else {
+        return false;
+    };
+    if state_staged.parent_self() == branch_latest || state_staged.parent_other() == branch_latest {
+        return true;
+    }
+
+    let Ok(state_latest) = State::deserialize(repository.clone(), branch_latest).await else {
+        return false;
+    };
+    let latest_number = state_latest.revision_number();
+
+    crate::find::find_revision(
+        repository,
+        branch,
+        state_staged.parent_self(),
+        false,
+        Some(BRANCH_LATEST_SEARCH_LIMIT),
+        |state, _| {
+            if state.revision() == branch_latest {
+                crate::find::FindMatchResult::Match
+            } else if state.revision_number() < latest_number {
+                // Walked past the point the latest could still appear.
+                crate::find::FindMatchResult::Abort
+            } else {
+                crate::find::FindMatchResult::Continue
+            }
+        },
+    )
+    .await
+    .is_ok()
 }
 
 /// Publish `signature` as `branch`'s tip and anchor it as the current revision.
