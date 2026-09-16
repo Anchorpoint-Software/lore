@@ -1,9 +1,12 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::collections::HashSet;
+
 use async_trait::async_trait;
 use lore_base::types::RepositoryId;
 use tonic::Status;
 
+use super::repository_authorizer::Grants;
 use super::repository_authorizer::RepositoryAuthorizer;
 use super::repository_authorizer::VerifiedToken;
 
@@ -20,17 +23,23 @@ impl GlobalGrantsAuthorizer {
         Self { permission_claim }
     }
 
-    fn permits(&self, token: &VerifiedToken<'_>, action: &str) -> bool {
+    /// Any authenticated principal reaches every partition on this tier. The
+    /// action set is the permission claim's string values, empty when the
+    /// claim is unconfigured or absent.
+    fn grants_for(&self, token: &VerifiedToken<'_>) -> Grants {
         let Some(claim) = &self.permission_claim else {
-            return false;
+            return Grants::Actions(HashSet::new());
         };
         let Some(serde_json::Value::Array(values)) = token.claims.claim_at(claim) else {
-            return false;
+            return Grants::Actions(HashSet::new());
         };
-        values
-            .iter()
-            .filter_map(serde_json::Value::as_str)
-            .any(|granted| granted == action)
+        Grants::Actions(
+            values
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(ToString::to_string)
+                .collect(),
+        )
     }
 }
 
@@ -48,9 +57,20 @@ impl RepositoryAuthorizer for GlobalGrantsAuthorizer {
         match action {
             // action == None -> just check that the user has a valid token
             None => Ok(()),
-            Some(action) if self.permits(token, action) => Ok(()),
+            Some(action) if self.grants_for(token).permits(action) => Ok(()),
             Some(_) => Err(Status::permission_denied("Action not permitted")),
         }
+    }
+
+    async fn granted_actions(
+        &self,
+        token: Option<&VerifiedToken<'_>>,
+        _repository_id: RepositoryId,
+    ) -> Result<Option<Grants>, Status> {
+        Ok(Some(match token {
+            None => Grants::Denied,
+            Some(token) => self.grants_for(token),
+        }))
     }
 }
 

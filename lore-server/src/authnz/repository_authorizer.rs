@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
 
@@ -17,6 +18,7 @@ use super::common::create_request_with_authorization;
 use super::global_grants_authorizer::GlobalGrantsAuthorizer;
 use super::resource_grants_authorizer::ResourceGrantsAuthorizer;
 use crate::auth::jwt::AuthorizationToken;
+use crate::auth::jwt::ResourceMatcher;
 use crate::grpc::ServerResultExt;
 use crate::settings::AuthSettings;
 
@@ -27,10 +29,47 @@ use crate::settings::AuthSettings;
 pub struct RawToken(pub String);
 
 /// A token the interceptor has already verified. Claim-reading authorizers
-/// use `claims`. [`AuthClientAuthorizer`] forwards `raw` upstream.
+/// use `claims`. [`AuthClientAuthorizer`] forwards `raw` upstream for
+/// identity tokens and answers access tokens from their `resources` claim.
 pub struct VerifiedToken<'a> {
     pub raw: &'a str,
     pub claims: &'a AuthorizationToken,
+}
+
+/// A caller's enumerated access to one partition.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Grants {
+    /// The partition is not reachable: every action denied.
+    Denied,
+    /// Reachable, permitted exactly these actions.
+    Actions(HashSet<String>),
+    /// Reachable, permitted every action.
+    All,
+}
+
+impl Grants {
+    pub fn reachable(&self) -> bool {
+        !matches!(self, Grants::Denied)
+    }
+
+    pub fn permits(&self, action: &str) -> bool {
+        match self {
+            Grants::Denied => false,
+            Grants::All => true,
+            Grants::Actions(actions) => actions.contains(action),
+        }
+    }
+}
+
+/// The partition-access layer's enumerated answer for the partition the
+/// request named in its metadata, inserted as a request extension so a
+/// handler can make action checks without asking the authorizer again.
+/// Carries the partition it answers for, so a handler acting on a different
+/// one — a cross-partition source, say — cannot consume it by mistake.
+#[derive(Clone)]
+pub struct PartitionGrants {
+    pub repository_id: RepositoryId,
+    pub grants: Grants,
 }
 
 #[async_trait]
@@ -43,6 +82,51 @@ pub trait RepositoryAuthorizer: Send + Sync {
         repository_id: RepositoryId,
         action: Option<&str>,
     ) -> Result<(), Status>;
+
+    /// The caller's enumerated access to `repository_id`, when this
+    /// authorizer can enumerate it. `Ok(None)` means enumeration is
+    /// not possible: an authorizer backed by a policy engine can answer
+    /// "may X do A?" without being able to list everything X may do.
+    /// Callers fall back to
+    /// [`check_repository_access`](Self::check_repository_access) per
+    /// question on `Ok(None)`.
+    async fn granted_actions(
+        &self,
+        _token: Option<&VerifiedToken<'_>>,
+        _repository_id: RepositoryId,
+    ) -> Result<Option<Grants>, Status> {
+        Ok(None)
+    }
+}
+
+impl dyn RepositoryAuthorizer {
+    /// Whether the caller may perform `action` on `repository_id` — the one
+    /// call a handler makes for a fine-grained permission check.
+    ///
+    /// Answered from the [`PartitionGrants`] the partition-access layer
+    /// enumerated, when the request carries them for this partition. Asked
+    /// of the authorizer otherwise, which is the fallback for authorizers
+    /// that can only answer per-action policy questions (and for call sites
+    /// that are not behind the Tower middleware).
+    pub async fn permits(
+        &self,
+        extensions: &tonic::Extensions,
+        repository_id: RepositoryId,
+        action: &str,
+    ) -> bool {
+        if let Some(grants) = extensions
+            .get::<PartitionGrants>()
+            .filter(|grants| grants.repository_id == repository_id)
+        {
+            return grants.grants.permits(action);
+        }
+        let Some(token) = crate::grpc::get_verified_token(extensions) else {
+            return false;
+        };
+        self.check_repository_access(Some(&token), repository_id, Some(action))
+            .await
+            .is_ok()
+    }
 }
 
 /// Always allows access. Selected when no `[server.auth]` is configured:
@@ -58,6 +142,14 @@ impl RepositoryAuthorizer for AllowAllRepositoryAuthorizer {
         _action: Option<&str>,
     ) -> Result<(), Status> {
         Ok(())
+    }
+
+    async fn granted_actions(
+        &self,
+        _token: Option<&VerifiedToken<'_>>,
+        _repository_id: RepositoryId,
+    ) -> Result<Option<Grants>, Status> {
+        Ok(Some(Grants::All))
     }
 }
 
@@ -78,9 +170,19 @@ impl AuthClientAuthorizer {
         repository_id: RepositoryId,
         action: Option<&str>,
     ) -> Result<(), Status> {
-        let mut client = grpc_get_auth_client(self.auth_url.clone()).await?;
         let resource_id = format!("urc-{repository_id}");
-        let request = check_user_permission_request(resource_id.clone(), authorization)?;
+        let permissions = self.fetch_permissions(authorization, &resource_id).await?;
+        evaluate_check_user_permission(&permissions, &resource_id, action)
+    }
+
+    /// One `CheckUserPermission` round trip for `resource_id`.
+    async fn fetch_permissions(
+        &self,
+        authorization: Option<String>,
+        resource_id: &str,
+    ) -> Result<CheckUserPermissionResponse, Status> {
+        let mut client = grpc_get_auth_client(self.auth_url.clone()).await?;
+        let request = check_user_permission_request(resource_id.to_string(), authorization)?;
 
         let permissions = client
             .check_user_permission(request)
@@ -94,7 +196,7 @@ impl AuthClientAuthorizer {
                 Status::internal(format!("Failed to call auth check_user_permission: {err}"))
             })?;
 
-        evaluate_check_user_permission(&permissions.into_inner(), &resource_id, action)
+        Ok(permissions.into_inner())
     }
 }
 
@@ -113,6 +215,66 @@ fn check_user_permission_request(
 
 fn bearer_header(token: Option<&VerifiedToken<'_>>) -> Option<String> {
     token.map(|token| format!("Bearer {}", token.raw))
+}
+
+/// The grants an exchanged access token's `resources` claim holds on
+/// `repository_id`, in the legacy `urc-{id}` / `urc-*` shape the auth
+/// service mints: unreachable when no entry names the partition, otherwise
+/// the permissions merged across every matching entry.
+fn grants_from_resources_claim(
+    resources: &[crate::auth::jwt::ResourcePermission],
+    repository_id: RepositoryId,
+) -> Grants {
+    let matcher = ResourceMatcher::default();
+    if !matcher.any_match(resources, repository_id) {
+        return Grants::Denied;
+    }
+    Grants::Actions(
+        matcher
+            .merged_permissions(resources, repository_id)
+            .into_iter()
+            .collect(),
+    )
+}
+
+/// Grants from a `CheckUserPermission` response: unreachable when no
+/// allowed entry names the resource, otherwise the permissions merged across
+/// every entry for the resource.
+fn grants_from_response(response: &CheckUserPermissionResponse, resource_id: &str) -> Grants {
+    let matching: Vec<_> = response
+        .allowed_resource_permission
+        .iter()
+        .filter(|entry| entry.resource_id == resource_id)
+        .collect();
+    if matching.is_empty() {
+        return Grants::Denied;
+    }
+    Grants::Actions(
+        matching
+            .iter()
+            .flat_map(|entry| entry.permission.iter().cloned())
+            .collect(),
+    )
+}
+
+/// Answer an access question from the `resources` claim of an exchanged
+/// access token. `action: None` asks whether any entry names the partition.
+/// `action: Some` asks for membership in the merged permission lists.
+fn evaluate_resources_claim(
+    resources: &[crate::auth::jwt::ResourcePermission],
+    repository_id: RepositoryId,
+    action: Option<&str>,
+) -> Result<(), Status> {
+    let grants = grants_from_resources_claim(resources, repository_id);
+    let permitted = match action {
+        None => grants.reachable(),
+        Some(action) => grants.permits(action),
+    };
+    if permitted {
+        Ok(())
+    } else {
+        Err(Status::permission_denied("Not permitted for resource"))
+    }
 }
 
 /// Answer an access question from a `CheckUserPermission` response.
@@ -162,8 +324,41 @@ impl RepositoryAuthorizer for AuthClientAuthorizer {
         repository_id: RepositoryId,
         action: Option<&str>,
     ) -> Result<(), Status> {
+        // An exchanged access token carries the auth service's own signed
+        // answer for the partition in its `resources` claim, and the auth
+        // service refuses access tokens as `CheckUserPermission` credentials
+        // (`Unauthenticated: INVALID_FORMAT, field=authorization`), so the
+        // claim is evaluated in place. Identity tokens carry no `resources`
+        // claim and are checked online — the identity-token paths are where
+        // revocation is observable. An access token's grants hold for its
+        // lifetime, on this path as on QUIC.
+        if let Some(resources) = token.and_then(|token| token.claims.resources.as_deref()) {
+            return evaluate_resources_claim(resources, repository_id, action);
+        }
         self.check_access_with_header(bearer_header(token), repository_id, action)
             .await
+    }
+
+    async fn granted_actions(
+        &self,
+        token: Option<&VerifiedToken<'_>>,
+        repository_id: RepositoryId,
+    ) -> Result<Option<Grants>, Status> {
+        let Some(token) = token else {
+            // Nothing to enumerate for. The per-question path answers this
+            // the same way it always has.
+            return Ok(None);
+        };
+        if let Some(resources) = token.claims.resources.as_deref() {
+            return Ok(Some(grants_from_resources_claim(resources, repository_id)));
+        }
+        // An identity token: the one CheckUserPermission response carries the
+        // full permission list.
+        let resource_id = format!("urc-{repository_id}");
+        let permissions = self
+            .fetch_permissions(bearer_header(Some(token)), &resource_id)
+            .await?;
+        Ok(Some(grants_from_response(&permissions, &resource_id)))
     }
 }
 
@@ -294,6 +489,247 @@ mod tests {
                     .await
                     .unwrap();
             }
+        }
+    }
+
+    mod resources_claim {
+        use std::str::FromStr;
+
+        use lore_base::types::Context;
+
+        use super::*;
+
+        fn repository() -> RepositoryId {
+            Context::from_str("0194b726b34e72b0b45550b88a967076")
+                .unwrap()
+                .into()
+        }
+
+        fn access_token_claims(
+            resource_id: &str,
+            permissions: &[&str],
+        ) -> crate::auth::jwt::AuthorizationToken {
+            AuthorizationToken {
+                resources: Some(vec![crate::auth::jwt::ResourcePermission {
+                    resource_id: resource_id.to_string(),
+                    permission: permissions.iter().map(ToString::to_string).collect(),
+                }]),
+                ..Default::default()
+            }
+        }
+
+        async fn check(claims: &AuthorizationToken, action: Option<&str>) -> Result<(), Status> {
+            // A URL nothing listens on: reaching for the network here would
+            // hang or error, so a verdict proves the claim answered in place.
+            AuthClientAuthorizer::new("https://auth.invalid".to_string())
+                .check_repository_access(
+                    Some(&VerifiedToken {
+                        raw: "raw.jwt",
+                        claims,
+                    }),
+                    repository(),
+                    action,
+                )
+                .await
+        }
+
+        /// The auth service refuses exchanged access tokens as
+        /// `CheckUserPermission` credentials, so a token carrying a
+        /// `resources` claim must be answered from the claim, never sent
+        /// upstream.
+        #[tokio::test]
+        async fn an_access_token_is_answered_from_its_claim() {
+            let granted = access_token_claims(
+                &format!("urc-{}", repository()),
+                &["read", "write", "migrate"],
+            );
+            check(&granted, None).await.unwrap();
+            check(&granted, Some("migrate")).await.unwrap();
+            check(&granted, Some("obliterate")).await.unwrap_err();
+
+            let other_partition = access_token_claims("urc-somewhere-else", &["read"]);
+            check(&other_partition, None).await.unwrap_err();
+
+            // A wildcard grant reaches every partition, as everywhere else.
+            let wildcard = access_token_claims("urc-*", &["read"]);
+            check(&wildcard, None).await.unwrap();
+        }
+
+        /// A `resources` claim scoped to no partition denies everything —
+        /// present-but-empty is a verdict, not a fallback to the network.
+        #[tokio::test]
+        async fn an_empty_resources_claim_denies() {
+            let empty = AuthorizationToken {
+                resources: Some(vec![]),
+                ..Default::default()
+            };
+            check(&empty, None).await.unwrap_err();
+            check(&empty, Some("read")).await.unwrap_err();
+        }
+
+        /// The enumeration and the per-question path answer from the same
+        /// derivation, so their verdicts must agree for every access token.
+        #[tokio::test]
+        async fn enumeration_agrees_with_the_per_question_path() {
+            let authorizer = AuthClientAuthorizer::new("https://auth.invalid".to_string());
+            let tokens = [
+                access_token_claims(&format!("urc-{}", repository()), &["read", "migrate"]),
+                access_token_claims("urc-somewhere-else", &["read"]),
+                access_token_claims("urc-*", &[]),
+                AuthorizationToken {
+                    resources: Some(vec![]),
+                    ..Default::default()
+                },
+            ];
+            for claims in &tokens {
+                let token = VerifiedToken {
+                    raw: "raw.jwt",
+                    claims,
+                };
+                let grants = authorizer
+                    .granted_actions(Some(&token), repository())
+                    .await
+                    .unwrap()
+                    .expect("access tokens are enumerable");
+                assert_eq!(
+                    grants.reachable(),
+                    check(claims, None).await.is_ok(),
+                    "reachability must agree for {claims:?}"
+                );
+                for action in ["read", "migrate", "obliterate"] {
+                    assert_eq!(
+                        grants.permits(action),
+                        check(claims, Some(action)).await.is_ok(),
+                        "verdict for {action} must agree for {claims:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    mod permits_helper {
+        use std::str::FromStr;
+
+        use lore_base::types::Context;
+
+        use super::*;
+        use crate::authnz::repository_authorizer::RawToken;
+
+        fn repository() -> RepositoryId {
+            Context::from_str("0194b726b34e72b0b45550b88a967076")
+                .unwrap()
+                .into()
+        }
+
+        fn extensions_with(grants: Option<PartitionGrants>, token: bool) -> tonic::Extensions {
+            let mut extensions = tonic::Extensions::new();
+            if let Some(grants) = grants {
+                extensions.insert(grants);
+            }
+            if token {
+                extensions.insert(AuthorizationToken::default());
+                extensions.insert(RawToken("raw.jwt".into()));
+            }
+            extensions
+        }
+
+        /// The layer's enumerated grants answer first — proven by pairing an
+        /// allow-all authorizer with grants that deny: the denial wins.
+        #[tokio::test]
+        async fn enumerated_grants_answer_before_the_authorizer() {
+            let authorizer: Arc<dyn RepositoryAuthorizer> = Arc::new(AllowAllRepositoryAuthorizer);
+            let extensions = extensions_with(
+                Some(PartitionGrants {
+                    repository_id: repository(),
+                    grants: Grants::Actions(HashSet::new()),
+                }),
+                true,
+            );
+            assert!(
+                !authorizer
+                    .permits(&extensions, repository(), "migrate")
+                    .await
+            );
+        }
+
+        /// Grants naming another partition are not consumed; the check falls
+        /// back to the authorizer with the verified token.
+        #[tokio::test]
+        async fn grants_for_another_partition_fall_back_to_the_authorizer() {
+            let authorizer: Arc<dyn RepositoryAuthorizer> = Arc::new(AllowAllRepositoryAuthorizer);
+            let other: RepositoryId = Context::from_str("f6ca55437aa34198ba0f0fdc33154d51")
+                .unwrap()
+                .into();
+            let extensions = extensions_with(
+                Some(PartitionGrants {
+                    repository_id: other,
+                    grants: Grants::Denied,
+                }),
+                true,
+            );
+            assert!(
+                authorizer
+                    .permits(&extensions, repository(), "migrate")
+                    .await
+            );
+        }
+
+        /// Without a verified token nothing is granted, whatever the
+        /// authorizer would say.
+        #[tokio::test]
+        async fn no_token_and_no_grants_deny_even_under_allow_all() {
+            let authorizer: Arc<dyn RepositoryAuthorizer> = Arc::new(AllowAllRepositoryAuthorizer);
+            let extensions = extensions_with(None, false);
+            assert!(
+                !authorizer
+                    .permits(&extensions, repository(), "migrate")
+                    .await
+            );
+        }
+    }
+
+    mod grants {
+        use super::*;
+
+        #[test]
+        fn permits_and_reachable_follow_the_variant() {
+            assert!(Grants::All.reachable());
+            assert!(Grants::All.permits("anything"));
+
+            assert!(!Grants::Denied.reachable());
+            assert!(!Grants::Denied.permits("anything"));
+
+            let actions = Grants::Actions(["migrate".to_string()].into());
+            assert!(actions.reachable());
+            assert!(actions.permits("migrate"));
+            assert!(!actions.permits("obliterate"));
+
+            // Reachable with nothing granted: a matched entry with an empty
+            // permission list, or Tier 1 without a permission claim.
+            let none = Grants::Actions(HashSet::new());
+            assert!(none.reachable());
+            assert!(!none.permits("read"));
+        }
+
+        /// The response-derived grants merge every entry naming the
+        /// resource and ignore the rest.
+        #[test]
+        fn response_grants_merge_matching_entries() {
+            let response = response(vec![
+                entry("urc-abc", &["read"]),
+                entry("urc-other", &["obliterate"]),
+                entry("urc-abc", &["migrate"]),
+            ]);
+            let grants = grants_from_response(&response, "urc-abc");
+            assert!(grants.reachable());
+            assert!(grants.permits("read"));
+            assert!(grants.permits("migrate"));
+            assert!(!grants.permits("obliterate"));
+
+            assert_eq!(
+                grants_from_response(&response, "urc-absent"),
+                Grants::Denied
+            );
         }
     }
 

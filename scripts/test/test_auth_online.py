@@ -24,6 +24,8 @@ records reset between tests.
 """
 
 import logging
+import threading
+import time
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
@@ -31,7 +33,8 @@ from types import SimpleNamespace
 import grpc
 import pytest
 from error_types import LoreException
-from grpc_probe import call
+from grpc_probe import REVISION_INFO, STORAGE_QUERY, call, repository_metadata
+from protobuf_wire import encode_bytes_field
 from lore_server import (
     _kill_server_by_pid,
     allocate_free_port,
@@ -255,16 +258,18 @@ def script_partition_access(
 ) -> None:
     """What is asked while `user` works on one partition: the CLI exchanges
     its login token for the partition-scoped one, and the server's online
-    authorizer checks whichever of the two tokens a request carried."""
+    authorizer checks the login token where a request carries it. The access
+    token is answered server-side from its own `resources` claim — the auth
+    service refuses access tokens as CheckUserPermission credentials, and the
+    stub does too — so only the login token gets a check rule."""
     mock.on(
         "ExchangeUserTokenForMultiresourceToken",
         bearer=login_token,
         resource_id=resource_id,
     ).respond(user_token_response(user, authz_token))
-    for token in (login_token, authz_token):
-        mock.on("CheckUserPermission", bearer=token, resource_id=resource_id).respond(
-            check_user_permission_response(resource_id, permissions)
-        )
+    mock.on(
+        "CheckUserPermission", bearer=login_token, resource_id=resource_id
+    ).respond(check_user_permission_response(resource_id, permissions))
 
 
 def script_repository_lifecycle(mock: MockAuthServer, resource_id: str) -> None:
@@ -614,6 +619,299 @@ def test_garbage_token_is_rejected(auth_env, make_actor):
 
 
 # ---------------------------------------------------------------------------
+# Partition access on every partition-scoped gRPC service
+# ---------------------------------------------------------------------------
+
+# One unary RPC per partition-scoped service. The partition-access check runs
+# before the handler and before the body is decoded, so an empty request body
+# is enough to observe the verdict: PERMISSION_DENIED is the check, anything
+# else means the check passed and the handler answered for the empty body.
+# A new partition-scoped service belongs in this table.
+PARTITION_SCOPED_PROBES = (
+    ("storage v0", "/urc.rpc.StorageService/Query"),
+    ("storage v1", STORAGE_QUERY),
+    ("revision v0", "/urc.rpc.RevisionService/BranchList"),
+    ("revision v1", "/lore.revision.v1.RevisionService/BranchList"),
+    ("thin client v1", REVISION_INFO),
+    ("lock", "/urc.lock.LockService/Query"),
+)
+
+SUBSCRIBE = "/lore.notification.NotificationService/Subscribe"
+
+
+def grpc_target(remote_url: str) -> str:
+    return remote_url.removeprefix("lore://").rstrip("/")
+
+
+def subscribe_code(target: str, repo_id_hex: str, token: str) -> grpc.StatusCode:
+    """Open a notification subscription and report how it ends.
+
+    Subscribe is server-streaming and a granted stream stays open with no
+    events, so the deadline is what closes it: DEADLINE_EXCEEDED means the
+    subscription was accepted, PERMISSION_DENIED that it was refused."""
+    request = encode_bytes_field(1, bytes.fromhex(repo_id_hex))
+    with grpc.insecure_channel(target) as channel:
+        invoke = channel.unary_stream(SUBSCRIBE, lambda b: b, lambda b: b)
+        stream = invoke(
+            request,
+            metadata=(("authorization", f"Bearer {token}"),),
+            timeout=2.0,
+        )
+        try:
+            next(stream)
+            return grpc.StatusCode.OK
+        except grpc.RpcError as error:
+            return error.code()
+
+
+@pytest.mark.smoke
+def test_every_partition_scoped_service_enforces_partition_access(
+    auth_env, make_actor
+):
+    """Every partition-scoped gRPC service sits behind the partition-access
+    check: on each one, a verifiable token holding no grant for the partition
+    answers PERMISSION_DENIED, the owner's granted token never does, and the
+    stub's records show the denials were the online check's verdicts. This is
+    the registration proof — a service mounted without the check fails the
+    ungranted half of its probe."""
+    mock = auth_env.mock
+    owner = provision_owner(auth_env, make_actor, "user1", USER1)
+    target = grpc_target(auth_env.remote_url)
+    repo_id_hex = owner.resource_id.removeprefix("urc-")
+
+    # Verifies against the same issuer and JWKS, but the stub holds no
+    # CheckUserPermission rule for it, so every online check denies it.
+    ungranted = mock.mint_token(USER2)
+
+    def probe_metadata(token: str):
+        return repository_metadata(repo_id_hex) + (
+            ("authorization", f"Bearer {token}"),
+        )
+
+    for label, method in PARTITION_SCOPED_PROBES:
+        code, _body, details = call(target, method, metadata=probe_metadata(ungranted))
+        assert code == grpc.StatusCode.PERMISSION_DENIED, (
+            f"{label}: an ungranted token must be denied, got {code} '{details}'"
+        )
+
+        code, _body, details = call(
+            target, method, metadata=probe_metadata(owner.authz_token)
+        )
+        assert code != grpc.StatusCode.PERMISSION_DENIED, (
+            f"{label}: the granted owner token must pass the partition check, "
+            f"got {code} '{details}'"
+        )
+
+    # Notification reads the partition from the request body, so its check
+    # lives in the subscribe handler; probed on the body field, no partition
+    # metadata at all.
+    assert subscribe_code(target, repo_id_hex, ungranted) == (
+        grpc.StatusCode.PERMISSION_DENIED
+    ), "notification: an ungranted subscribe must be denied"
+    granted_subscribe = subscribe_code(target, repo_id_hex, owner.authz_token)
+    assert granted_subscribe == grpc.StatusCode.DEADLINE_EXCEEDED, (
+        f"notification: a granted subscribe holds the stream open until the "
+        f"probe's deadline, got {granted_subscribe}"
+    )
+
+    denied_checks = [
+        check
+        for check in mock.requests_for("CheckUserPermission")
+        if check["bearer"] == ungranted and owner.resource_id in check["resource_id"]
+    ]
+    assert len(denied_checks) >= len(PARTITION_SCOPED_PROBES) + 1, (
+        "every denial must be the online check's verdict: one CheckUserPermission "
+        f"per probed service, got {len(denied_checks)}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# CLI operations against the authorization rules
+# ---------------------------------------------------------------------------
+
+
+def provision_member(auth_env, make_actor, owner, label: str, permissions):
+    """Log USER2 in with an API key and grant `permissions` on `owner`'s
+    repository: the exchange and the online checks both answer for USER2's
+    tokens, and the authorization token carries the matching resources claim
+    so the QUIC data paths agree with the online checks."""
+    mock = auth_env.mock
+    login_token = mock.mint_token(USER2)
+    authz_token = mock.mint_token(
+        USER2, resources=authz_resources(owner.resource_id, permissions)
+    )
+    script_api_key_login(mock, USER2, login_token, USER2_API_KEY)
+    script_partition_access(
+        mock, USER2, login_token, owner.resource_id, authz_token, permissions
+    )
+
+    actor = make_actor(label)
+    seed = actor.make_repo(remote_path=owner.repo.remote_path)
+    login_api_key(seed, auth_env.remote_url, USER2_API_KEY)
+    repo = seed.clone()
+    repo.environment_vars.update(seed.environment_vars)
+    return SimpleNamespace(
+        repo=repo, login_token=login_token, authz_token=authz_token
+    )
+
+
+def revoke(mock, member, resource_id: str) -> None:
+    """Newest rule wins: shadow the member's allows with denies."""
+    for token in (member.login_token, member.authz_token):
+        mock.on("CheckUserPermission", bearer=token, resource_id=resource_id).deny()
+
+
+def lock_release_is_denied(repo: Lore, path: str) -> bool:
+    """Whether a release failed to release: the CLI surfaces the server's
+    ownership refusal either as an error or by not releasing the path."""
+    try:
+        released = repo.lock_release(path).released
+    except LoreException:
+        return True
+    return path not in released
+
+
+@pytest.mark.smoke
+def test_cli_lock_operations_follow_the_grant(auth_env, make_actor):
+    """`lore lock acquire/release/query` under the online rules: a granted
+    member locks and releases their own locks; without `owner`/`admin` they
+    cannot release the owner's lock; and after revocation every lock command
+    is denied by the server, not the client."""
+    mock = auth_env.mock
+    owner = provision_owner(auth_env, make_actor, "user1", USER1)
+    commit_file(owner.repo, "locked.txt", "contested content")
+    member = provision_member(
+        auth_env, make_actor, owner, "member-rw", ("read", "write")
+    )
+
+    # A granted member manages their own locks.
+    assert "locked.txt" in member.repo.lock_acquire("locked.txt").acquired
+    assert "locked.txt" in member.repo.lock_release("locked.txt").released
+
+    # The owner's lock is not theirs to release: `read`/`write` carry no
+    # `owner`/`admin`, so the unlock stays owner-validated on the server.
+    assert "locked.txt" in owner.repo.lock_acquire("locked.txt").acquired
+    assert lock_release_is_denied(member.repo, "locked.txt")
+
+    # Lock RPCs carry the exchanged access token, which is authorized from
+    # its own `resources` claim: revoking the grant upstream does not reach
+    # an unexpired access token, so lock commands keep working for the
+    # token's lifetime. Revocation is observable on the identity-token paths
+    # (see test_cli_push_and_sync_follow_the_grant).
+    revoke(mock, member, owner.resource_id)
+    assert "locked.txt" in member.repo.run(["lock", "query"])
+
+
+@pytest.mark.smoke
+def test_cli_admin_grant_releases_anothers_lock(auth_env, make_actor):
+    """The unlock elevation end to end: `admin` on the partition lets a
+    member's `lore lock release` take down the owner's lock, which is the
+    LORE-211 owner/admin waiver answered by the online authorizer."""
+    owner = provision_owner(auth_env, make_actor, "user1", USER1)
+    commit_file(owner.repo, "locked.txt", "contested content")
+    member = provision_member(
+        auth_env, make_actor, owner, "member-admin", ("read", "write", "admin")
+    )
+
+    assert "locked.txt" in owner.repo.lock_acquire("locked.txt").acquired
+    assert "locked.txt" in member.repo.lock_release("locked.txt").released
+
+
+@pytest.mark.smoke
+def test_cli_push_and_sync_follow_the_grant(auth_env, make_actor):
+    """Push and sync — the revision and storage paths a user actually
+    exercises — succeed for a granted member and are refused by the server
+    once the grant is revoked, even though the member still holds valid,
+    unexpired tokens."""
+    mock = auth_env.mock
+    owner = provision_owner(auth_env, make_actor, "user1", USER1)
+    commit_file(owner.repo, "one.txt", "from the owner")
+    member = provision_member(
+        auth_env, make_actor, owner, "member-push", ("read", "write")
+    )
+
+    # Granted: the member's work flows both ways. Each writer syncs before
+    # committing, since both push to the same branch.
+    commit_file(owner.repo, "three.txt", "more from the owner")
+    member.repo.revision_sync()
+    assert (Path(member.repo.path) / "three.txt").read_text() == "more from the owner"
+    commit_file(member.repo, "two.txt", "from the member")
+
+    # Revoked: data RPCs carry the exchanged access token, which is
+    # authorized from its own `resources` claim — an unexpired token keeps
+    # its grants, so push and sync continue for the token's lifetime, on
+    # gRPC as on QUIC. Revocation is observable where the identity token is
+    # the credential: the online check refuses the metadata write.
+    revoke(mock, member, owner.resource_id)
+    owner.repo.revision_sync()
+    commit_file(owner.repo, "four.txt", "written after revocation")
+
+    member.repo.revision_sync()
+    assert (
+        Path(member.repo.path) / "four.txt"
+    ).read_text() == "written after revocation"
+    commit_file(member.repo, "five.txt", "pushed with an unexpired token")
+
+    with pytest.raises(LoreException):
+        member.repo.repository_metadata_set(["probe", "refused"])
+
+    denied_checks = [
+        check
+        for check in mock.requests_for("CheckUserPermission")
+        if check["bearer"] in (member.login_token, member.authz_token)
+        and owner.resource_id in check["resource_id"]
+    ]
+    assert denied_checks, "the refusals must be the online check's verdicts"
+
+
+@pytest.mark.smoke
+def test_cli_notification_subscribe_follows_the_grant(auth_env, make_actor):
+    """`lore notification subscribe` under the online rules: a granted
+    member's subscription is accepted and receives the owner's lock events
+    until its listen window closes; once revoked, the subscribe bails out
+    early with an error instead of holding a stream open."""
+    mock = auth_env.mock
+    owner = provision_owner(auth_env, make_actor, "user1", USER1)
+    commit_file(owner.repo, "watched.txt", "watched content")
+    member = provision_member(
+        auth_env, make_actor, owner, "member-notify", ("read", "write")
+    )
+
+    result: dict = {}
+
+    def subscribe():
+        try:
+            result["output"] = member.repo.run(["notification", "subscribe", "8"])
+        except LoreException as error:
+            result["error"] = error
+
+    listener = threading.Thread(target=subscribe)
+    listener.start()
+    time.sleep(2)  # let the subscription establish before the event fires
+    owner.repo.lock_acquire("watched.txt")
+    time.sleep(1)
+    owner.repo.lock_release("watched.txt")
+    listener.join(timeout=30)
+
+    assert not listener.is_alive(), "the listen window must close the subscriber"
+    assert "error" not in result, f"granted subscribe failed: {result.get('error')}"
+    assert "Subscribed to events" in result["output"]
+    assert "Resource locked by" in result["output"]
+
+    # An unexpired access token keeps its grants, so the denial to probe is
+    # a token the auth service scoped to nothing: the subscribe handler reads
+    # its empty `resources` claim, refuses the body-declared partition, and
+    # the CLI bails out instead of listening.
+    unscoped = mock.mint_token(USER2, resources=[])
+    with pytest.raises(LoreException):
+        member.repo.run(
+            ["notification", "subscribe", "3"],
+            identity_token=unscoped,
+            access_token=unscoped,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Forwarded requests under authentication
 # ---------------------------------------------------------------------------
 
@@ -624,14 +922,14 @@ class TestForwardedRepositoryGetWithAuth:
 
     The internal endpoint runs no JWT interceptor, so the target server must
     itself verify the end-user token the origin stamped into
-    `on-behalf-of-authorization` and make its own online CheckUserPermission
-    call. Two authenticated servers share the module's stub: the origin
-    forwards RepositoryGet to the target, whose store is the only one holding
-    the repository, so a get that succeeds through the origin proves the
-    delegation, and the stub's records prove the token crossed the hop and
-    was re-checked at the target — the origin never checks permissions for a
-    get it forwards, so every recorded check for these probes is the
-    target's."""
+    `on-behalf-of-authorization` and make its own access decision. Two
+    authenticated servers share the module's stub: the origin forwards
+    RepositoryGet to the target, whose store is the only one holding the
+    repository, so a get that succeeds through the origin proves the
+    delegation. A forwarded access token is answered from its own `resources`
+    claim at the target; a token with no claim is checked online there — the
+    origin never checks permissions for a get it forwards, so every recorded
+    check for these probes is the target's."""
 
     @pytest.fixture(scope="class")
     def server_hostname(self, request):
@@ -725,10 +1023,12 @@ class TestForwardedRepositoryGetWithAuth:
     def test_forwarded_get_rechecks_the_token_at_the_target(
         self, auth_env, target_server, origin_server, make_actor
     ):
-        """A granted user's get resolves through the origin and the stub
-        records the target's online check carrying the exact token the client
-        sent; a verifiable token with no grant is denied at the target and the
-        caller sees NOT_FOUND, the same shape a direct denial answers."""
+        """A granted user's get resolves through the origin, with the target
+        answering the forwarded access token from its `resources` claim — no
+        online check carries it, since the auth service refuses access tokens
+        as credentials; a verifiable token with no claim and no grant is
+        checked online at the target, denied, and the caller sees NOT_FOUND,
+        the same shape a direct denial answers."""
         mock = auth_env.mock
 
         # USER1 provisions a repository on the target, exactly as
@@ -765,14 +1065,14 @@ class TestForwardedRepositoryGetWithAuth:
         )
         assert repository_name_in_response(body) == repo.name
 
-        rechecks = [
+        access_token_checks = [
             check
             for check in mock.requests_for("CheckUserPermission")[checks_before:]
-            if check["bearer"] == authz_token and resource_id in check["resource_id"]
+            if check["bearer"] == authz_token
         ]
-        assert rechecks, (
-            "the target must re-check the forwarded token online, with the "
-            "exact bearer the client sent"
+        assert not access_token_checks, (
+            "the forwarded access token is answered from its claim at the "
+            "target; sending it to CheckUserPermission would be refused"
         )
 
         # Denied: the token verifies (same issuer and JWKS) but holds no

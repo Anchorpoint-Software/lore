@@ -1097,6 +1097,26 @@ request performs, so action checks such as `can_admin_lock` stay in handlers eit
 interceptor-resident check covers the plain reachability question only. What this proposal needs is
 that nothing in the current code rules out either placement, and nothing does.
 
+*Resolved 2026-09-15, a third way.* The check landed as an **async tower layer**
+([`partition_access.rs`](../../lore-server/src/grpc/tower/partition_access.rs)) mounted inside
+each partition-scoped service's JWT interceptor. The interceptor placement was only ruled out
+above for being synchronous. A tower `Service` can await, so the online authorizer is reachable
+from a pre-handler check after all, and every RPC of a wrapped service — including ones added
+later — is covered by its registration. The layer reads the partition from the request metadata,
+and does access control to check if the caller is authorized. If there are no partition/repository
+metadata for the call, the middleware doesn't do anything.
+
+Operation-specific permissions can be done in the gRPC handlers. To answer them without a second
+authorizer round trip, the middleware asks the authorizer to enumerate the caller's grants for
+the partition and exposes the enumeration to the handler as a request extension. An authorizer
+that cannot enumerate (a policy engine can answer only "may X do A?" without listing everything
+X may do) is asked the plain reachability question, and handlers fall back to per-action
+authorizer calls. The two constraints above still hold where they must: checks that read the
+request body stay in handlers. The generic handler requires the partition/repository to be
+defined in the headers in a standardized way. The lock action checks, and notification
+subscribe are the current exceptions that authorize calls through a partition declared in the
+request body.
+
 **Notification is the exception either way.** `NotificationService::subscribe`
 ([`notification_service.rs`](../../lore-server/src/grpc/notification_service.rs)) takes the
 partition from `SubscribeRequest.repository`, the request *body*, and registers the stream on that

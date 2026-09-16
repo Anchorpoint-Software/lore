@@ -1454,6 +1454,7 @@ async fn configure_composite_substore(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn configure_notification(
     endpoints: &mut JoinSet<Result<()>>,
     registry: &PluginRegistry,
@@ -1461,6 +1462,8 @@ async fn configure_notification(
     notification_settings: &Option<NotificationSettings>,
     immutable_store: Option<&Arc<dyn ImmutableStore>>,
     plugins: &HashMap<String, toml::Value>,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
+    authorization_timeout: Duration,
 ) -> Result<(Arc<dyn NotificationSender>, Option<NotificationService>)> {
     let mode = notification_settings
         .as_ref()
@@ -1469,7 +1472,14 @@ async fn configure_notification(
         "local" => {
             info!("Starting local notification service");
             let sender = Arc::new(crate::notification::local::NotificationSender::default());
-            Ok((sender.clone(), Some(NotificationService::new(sender))))
+            Ok((
+                sender.clone(),
+                Some(NotificationService::new(
+                    sender,
+                    repository_authorizer,
+                    authorization_timeout,
+                )),
+            ))
         }
         plugin_name => {
             info!(plugin_name = plugin_name, "Creating notification plugin");
@@ -1882,6 +1892,17 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     });
 
     if !is_maintenance {
+        // The subscribe authorization check runs under the same handler
+        // timeout as the gRPC endpoint the service registers on. Without a
+        // gRPC endpoint the service is unreachable and the fallback (the
+        // config default) is moot.
+        let notification_authorization_timeout = Duration::from_secs(
+            settings
+                .server
+                .grpc
+                .as_ref()
+                .map_or(50, |grpc| grpc.request_handler_timeout_seconds),
+        );
         let (notification, notification_service) = configure_notification(
             &mut endpoints,
             &plugin_registry,
@@ -1889,6 +1910,8 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
             &settings.notification,
             local_store().as_ref(),
             &settings.plugins,
+            repository_authorizer.clone(),
+            notification_authorization_timeout,
         )
         .await?;
 

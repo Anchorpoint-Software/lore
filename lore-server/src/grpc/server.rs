@@ -31,6 +31,7 @@ use tonic::transport::Certificate;
 use tonic::transport::Identity;
 use tonic::transport::ServerTlsConfig;
 use tonic::transport::server::Server;
+use tower::Layer;
 use tower::ServiceBuilder;
 use tower::layer::util::Stack;
 use tower_http::classify::GrpcCode;
@@ -42,7 +43,6 @@ use tracing::warn;
 
 use super::lock_service::LoreLockService;
 use crate::auth::jwt::JwtVerifier;
-use crate::auth::jwt_interceptor::JWTAuthnInterceptor;
 use crate::auth::jwt_interceptor::JWTInterceptor;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::correlation::layer::CorrelationIdLayer;
@@ -63,6 +63,8 @@ use crate::grpc::storage_service::LoreStorageService;
 use crate::grpc::thinclient::LoreThinClientV1Service;
 use crate::grpc::tower::grpc_response_trace::GrpcResponseTraceLayer;
 use crate::grpc::tower::malformed_request::MalformedRequestLayer;
+use crate::grpc::tower::partition_access::PartitionAccessLayer;
+use crate::grpc::tower::partition_access::PartitionAccessService;
 use crate::grpc::tower::tracing::LoreTracingLayer;
 use crate::hooks::HookDispatcher;
 use crate::legacy::rpc::environment_service_server::EnvironmentServiceServer;
@@ -600,6 +602,33 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
         lock_service
     }
 
+    /// The one registration path for a partition-scoped authenticated
+    /// service: the JWT interceptor verifies the token, and the
+    /// [`PartitionAccessLayer`] inside it asks the configured authorizer
+    /// whether that caller may reach the partition the request names.
+    /// Per-operation permissions are the handlers' own checks, answered from
+    /// the `PartitionGrants` extension the layer exposes (or the authorizer,
+    /// when the grants are not enumerable).
+    ///
+    /// This layer checks access only from the request metadata headers,
+    /// which covers most of the operations. If the authorization decision
+    /// needs to be done based on a request body value, needs custom authz
+    /// check inside the handler (e.g. notification subscribe, lock action
+    /// checks). The middleware sees the request body only as a binary stream,
+    /// so we cannot easily action on any body values.
+    fn partition_scoped<S>(
+        service: S,
+        jwt_interceptor: &JWTInterceptor,
+        authorizer: &Arc<dyn RepositoryAuthorizer>,
+        request_timeout: Duration,
+    ) -> tonic::service::interceptor::InterceptedService<PartitionAccessService<S>, JWTInterceptor>
+    {
+        tonic::service::interceptor::InterceptedService::new(
+            PartitionAccessLayer::new(authorizer.clone(), request_timeout).layer(service),
+            jwt_interceptor.clone(),
+        )
+    }
+
     pub fn with_jwt_verifier(
         self,
         jwt_verifier: Option<JwtVerifier>,
@@ -718,8 +747,15 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
         let environment_svc = LoreEnvironmentService::new(self.0.environment.clone());
         let environment_v1_svc = LoreEnvironmentV1Service::new(self.0.environment);
         let lock_svc = self.0.lock_store.map(|lock_store| {
-            LoreLockService::new(lock_store, self.0.notification_sender.clone(), rpc_timeout)
+            LoreLockService::new(
+                lock_store,
+                self.0.notification_sender.clone(),
+                repository_authorizer.clone(),
+                rpc_timeout,
+            )
         });
+
+        let notification_service = self.0.notification_service;
 
         let authenticated = jwt_verifier.is_some();
 
@@ -729,52 +765,55 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
 
         if let Some(jwt_verifier) = jwt_verifier.as_ref() {
             let jwt_interceptor = JWTInterceptor::new(jwt_verifier);
-            // TODO(UCS-13506): Placeholder authn verifier until separate authz flow for repository service is in place
-            let jwt_authn_interceptor = JWTAuthnInterceptor::new(jwt_verifier);
 
             if check_enabled(&services.storage_service, "storage_service") {
                 router = router
-                    .add_service(StorageServiceServer::with_interceptor(
-                        storage_svc.clone(),
-                        jwt_interceptor.clone(),
+                    .add_service(Self::partition_scoped(
+                        StorageServiceServer::new(storage_svc.clone()),
+                        &jwt_interceptor,
+                        &repository_authorizer,
+                        rpc_timeout,
                     ))
-                    .add_service(
-                        storage_service_v1_server::StorageServiceServer::with_interceptor(
-                            storage_svc,
-                            jwt_interceptor.clone(),
-                        ),
-                    );
+                    .add_service(Self::partition_scoped(
+                        storage_service_v1_server::StorageServiceServer::new(storage_svc),
+                        &jwt_interceptor,
+                        &repository_authorizer,
+                        rpc_timeout,
+                    ));
             }
             if check_enabled(&services.revision_service, "revision_service") {
                 router = router
-                    .add_service(RevisionServiceServer::with_interceptor(
-                        revision_svc,
-                        jwt_interceptor.clone(),
+                    .add_service(Self::partition_scoped(
+                        RevisionServiceServer::new(revision_svc),
+                        &jwt_interceptor,
+                        &repository_authorizer,
+                        rpc_timeout,
                     ))
-                    .add_service(revision_v1_server::RevisionServiceServer::with_interceptor(
-                        revision_v1_svc,
-                        jwt_interceptor.clone(),
+                    .add_service(Self::partition_scoped(
+                        revision_v1_server::RevisionServiceServer::new(revision_v1_svc),
+                        &jwt_interceptor,
+                        &repository_authorizer,
+                        rpc_timeout,
                     ));
             }
             if check_enabled(&services.thin_client_service, "thin_client_service") {
-                router = router.add_service(
-                    thin_client_v1_server::ThinClientServiceServer::with_interceptor(
-                        thin_client_v1_svc,
-                        jwt_interceptor.clone(),
-                    ),
-                );
+                router = router.add_service(Self::partition_scoped(
+                    thin_client_v1_server::ThinClientServiceServer::new(thin_client_v1_svc),
+                    &jwt_interceptor,
+                    &repository_authorizer,
+                    rpc_timeout,
+                ));
             }
             if check_enabled(&services.repository_service, "repository_service") {
                 router = router
                     .add_service(RepositoryServiceServer::with_interceptor(
                         repository_svc,
-                        // TODO(UCS-13506): Placeholder authn verifier until separate authz flow for repository service is in place
-                        jwt_authn_interceptor.clone(),
+                        jwt_interceptor.clone(),
                     ))
                     .add_service(
                         repository_v1_server::RepositoryServiceServer::with_interceptor(
                             repository_v1_svc,
-                            jwt_authn_interceptor.clone(),
+                            jwt_interceptor.clone(),
                         ),
                     );
             }
@@ -792,15 +831,16 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
             {
                 let lock_service =
                     Self::make_lock_service(services.lock_service.general(), lock_svc);
-                let intercepted_service = tonic::service::interceptor::InterceptedService::new(
+                router = router.add_service(Self::partition_scoped(
                     lock_service,
-                    jwt_interceptor.clone(),
-                );
-                router = router.add_service(intercepted_service);
+                    &jwt_interceptor,
+                    &repository_authorizer,
+                    rpc_timeout,
+                ));
             }
 
             // Notifications require auth
-            if let Some(notification_service) = self.0.notification_service
+            if let Some(notification_service) = notification_service
                 && check_enabled(&services.notification_service, "notification_service")
             {
                 router = router.add_service(
@@ -851,7 +891,7 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
                     Self::make_lock_service(services.lock_service.general(), lock_svc);
                 router = router.add_service(lock_service);
             }
-            if let Some(notification_service) = self.0.notification_service
+            if let Some(notification_service) = notification_service
                 && check_enabled(&services.notification_service, "notification_service")
             {
                 router = router.add_service(lore_notification::NotificationServiceServer::new(

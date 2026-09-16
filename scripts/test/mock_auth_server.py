@@ -315,6 +315,20 @@ class _JwksHttpServer(ThreadingHTTPServer):
         self.mock = mock
 
 
+def _is_access_token(bearer: str) -> bool:
+    """Whether the bearer is an exchanged access token: one whose payload
+    carries a `resources` claim. Decoded without verification -- this asks
+    what kind of token it is, not whether it is genuine."""
+    try:
+        payload = bearer.split(".")[1]
+        claims = json.loads(
+            base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4))
+        )
+    except (IndexError, ValueError):
+        return False
+    return isinstance(claims, dict) and "resources" in claims
+
+
 class MockAuthServer:
     """The declarative stub. `start()` binds OS-assigned loopback ports.
 
@@ -554,6 +568,19 @@ class MockAuthServer:
             self.calls[method] += 1
             self.requests.append((method, decoded))
             rules = [rule for rule in self._rules if rule.method == method]
+
+        # The real auth service refuses exchanged access tokens as
+        # CheckUserPermission credentials (UNAUTHENTICATED, INVALID_FORMAT on
+        # the authorization field). only identity tokens may ask. Enforced
+        # before rule matching so no test can script the unreal case.
+        if method == "CheckUserPermission" and _is_access_token(decoded["bearer"]):
+            logger.info(
+                "mock auth: %s refused: an access token is not a credential", method
+            )
+            raise _AbortError(
+                grpc.StatusCode.UNAUTHENTICATED,
+                "invalid or expired authentication token",
+            )
 
         for rule in rules:
             if not rule.matches(decoded):

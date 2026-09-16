@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use lore_base::types::RepositoryId;
 use tonic::Status;
 
+use super::repository_authorizer::Grants;
 use super::repository_authorizer::RepositoryAuthorizer;
 use super::repository_authorizer::VerifiedToken;
 use crate::auth::jwt::ResourceMatcher;
@@ -87,6 +88,23 @@ fn value_at<'a>(value: &'a serde_json::Value, dotted_path: &str) -> Option<&'a s
         .try_fold(value, |value, segment| value.get(segment))
 }
 
+impl ResourceGrantsAuthorizer {
+    /// The token's access to one partition: unreachable when no entry
+    /// matches, otherwise the permissions merged across every matching entry.
+    fn grants_on(&self, token: &VerifiedToken<'_>, repository_id: RepositoryId) -> Grants {
+        let entries = self.grants(token);
+        if !self.matcher.any_match(&entries, repository_id) {
+            return Grants::Denied;
+        }
+        Grants::Actions(
+            self.matcher
+                .merged_permissions(&entries, repository_id)
+                .into_iter()
+                .collect(),
+        )
+    }
+}
+
 #[async_trait]
 impl RepositoryAuthorizer for ResourceGrantsAuthorizer {
     async fn check_repository_access(
@@ -98,23 +116,26 @@ impl RepositoryAuthorizer for ResourceGrantsAuthorizer {
         let Some(token) = token else {
             return Err(Status::unauthenticated("No token"));
         };
-        let grants = self.grants(token);
-        if !self.matcher.any_match(&grants, repository_id) {
+        let grants = self.grants_on(token, repository_id);
+        if !grants.reachable() {
             return Err(Status::permission_denied("No grant for repository"));
         }
         match action {
             None => Ok(()),
-            Some(action)
-                if self
-                    .matcher
-                    .merged_permissions(&grants, repository_id)
-                    .iter()
-                    .any(|granted| granted == action) =>
-            {
-                Ok(())
-            }
+            Some(action) if grants.permits(action) => Ok(()),
             Some(_) => Err(Status::permission_denied("Action not permitted")),
         }
+    }
+
+    async fn granted_actions(
+        &self,
+        token: Option<&VerifiedToken<'_>>,
+        repository_id: RepositoryId,
+    ) -> Result<Option<Grants>, Status> {
+        Ok(Some(match token {
+            None => Grants::Denied,
+            Some(token) => self.grants_on(token, repository_id),
+        }))
     }
 }
 
