@@ -1352,8 +1352,7 @@ mod tests {
                     serialized,
                     true,
                     true,
-                    false,
-                    false,
+                    crate::grpc::handlers::branch_push::Integration::Refuse,
                     STEP_ONE_HUNDRED,
                     BOTH,
                 )
@@ -1386,8 +1385,7 @@ mod tests {
                 serialized,
                 true,
                 true,
-                false,
-                false,
+                crate::grpc::handlers::branch_push::Integration::Refuse,
                 STEP_ONE_HUNDRED,
                 BOTH,
             )

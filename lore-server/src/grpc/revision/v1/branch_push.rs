@@ -31,6 +31,7 @@ use crate::grpc::extract_correlation_id;
 use crate::grpc::get_authorization;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
+use crate::grpc::handlers::branch_push::Integration;
 use crate::grpc::handlers::branch_push::PushResult;
 use crate::grpc::handlers::branch_push::dispatch_response_message;
 use crate::grpc::handlers::branch_push::extract_client_ip;
@@ -97,15 +98,22 @@ pub async fn handler(
         ));
     }
 
-    // The two ask for different histories. Integrating one way anyway would
-    // leave the client unable to tell which it got, so refuse the request
-    // rather than resolve it by precedence.
-    if fast_forward_merge && rebase {
-        info!("Invalid branch push request, fast_forward_merge and rebase both set");
-        return Err(Status::invalid_argument(
-            "fast_forward_merge and rebase are mutually exclusive",
-        ));
-    }
+    // The wire carries two independent bits; the server takes one decision.
+    // Both set is refused rather than resolved by precedence: they ask for
+    // different histories, and applying one anyway would leave the client
+    // unable to tell which it got. Past this point the invalid combination
+    // cannot be expressed.
+    let integration = match (fast_forward_merge, rebase) {
+        (true, true) => {
+            info!("Invalid branch push request, fast_forward_merge and rebase both set");
+            return Err(Status::invalid_argument(
+                "fast_forward_merge and rebase are mutually exclusive",
+            ));
+        }
+        (true, false) => Integration::Merge,
+        (false, true) => Integration::Rebase,
+        (false, false) => Integration::Refuse,
+    };
 
     debug!(
         {REVISION} = %revision,
@@ -158,8 +166,7 @@ pub async fn handler(
                 revision,
                 bypass_protection,
                 force,
-                fast_forward_merge,
-                rebase,
+                integration,
                 history_step_size,
                 acceleration,
             )
@@ -434,7 +441,14 @@ mod test {
         force: bool,
         fast_forward_merge: bool,
     ) -> Request<BranchPushRequest> {
-        make_request_with(repository, branch, revision, force, fast_forward_merge, false)
+        make_request_with(
+            repository,
+            branch,
+            revision,
+            force,
+            fast_forward_merge,
+            false,
+        )
     }
 
     fn make_request_with(

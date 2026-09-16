@@ -159,10 +159,13 @@ pub async fn handler(
                 revision,
                 bypass_protection,
                 force,
-                fast_forward_merge,
                 // The deprecated request has no rebase field, so this path
-                // always integrates by merging.
-                false,
+                // can only ever merge.
+                if fast_forward_merge {
+                    Integration::Merge
+                } else {
+                    Integration::Refuse
+                },
                 history_step_size,
                 acceleration,
             )
@@ -284,6 +287,26 @@ pub struct PushResult {
     pub revision_number: u64,
 }
 
+/// What the server may do with a push whose parent is no longer the branch
+/// head.
+///
+/// One value rather than a pair of flags because the two ways of integrating
+/// are mutually exclusive — they produce different histories, and a request
+/// asking for both is refused at the wire boundary. Expressing that here makes
+/// the invalid combination unrepresentable rather than something every caller
+/// has to be trusted not to construct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Integration {
+    /// Refuse the push and let the client resolve the divergence itself.
+    Refuse,
+    /// Merge onto the head, recording the pushed revision as the second
+    /// parent, which keeps it reachable on the branch.
+    Merge,
+    /// Rebase onto the head, recording only the head as the parent, which
+    /// keeps the branch linear.
+    Rebase,
+}
+
 #[allow(clippy::too_many_arguments)]
 #[instrument(level = "debug", skip_all, fields(branch))]
 pub async fn push(
@@ -292,8 +315,7 @@ pub async fn push(
     latest: Hash,
     bypass_protection: bool,
     force: bool,
-    fast_forward_merge: bool,
-    rebase: bool,
+    integration: Integration,
     history_step_size: u64,
     acceleration: crate::grpc::server::RevisionListAcceleration,
 ) -> Result<PushResult, Status> {
@@ -369,7 +391,7 @@ pub async fn push(
                 return Err(Status::not_found("Branch not found"));
             }
 
-            if !fast_forward_merge && !rebase {
+            if integration == Integration::Refuse {
                 return Ok(PushResult {
                     success: false,
                     fast_forward_merged: false,
@@ -388,7 +410,7 @@ pub async fn push(
                 branch,
                 state.clone(),
                 current_head,
-                rebase,
+                integration == Integration::Rebase,
                 history_step_size,
                 acceleration,
             )
@@ -1104,8 +1126,7 @@ mod tests {
                 state.revision(),
                 true,
                 true,
-                false,
-                false,
+                crate::grpc::handlers::branch_push::Integration::Refuse,
                 DEFAULT_HISTORY_STEP_SIZE,
                 RevisionListAcceleration::default(),
             )
@@ -1149,8 +1170,7 @@ mod tests {
             state.revision(),
             true,
             true,
-            false,
-            false,
+            crate::grpc::handlers::branch_push::Integration::Refuse,
             DEFAULT_HISTORY_STEP_SIZE,
             RevisionListAcceleration::default(),
         )
@@ -1306,8 +1326,7 @@ mod tests {
                     nonexistent_revision,
                     true,
                     true,
-                    false,
-                    false,
+                    crate::grpc::handlers::branch_push::Integration::Refuse,
                     DEFAULT_HISTORY_STEP_SIZE,
                     RevisionListAcceleration::default(),
                 )
@@ -1358,8 +1377,7 @@ mod tests {
                     state.revision(),
                     true,
                     true,
-                    false,
-                    false,
+                    crate::grpc::handlers::branch_push::Integration::Refuse,
                     DEFAULT_HISTORY_STEP_SIZE,
                     RevisionListAcceleration::default(),
                 )
@@ -1422,8 +1440,7 @@ mod tests {
                     state.revision(),
                     true,
                     true,
-                    false,
-                    false,
+                    crate::grpc::handlers::branch_push::Integration::Refuse,
                     DEFAULT_HISTORY_STEP_SIZE,
                     RevisionListAcceleration::default(),
                 )
@@ -1487,8 +1504,7 @@ mod tests {
                     merge.revision(),
                     true,
                     true,
-                    false,
-                    false,
+                    crate::grpc::handlers::branch_push::Integration::Refuse,
                     DEFAULT_HISTORY_STEP_SIZE,
                     RevisionListAcceleration::default(),
                 )
@@ -1560,8 +1576,7 @@ mod tests {
                     merge.revision(),
                     true,
                     true,
-                    false,
-                    false,
+                    crate::grpc::handlers::branch_push::Integration::Refuse,
                     DEFAULT_HISTORY_STEP_SIZE,
                     RevisionListAcceleration::default(),
                 )

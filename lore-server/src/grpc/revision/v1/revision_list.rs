@@ -1166,8 +1166,7 @@ mod test {
                 serialized,
                 true,
                 true,
-                false,
-                false,
+                crate::grpc::handlers::branch_push::Integration::Refuse,
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
             )
@@ -1240,8 +1239,7 @@ mod test {
             serialized,
             true,
             true,
-            false,
-            false,
+            crate::grpc::handlers::branch_push::Integration::Refuse,
             DEFAULT_HISTORY_STEP_SIZE,
             crate::grpc::server::RevisionListAcceleration::default(),
         )

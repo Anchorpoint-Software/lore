@@ -151,8 +151,7 @@ mod tests {
                     first_hash,
                     true,
                     true,
-                    false,
-                    false,
+                    crate::grpc::handlers::branch_push::Integration::Refuse,
                     DEFAULT_HISTORY_STEP_SIZE,
                     crate::grpc::server::RevisionListAcceleration::default(),
                 )
@@ -174,8 +173,7 @@ mod tests {
                     second_hash,
                     true,
                     true,
-                    false,
-                    false,
+                    crate::grpc::handlers::branch_push::Integration::Refuse,
                     DEFAULT_HISTORY_STEP_SIZE,
                     crate::grpc::server::RevisionListAcceleration::default(),
                 )
@@ -197,8 +195,7 @@ mod tests {
                     third_hash,
                     true,
                     true,
-                    false,
-                    false,
+                    crate::grpc::handlers::branch_push::Integration::Refuse,
                     DEFAULT_HISTORY_STEP_SIZE,
                     crate::grpc::server::RevisionListAcceleration::default(),
                 )
@@ -269,8 +266,7 @@ mod tests {
                     merge_hash,
                     true,
                     true,
-                    false,
-                    false,
+                    crate::grpc::handlers::branch_push::Integration::Refuse,
                     DEFAULT_HISTORY_STEP_SIZE,
                     crate::grpc::server::RevisionListAcceleration::default(),
                 )

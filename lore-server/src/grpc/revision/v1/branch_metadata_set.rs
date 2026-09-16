@@ -520,8 +520,7 @@ mod test {
                 state_hash,
                 true,
                 true,
-                false,
-                false,
+                crate::grpc::handlers::branch_push::Integration::Refuse,
                 lore_revision::branch::DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
             )
