@@ -600,4 +600,252 @@ mod tests {
             "expected NO RevisionCommitRevision event (discriminant {commit_discriminant}) in captured {captured:?}"
         );
     }
+
+    // ---------------------------------------------------------------------
+    // Branch-advanced gate: the check is "does this commit drop what another
+    // instance added", not "is your anchor the branch latest". These two
+    // tests are the pair that defines the difference — one staged state that
+    // already carries the latest, one that does not, with identical pointers.
+    //
+    // The pointers are set directly rather than produced by a race, because
+    // the gate only ever reads them: how the anchor came to differ from the
+    // latest (a server-side fast-forward merge, a forced commit) is not
+    // something it can see.
+    // ---------------------------------------------------------------------
+
+    /// Build a repository with three linear revisions and return
+    /// `(repository, write_token, [r1, r2, r3])`, leaving the anchor and the
+    /// branch latest both on `r3`.
+    async fn three_revision_chain(
+        path: &std::path::Path,
+        immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+        mutable_store: Arc<dyn lore_storage::MutableStore>,
+    ) -> (
+        Arc<RepositoryContext>,
+        repository::RepositoryWriteToken,
+        BranchId,
+        Vec<lore_base::types::Hash>,
+    ) {
+        std::fs::create_dir_all(path).expect("Create directory failed");
+        let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+        let default_branch_id = BranchId::from(uuid::Uuid::now_v7());
+        let write_token = repository::RepositoryWriteToken::acquire(path).await;
+        let created_repo = repository::create_local(
+            path,
+            &write_token,
+            repository_id,
+            default_branch_id,
+            branch::DEFAULT_DEFAULT_NAME.to_string(),
+            repository::RepositoryConfig::default(),
+            false,
+        )
+        .await
+        .expect("Failed to initialize repository");
+
+        let repository = Arc::new(
+            RepositoryContext::new(
+                default_repository_creation_args(immutable_store, mutable_store)
+                    .with_path(path)
+                    .with_id(repository_id)
+                    .with_instance_id(created_repo.instance_id),
+            )
+            .with_write_token(write_token.share()),
+        );
+        lore_revision::instance::store_current_anchor_branch(&repository, default_branch_id)
+            .await
+            .expect("Failed to store anchor branch");
+
+        let mut revisions = Vec::new();
+        for i in 0..3u8 {
+            let file_path = path.join(format!("file{i}.bin"));
+            {
+                let mut file = std::fs::File::options()
+                    .create(true)
+                    .truncate(true)
+                    .write(true)
+                    .open(&file_path)
+                    .expect("Failed to create test file");
+                file.write_all(&[i, i, i])
+                    .expect("Failed to write test file");
+            }
+            file::stage::stage(
+                repository.clone(),
+                &write_token,
+                LoreArray::from_vec(vec![LoreString::from(&file_path)]),
+                StageOptions {
+                    case_change: stage::StageCaseChange::Error,
+                    node_flags: NodeFlags::NoFlags,
+                    file_id: None,
+                    no_children: false,
+                    scan: true,
+                },
+            )
+            .await
+            .expect("Failed to stage file");
+
+            let signature = Box::pin(commit::commit(
+                repository.clone(),
+                &write_token,
+                CommitOptions {
+                    message: format!("r{i}"),
+                    link_messages: std::collections::HashMap::new(),
+                    link: None,
+                    layer_messages: std::collections::HashMap::new(),
+                    layer: None,
+                },
+            ))
+            .await
+            .expect("Failed to commit revision");
+            revisions.push(signature);
+        }
+
+        (repository, write_token, default_branch_id, revisions)
+    }
+
+    /// Stage a state with a chosen ancestry, the way a merge leaves one behind:
+    /// a serialized state stored as the staged anchor. `parent_other` set makes
+    /// it a merge, which is the shape sync stages — `parent_self` the remote
+    /// target it is synchronizing to, `parent_other` the local revision.
+    async fn stage_state_on(
+        repository: &Arc<RepositoryContext>,
+        write_token: &repository::RepositoryWriteToken,
+        parent_self: lore_base::types::Hash,
+        parent_other: lore_base::types::Hash,
+    ) -> lore_base::types::Hash {
+        let state = state::State::deserialize(repository.clone(), parent_self)
+            .await
+            .expect("deserialize parent state");
+        state.set_parent_self(parent_self);
+        state.set_parent_other(parent_other);
+        state.set_revision_number(0);
+        state.set_metadata_hash(Default::default());
+        state.mark_dirty();
+        let signature = state
+            .serialize(repository.clone(), write_token)
+            .await
+            .expect("serialize staged state");
+        lore_revision::instance::store_staged_anchor(repository, signature)
+            .await
+            .expect("store staged anchor");
+        signature
+    }
+
+    /// The branch latest is already in the staged state's ancestry — two steps
+    /// back, the shape a sync's own merge commit has. Committing it publishes
+    /// that work rather than replacing it, so it is allowed even though the
+    /// anchor is not the latest.
+    #[tokio::test]
+    async fn commit_allowed_when_staged_state_already_carries_the_branch_latest() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let tempdir = generate_tempdir();
+                let (repository, write_token, branch_id, revisions) =
+                    three_revision_chain(tempdir.to_path_buf().as_path(), immutable_store, mutable_store)
+                        .await;
+                let (r1, r2, r3) = (revisions[0], revisions[1], revisions[2]);
+
+                // Anchor behind the latest, and the latest itself behind the
+                // revision the staged state is built on: r1 <- r2 <- r3.
+                lore_revision::instance::store_current_anchor(&repository, r1)
+                    .await
+                    .expect("store anchor");
+                branch::store_latest(
+                    repository.clone(),
+                    branch_id,
+                    r3,
+                    r2,
+                    branch::BranchLatestStatus::Divergent,
+                )
+                .await
+                .expect("store latest");
+
+                // The shape sync stages: parent_self the target it is
+                // synchronizing to, parent_other the revision it is on.
+                let staged = stage_state_on(&repository, &write_token, r3, r1).await;
+                assert_ne!(staged, r3, "staged state must be its own revision");
+
+                let result = Box::pin(commit::commit(
+                    repository.clone(),
+                    &write_token,
+                    CommitOptions {
+                        message: "carries the latest".to_string(),
+                        link_messages: std::collections::HashMap::new(),
+                        link: None,
+                        layer_messages: std::collections::HashMap::new(),
+                        layer: None,
+                    },
+                ))
+                .await;
+
+                assert!(
+                    result.is_ok(),
+                    "a staged state whose ancestry contains the branch latest must commit, got {result:?}"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// The counterpart, and the reason the check still earns its place: the
+    /// staged state hangs off the stale anchor and never reaches the latest, so
+    /// committing it would drop whatever advanced the branch. Still refused.
+    #[tokio::test]
+    async fn commit_refused_when_staged_state_cannot_reach_the_branch_latest() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let tempdir = generate_tempdir();
+                let (repository, write_token, branch_id, revisions) = three_revision_chain(
+                    tempdir.to_path_buf().as_path(),
+                    immutable_store,
+                    mutable_store,
+                )
+                .await;
+                let (r1, r2, r3) = (revisions[0], revisions[1], revisions[2]);
+
+                // Same pointers as the test above — only the staged state
+                // differs: it is built on r1, which cannot reach r2.
+                lore_revision::instance::store_current_anchor(&repository, r1)
+                    .await
+                    .expect("store anchor");
+                branch::store_latest(
+                    repository.clone(),
+                    branch_id,
+                    r3,
+                    r2,
+                    branch::BranchLatestStatus::Divergent,
+                )
+                .await
+                .expect("store latest");
+
+                stage_state_on(&repository, &write_token, r1, Default::default()).await;
+
+                let result = Box::pin(commit::commit(
+                    repository.clone(),
+                    &write_token,
+                    CommitOptions {
+                        message: "would drop the advance".to_string(),
+                        link_messages: std::collections::HashMap::new(),
+                        link: None,
+                        layer_messages: std::collections::HashMap::new(),
+                        layer: None,
+                    },
+                ))
+                .await;
+
+                assert!(
+                    result.is_err(),
+                    "a staged state that cannot reach the branch latest must still be refused"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
 }
