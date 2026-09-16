@@ -1353,6 +1353,7 @@ mod tests {
                     true,
                     true,
                     false,
+                    false,
                     STEP_ONE_HUNDRED,
                     BOTH,
                 )
@@ -1385,6 +1386,7 @@ mod tests {
                 serialized,
                 true,
                 true,
+                false,
                 false,
                 STEP_ONE_HUNDRED,
                 BOTH,

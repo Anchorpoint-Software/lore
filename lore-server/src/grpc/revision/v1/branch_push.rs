@@ -434,11 +434,23 @@ mod test {
         force: bool,
         fast_forward_merge: bool,
     ) -> Request<BranchPushRequest> {
+        make_request_with(repository, branch, revision, force, fast_forward_merge, false)
+    }
+
+    fn make_request_with(
+        repository: RepositoryId,
+        branch: BranchId,
+        revision: Hash,
+        force: bool,
+        fast_forward_merge: bool,
+        rebase: bool,
+    ) -> Request<BranchPushRequest> {
         let mut request = Request::new(BranchPushRequest {
             id: branch.into(),
             revision_signature: revision.into(),
             force,
             fast_forward_merge,
+            rebase,
         });
         request.metadata_mut().insert_bin(
             REPOSITORY_ID_KEY,
@@ -503,6 +515,45 @@ mod test {
             assert_eq!(inner.revision_signature, bytes::Bytes::from(revision));
             assert_eq!(inner.revision_number, 1);
             assert!(!inner.fast_forward_merged);
+        }))
+        .await;
+    }
+
+    /// The two ask for different histories, so the request is refused rather
+    /// than resolved by precedence — a client must never be left guessing
+    /// which of the two it got.
+    #[tokio::test]
+    async fn push_with_both_merge_and_rebase_returns_invalid_argument() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        let notification_sender = Arc::new(MockNotificationSender::new());
+        let instrument_provider = TestInstrumentProvider {};
+
+        Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            let main = create_root_branch(&repository_context, "main").await;
+            let revision = build_revision(&repository_context, Hash::default(), 1).await;
+
+            let hook_dispatcher = HookDispatcher::empty();
+            let err = handler(
+                make_request_with(repository, main, revision, false, true, true),
+                immutable_store.clone(),
+                mutable_store.clone(),
+                notification_sender.clone(),
+                &hook_dispatcher,
+                DEFAULT_HISTORY_STEP_SIZE,
+                crate::grpc::server::RevisionListAcceleration::default(),
+                &instrument_provider,
+            )
+            .await
+            .expect_err("asking for a merge and a rebase at once should fail");
+            assert_eq!(err.code(), tonic::Code::InvalidArgument);
         }))
         .await;
     }

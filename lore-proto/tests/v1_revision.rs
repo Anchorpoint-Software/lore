@@ -76,6 +76,7 @@ fn v1_revision_field_shapes() {
         revision_signature: _,
         force: _,
         fast_forward_merge: _,
+        rebase: _,
     } = BranchPushRequest::default();
     let BranchPushResponse {
         revision_signature: _,

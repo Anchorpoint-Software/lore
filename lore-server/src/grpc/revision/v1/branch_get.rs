@@ -230,6 +230,7 @@ mod test {
             true,
             true,
             false,
+            false,
             DEFAULT_HISTORY_STEP_SIZE,
             crate::grpc::server::RevisionListAcceleration::default(),
         )

@@ -361,6 +361,7 @@ mod test {
                 true,
                 true,
                 false,
+                false,
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
             )
@@ -552,6 +553,7 @@ mod test {
                 true,
                 true,
                 false,
+                false,
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
             )
@@ -644,6 +646,7 @@ mod test {
                 serialized,
                 true,
                 true,
+                false,
                 false,
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),

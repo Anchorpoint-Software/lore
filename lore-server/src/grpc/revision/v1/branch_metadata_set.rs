@@ -521,6 +521,7 @@ mod test {
                 true,
                 true,
                 false,
+                false,
                 lore_revision::branch::DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
             )
