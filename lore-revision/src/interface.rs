@@ -584,6 +584,11 @@ impl<T> LoreArray<T> {
 
     /// Moves the strings from the vec in the string array
     pub fn from_vec(vec: Vec<T>) -> Self {
+        // `from_raw_parts_mut` below requires a non-null pointer even for a zero length, and
+        // `new` returns null for a zero count.
+        if vec.is_empty() {
+            return Self::default();
+        }
         let target = LoreArray::<T>::new(vec.len());
 
         // SAFETY: target is created to the same count as the vec and we're going to initialise
@@ -608,7 +613,23 @@ impl<T> LoreArray<T> {
         self.count
     }
 
+    /// Room for `count` uninitialised elements.
+    ///
+    /// `Layout::array` is zero-sized for a zero count and for any count of a zero-sized type, and
+    /// `std::alloc::alloc` is undefined behaviour for a zero-sized layout, so neither case
+    /// allocates. A zero count returns the null pointer. A zero-sized type returns a dangling
+    /// aligned pointer and keeps the count, because `as_slice` must still answer that many
+    /// elements and a slice needs a non-null aligned pointer to start from.
     fn new(count: usize) -> Self {
+        if count == 0 {
+            return Self::default();
+        }
+        if std::mem::size_of::<T>() == 0 {
+            return Self {
+                ptr: std::ptr::NonNull::<T>::dangling().as_ptr(),
+                count,
+            };
+        }
         let layout =
             std::alloc::Layout::array::<T>(count).expect("layout overflow in LoreArray<T>::new");
         unsafe {
@@ -655,9 +676,13 @@ impl<T> Drop for LoreArray<T> {
             unsafe {
                 let items = std::ptr::slice_from_raw_parts_mut(self.ptr.cast_mut(), self.count);
                 std::ptr::drop_in_place(items);
-                let layout = std::alloc::Layout::array::<T>(self.count)
-                    .expect("layout overflow in LoreArray<T>::drop");
-                std::alloc::dealloc(self.ptr as *mut u8, layout);
+                // A zero-sized type took no heap in `new`, which handed back a dangling pointer
+                // rather than an allocation. Every element still drops, above.
+                if std::mem::size_of::<T>() != 0 {
+                    let layout = std::alloc::Layout::array::<T>(self.count)
+                        .expect("layout overflow in LoreArray<T>::drop");
+                    std::alloc::dealloc(self.ptr as *mut u8, layout);
+                }
             }
             self.ptr = std::ptr::null();
             self.count = 0;
@@ -1626,6 +1651,71 @@ pub fn shutdown() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An empty array holds a null pointer whichever constructor built it. `Drop` frees only a
+    /// non-null pointer with a count above zero, so any other pairing leaks.
+    #[test]
+    fn an_empty_array_holds_no_buffer() {
+        let from_empty_vec = LoreArray::<u32>::from_vec(Vec::new());
+
+        assert!(
+            from_empty_vec.ptr.is_null(),
+            "from_vec allocated for an empty vec, and Drop's `count > 0` guard skips that buffer"
+        );
+        assert_eq!(from_empty_vec.count, 0);
+        assert_eq!(from_empty_vec, LoreArray::default());
+    }
+
+    /// A zero-sized element type gives a zero-sized layout at every count, so nothing is
+    /// allocated, yet the count and the elements must survive.
+    #[test]
+    fn a_zero_sized_element_type_keeps_its_count_without_allocating() {
+        let array = LoreArray::<()>::from_vec(vec![(); 3]);
+
+        // The dangling pointer is the observable proof that nothing was allocated: an allocator
+        // would not answer the alignment as an address. A slice also needs it non-null.
+        assert_eq!(
+            array.ptr,
+            std::ptr::NonNull::<()>::dangling().as_ptr(),
+            "a zero-sized type must take a dangling pointer, not an allocation"
+        );
+        assert_eq!(array.len(), 3);
+        assert_eq!(array.as_slice(), [(), (), ()]);
+        assert_eq!(array.clone().as_slice(), [(), (), ()]);
+    }
+
+    /// Skipping the allocation must not skip the elements: `Drop` still runs each one.
+    #[test]
+    fn a_zero_sized_element_type_still_drops_every_element() {
+        static DROPPED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+        struct Counted;
+        impl Drop for Counted {
+            fn drop(&mut self) {
+                DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        drop(LoreArray::from_vec(vec![Counted, Counted, Counted]));
+
+        assert_eq!(
+            DROPPED.load(std::sync::atomic::Ordering::Relaxed),
+            3,
+            "every element must drop even though nothing was allocated"
+        );
+    }
+
+    /// Deserializing an empty sequence routes through `from_vec`.
+    #[test]
+    fn a_deserialized_empty_array_holds_no_buffer() {
+        let decoded: LoreArray<u32> =
+            serde_json::from_str("[]").expect("an empty sequence deserializes");
+
+        assert!(
+            decoded.ptr.is_null(),
+            "deserializing an empty array allocated a buffer Drop will not free"
+        );
+    }
 
     /// Arguments are logged whole, so a rendering that named every element of a
     /// caller's path list would be the bulk of a log.
