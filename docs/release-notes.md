@@ -7,6 +7,9 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Breaking changes
 
+- C API: `lore_revision_diff_args_t` gains `no_view_filter`, changing its size; rebuild against the new `lore.h`. A
+  zero-initialized struct keeps today's behavior
+
 ### Features
 
 - `lore service run` runs the Lore service in the current process, returning once it stops, whether by
@@ -21,6 +24,8 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 - `lore auth logout` (C API: `lore_auth_logout`) revokes an OIDC login's refresh token at the provider (OAuth 2.0
   token revocation, RFC 7009) if the provider advertises a revocation endpoint. A failed revocation, such as at an
   unreachable provider, now fails the logout, after the login is removed from this machine
+- `lore revision diff --no-view-filter` (C API: `no_view_filter` on `lore_revision_diff_args_t`) also lists changes to
+  paths the repository's view excludes
 
 ### Fixes & Improvements
 
